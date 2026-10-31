@@ -1,0 +1,962 @@
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -6,6 +6,7 @@
+ #include "llama-grammar.h"
+ 
+ #include "ggml-cpp.h"
++#include "ggml-cuda.h"
+ 
+ #include <array>
+ #include <atomic>
+@@ -3489,7 +3490,7 @@
+ 
+ // DRY
+ 
+-struct llama_sampler_dry {
++struct llama_sampler_dry : llama_sampler_backend {
+     const float   dry_multiplier;
+     const float   dry_base;
+     const int32_t dry_allowed_length;
+@@ -3499,6 +3500,25 @@
+     std::vector<int> dry_repeat_count;
+     std::unordered_map<llama_token, int> dry_max_token_repeat;
+     ring_buffer<llama_token> last_tokens;
++
++    // The original CPU Z-algorithm owns logical history. Only its sparse final
++    // penalty values cross to the backend, never logits or sampler RNG.
++    int32_t n_vocab = 0;
++    static constexpr int32_t backend_max_entries = 65536;
++    ggml_tensor * inp_token_ids = nullptr;
++    ggml_tensor * inp_penalties = nullptr;
++    int32_t n_max = 0;
++    bool has_candidates = false;
++    std::vector<int32_t> host_token_ids;
++    std::vector<float> host_penalties;
++
++    void copy_state(const llama_sampler_dry & src) {
++        // Input pointers/staging belong to the currently selected graph.
++        last_tokens = src.last_tokens;
++        // Z-algorithm workspaces are overwritten before use, not logical state.
++        dry_repeat_count.clear();
++        dry_max_token_repeat.clear();
++    }
+ };
+ 
+ // Ported from Koboldcpp, original PR: https://github.com/LostRuins/koboldcpp/pull/982 (Original author: pi6am)
+@@ -3544,8 +3564,8 @@
+     }
+ }
+ 
+-static const char * llama_sampler_dry_name(const struct llama_sampler * /*smpl*/) {
+-    return "dry";
++static const char * llama_sampler_dry_name(const struct llama_sampler * smpl) {
++    return static_cast<llama_sampler_dry *>(smpl->ctx)->get_name();
+ }
+ 
+ static void llama_sampler_dry_accept(struct llama_sampler * smpl, llama_token token) {
+@@ -3558,17 +3578,16 @@
+ }
+ 
+ // Ported from Koboldcpp, original PR: https://github.com/LostRuins/koboldcpp/pull/982 (Original author: pi6am)
+-static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+-    auto * ctx = (llama_sampler_dry *) smpl->ctx;
++static bool llama_sampler_dry_prepare(llama_sampler_dry * ctx) {
+ 
+     if (ctx->dry_multiplier == 0.0f || ctx->dry_base < 1.0f || ctx->dry_penalty_last_n == 0) {
+-        return;
++        return false;
+     }
+ 
+     int last_n_repeat = std::min((int) ctx->last_tokens.size(), ctx->dry_penalty_last_n);
+ 
+     if (last_n_repeat <= ctx->dry_allowed_length) {
+-        return;
++        return false;
+     }
+ 
+     ctx->dry_repeat_count.assign(last_n_repeat, 0);
+@@ -3632,7 +3651,7 @@
+         }
+     }
+     if (rep_limit < ctx->dry_allowed_length) {
+-        return;
++        return false;
+     }
+ 
+     // Step 2: Iterate in reverse over the last N tokens of the context, using the "Z-algorithm" (in
+@@ -3726,6 +3745,13 @@
+         }
+     }
+ 
++    return true;
++}
++
++static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
++    auto * ctx = (llama_sampler_dry *) smpl->ctx;
++    if (!llama_sampler_dry_prepare(ctx)) { return; }
++
+     // Step 4: Apply logit penalties based on the maximum repeat length for relevant tokens.
+ 
+     // Prevent floating point overflow in `pow(penalty_base, exponent)` by clamping to `max_exponent`.
+@@ -3778,22 +3804,146 @@
+     llama_vocab dummy_vocab;
+ 
+     // dummy vocab is passed because it is only needed for raw sequence breaker processing, which we have already done and will simply be copying
+-    auto * result = llama_sampler_init_dry(&dummy_vocab, ctx->dry_multiplier, ctx->dry_base, ctx->dry_allowed_length, ctx->dry_penalty_last_n, NULL, 0);
++    llama_sampler_ptr result(llama_sampler_init_dry(&dummy_vocab, ctx->dry_multiplier, ctx->dry_base, ctx->dry_allowed_length, ctx->dry_penalty_last_n, NULL, 0));
+ 
+     // Copy the state, including the processed breakers
+     {
+         auto * result_ctx = (llama_sampler_dry *) result->ctx;
+         result_ctx->dry_processed_breakers = ctx->dry_processed_breakers;
+-        result_ctx->dry_repeat_count = ctx->dry_repeat_count;
+-        result_ctx->dry_max_token_repeat = ctx->dry_max_token_repeat;
+         result_ctx->last_tokens = ctx->last_tokens;
+-    }
+-
+-    return result;
++        result_ctx->n_vocab = ctx->n_vocab;
++    }
++
++    return result.release();
+ }
+ 
+ static void llama_sampler_dry_free(struct llama_sampler * smpl) {
+     delete (llama_sampler_dry *) smpl->ctx;
++}
++
++// A DRY plan is history-only, so keep the exact CPU Z-algorithm and pow
++// arithmetic, upload bounded sparse penalties, then subtract on the backend.
++// Larger plans and multi-output verification retain the original host path.
++static bool llama_sampler_dry_backend_init(llama_sampler * sampler,
++        ggml_backend_buffer_type_t buft, uint32_t max_outputs) {
++    auto * ctx = static_cast<llama_sampler_dry *>(sampler->ctx);
++    // A newly complete backend chain can select tokens with a different device
++    // RNG algorithm than the old CPU suffix. Preserve existing seeded profiles
++    // unless the caller explicitly opts into that backend execution contract.
++    const char * enabled = std::getenv("WILDLLAMA_DRY_BACKEND");
++    if (!enabled || std::strcmp(enabled, "1") != 0) {
++        ctx->init(false);
++        return false;
++    }
++    const int32_t entries = std::min(ctx->dry_penalty_last_n, ctx->n_vocab);
++    // Include sparse inputs, gathered/subtracted scores, possible full-vocab
++    // penalty rows, and graph metadata. This is a conservative admission bound,
++    // not an additional allowance beyond the allocator's existing VRAM quota.
++    const uint64_t extra_bound = uint64_t(std::max(ctx->n_vocab, 0)) * 24u +
++        uint64_t(std::max(entries, 0)) * 32u + 64u * ggml_tensor_overhead();
++    bool budget_ok = extra_bound <= 8u * 1024u * 1024u;
++    auto * device = ggml_backend_buft_get_device(buft);
++    auto * registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++    if (budget_ok && registry && std::strcmp(ggml_backend_reg_name(registry), "CUDA") == 0) {
++        auto stats_fn = reinterpret_cast<bool (*)(ggml_backend_dev_t, ggml_backend_cuda_memory_stats *)>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_get_memory_stats"));
++        ggml_backend_cuda_memory_stats stats{};
++        budget_ok = stats_fn && stats_fn(device, &stats);
++        if (budget_ok && stats.enabled && stats.limit_bytes) {
++            budget_ok = stats.managed_used_bytes <= stats.limit_bytes &&
++                extra_bound <= stats.limit_bytes - stats.managed_used_bytes;
++        }
++        size_t free = 0, total = 0;
++        ggml_backend_dev_memory(device, &free, &total);
++        budget_ok = budget_ok && extra_bound <= free;
++    }
++    if (max_outputs > 1 || entries <= 0 || entries > llama_sampler_dry::backend_max_entries || !budget_ok) {
++        ctx->init(false);
++        return false;
++    }
++    const bool supported = llama_sampler_backend_support(sampler, buft);
++    ctx->init(supported);
++    return supported;
++}
++
++static void llama_sampler_dry_backend_reset(llama_sampler * sampler) {
++    auto * ctx = static_cast<llama_sampler_dry *>(sampler->ctx);
++    ctx->inp_token_ids = nullptr;
++    ctx->inp_penalties = nullptr;
++}
++
++static void llama_sampler_dry_backend_apply(llama_sampler * sampler, ggml_context * context,
++        ggml_cgraph * graph, llama_sampler_data * data) {
++    GGML_UNUSED(graph);
++    auto * ctx = static_cast<llama_sampler_dry *>(sampler->ctx);
++    ctx->n_max = std::min(ctx->dry_penalty_last_n, ctx->n_vocab);
++    GGML_ASSERT(ctx->n_max > 0 && ctx->n_max <= llama_sampler_dry::backend_max_entries);
++    ctx->has_candidates = data->candidates != nullptr;
++    ctx->inp_token_ids = ggml_new_tensor_1d(context, GGML_TYPE_I32, ctx->n_max);
++    ctx->inp_penalties = ggml_new_tensor_1d(context, GGML_TYPE_F32, ctx->n_max);
++    ggml_set_name(ctx->inp_token_ids, "dry_token_ids");
++    ggml_set_name(ctx->inp_penalties, "dry_penalties");
++    ggml_set_input(ctx->inp_token_ids);
++    ggml_set_input(ctx->inp_penalties);
++    ctx->host_token_ids.resize(ctx->n_max);
++    ctx->host_penalties.resize(ctx->n_max);
++    auto * logits = ggml_reshape_1d(context, data->logits, ggml_nelements(data->logits));
++    if (ctx->has_candidates) {
++        // IDs may already be filtered/reordered (or duplicated). Gather the
++        // same penalty per ID instead of treating candidate positions as IDs.
++        auto * rows = ggml_fill(context, ggml_new_tensor_2d(context, GGML_TYPE_F32, 1, ctx->n_vocab), 0.f);
++        rows = ggml_set_rows(context, rows, ggml_reshape_2d(context, ctx->inp_penalties, 1, ctx->n_max), ctx->inp_token_ids);
++        auto * candidates = ggml_reshape_1d(context, data->candidates, ggml_nelements(data->candidates));
++        GGML_ASSERT(ggml_nelements(candidates) == ggml_nelements(logits));
++        auto * penalties = ggml_get_rows(context, rows, candidates);
++        data->logits = ggml_sub(context, logits, ggml_reshape_1d(context, penalties, ggml_nelements(logits)));
++    } else {
++        auto * rows = ggml_reshape_2d(context, logits, 1, ggml_nelements(logits));
++        auto * gathered = ggml_get_rows(context, rows, ctx->inp_token_ids);
++        auto * penalized = ggml_sub(context, ggml_reshape_1d(context, gathered, ctx->n_max), ctx->inp_penalties);
++        rows = ggml_set_rows(context, rows, ggml_reshape_2d(context, penalized, 1, ctx->n_max), ctx->inp_token_ids);
++        data->logits = ggml_reshape_1d(context, rows, ggml_nelements(logits));
++    }
++}
++
++static void llama_sampler_dry_backend_set_input(llama_sampler * sampler) {
++    auto * ctx = static_cast<llama_sampler_dry *>(sampler->ctx);
++    if (!ctx->inp_token_ids || !ctx->inp_penalties || ctx->n_max <= 0) { return; }
++    int32_t active = 0;
++    if (llama_sampler_dry_prepare(ctx)) {
++        for (const auto & entry : ctx->dry_max_token_repeat) {
++            if (entry.first < 0 || entry.first >= ctx->n_vocab) { continue; }
++            bool breaker = false;
++            const auto range = ctx->dry_processed_breakers.equal_range(entry.first);
++            for (auto it = range.first; it != range.second; ++it) {
++                if (it->second.empty()) { breaker = true; break; }
++            }
++            if (!breaker) {
++                GGML_ASSERT(active < ctx->n_max);
++                ctx->host_token_ids[active++] = entry.first;
++            }
++        }
++    }
++    std::sort(ctx->host_token_ids.begin(), ctx->host_token_ids.begin() + active);
++    const float FLOAT_MAX_LOG = 88.7228391f;
++    int max_exponent = 0;
++    if (ctx->dry_base > 1.000001f) { max_exponent = FLOAT_MAX_LOG / std::log(ctx->dry_base); }
++    for (int32_t i = 0; i < active; ++i) {
++        int exponent = ctx->dry_max_token_repeat.at(ctx->host_token_ids[i]) - ctx->dry_allowed_length;
++        if (max_exponent > 0 && exponent > max_exponent) { exponent = max_exponent; }
++        ctx->host_penalties[i] = ctx->dry_multiplier * std::pow(ctx->dry_base, exponent);
++    }
++    // Every padding ID is distinct and absent from the active set. Unlike
++    // duplicate scatter indices, these writes have a defined order-free result.
++    int32_t filler = 0, seen = 0;
++    for (int32_t i = active; i < ctx->n_max; ++i) {
++        while (seen < active && ctx->host_token_ids[seen] == filler) { ++seen; ++filler; }
++        GGML_ASSERT(filler < ctx->n_vocab);
++        ctx->host_token_ids[i] = filler++;
++        ctx->host_penalties[i] = 0.f;
++    }
++    ggml_backend_tensor_set(ctx->inp_token_ids, ctx->host_token_ids.data(), 0, ctx->n_max * sizeof(int32_t));
++    ggml_backend_tensor_set(ctx->inp_penalties, ctx->host_penalties.data(), 0, ctx->n_max * sizeof(float));
+ }
+ 
+ static struct llama_sampler_i llama_sampler_dry_i = {
+@@ -3803,12 +3953,12 @@
+     /* .reset             = */ llama_sampler_dry_reset,
+     /* .clone             = */ llama_sampler_dry_clone,
+     /* .free              = */ llama_sampler_dry_free,
+-    /* .backend_init      = */ nullptr,
++    /* .backend_init      = */ llama_sampler_dry_backend_init,
+     /* .backend_accept    = */ nullptr,
+-    /* .backend_apply     = */ nullptr,
+-    /* .backend_set_input = */ nullptr,
+-    /* .backend_reset     = */ nullptr,
+-    /* .copy_state        = */ nullptr,
++    /* .backend_apply     = */ llama_sampler_dry_backend_apply,
++    /* .backend_set_input = */ llama_sampler_dry_backend_set_input,
++    /* .backend_reset     = */ llama_sampler_dry_backend_reset,
++    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dry>,
+ };
+ 
+ struct llama_sampler * llama_sampler_init_dry(const struct llama_vocab * vocab, float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const char** seq_breakers, size_t num_breakers) {
+@@ -3849,14 +3999,16 @@
+     return llama_sampler_init(
+         /* .iface = */ &llama_sampler_dry_i,
+         /* .ctx   = */ new llama_sampler_dry {
++            /* .backend                = */ llama_sampler_backend("dry"),
+             /* .dry_multiplier         = */ dry_multiplier,
+             /* .dry_base               = */ dry_base,
+             /* .dry_allowed_length     = */ dry_allowed_length,
+             /* .dry_penalty_last_n     = */ dry_penalty_last_n,
+             /* .dry_processed_breakers = */ std::move(processed_breakers),
+-            /* .dry_repeat_count       = */ dry_enabled ? std::vector<int>(dry_penalty_last_n, 0) : std::vector<int>{},
++            /* .dry_repeat_count       = */ {},
+             /* .dry_max_token_repeat   = */ {},
+             /* .last_tokens            = */ dry_enabled ? ring_buffer<llama_token>(dry_penalty_last_n) : ring_buffer<llama_token>(0),
++            /* .n_vocab                = */ vocab ? int32_t(vocab->n_tokens()) : 0,
+         }
+     );
+ }
+@@ -3865,6 +4017,7 @@
+ struct llama_sampler * llama_sampler_init_dry_testing(float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const std::vector<std::vector<llama_token>>& seq_breakers) {
+     llama_vocab dummy_vocab;
+     auto * result = llama_sampler_init_dry(&dummy_vocab, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, NULL, 0);
++    if (result->iface != &llama_sampler_dry_i) { return result; }
+     auto * ctx = (llama_sampler_dry *) result->ctx;
+ 
+     // Process the token-based sequence breakers
+@@ -4001,16 +4154,27 @@
+ 
+ static struct llama_sampler * llama_sampler_adaptive_p_clone(const struct llama_sampler * smpl) {
+     const auto * ctx  = (const llama_sampler_adaptive_p *) smpl->ctx;
+-    auto * result     = llama_sampler_init_adaptive_p(ctx->target, ctx->decay, ctx->seed);
++    llama_sampler_ptr result(llama_sampler_init_adaptive_p(ctx->target, ctx->decay, ctx->seed));
+     auto * result_ctx = (llama_sampler_adaptive_p *) result->ctx;
+ 
+-    // copy everything (target, decay, seed, and RNG are already set)
++    // Construction seeds a fresh generator; a checkpoint must instead retain
++    // its current RNG position and the probability row for a pending accept.
++    result_ctx->seed_cur          = ctx->seed_cur;
++    result_ctx->rng               = ctx->rng;
+     result_ctx->weighted_sum      = ctx->weighted_sum;
+     result_ctx->total_weight      = ctx->total_weight;
+     result_ctx->pending_token_id  = ctx->pending_token_id;
+     result_ctx->pending_token_idx = ctx->pending_token_idx;
+-
+-    return result;
++    if (ctx->pending_token_id != LLAMA_TOKEN_NULL) {
++        GGML_ASSERT(ctx->pending_token_idx >= 0 && size_t(ctx->pending_token_idx) < ctx->original_probs.size());
++        // accept() can observe only the chosen token's original probability;
++        // the next apply() overwrites the complete vector. Keep one exact
++        // float rather than cloning a vocabulary-sized scratch allocation.
++        result_ctx->original_probs.push_back(ctx->original_probs[ctx->pending_token_idx]);
++        result_ctx->pending_token_idx = 0;
++    }
++
++    return result.release();
+ }
+ 
+ static void llama_sampler_adaptive_p_free(struct llama_sampler * smpl) {
+@@ -4534,6 +4698,12 @@
+         });
+     }
+     const auto accept = sampler->iface->accept;
++    if (sampler->iface == &llama_sampler_dry_i) {
++        const auto & dry = *static_cast<const llama_sampler_dry *>(sampler->ctx);
++        // The exact builtin accept only writes an already allocated ring; it
++        // neither inspects candidates nor allocates/throws with this capacity.
++        return dry.dry_penalty_last_n > 0 && dry.last_tokens.capacity == size_t(dry.dry_penalty_last_n);
++    }
+     return !accept || accept == llama_sampler_empty_accept || accept == llama_sampler_dist_accept;
+ }
+ 
+@@ -4768,7 +4938,12 @@
+         if(!child.is_backend) {break;}
+         if(child.ptr->iface==&llama_sampler_token_mask_i) {
+             const auto & mask=*static_cast<llama_sampler_token_mask *>(child.ptr->ctx);
+-            data->sampled=ggml_token_mask_validate(ctx,data->logits,mask.inp_words,data->sampled,
++            // Top-k gathers leave contiguous [1,K] rows. Distribution flattens
++            // its own input without changing data->logits; validation needs
++            // the same candidate order through a metadata-only vector view.
++            auto * logits=data->logits;
++            if(!ggml_is_vector(logits)) {logits=ggml_reshape_1d(ctx,logits,ggml_nelements(logits));}
++            data->sampled=ggml_token_mask_validate(ctx,logits,mask.inp_words,data->sampled,
+                 data->candidates,data->probs,pre_filter,mask.n_vocab);
+         }
+     }
+@@ -4790,7 +4965,7 @@
+            iface == &llama_sampler_top_p_i     || iface == &llama_sampler_min_p_i  ||
+            iface == &llama_sampler_temp_i      || iface == &llama_sampler_temp_ext_i ||
+            iface == &llama_sampler_penalties_i || iface == &llama_sampler_penalties_canonical_i || iface == &llama_sampler_logit_bias_i ||
+-           iface == &llama_sampler_token_mask_i;
++           iface == &llama_sampler_token_mask_i || iface == &llama_sampler_dry_i;
+ }
+ 
+ class sampler_graph_binding final : public llama_sampler_graph_binding {
+@@ -4812,6 +4987,7 @@
+         int32_t n_max = 0;
+         bool has_candidates = false;
+         std::vector<int32_t> token_ids, counts;
++        std::vector<float> penalties;
+     };
+     std::vector<entry> entries;
+ 
+@@ -4832,6 +5008,10 @@
+             const auto & ctx=*static_cast<const llama_sampler_penalties *>(sampler->ctx);
+             add(result.payload,vector_bytes(ctx.host_token_ids.size(),sizeof(int32_t)));
+             add(result.payload,vector_bytes(ctx.host_counts.size(),sizeof(int32_t)));
++        } else if(sampler->iface==&llama_sampler_dry_i) {
++            const auto & ctx=*static_cast<const llama_sampler_dry *>(sampler->ctx);
++            add(result.payload,vector_bytes(ctx.host_token_ids.size(),sizeof(int32_t)));
++            add(result.payload,vector_bytes(ctx.host_penalties.size(),sizeof(float)));
+         }
+         return result;
+     }
+@@ -4852,6 +5032,11 @@
+             e.input0 = ctx.inp_token_ids; e.input1 = ctx.inp_counts;
+             e.n_max = ctx.n_max; e.has_candidates = ctx.has_candidates;
+             e.token_ids = ctx.host_token_ids; e.counts = ctx.host_counts;
++        } else if (sampler->iface == &llama_sampler_dry_i) {
++            const auto & ctx = *static_cast<llama_sampler_dry *>(sampler->ctx);
++            e.input0 = ctx.inp_token_ids; e.input1 = ctx.inp_penalties;
++            e.n_max = ctx.n_max; e.has_candidates = ctx.has_candidates;
++            e.token_ids = ctx.host_token_ids; e.penalties = ctx.host_penalties;
+         } else if (sampler->iface == &llama_sampler_logit_bias_i) {
+             const auto & ctx = *static_cast<llama_sampler_logit_bias *>(sampler->ctx);
+             e.input0 = ctx.inp_logit_bias; e.input1 = ctx.inp_logit_idxs;
+@@ -4919,6 +5104,11 @@
+                 std::swap(ctx.inp_token_ids, e.input0); std::swap(ctx.inp_counts, e.input1);
+                 std::swap(ctx.n_max, e.n_max); std::swap(ctx.has_candidates, e.has_candidates);
+                 ctx.host_token_ids.swap(e.token_ids); ctx.host_counts.swap(e.counts);
++            } else if (e.iface == &llama_sampler_dry_i) {
++                auto & ctx = *static_cast<llama_sampler_dry *>(e.identity->ctx);
++                std::swap(ctx.inp_token_ids, e.input0); std::swap(ctx.inp_penalties, e.input1);
++                std::swap(ctx.n_max, e.n_max); std::swap(ctx.has_candidates, e.has_candidates);
++                ctx.host_token_ids.swap(e.token_ids); ctx.host_penalties.swap(e.penalties);
+             } else if (e.iface == &llama_sampler_logit_bias_i) {
+                 auto & ctx = *static_cast<llama_sampler_logit_bias *>(e.identity->ctx);
+                 std::swap(ctx.inp_logit_bias, e.input0); std::swap(ctx.inp_logit_idxs, e.input1);
+@@ -4934,6 +5124,7 @@
+         for (const auto & e : entries) {
+             bytes += e.uniforms.capacity()*sizeof(ggml_tensor *);
+             bytes += (e.token_ids.capacity() + e.counts.capacity())*sizeof(int32_t);
++            bytes += e.penalties.capacity()*sizeof(float);
+         }
+         return bytes;
+     }
+diff --git a/tests/test-sampler-backend-extensions.cpp b/tests/test-sampler-backend-extensions.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-sampler-backend-extensions.cpp
+@@ -0,0 +1,540 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "ggml-cuda.h"
++#include "../src/llama-sampler.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++static size_t max_graph_buffer_bytes=0, max_sparse_input_bytes=0;
++
++struct scoped_dry_backend {
++    bool had_value=false;
++    std::string previous;
++    static int set(const char * value) {
++#ifdef _WIN32
++        return _putenv_s("WILDLLAMA_DRY_BACKEND",value ? value : "");
++#else
++        return value ? setenv("WILDLLAMA_DRY_BACKEND",value,1) : unsetenv("WILDLLAMA_DRY_BACKEND");
++#endif
++    }
++    explicit scoped_dry_backend(const char * value) {
++        const char * old=std::getenv("WILDLLAMA_DRY_BACKEND");had_value=old!=nullptr;
++        if(old) {previous=old;}
++        require(set(value)==0,"could not set isolated DRY backend fixture switch");
++    }
++    ~scoped_dry_backend() {set(had_value ? previous.c_str() : nullptr);}
++};
++
++// Vocabulary-only metadata: zero model weights, no downloaded files.
++static llama_model_ptr vocabulary(int count = 259) {
++    gguf_context_ptr metadata(gguf_init_empty());
++    gguf_set_val_str(metadata.get(), "general.architecture", "llama");
++    for (const auto & item : std::vector<std::pair<const char *, uint32_t>>{
++            {"context_length",128},{"embedding_length",32},{"feed_forward_length",64},
++            {"block_count",1},{"attention.head_count",1},{"attention.head_count_kv",1},
++            {"rope.dimension_count",32}}) {
++        gguf_set_val_u32(metadata.get(), (std::string("llama.")+item.first).c_str(), item.second);
++    }
++    gguf_set_val_f32(metadata.get(), "llama.attention.layer_norm_rms_epsilon", 1e-6f);
++    gguf_set_val_str(metadata.get(), "tokenizer.ggml.model", "llama");
++    gguf_set_val_bool(metadata.get(), "tokenizer.ggml.add_space_prefix", false);
++    std::vector<std::string> names = {"<unk>","<s>","</s>"};
++    for (int i=0; i<256; ++i) { char byte[16]; std::snprintf(byte,sizeof(byte),"<0x%02X>",i); names.emplace_back(byte); }
++    for (int i=259; i<count; ++i) { names.emplace_back("word"+std::to_string(i)); }
++    std::vector<const char *> tokens; for (const auto & name:names) { tokens.push_back(name.c_str()); }
++    std::vector<float> scores(count,0.f);
++    std::vector<int32_t> types(count,6); types[0]=2;types[1]=types[2]=3;
++    for (int i=259; i<count; ++i) { types[i]=1; }
++    gguf_set_arr_str(metadata.get(), "tokenizer.ggml.tokens", tokens.data(),tokens.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32,scores.data(),scores.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32,types.data(),types.size());
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.unknown_token_id",0);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.bos_token_id",1);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.eos_token_id",2);
++    auto params=llama_model_default_params(); params.vocab_only=true; params.n_gpu_layers=0;
++    llama_model_ptr model(llama_model_init_from_user(metadata.get(),nullptr,nullptr,params));
++    require(bool(model) && llama_vocab_n_tokens(llama_model_get_vocab(model.get()))==count,"vocabulary-only fixture failed");
++    return model;
++}
++
++static llama_sampler_ptr dry(const llama_vocab * vocab, float multiplier=.75f, float base=2.f,
++        int allowed=2, int window=32, const std::vector<const char *> & breakers={}) {
++    return llama_sampler_ptr(llama_sampler_init_dry(vocab,multiplier,base,allowed,window,
++        breakers.empty() ? nullptr : const_cast<const char **>(breakers.data()),breakers.size()));
++}
++
++static void accept(llama_sampler * sampler, const std::vector<llama_token> & history) {
++    for (auto token:history) { llama_sampler_accept(sampler,token); }
++}
++
++static std::vector<llama_token_data> rows(const std::vector<llama_token> & ids, bool nonfinite=false) {
++    std::vector<llama_token_data> values;
++    for (auto id:ids) {
++        float score=float((id*17)%37-18)/8.f;
++        if (id==0) {score=0.f;} if (id==1) {score=-0.f;}
++        if (nonfinite && id==2) {score=INFINITY;}
++        if (nonfinite && id==3) {score=-INFINITY;}
++        if (nonfinite && id==4) {score=NAN;}
++        values.push_back({id,score,float(id%5)/8.f});
++    }
++    return values;
++}
++
++static void same_float(float actual, float expected) {
++    if (std::isnan(expected)) { require(std::isnan(actual),"nonfinite DRY classification changed"); }
++    else { require(std::memcmp(&actual,&expected,sizeof(float))==0,"DRY score/signed-zero bits changed"); }
++}
++
++struct raw_graph {
++    llama_sampler * sampler;
++    ggml_context_ptr context;
++    ggml_cgraph * graph=nullptr;
++    ggml_tensor * scores=nullptr;
++    ggml_tensor * ids=nullptr;
++    llama_sampler_data output{};
++    ggml_backend_buffer_ptr storage;
++    size_t bytes=0;
++    raw_graph(llama_sampler * sampler, ggml_backend_t backend, size_t count, bool candidates, bool selected=false, bool expect_dry=true)
++        :sampler(sampler),context(ggml_init({4*1024*1024,nullptr,true})) {
++        require(bool(context),"raw graph metadata allocation failed");
++        scores=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,count);ggml_set_input(scores);
++        ids=candidates ? ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,count) : nullptr;
++        if(ids) {ggml_set_input(ids);}
++        graph=ggml_new_graph_custom(context.get(),2048,false);
++        output={scores,nullptr,nullptr,ids};
++        sampler->iface->backend_reset(sampler);
++        sampler->iface->backend_apply(sampler,context.get(),graph,&output);
++        require(ggml_graph_n_nodes(graph)==0,"sampler expanded an inactive output branch");
++        require(!selected || output.sampled,"backend selector was absent");
++        ggml_build_forward_expand(graph,selected ? output.sampled : output.logits);
++        for(int i=0;i<ggml_graph_n_nodes(graph);++i) {
++            require(ggml_backend_supports_op(backend,ggml_graph_node(graph,i)),"raw backend cannot execute operation");
++        }
++        storage.reset(ggml_backend_alloc_ctx_tensors(context.get(),backend));
++        require(bool(storage),"raw graph buffer unavailable");
++        bytes=ggml_backend_buffer_get_size(storage.get());
++        require(bytes<=8*1024*1024,"DRY fixture graph escaped the conservative byte bound");
++        max_graph_buffer_bytes=std::max(max_graph_buffer_bytes,bytes);
++        size_t sparse=0;
++        for(auto * tensor=ggml_get_first_tensor(context.get());tensor;tensor=ggml_get_next_tensor(context.get(),tensor)) {
++            if(std::strcmp(ggml_get_name(tensor),"dry_token_ids")==0 || std::strcmp(ggml_get_name(tensor),"dry_penalties")==0) {sparse+=ggml_nbytes(tensor);}
++        }
++        require((!expect_dry || sparse>0) && sparse<=512*1024,"DRY graph lacks bounded sparse metadata inputs");
++        max_sparse_input_bytes=std::max(max_sparse_input_bytes,sparse);
++    }
++    std::vector<float> compute(ggml_backend_t backend, const std::vector<llama_token_data> & values) {
++        std::vector<float> logits;std::vector<llama_token> candidates;
++        for(const auto & value:values) {logits.push_back(value.logit);candidates.push_back(value.id);}
++        ggml_backend_tensor_set(scores,logits.data(),0,logits.size()*sizeof(float));
++        if(ids) {ggml_backend_tensor_set(ids,candidates.data(),0,candidates.size()*sizeof(llama_token));}
++        sampler->iface->backend_set_input(sampler);
++        require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"raw DRY graph execution failed");
++        std::vector<float> result(output.logits ? ggml_nelements(output.logits) : 0);
++        if(output.logits) {ggml_backend_tensor_get(output.logits,result.data(),0,result.size()*sizeof(float));}
++        return result;
++    }
++};
++
++static void compare(raw_graph & graph, ggml_backend_t backend, llama_sampler * cpu,
++        const std::vector<llama_token_data> & input) {
++    auto values=input;
++    llama_token_data_array expected{values.data(),values.size(),-1,false};llama_sampler_apply(cpu,&expected);
++    const auto actual=graph.compute(backend,input);
++    for(size_t i=0;i<values.size();++i) {same_float(actual[i],values[i].logit);}
++}
++
++static void dry_backend(llama_model * model, ggml_backend_t backend) {
++    const auto * vocab=llama_model_get_vocab(model);
++    const auto buft=ggml_backend_get_default_buffer_type(backend);
++    std::vector<llama_token> canonical(259);std::iota(canonical.begin(),canonical.end(),0);
++    int comparisons=0;
++    const std::vector<std::vector<llama_token>> histories={
++        {},{3,4},{3,4,5,3,4},{3,4,3,4,3,4},{3,4,5,6,3,4},
++        {3+'a',3+'b',3+'c',3+'a',3+'b'},
++        {3+'a',3+'b',3+'c',3+'x',3+'a',3+'b'},
++        {-1,3,4,90000,-1,3,4}};
++    for(const auto & history:histories) for(bool filtered:{false,true}) for(bool nonfinite:{false,true}) {
++        auto current=dry(vocab);auto cpu=dry(vocab);accept(current.get(),history);accept(cpu.get(),history);
++        require(current->iface->backend_init(current.get(),buft,1),"DRY backend was not admitted");
++        require(std::string(llama_sampler_name(current.get()))=="+dry","actual DRY backend marker missing");
++        auto ids=canonical;
++        if(filtered) {ids={9,5,4,3,0,1,2,4,900%259};}
++        raw_graph graph(current.get(),backend,ids.size(),filtered);
++        const auto input=rows(ids,nonfinite);
++        compare(graph,backend,cpu.get(),input);++comparisons;
++        // Repeated graph evaluation never accepts tokens by itself.
++        compare(graph,backend,cpu.get(),input);++comparisons;
++        if(history==std::vector<llama_token>{3,4,5,3,4} && !filtered && !nonfinite) {
++            auto expected=input;llama_token_data_array array{expected.data(),expected.size(),-1,false};
++            llama_sampler_apply(cpu.get(),&array);
++            require(expected[5].logit==input[5].logit-.75f,"manual repeated-suffix penalty did not fire");
++        }
++    }
++    for(const auto & breakers:std::vector<std::vector<const char *>>{{"x"},{"ab"},{"aab","ab","\n"}}) {
++        auto current=dry(vocab,.5f,1.1f,1,32,breakers),cpu=dry(vocab,.5f,1.1f,1,32,breakers);
++        const std::vector<llama_token> history={3+'a',3+'b',3+'c',3+'a',3+'b',3+'x',3+'a',3+'b'};
++        accept(current.get(),history);accept(cpu.get(),history);
++        require(current->iface->backend_init(current.get(),buft,1),"sequence-breaker DRY backend missing");
++        raw_graph graph(current.get(),backend,canonical.size(),false);
++        compare(graph,backend,cpu.get(),rows(canonical));++comparisons;
++    }
++    // Full/filtered graph bindings exchange scratch, never logical history.
++    auto current=dry(vocab),cpu=dry(vocab);accept(current.get(),{3,4,5,3,4});accept(cpu.get(),{3,4,5,3,4});
++    require(current->iface->backend_init(current.get(),buft,1),"binding DRY backend missing");
++    raw_graph full(current.get(),backend,canonical.size(),false);
++    auto binding=llama_sampler_backend_capture_bindings(current.get());
++    require(binding && llama_sampler_backend_binding_size_bound(current.get())>=binding->memory_size(),"DRY binding budget missing");
++    raw_graph filtered(current.get(),backend,7,true);
++    auto current_copy=llama_sampler_ptr(llama_sampler_clone(cpu.get()));
++    accept(current_copy.get(),{5,3,4});accept(cpu.get(),{5,3,4});
++    current->iface->copy_state(current_copy.get(),current.get());
++    binding->swap_bindings(current.get());compare(full,backend,cpu.get(),rows(canonical));binding->swap_bindings(current.get());
++    compare(filtered,backend,cpu.get(),rows({0,1,3,4,5,6,5}));comparisons+=2;
++    llama_sampler_reset(current.get());llama_sampler_reset(cpu.get());
++    binding->swap_bindings(current.get());compare(full,backend,cpu.get(),rows(canonical));binding->swap_bindings(current.get());++comparisons;
++    auto custom=*current->iface;llama_sampler alias{&custom,current->ctx};
++    require(!llama_sampler_backend_can_bind_graph(&alias),"copied custom DRY table was treated as builtin");
++    require(!llama_sampler_can_defer_candidates(&alias),"copied custom DRY accept gained compact-output permission");
++    auto multi=dry(vocab);require(!multi->iface->backend_init(multi.get(),buft,2),"unaccepted multi-output history was offloaded");
++    auto disabled=dry(vocab,0.f);require(std::string(llama_sampler_name(disabled.get()))=="?dry","disabled DRY no-op changed");
++    auto large=vocabulary(70000);auto oversized=dry(llama_model_get_vocab(large.get()),1.f,2.f,2,65537);
++    require(!oversized->iface->backend_init(oversized.get(),buft,1),"oversized sparse DRY plan was admitted");
++    std::printf("DRY_BACKEND sparse_exact_cases=%d selected_history_cpu_exact=1 graph_bindings=1 reset_clone_copy=1 bounds_fallback=1 PASS\n",comparisons);
++}
++
++static void chains(llama_model * model, ggml_backend_t backend) {
++    auto * vocab=llama_model_get_vocab(model);const auto buft=ggml_backend_get_default_buffer_type(backend);
++    std::vector<llama_token> canonical(259);std::iota(canonical.begin(),canonical.end(),0);
++    for(bool partial:{false,true}) for(bool constrained:{false,true}) {
++        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        if(constrained) {
++            llama_sampler_ptr mask(llama_sampler_init_token_mask(259));std::vector<uint32_t> words(9,0);
++            for(int id:{3,4,5}) {words[id/32]|=UINT32_C(1)<<(id%32);}
++            require(llama_sampler_set_token_mask(mask.get(),words.data(),words.size()),"mask setup failed");
++            llama_sampler_chain_add(chain.get(),mask.release());
++        }
++        auto penalty=dry(vocab);accept(penalty.get(),{3,4,5,3,4});llama_sampler_chain_add(chain.get(),penalty.release());
++        if(partial) {llama_sampler_chain_add(chain.get(),llama_sampler_init_top_n_sigma(.8f));}
++        llama_sampler_chain_add(chain.get(),llama_sampler_init_greedy());
++        auto cpu=llama_sampler_ptr(llama_sampler_clone(chain.get()));
++        require(llama_sampler_backend_set_selected_only(chain.get()),"selected-only contract rejected before backend init");
++        require(chain->iface->backend_init(chain.get(),buft,1)==!partial,"DRY chain backend support changed");
++        auto * state=static_cast<llama_sampler_chain *>(chain->ctx);
++        if(partial && constrained) {
++            for(const auto & child:state->samplers) {require(!child.is_backend,"partial constrained DRY chain did not wholly fall back");}
++            auto input=rows(canonical);input[4].logit=2.5f;input[5].logit=3.f;auto expected=input;
++            llama_token_data_array a{input.data(),input.size(),-1,false},b{expected.data(),expected.size(),-1,false};
++            llama_sampler_apply(chain.get(),&a);llama_sampler_apply(cpu.get(),&b);
++            require(a.selected==b.selected && a.data[a.selected].id==b.data[b.selected].id,"constrained DRY CPU fallback changed selection");
++            for(size_t i=0;i<input.size();++i) {same_float(input[i].logit,expected[i].logit);}
++            continue;
++        }
++        raw_graph graph(chain.get(),backend,canonical.size(),false,!partial);
++        auto input=rows(canonical);
++        // DRY must change the winner from5 to4; the post-penalty maximum has
++        // a unique margin, so host/backend tie conventions are irrelevant.
++        input[4].logit=2.5f;input[5].logit=3.f;
++        auto expected=input;llama_token_data_array array{expected.data(),expected.size(),-1,false};
++        llama_sampler_apply(cpu.get(),&array);
++        require(array.data[array.selected].id==4,"manual DRY chain winner did not change from5 to4");
++        const auto computed=graph.compute(backend,input);
++        if(!partial) {
++            int32_t selected=-1;ggml_backend_tensor_get(graph.output.sampled,&selected,0,sizeof(selected));
++            for(size_t i=0;i<expected.size();++i) {same_float(computed[i],expected[i].logit);}
++            if(selected!=array.data[array.selected].id) {
++                std::fprintf(stderr,"DRY_CHAIN_DIAGNOSTIC partial=%d constrained=%d actual=%d expected=%d\n",partial,constrained,selected,array.data[array.selected].id);
++            }
++            require(selected==array.data[array.selected].id,"complete DRY/grammar backend selected a different token");
++            require(llama_sampler_backend_selected_only_ready(chain.get()),"complete DRY chain lost compact output");
++        } else {
++            for(size_t i=0;i<input.size();++i) {input[i].logit=computed[i];}
++            llama_token_data_array actual{input.data(),input.size(),-1,false};llama_sampler_apply(chain.get(),&actual);
++            require(actual.data[actual.selected].id==array.data[array.selected].id,"partial DRY GPU prefix changed CPU suffix selection");
++            for(size_t i=0;i<input.size();++i) {same_float(input[i].logit,expected[i].logit);}
++        }
++    }
++    std::puts("DRY_CHAIN full_compact=1 grammar_guard=1 partial_host_suffix=1 constrained_full_fallback=1 PASS");
++}
++
++static void greedy_tie_contract(llama_model * model,ggml_backend_t backend) {
++    const auto * vocab=llama_model_get_vocab(model);
++    auto penalty=dry(vocab),cpu=dry(vocab);
++    accept(penalty.get(),{3,4,5,3,4});accept(cpu.get(),{3,4,5,3,4});
++    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++    llama_sampler_chain_add(chain.get(),penalty.release());llama_sampler_chain_add(chain.get(),llama_sampler_init_greedy());
++    require(llama_sampler_backend_set_selected_only(chain.get()),"tie fixture compact output unavailable");
++    require(chain->iface->backend_init(chain.get(),ggml_backend_get_default_buffer_type(backend),1),"tie fixture backend unavailable");
++    std::vector<llama_token> ids(259);std::iota(ids.begin(),ids.end(),0);
++    auto input=rows(ids),expected=input;llama_token_data_array values{expected.data(),expected.size(),-1,false};
++    llama_sampler_apply(cpu.get(),&values);
++    raw_graph graph(chain.get(),backend,ids.size(),false,true);
++    const auto actual_logits=graph.compute(backend,input);
++    std::vector<float> reference_logits;
++    for(size_t i=0;i<expected.size();++i) {same_float(actual_logits[i],expected[i].logit);reference_logits.push_back(expected[i].logit);}
++    // Compare with the existing selector on this same backend, not the host
++    // sampler's distinct FIRST-tie rule (the ordinary CPU backend uses LAST).
++    ggml_context_ptr context(ggml_init({1024*1024,nullptr,true}));
++    auto * scores=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,ids.size());ggml_set_input(scores);
++    auto * selected=ggml_argmax(context.get(),scores);auto * baseline=ggml_new_graph(context.get());
++    ggml_build_forward_expand(baseline,selected);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(context.get(),backend));require(bool(buffer),"baseline selector buffer unavailable");
++    ggml_backend_tensor_set(scores,reference_logits.data(),0,reference_logits.size()*sizeof(float));
++    require(ggml_backend_graph_compute(backend,baseline)==GGML_STATUS_SUCCESS,"baseline backend selector failed");
++    int32_t expected_token=-1,actual_token=-1;
++    ggml_backend_tensor_get(selected,&expected_token,0,sizeof(expected_token));
++    ggml_backend_tensor_get(graph.output.sampled,&actual_token,0,sizeof(actual_token));
++    require(actual_token==expected_token,"DRY changed the existing backend tie contract");
++    const float maximum=*std::max_element(reference_logits.begin(),reference_logits.end());
++    require(actual_token>=0 && size_t(actual_token)<reference_logits.size() && reference_logits[actual_token]==maximum,"backend tie selection was not a maximum");
++    llama_sampler_ptr host(llama_sampler_init_greedy());llama_sampler_apply(host.get(),&values);
++    require(values.data[values.selected].id==13,"fixture no longer exercises the host FIRST tie");
++    if(ggml_backend_dev_type(ggml_backend_get_device(backend))==GGML_BACKEND_DEVICE_TYPE_CPU) {
++        require(actual_token==235,"existing CPU backend LAST tie changed");
++    }
++    std::printf("DRY_GREEDY_TIES full_logits_exact=1 baseline_backend_selector_exact=1 host_first=13 backend_selected=%d PASS\n",actual_token);
++}
++
++static void masked_top_k_distribution(llama_model * model, ggml_backend_t backend) {
++    const auto * vocab=llama_model_get_vocab(model);
++    const auto buft=ggml_backend_get_default_buffer_type(backend);
++    const std::vector<llama_token> history={3,4,5,3,4};
++    std::vector<llama_token> ids(259);std::iota(ids.begin(),ids.end(),0);
++    auto input=rows(ids);
++    for(auto & value:input) {value.logit=-10.f;}
++    input[3].logit=1.7f;input[4].logit=2.f;input[5].logit=2.4f;
++    auto make_chain=[&](bool with_dry) {
++        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        llama_sampler_ptr mask(llama_sampler_init_token_mask(259));
++        std::vector<uint32_t> words(9,0);
++        for(int id:{3,4,5}) {words[id/32]|=UINT32_C(1)<<(id%32);}
++        require(llama_sampler_set_token_mask(mask.get(),words.data(),words.size()),"distribution mask setup failed");
++        llama_sampler_chain_add(chain.get(),mask.release());
++        if(with_dry) {llama_sampler_chain_add(chain.get(),dry(vocab).release());}
++        llama_sampler_chain_add(chain.get(),llama_sampler_init_top_k(5));
++        llama_sampler_chain_add(chain.get(),llama_sampler_init_temp(.6f));
++        llama_sampler_chain_add(chain.get(),llama_sampler_init_dist(424242));
++        accept(chain.get(),history);
++        require(chain->iface->backend_init(chain.get(),buft,1),"complete masked top-k distribution was not admitted");
++        const auto * state=static_cast<const llama_sampler_chain *>(chain->ctx);
++        require(std::all_of(state->samplers.begin(),state->samplers.end(),
++            [](const llama_sampler_chain::info & child){return child.is_backend;}),"distribution fixture hid a CPU suffix");
++        return chain;
++    };
++    int draws=0;
++    for(bool with_dry:{false,true}) {
++        auto chain=make_chain(with_dry),reference=make_chain(false);
++        auto host_penalty=dry(vocab);accept(host_penalty.get(),history);
++        raw_graph graph(chain.get(),backend,ids.size(),false,true,with_dry);
++        raw_graph baseline(reference.get(),backend,ids.size(),false,true,false);
++        require(graph.output.logits->ne[0]==1 && graph.output.logits->ne[1]==5 &&
++            ggml_is_contiguous(graph.output.logits) && !ggml_is_vector(graph.output.logits),
++            "fixture no longer exercises the original contiguous [1,5] top-k shape");
++        require(graph.output.sampled->op==GGML_OP_TOKEN_MASK && graph.output.sampled->src[0]->op==GGML_OP_RESHAPE &&
++            ggml_is_vector(graph.output.sampled->src[0]) && graph.output.sampled->src[0]->view_src==graph.output.logits,
++            "final mask guard did not use a metadata-only view of the actual top-k logits");
++        std::vector<int32_t> first_sequence;
++        for(int cycle=0;cycle<2;++cycle) {
++            if(cycle) {
++                llama_sampler_reset(chain.get());llama_sampler_reset(reference.get());llama_sampler_reset(host_penalty.get());
++                accept(chain.get(),history);accept(reference.get(),history);accept(host_penalty.get(),history);
++            }
++            for(int step=0;step<16;++step) {
++                auto expected=input;
++                if(with_dry) {
++                    llama_token_data_array values{expected.data(),expected.size(),-1,false};
++                    llama_sampler_apply(host_penalty.get(),&values);
++                }
++                const auto actual=graph.compute(backend,input),ordinary=baseline.compute(backend,expected);
++                require(actual.size()==5 && ordinary.size()==5,"top-k fixture candidate count changed");
++                std::vector<int32_t> actual_ids(5),ordinary_ids(5);
++                std::vector<float> probabilities(5),ordinary_probabilities(5);
++                ggml_backend_tensor_get(graph.output.candidates,actual_ids.data(),0,actual_ids.size()*sizeof(int32_t));
++                ggml_backend_tensor_get(baseline.output.candidates,ordinary_ids.data(),0,ordinary_ids.size()*sizeof(int32_t));
++                ggml_backend_tensor_get(graph.output.probs,probabilities.data(),0,probabilities.size()*sizeof(float));
++                ggml_backend_tensor_get(baseline.output.probs,ordinary_probabilities.data(),0,ordinary_probabilities.size()*sizeof(float));
++                require(actual_ids==ordinary_ids,"DRY changed the same-backend candidate indexing");
++                float total=0.f;int positive=0;
++                for(size_t i=0;i<actual.size();++i) {
++                    same_float(actual[i],ordinary[i]);same_float(probabilities[i],ordinary_probabilities[i]);
++                    require(std::isfinite(probabilities[i]) && probabilities[i]>=0.f,"masked distribution contained invalid probabilities");
++                    total+=probabilities[i];positive+=probabilities[i]>0.f;
++                    if(probabilities[i]>0.f) {require(actual_ids[i]>=3 && actual_ids[i]<=5,"masked-out candidate retained probability mass");}
++                }
++                require(std::fabs(total-1.f)<2e-6f && positive>=2,"masked distribution lost normalized nontrivial support");
++                int32_t selected=-1,ordinary_selected=-1;
++                ggml_backend_tensor_get(graph.output.sampled,&selected,0,sizeof(selected));
++                ggml_backend_tensor_get(baseline.output.sampled,&ordinary_selected,0,sizeof(ordinary_selected));
++                require(selected>=3 && selected<=5 && selected==ordinary_selected,"masked DRY changed the same-backend seeded distribution");
++                if(!cycle) {first_sequence.push_back(selected);}
++                else {require(selected==first_sequence[step],"masked distribution reset did not reproduce the seeded sequence");}
++                llama_sampler_accept(chain.get(),selected);llama_sampler_accept(reference.get(),selected);llama_sampler_accept(host_penalty.get(),selected);
++                ++draws;
++            }
++        }
++    }
++    std::printf("DRY_MASKED_TOP_K original_shape_1x5=1 zero_copy_validation_view=1 no_dry_control=1 same_backend_distribution_bits_exact=1 seeded_reset_draws=%d mask_support_valid=1 PASS\n",draws);
++}
++
++static void masked_top_k_invalid_support(ggml_backend_t backend) {
++    ggml_context_ptr context(ggml_init({1024*1024,nullptr,true}));
++    auto * scores=ggml_new_tensor_2d(context.get(),GGML_TYPE_F32,1,5);
++    auto * words=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,9);
++    auto * selected=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,1);
++    auto * candidates=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,5);
++    auto * probabilities=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,5);
++    auto * pre_filter=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,259);
++    for(auto * input:{scores,words,selected,candidates,probabilities,pre_filter}) {ggml_set_input(input);}
++    auto * guard=ggml_token_mask_validate(context.get(),ggml_reshape_1d(context.get(),scores,5),words,
++        selected,candidates,probabilities,pre_filter,259);
++    auto * graph=ggml_new_graph(context.get());ggml_build_forward_expand(graph,guard);
++    for(int i=0;i<ggml_graph_n_nodes(graph);++i) {require(ggml_backend_supports_op(backend,ggml_graph_node(graph,i)),"invalid-support guard backend unavailable");}
++    ggml_backend_buffer_ptr storage(ggml_backend_alloc_ctx_tensors(context.get(),backend));require(bool(storage),"invalid-support guard allocation failed");
++    for(int mode=0;mode<7;++mode) {
++        std::vector<uint32_t> allowed(9,0);for(int id:{3,4,5}) {allowed[id/32]|=UINT32_C(1)<<(id%32);}
++        std::vector<float> logits={3.f,2.f,1.f,-INFINITY,-INFINITY},probs={.5f,.3f,.2f,0.f,0.f},original(259,-10.f);
++        const int32_t ids[]={5,4,3,8,9};int32_t chosen=5;
++        if(mode==1) {std::fill(allowed.begin(),allowed.end(),0);}
++        if(mode==2) {chosen=259;}
++        if(mode==3) {probs[0]=0.f;}
++        if(mode==4) {original[200]=NAN;}
++        if(mode==5) {logits[0]=-INFINITY;}
++        if(mode==6) {logits[4]=INFINITY;}
++        ggml_backend_tensor_set(scores,logits.data(),0,logits.size()*sizeof(float));
++        ggml_backend_tensor_set(words,allowed.data(),0,allowed.size()*sizeof(uint32_t));
++        ggml_backend_tensor_set(selected,&chosen,0,sizeof(chosen));
++        ggml_backend_tensor_set(candidates,ids,0,sizeof(ids));
++        ggml_backend_tensor_set(probabilities,probs.data(),0,probs.size()*sizeof(float));
++        ggml_backend_tensor_set(pre_filter,original.data(),0,original.size()*sizeof(float));
++        require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"invalid-support guard graph failed");
++        int32_t actual=-2;ggml_backend_tensor_get(guard,&actual,0,sizeof(actual));
++        require(actual==(mode ? -1 : 5),"reshaped mask validation changed invalid-support rejection");
++    }
++    std::puts("DRY_MASKED_TOP_K_INVALID support_cases=7 finite_selected_probability=1 empty_mask=1 candidate_bounds=1 prefilter_nonfinite=1 sentinel_rejection_preserved=1 PASS");
++}
++
++static void adaptive_clone() {
++    const std::vector<llama_token> ids={3,7,9,11,13,15};
++    auto sample=[&](llama_sampler * sampler) {
++        auto input=rows(ids);llama_token_data_array current{input.data(),input.size(),-1,false};
++        llama_sampler_apply(sampler,&current);
++        return std::make_pair(current.data[current.selected].id,input);
++    };
++    for(float target:{-.1f,.15f,.7f}) for(uint32_t seed:{93281u,LLAMA_DEFAULT_SEED}) for(int mode=0;mode<4;++mode) {
++        llama_sampler_ptr original(llama_sampler_init_adaptive_p(target,.9f,seed));
++        for(int i=0;i<19;++i) {auto result=sample(original.get());llama_sampler_accept(original.get(),result.first);}
++        const auto pending=sample(original.get());
++        llama_sampler_ptr clone(llama_sampler_clone(original.get()));
++        llama_sampler_ptr twice(llama_sampler_clone(clone.get()));
++        require(llama_sampler_get_seed(original.get())==llama_sampler_get_seed(clone.get()) &&
++            llama_sampler_get_seed(original.get())==llama_sampler_get_seed(twice.get()),"adaptive clone changed actual seed metadata");
++        // This pending accept used to index a missing original_probs vector.
++        auto accepted=pending.first;
++        if(mode==1) {
++            const auto a=sample(original.get()),b=sample(clone.get()),c=sample(twice.get());
++            require(a.first==b.first && a.first==c.first,"replacement apply after pending clone changed RNG");
++            accepted=a.first;
++        }
++        if(mode==2) {accepted=1000;} // Unaccepted pending row must not update EMA.
++        for(auto * sampler:{original.get(),clone.get(),twice.get()}) {
++            llama_sampler_accept(sampler,accepted);
++            if(mode==3) {llama_sampler_accept(sampler,accepted);}
++        }
++        for(int i=0;i<64;++i) {
++            const auto a=sample(original.get()),b=sample(clone.get()),c=sample(twice.get());
++            require(a.first==b.first && a.first==c.first,"adaptive clone lost advanced RNG/EMA state");
++            for(size_t j=0;j<a.second.size();++j) {
++                same_float(a.second[j].logit,b.second[j].logit);same_float(a.second[j].p,b.second[j].p);
++                same_float(a.second[j].logit,c.second[j].logit);same_float(a.second[j].p,c.second[j].p);
++            }
++            llama_sampler_accept(original.get(),a.first);llama_sampler_accept(clone.get(),b.first);llama_sampler_accept(twice.get(),c.first);
++        }
++        llama_sampler_reset(original.get());llama_sampler_reset(clone.get());
++        if (seed != LLAMA_DEFAULT_SEED) {
++            require(sample(original.get()).first==sample(clone.get()).first,"adaptive explicit-seed reset after clone diverged");
++        } else {
++            // Reset deliberately chooses a fresh random seed independently for
++            // each sampler. A checkpoint of that newly reset state must still
++            // reproduce its future draws and probabilities exactly.
++            llama_sampler_ptr reset_copy(llama_sampler_clone(original.get()));
++            require(llama_sampler_get_seed(original.get())==llama_sampler_get_seed(reset_copy.get()),
++                "adaptive reset checkpoint changed its actual random seed");
++            for (int i=0;i<8;++i) {
++                const auto a=sample(original.get()),b=sample(reset_copy.get());
++                require(a.first==b.first,"adaptive checkpoint after random reset diverged");
++                for(size_t j=0;j<a.second.size();++j) {same_float(a.second[j].p,b.second[j].p);}
++                llama_sampler_accept(original.get(),a.first);llama_sampler_accept(reset_copy.get(),b.first);
++            }
++            require(std::find(ids.begin(),ids.end(),sample(clone.get()).first)!=ids.end(),
++                "independent random reset produced an invalid token");
++        }
++    }
++    std::puts("ADAPTIVE_P_CLONE advanced_rng_steps=19 pending_accept=1 replacement_apply=1 double_accept=1 clone_of_clone=1 actual_seed_preserved=1 future_draws_exact=1536 candidate_probabilities_exact=1 reset=1 PASS");
++}
++
++static void quota_fallback(llama_model * model, ggml_backend_t backend, bool cuda) {
++    if(!cuda) {return;}
++    auto * device=ggml_backend_get_device(backend);auto * registry=ggml_backend_dev_backend_reg(device);
++    auto get=reinterpret_cast<bool (*)(ggml_backend_dev_t,ggml_backend_cuda_memory_stats *)>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_get_memory_stats"));
++    auto set=reinterpret_cast<bool (*)(ggml_backend_dev_t,size_t,bool)>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_set_memory_limit"));
++    ggml_backend_cuda_memory_stats stats{};require(get && set && get(device,&stats) && !stats.enabled,"quota fixture needs an isolated unbudgeted backend");
++    require(set(device,stats.managed_used_bytes+1,true),"quota fixture could not set remaining headroom to one byte");
++    struct release {ggml_backend_dev_t device;bool (*set)(ggml_backend_dev_t,size_t,bool);~release(){set(device,0,false);}} release{device,set};
++    auto sampler=dry(llama_model_get_vocab(model));
++    require(!sampler->iface->backend_init(sampler.get(),ggml_backend_get_default_buffer_type(backend),1),"insufficient CUDA quota did not retain CPU DRY");
++    accept(sampler.get(),{3,4,5,3,4});auto input=rows({3,4,5,6});llama_token_data_array values{input.data(),input.size(),-1,false};
++    const float before=input[2].logit;llama_sampler_apply(sampler.get(),&values);same_float(input[2].logit,before-.75f);
++    std::puts("DRY_QUOTA denied_optional_backend=1 exact_host_fallback=1 quota_preserved=1 PASS");
++}
++
++static void default_off(llama_model * model,ggml_backend_t backend) {
++    for(const char * value:std::vector<const char *>{nullptr,"0","","true","yes"}) {
++        scoped_dry_backend flag(value);
++        auto sampler=dry(llama_model_get_vocab(model));
++        require(!sampler->iface->backend_init(sampler.get(),ggml_backend_get_default_buffer_type(backend),1),"DRY backend changed an existing profile without exact opt-in");
++        accept(sampler.get(),{3,4,5,3,4});auto input=rows({3,4,5,6});
++        const float before=input[2].logit;llama_token_data_array current{input.data(),input.size(),-1,false};
++        llama_sampler_apply(sampler.get(),&current);same_float(input[2].logit,before-.75f);
++    }
++    std::puts("DRY_OPT_IN default_host=1 unknown_values_host=1 enabled_only_exact_one=1 PASS");
++}
++
++int main(int argc,char ** argv) {
++    try {
++        const bool cuda=argc==2 && std::string(argv[1])=="--cuda";
++        require(argc==1 || cuda,"use no arguments or --cuda");
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH),"explicit CPU backend unavailable");
++        if(cuda) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH),"explicit CUDA backend unavailable");
++#else
++            std::puts("SKIP: CUDA backend not built");return 77;
++#endif
++        }
++        auto * device=ggml_backend_dev_by_type(cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU);
++        require(device && (!cuda || std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)))=="CUDA"),"requested isolated device missing");
++        ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));require(bool(backend),"backend unavailable");
++        auto model=vocabulary();adaptive_clone();default_off(model.get(),backend.get());
++        scoped_dry_backend enable("1");
++        dry_backend(model.get(),backend.get());chains(model.get(),backend.get());greedy_tie_contract(model.get(),backend.get());
++        // CUDA distribution initialization can retain device RNG allocations
++        // outside the managed quota. Prove quota denial before that optional
++        // resource exists; both distribution regressions still run afterward.
++        quota_fallback(model.get(),backend.get(),cuda);
++        masked_top_k_distribution(model.get(),backend.get());masked_top_k_invalid_support(backend.get());
++        std::printf("SAMPLER_BACKEND_EXTENSIONS device=%s actual_raw_backend_execution=1 zero_model_weights=1 max_graph_buffer_bytes=%zu max_sparse_input_bytes=%zu PASS\n",cuda?"CUDA":"CPU",max_graph_buffer_bytes,max_sparse_input_bytes);
++        return 0;
++    } catch(const std::exception & e) {std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
++}

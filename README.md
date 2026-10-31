@@ -35,6 +35,8 @@ Coordinated MoE execution, GPU-exclusive execution, physical KV growth, and the 
 
 Further implementation details are available in [runtime efficiency](docs/runtime-efficiency.md), [SGLang-inspired execution](docs/sglang-inspired-runtime.md), [resident execution and bounded reuse](docs/resident-execution.md), [constrained sampling and cache tiers](docs/execution-pipeline.md), [dense-model improvements](docs/dense-runtime.md), and [GPU-first MoE inference](docs/gpu-first-moe-inference.md).
 
+Further [bounded pipeline extensions](docs/sglang-pipeline-followups.md) add indexed KV work, broader optional prefix/graph reuse, explicit DRY backend penalties, and experimental overlap of streaming-response work with a normal forward. Their memory budgets and activation rules are documented separately.
+
 ## Large MoE models on smaller machines
 
 A MoE model uses only its router-selected experts for each token, but the full set of expert weights can still be much larger than VRAM or available RAM. WildLlama's selective-weight path keeps bounded working sets in memory and reads missing weights from the original GGUF files on SSD.

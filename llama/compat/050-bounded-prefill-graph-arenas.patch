@@ -1,0 +1,346 @@
+--- a/src/llama-graph-variant-policy.h
++++ b/src/llama-graph-variant-policy.h
+@@ -1,11 +1,76 @@
+ #pragma once
+ 
++#include <array>
+ #include <cstddef>
++#include <cstdint>
+ #include <limits>
+ 
+ namespace llama_graph_variant_policy {
+ constexpr size_t max_variants = 4;
+-constexpr unsigned max_tokens = 8;
++constexpr unsigned max_decode_tokens = 8;
++constexpr unsigned max_tokens = 512;
++
++// Bucket only host/scheduler metadata capacity. Actual token counts and tensor
++// shapes are never rounded or padded. Fixed slots retain these allocations.
++inline unsigned metadata_tokens(unsigned tokens) {
++    if (!tokens || tokens > max_tokens) { return 0; }
++    unsigned capacity = max_decode_tokens;
++    while (capacity < tokens) { capacity *= 2; }
++    return capacity;
++}
++
++struct prefill_shape {
++    uint32_t tokens;
++    uint32_t outputs;
++    uint32_t position_bucket;
++    uint32_t sequences;
++    uint32_t graph_type;
++
++    bool operator==(const prefill_shape & other) const {
++        return tokens == other.tokens && outputs == other.outputs && position_bucket == other.position_bucket &&
++            sequences == other.sequences && graph_type == other.graph_type;
++    }
++};
++
++// Large one-off prompts must not allocate another graph arena merely because
++// a cache budget was supplied. Observe a bounded set of exact coarse shapes;
++// the complete can_reuse contract remains mandatory on every real cache hit.
++// This is host metadata only. No padding, device allocation, or budget increase.
++class prefill_admission {
++    struct entry {
++        prefill_shape shape = {};
++        bool occupied = false;
++        bool denied = false;
++    };
++    std::array<entry, 8> entries = {};
++    size_t next = 0;
++
++public:
++    bool observe(const prefill_shape & shape) {
++        if (!shape.tokens || shape.tokens > max_tokens || shape.outputs > shape.tokens ||
++                !shape.sequences || shape.sequences > shape.tokens) { return false; }
++        if (shape.tokens <= max_decode_tokens) { return true; }
++        for (const auto & item : entries) {
++            if (item.occupied && item.shape == shape) { return !item.denied; }
++        }
++        entries[next] = {shape, true, false};
++        next = (next + 1) % entries.size();
++        return false;
++    }
++
++    // An optional allocation/preflight failure retains the primary path. Avoid
++    // retrying the same expensive failure until invalidation or bounded aging.
++    void deny(const prefill_shape & shape) {
++        if (shape.tokens <= max_decode_tokens) { return; }
++        for (auto & item : entries) {
++            if (item.occupied && item.shape == shape) { item.denied = true; return; }
++        }
++    }
++
++    void clear() { entries = {}; next = 0; }
++};
++
++static_assert(sizeof(prefill_admission) <= 512, "prefill admission metadata must stay bounded");
+ 
+ // An optional cache must never turn malformed input into a large allocation.
+ inline size_t parse_budget(const char * text) {
+--- a/tests/test-graph-variants.cpp
++++ b/tests/test-graph-variants.cpp
+@@ -36,6 +36,27 @@
+     require(!fits(0, 0, 0), "zero budget enabled cache");
+     size_t sum = std::numeric_limits<size_t>::max() - 2;
+     require(add_size(sum, 2) && !add_size(sum, 1), "overflow accepted");
++    require(metadata_tokens(1) == 8 && metadata_tokens(8) == 8 && metadata_tokens(9) == 16 &&
++            metadata_tokens(16) == 16 && metadata_tokens(17) == 32 && metadata_tokens(512) == 512,
++            "metadata capacity buckets changed token bounds");
++    require(metadata_tokens(0) == 0 && metadata_tokens(513) == 0, "invalid metadata range admitted");
++    prefill_admission admit;
++    const prefill_shape cold{64, 1, 256, 1, 0};
++    require(admit.observe({8, 1, 256, 1, 0}), "short decode admission changed");
++    require(!admit.observe({0, 0, 0, 1, 0}) && !admit.observe({513, 1, 512, 1, 0}), "invalid token range admitted");
++    require(!admit.observe({64, 65, 256, 1, 0}) && !admit.observe({64, 1, 256, 0, 0}), "malformed shape admitted");
++    require(!admit.observe(cold) && admit.observe(cold), "large shape did not require two observations");
++    for (const prefill_shape distinct : {prefill_shape{64, 0, 256, 1, 0}, {64, 1, 512, 1, 0},
++            {64, 1, 256, 2, 0}, {64, 1, 256, 1, 1}}) {
++        require(!admit.observe(distinct) && admit.observe(distinct), "shape key omitted an output/memory/sequence/graph field");
++    }
++    admit.deny(cold);
++    require(!admit.observe(cold), "failed large shape retried optional allocation");
++    admit.clear();
++    require(!admit.observe(cold) && admit.observe(cold), "invalidation did not reset admission");
++    for (uint32_t i = 0; i < 8; ++i) { require(!admit.observe({65+i, 1, 256, 1, 0}), "cold shape admitted"); }
++    require(!admit.observe(cold), "bounded shape history did not age old entries");
++    std::puts("GRAPH_PREFILL_POLICY two_hit=1 bounded_history=8 max_tokens=512 failed_retry_suppressed=1 PASS");
+     std::puts("graph-variant policy: PASS");
+ }
+ 
+@@ -45,23 +66,25 @@
+     int reused = 0;
+     size_t peak_arenas = 0;
+     size_t peak_compute_bytes = 0;
++    size_t peak_total_bytes = 0;
+ };
+ 
+-static result run(llama_model * model, const char * budget, bool invalidate, bool backend = false) {
++static result run(llama_model * model, const char * budget, bool invalidate, bool backend = false, bool prefill = false) {
+     budget_environment(budget);
+     auto params = llama_context_default_params();
+-    params.n_ctx = 256;
+-    params.n_batch = 64;
+-    params.n_ubatch = 64;
++    const int capacity = prefill ? 256 : 64;
++    params.n_ctx = prefill ? 512 : 256;
++    params.n_batch = capacity;
++    params.n_ubatch = capacity;
+     params.n_threads = 2;
+     params.n_threads_batch = 2;
+     params.no_perf = false;
+-    params.n_outputs_max = 64;
+-    params.n_outputs_max_per_seq = 64;
++    params.n_outputs_max = capacity;
++    params.n_outputs_max_per_seq = capacity;
+     auto * ctx = llama_init_from_model(model, params);
+     require(ctx != nullptr, "small context allocation failed");
+     llama_sampler * chain = nullptr;
+-    auto batch = llama_batch_init(64, 0, 1);
++    auto batch = llama_batch_init(capacity, 0, 1);
+     result out;
+     try {
+         if (backend) {
+@@ -74,8 +97,11 @@
+         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+         llama_pos position = 0;
+         // A B C B A -> retains B/C with stable independent bindings. Additional
+-        // shapes exercise LRU eviction, while 16 uses the primary reservation.
+-        const std::vector<int> sizes = {32, 1, 3, 2, 3, 1, 4, 5, 6, 7, 8, 3, 2, 16, 1, 3, 2};
++        // shapes exercise LRU eviction. A one-off large shape stays primary.
++        // Larger repeated shapes exercise mature admission and exact reuse.
++        const std::vector<int> sizes = prefill ?
++            std::vector<int>{32, 64, 32, 64, 32, 64, 96, 64, 128, 64, 192, 64, 256, 64, 32, 64, 32, 64, 32, 64, 64} :
++            std::vector<int>{32, 1, 3, 2, 3, 1, 4, 5, 6, 7, 8, 3, 2, 16, 1, 3, 2};
+         for (size_t step = 0; step < sizes.size(); ++step) {
+             if (invalidate && step == 13) {
+                 // A real parameter change must return to the primary arena and
+@@ -83,24 +109,39 @@
+                 require(llama_set_adapter_cvec(ctx, nullptr, 0, 0, -1, -1) == 0, "parameter invalidation failed");
+             }
+             const int n = sizes[step];
++            if (prefill) {
++                // Same span, fresh text and memory context: an arena may only
++                // reuse after rebinding inputs and validating the complete key.
++                llama_memory_clear(llama_get_memory(ctx), true);
++                position = 0;
++            }
++            const int outputs = prefill ? ((!backend && step % 5 == 0) ? 0 : 1) : n;
+             batch.n_tokens = n;
+             for (int i = 0; i < n; ++i) {
+-                batch.token[i] = 1 + (position + i) % std::max(1, n_vocab - 1);
++                batch.token[i] = 1 + (position + i + (prefill ? int(step)*17 : 0)) % std::max(1, n_vocab - 1);
+                 batch.pos[i] = position + i;
+                 batch.n_seq_id[i] = 1;
+                 batch.seq_id[i][0] = 0;
+-                batch.logits[i] = true;
+-            }
++                batch.logits[i] = !prefill || (outputs && i == n - 1);
++            }
++            require(std::count_if(batch.logits, batch.logits + n, [](int8_t flag) { return flag != 0; }) == outputs,
++                    "fixture requested an unexpected number of output rows");
+             require(llama_decode(ctx, batch) == 0, "shape-changing decode failed");
+-            for (int i = 0; i < n; ++i) {
++            if (prefill) { llama_synchronize(ctx); }
++            for (int i = 0; i < outputs; ++i) {
++                // Positive getter indices address input-token positions, not
++                // compact output rows. Prefill requests only the final token;
++                // the decode fixture requests every token in original order.
++                const int output_index = prefill ? n - 1 : i;
++                require(batch.logits[output_index] != 0, "fixture read an unrequested output token");
+                 if (backend) {
+-                    const auto token = llama_get_sampled_token_ith(ctx, i);
++                    const auto token = llama_get_sampled_token_ith(ctx, output_index);
+                     require(token >= 0 && token < n_vocab, "backend sampling did not run");
+-                    require(llama_sampler_sample(chain, ctx, i) == token, "backend token consumption changed");
++                    require(llama_sampler_sample(chain, ctx, output_index) == token, "backend token consumption changed");
+                     out.sampled.push_back(token);
+                     continue;
+                 }
+-                const float * row = llama_get_logits_ith(ctx, i);
++                const float * row = llama_get_logits_ith(ctx, output_index);
+                 require(row != nullptr, "logits missing");
+                 for (int v = 0; v < n_vocab; ++v) { require(std::isfinite(row[v]), "nonfinite logits"); }
+                 out.logits.insert(out.logits.end(), row, row + n_vocab);
+@@ -111,6 +152,7 @@
+             require(stats.metadata_bytes <= llama_graph_variant_policy::parse_budget(budget) - stats.compute_bytes, "graph metadata exceeds budget");
+             out.peak_arenas = std::max(out.peak_arenas, stats.arenas);
+             out.peak_compute_bytes = std::max(out.peak_compute_bytes, stats.compute_bytes);
++            out.peak_total_bytes = std::max(out.peak_total_bytes, stats.compute_bytes + stats.metadata_bytes);
+             position += n;
+         }
+         out.reused = llama_perf_context(ctx).n_reused;
+@@ -130,10 +172,12 @@
+     try {
+         policy();
+         if (argc == 1) { return 0; }
+-        require(argc == 2, "usage: test-graph-variants [small-local.gguf]");
++        const bool cuda = argc == 3 && std::strcmp(argv[1], "--cuda") == 0;
++        require(argc == 2 || cuda, "usage: test-graph-variants [--cuda] small-local.gguf");
++        const char * fixture = argv[cuda ? 2 : 1];
+         // This test never downloads a model. The caller supplies a small local
+         // fixture; refuse larger files even when the wrong path is supplied.
+-        FILE * file = std::fopen(argv[1], "rb");
++        FILE * file = std::fopen(fixture, "rb");
+         require(file != nullptr, "fixture missing");
+         std::fseek(file, 0, SEEK_END);
+         const long length = std::ftell(file);
+@@ -143,7 +187,17 @@
+         llama_backend_init();
+         auto params = llama_model_default_params();
+         params.n_gpu_layers = 0;
+-        auto * model = llama_model_load_from_file(argv[1], params);
++        ggml_backend_dev_t devices[] = {nullptr, nullptr};
++        if (cuda) {
++            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++                auto * device = ggml_backend_dev_get(i);
++                if (std::strstr(ggml_backend_dev_name(device), "CUDA")) { devices[0] = device; break; }
++            }
++            require(devices[0] != nullptr, "explicit CUDA fixture backend unavailable; refusing CPU fallback");
++            params.devices = devices;
++            params.n_gpu_layers = 99;
++        }
++        auto * model = llama_model_load_from_file(fixture, params);
+         require(model != nullptr, "fixture load failed");
+         try {
+             const auto baseline = run(model, "0", false);
+@@ -164,6 +218,23 @@
+             require(sampler_baseline.sampled == sampler_cached.sampled, "fallback changed stochastic RNG");
+             require(sampler_cached.peak_arenas > 0, "backend sampler graph bindings were not retained");
+             require(sampler_cached.reused > sampler_baseline.reused, "backend sampler shapes were rebuilt rather than reused");
++            const auto prefill_baseline = run(model, "0", false, false, true);
++            const auto prefill_cached = run(model, "128", false, false, true);
++            const auto prefill_limited = run(model, "1", false, false, true);
++            const auto prefill_invalidated = run(model, "128", true, false, true);
++            const auto prefill_sampler_baseline = run(model, "0", false, true, true);
++            const auto prefill_sampler_cached = run(model, "128", false, true, true);
++            require(prefill_baseline.logits == prefill_cached.logits, "larger retained graph changed logits");
++            require(prefill_baseline.logits == prefill_limited.logits, "larger budget fallback changed logits");
++            require(prefill_baseline.logits == prefill_invalidated.logits, "larger invalidation changed logits");
++            require(prefill_cached.peak_arenas > 0 && prefill_cached.reused > prefill_baseline.reused,
++                    "larger repeated shapes were not retained/reused");
++            require(prefill_sampler_baseline.sampled == prefill_sampler_cached.sampled,
++                    "larger backend bindings changed RNG/token sequence");
++            require(prefill_sampler_cached.peak_arenas > 0 && prefill_sampler_cached.reused > prefill_sampler_baseline.reused,
++                    "larger backend sampler shapes were not retained/reused");
++            std::printf("GRAPH_PREFILL_RUNTIME device=%s logits_exact=1 seeded_tokens_exact=1 tiny_quota_exact=1 invalidation_exact=1 reused=%d->%d peak_extra_compute_bytes=%zu peak_extra_total_bytes=%zu PASS\n",
++                    cuda ? "CUDA" : "CPU", prefill_baseline.reused, prefill_cached.reused, prefill_cached.peak_compute_bytes, prefill_cached.peak_total_bytes);
+             std::printf("graph variants: PASS, reused %d -> %d; peak %zu arenas / %zu compute bytes\n",
+                     baseline.reused, cached.reused, cached.peak_arenas, cached.peak_compute_bytes);
+         } catch (...) { llama_model_free(model); throw; }
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1773,6 +1773,7 @@
+ }
+ 
+ void llama_context::graph_variants_clear() {
++    graph_prefill_admission.clear();
+     if (graph_variant_active) {
+         ggml_backend_sched_synchronize(sched.get());
+         graph_variant_save();
+@@ -1870,7 +1871,21 @@
+     // useful only after a real change of shape, not during the first decode.
+     if (!gf_res_prev_active) { return graph_variant_selection::none; }
+ 
+-    const size_t max_nodes = graph_max_nodes(llama_graph_variant_policy::max_tokens);
++    // This coarse history key only decides whether trying an optional arena
++    // is worthwhile. Actual memory spans and every input remain in can_reuse.
++    uint32_t position_bucket = 0;
++    if (ubatch.n_tokens > llama_graph_variant_policy::max_decode_tokens && ubatch.pos) {
++        llama_pos maximum = 0;
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) { maximum = std::max(maximum, ubatch.pos[i]); }
++        position_bucket = uint32_t(maximum) / 256;
++    }
++    const llama_graph_variant_policy::prefill_shape shape = {
++        ubatch.n_tokens, n_outputs, position_bucket, ubatch.n_seqs_unq, uint32_t(gtype)};
++    if (!graph_prefill_admission.observe(shape)) { return graph_variant_selection::none; }
++
++    // Short decode keeps its previous metadata bound. Coarse metadata capacity
++    // buckets limit node-address churn; actual tokens/tensors are never padded.
++    const size_t max_nodes = graph_max_nodes(llama_graph_variant_policy::metadata_tokens(ubatch.n_tokens));
+     size_t metadata = ggml_graph_overhead_custom(max_nodes, false);
+     if (max_nodes > std::numeric_limits<size_t>::max()/ggml_tensor_overhead() ||
+         !llama_graph_variant_policy::add_size(metadata, max_nodes*ggml_tensor_overhead())) {
+@@ -1892,13 +1907,14 @@
+         }
+         if (!chosen || variant.last_used < graph_variants[chosen].last_used) { chosen = i; }
+     }
+-    if (!chosen) { return graph_variant_selection::none; }
++    if (!chosen) { graph_prefill_admission.deny(shape); return graph_variant_selection::none; }
+ 
+     ggml_backend_sched_synchronize(sched.get());
+     graph_variant_save();
+     graph_variant_evict(chosen);
+     graph_variant_restore(chosen);
+     auto restore_primary = [&] {
++        graph_prefill_admission.deny(shape);
+         // No candidate graph has been submitted. Failed optional allocations
+         // are released before retrying through the conventional scheduler.
+         sched.reset();
+@@ -1980,7 +1996,7 @@
+         graph_variant_bytes = actual;
+         graph_variant_last_used = ++graph_variant_clock;
+         gf_res_prev_active = get_gf_res_prev();
+-        LLAMA_LOG_DEBUG("%s: retained short graph in arena %zu (%zu bytes, total %zu)\n",
++        LLAMA_LOG_DEBUG("%s: retained exact graph in arena %zu (%zu bytes, total %zu)\n",
+                 __func__, chosen, actual, graph_variant_retained_bytes());
+         return graph_variant_selection::built;
+     } catch (const std::exception & error) {
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -4,6 +4,7 @@
+ #include "llama-ext.h"
+ #include "llama-cparams.h"
+ #include "llama-graph.h"
++#include "llama-graph-variant-policy.h"
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
+@@ -489,6 +490,7 @@
+     std::array<graph_variant_runtime, 5> graph_variants;
+     size_t graph_variant_active = 0;
+     size_t graph_variant_budget = 0;
++    llama_graph_variant_policy::prefill_admission graph_prefill_admission;
+     bool graph_sampler_bindings_failed = false;
+     size_t graph_variant_bytes = 0;
+     uint64_t graph_variant_clock = 0;

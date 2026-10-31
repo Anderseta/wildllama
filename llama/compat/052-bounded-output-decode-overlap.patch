@@ -1,0 +1,499 @@
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -14,6 +14,8 @@
+ #include "llama-io.h"
+ #include "llama-state-transfer.h"
+ #include "llama-memory.h"
++#include "llama-kv-cache.h"
++#include <typeinfo>
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -1037,6 +1039,49 @@
+     t_compute_start_us = 0;
+ }
+ 
++
++bool llama_context::output_overlap_supported() const {
++    if (!memory || typeid(*memory) != typeid(llama_kv_cache) || !sched || sched_need_reserve ||
++            !gf_res_prev_active || n_outputs != 1 || cparams.training || cparams.pipeline_parallel ||
++            cparams.embeddings || cparams.n_seq_max != 1 || model.hparams.n_pos_per_embd() != 1 ||
++            model.hparams.ple_n_heads || moe_cache || model.ram_cache || model.hparams.no_alloc ||
++            model.n_devices() != 1 || model.has_tensor_overrides()) { return false; }
++    if (output_overlap_checked == gf_res_prev_active) { return output_overlap_cached; }
++    output_overlap_checked = gf_res_prev_active;
++    output_overlap_cached = false;
++    const auto * result = gf_res_prev_active;
++    if (result->t_sampled.size() != 1 || !result->t_sampled[0]) { return false; }
++    auto * target = ggml_backend_sched_get_tensor_backend(sched.get(), result->t_sampled[0]);
++    auto * device = target ? ggml_backend_get_device(target) : nullptr;
++    auto * registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++    if (!registry || std::strcmp(ggml_backend_reg_name(registry), "CUDA") != 0 ||
++            ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) { return false; }
++    // Cache this placement proof per built graph, not per generated token.
++    // CPU token embedding lookup is safe here: IDs are already known and the
++    // next ordinary forward uploads its rows before its CUDA work is queued.
++    auto * graph = result->get_gf();
++    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++        auto * node = ggml_graph_node(graph, i);
++        if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE)) { continue; }
++        switch (node->op) {
++            case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE:
++            case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE: continue;
++            default: break;
++        }
++        auto * actual = ggml_backend_sched_get_tensor_backend(sched.get(), node);
++        if (actual == target) { continue; }
++        if (node->op == GGML_OP_GET_ROWS && node->src[0] == model.tok_embd && actual &&
++                ggml_backend_dev_type(ggml_backend_get_device(actual)) == GGML_BACKEND_DEVICE_TYPE_CPU) { continue; }
++        return false;
++    }
++    output_overlap_cached = true;
++    return true;
++}
++
++bool llama_output_overlap_supported(const llama_context * ctx) {
++    return ctx && ctx->output_overlap_supported();
++}
++
+ const llama_model & llama_context::get_model() const {
+     return model;
+ }
+@@ -1755,6 +1800,7 @@
+ }
+ 
+ void llama_context::graph_variant_evict(size_t index) {
++    output_overlap_checked = nullptr;
+     auto & variant = graph_variants[index];
+     GGML_ASSERT(index && index != graph_variant_active);
+     if (variant.sched) {
+@@ -1773,6 +1819,7 @@
+ }
+ 
+ void llama_context::graph_variants_clear() {
++    output_overlap_checked = nullptr;
+     graph_prefill_admission.clear();
+     if (graph_variant_active) {
+         ggml_backend_sched_synchronize(sched.get());
+@@ -1933,6 +1980,7 @@
+             }
+         }
+         auto create = [&]() -> ggml_cgraph * {
++            output_overlap_checked = nullptr;
+             sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
+                     backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+             if (!sched) { return nullptr; }
+@@ -2051,6 +2099,7 @@
+ 
+         if (reuse_current || selected == graph_variant_selection::reused) { n_reused++; }
+     } else {
++        output_overlap_checked = nullptr;
+         gf_res_prev_active = nullptr;
+         res->reset();
+ 
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -61,6 +61,7 @@
+     void sched_reserve();
+ 
+     void synchronize();
++    bool output_overlap_supported() const;
+ 
+     const llama_model   & get_model()   const;
+     const llama_cparams & get_cparams() const;
+@@ -490,6 +491,8 @@
+     std::array<graph_variant_runtime, 5> graph_variants;
+     size_t graph_variant_active = 0;
+     size_t graph_variant_budget = 0;
++    mutable const llm_graph_result * output_overlap_checked = nullptr;
++    mutable bool output_overlap_cached = false;
+     llama_graph_variant_policy::prefill_admission graph_prefill_admission;
+     bool graph_sampler_bindings_failed = false;
+     size_t graph_variant_bytes = 0;
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -35,6 +35,10 @@
+ // It performs no synchronization. General callers must use the safe public
+ // llama_get_sampler_output_ith instead. Borrowed pointer lifetime is unchanged.
+ LLAMA_API llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i);
++// Read-only capability query after a completed decode. It permits a server to
++// overlap CPU response formatting with the next ordinary known-token decode;
++// it neither queues speculative work nor creates an autonomous token pipeline.
++LLAMA_API bool llama_output_overlap_supported(const llama_context * ctx);
+ 
+ // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
+ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -667,6 +667,20 @@
+         llama_sampler_backend_set_selected_only(backend);
+     }
+     return backend;
++}
++
++
++bool common_sampler_can_overlap_output(const common_sampler * gsmpl) {
++    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || !gsmpl->params.backend_sampling ||
++            gsmpl->params.n_probs || gsmpl->cur_p.data || gsmpl->cur_p.size ||
++            gsmpl->params.penalty_repeat != 1.0f || gsmpl->params.penalty_freq != 0.0f ||
++            gsmpl->params.penalty_present != 0.0f || gsmpl->params.dry_multiplier != 0.0f ||
++            gsmpl->params.xtc_probability != 0.0f || gsmpl->params.reasoning_control ||
++            !llama_sampler_backend_selected_only_ready(gsmpl->chain) ||
++            !llama_sampler_backend_can_bind_graph(gsmpl->chain)) { return false; }
++    const int count = llama_sampler_chain_n(gsmpl->chain);
++    const auto * terminal = count ? llama_sampler_chain_get(gsmpl->chain, count - 1) : nullptr;
++    return terminal && std::strcmp(llama_sampler_name(terminal), "+greedy") == 0;
+ }
+ 
+ static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first,
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -66,6 +66,9 @@
+ // candidates. Unsupported/partial chains retain their normal output. This is
+ // unsuitable for draft/rejection verification or candidate inspection.
+ struct llama_sampler * common_sampler_get_backend_selected_only(const struct common_sampler * gsmpl);
++// A completed compact builtin greedy result with no mutable RNG/history or
++// grammar/controller dependency. No sampler or output configuration is changed.
++bool common_sampler_can_overlap_output(const struct common_sampler * gsmpl);
+ 
+ // extended sampling implementation:
+ //
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,5 +1,6 @@
+ #include "server-context.h"
+ #include "server-admission.h"
++#include "server-decode-overlap.h"
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
+@@ -28,6 +29,9 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
+ #include <cinttypes>
+ #include <deque>
+ #include <exception>
+@@ -1088,6 +1092,10 @@
+     llama_context * ctx_tgt = nullptr;
+ 
+     server_batch batch;
++    server_batch decode_overlap_batch;
++    server_decode_overlap decode_overlap;
++    bool decode_overlap_enabled = false;
++    bool decode_overlap_failed = false;
+     server_decode_metadata decode_metadata;
+     server_admission admission;
+ 
+@@ -1142,6 +1150,7 @@
+     int64_t t_last_load_progress_ms = 0;
+ 
+     void destroy() {
++        discard_decode_overlap();
+         admission.clear();
+         spec.reset();
+         spec_init.reset();
+@@ -1553,6 +1562,11 @@
+             };
+ 
+             slot.callback_on_reset = [this](const server_slot & slot) {
++                if (decode_overlap.matches(slot.id, slot.task->id)) { discard_decode_overlap(); }
++                if (decode_overlap_enabled) {
++                    SLT_DBG(slot, "decode-overlap summary queued=%" PRIu64 " consumed=%" PRIu64 " discarded=%" PRIu64 " pending=%d\n",
++                            decode_overlap.queued, decode_overlap.consumed, decode_overlap.discarded, int(decode_overlap.pending()));
++                }
+                 // flush the generated token stats before reset()
+                 if (slot.stats.n_gen > 0) {
+                     metrics_on_prediction(slot);
+@@ -1595,6 +1609,10 @@
+             const int32_t n_batch = llama_n_batch(ctx_tgt);
+             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
+             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
++            decode_overlap_batch.init(ctx_tgt, 1, n_embd);
++            const char * option = std::getenv("WILDLLAMA_DECODE_OVERLAP");
++            decode_overlap_enabled = option && std::strcmp(option, "1") == 0;
++            decode_overlap_failed = false;
+         }
+ 
+         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
+@@ -2149,7 +2167,10 @@
+         return true;
+     }
+ 
+-    bool process_token(completion_token_output & result, server_slot & slot) {
++    bool process_token(completion_token_output & result, server_slot & slot, bool * deferred_partial = nullptr,
++            bool * deferred_stop_stats = nullptr) {
++        if (deferred_partial) { *deferred_partial = false; }
++        if (deferred_stop_stats) { *deferred_stop_stats = false; }
+         // remember which tokens were sampled - used for repetition penalties during sampling
+         const std::string token_str = result.text_to_send;
+         slot.sampled = result.tok;
+@@ -2191,7 +2212,11 @@
+ 
+             slot.add_token(result);
+             if (slot.task->params.stream) {
+-                send_partial_response(slot, result, false);
++                if (deferred_partial) {
++                    *deferred_partial = true;
++                    if (deferred_stop_stats) { *deferred_stop_stats = slot.stop != STOP_TYPE_NONE; }
++                }
++                else { send_partial_response(slot, result, false); }
+             }
+         }
+ 
+@@ -2360,7 +2385,8 @@
+         queue_results.send(std::move(res));
+     }
+ 
+-    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
++    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false,
++            bool before_stop_checks = false) {
+         auto res = std::make_unique<server_task_result_cmpl_partial>();
+ 
+         res->id    = slot.task->id;
+@@ -2396,7 +2422,7 @@
+         }
+ 
+         // populate timings if this is final response or timings_per_token is enabled
+-        if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
++        if ((!before_stop_checks && slot.stop != STOP_TYPE_NONE) || slot.task->params.timings_per_token) {
+             res->stats = slot.stats;
+         }
+ 
+@@ -3534,6 +3560,96 @@
+         return false;
+     }
+ 
++
++    bool can_overlap_response(const server_slot & slot) const {
++        return decode_overlap_enabled && !decode_overlap_failed && !decode_overlap.pending() &&
++            slots.size() == 1 && params_base.n_parallel == 1 && !spec && !ctx_dft && !mctx &&
++            slot.state == SLOT_STATE_GENERATING && slot.task && !slot.task->is_parent() &&
++            !slot.task->is_child() && !slot.task->is_stateless() && slot.task->params.stream &&
++            slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.prompt.tokens.has_mtmd &&
++            !slot.audio_stream && slot.inp_embd.empty() && slot.lora.empty() &&
++            slot.task->params.n_indent == 0 && slot.task->params.t_max_predict_ms <= 0 &&
++            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
++            slot.prompt.n_tokens() + 2 < slot.n_ctx &&
++            common_sampler_can_overlap_output(slot.smpl.get()) && llama_output_overlap_supported(slot.ctx_tgt);
++    }
++
++    void discard_decode_overlap() {
++        if (!decode_overlap.pending()) { return; }
++        llama_synchronize(ctx_tgt);
++        decode_overlap.discard([&](const server_decode_overlap::checkpoint & saved) {
++            auto * slot = get_slot_by_id(saved.slot);
++            if (!slot || !slot->task || slot->task->id != saved.task) {
++                throw std::logic_error("decode-overlap rollback owner changed");
++            }
++            if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), saved.slot, saved.position, -1)) {
++                throw std::runtime_error("decode-overlap rollback failed");
++            }
++            slot->prompt.tokens.keep_first(saved.prompt_tokens);
++            slot->i_batch = -1;
++            SLT_DBG(*slot, "decode-overlap discarded position=%d\n", saved.position);
++        });
++        decode_overlap_batch.clear();
++    }
++
++    void start_decode_overlap(server_slot & slot) {
++        try {
++            decode_overlap_batch.clear();
++            decode_overlap_batch.slot_batched = &slot;
++            const auto position = slot.prompt.tokens.pos_next();
++            if (!decode_overlap_batch.add(slot.id, slot.sampled, position, true, false)) { return; }
++            decode_overlap_batch.render(0, 1);
++            if (!decode_overlap.begin({slot.id, slot.task->id, position, slot.prompt.tokens.size()})) { return; }
++            // Match ordinary pre_decode bookkeeping, with the actual accepted
++            // token. There is no placeholder token, D2D copy, or RNG prediction.
++            slot.prompt.tokens.push_back(slot.sampled);
++            slot.i_batch = 0;
++            metrics_pre_decode();
++            const int status = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, decode_overlap_batch.view.get());
++            if (status != 0) { throw std::runtime_error("optional ahead forward was not admitted"); }
++            decode_metadata.prepare(decode_overlap_batch.tokens, 0, 1, slots.size());
++            SLT_DBG(slot, "decode-overlap queued position=%d queued=%" PRIu64 "\n", position, decode_overlap.queued);
++        } catch (const std::exception & error) {
++            // Failed optional launch/preparation never turns a completed current
++            // token into an error or silently leaves an extra KV cell behind.
++            discard_decode_overlap();
++            decode_overlap_failed = true;
++            SLT_DBG(slot, "decode-overlap disabled after fallback: %s\n", error.what());
++        }
++    }
++
++    bool consume_decode_overlap() {
++        if (!decode_overlap.pending()) { return false; }
++        const auto saved = decode_overlap.owner();
++        auto * slot = get_slot_by_id(saved.slot);
++        if (!slot || !slot->task || slot->task->id != saved.task || slot->state != SLOT_STATE_GENERATING) {
++            discard_decode_overlap();
++            return false;
++        }
++        try {
++            // Queue-changing tasks remain deferred by the existing yield
++            // contract; metrics may still inspect immutable submitted state.
++            queue_tasks.yield_to_queue([&] { llama_synchronize(ctx_tgt); });
++            const auto submitted = decode_overlap_batch.tokens.at(0);
++            // Preserve the shared batch's full prompt capacity. Swapping it
++            // with the one-token ticket would throttle later ordinary prompts.
++            batch.clear();
++            batch.slot_batched = slot;
++            if (!batch.add(submitted.id_slot, submitted.token, submitted.pos[0], true, false)) {
++                throw std::runtime_error("decode-overlap completion batch is unavailable");
++            }
++            batch.render(0, 1);
++            decode_overlap_batch.clear();
++            decode_overlap.commit(slot->id, slot->task->id);
++            metrics_post_decode(true);
++            SLT_DBG(*slot, "decode-overlap consumed position=%d consumed=%" PRIu64 "\n", saved.position, decode_overlap.consumed);
++            post_decode(1, 0);
++        } catch (const std::exception & error) {
++            abort_all_slots("decode-overlap consume failed: " + std::string(error.what()));
++        }
++        return true;
++    }
++
+     void update_slots() {
+         admission.resume_ready([this](int id_task) { queue_tasks.pop_deferred_task_by_id(id_task); });
+ #ifdef DEBUG_TIMINGS
+@@ -3576,6 +3692,8 @@
+                 queue_tasks.post(std::move(task));
+             }
+         }
++
++        if (consume_decode_overlap()) { return; }
+ 
+         try {
+             scoped_timer t(t_pre_decode, n_pre_decode);
+@@ -4932,7 +5050,18 @@
+                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+             }
+ 
+-            if (!process_token(result, slot)) {
++            const bool eligible_overlap = can_overlap_response(slot);
++            bool deferred_partial = false;
++            bool deferred_stop_stats = false;
++            const bool continues = process_token(result, slot, eligible_overlap ? &deferred_partial : nullptr,
++                    eligible_overlap ? &deferred_stop_stats : nullptr);
++            if (continues && deferred_partial) { start_decode_overlap(slot); }
++            if (deferred_partial) {
++                // This used to run before terminal checks. Preserve the same
++                // partial-chunk stats contract even when this is the last token.
++                send_partial_response(slot, result, false, false, !deferred_stop_stats);
++            }
++            if (!continues) {
+                 // release slot because of stop condition
+                 slot.print_timings();
+                 send_final_response(slot);
+--- /dev/null
++++ b/tools/server/server-decode-overlap.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++
++// Inference-thread-owned transaction for one ordinary, already-accepted token.
++// No device tensors or speculative token IDs are owned by this metadata.
++class server_decode_overlap {
++public:
++    struct checkpoint {
++        int32_t slot = -1;
++        int32_t task = -1;
++        int32_t position = -1;
++        size_t prompt_tokens = 0;
++    };
++
++    bool pending() const { return active; }
++    const checkpoint & owner() const { return saved; }
++    uint64_t queued = 0;
++    uint64_t consumed = 0;
++    uint64_t discarded = 0;
++
++    bool begin(checkpoint value) {
++        if (active || value.slot < 0 || value.task < 0 || value.position < 0) { return false; }
++        saved = value;
++        active = true;
++        ++queued;
++        return true;
++    }
++
++    bool matches(int32_t slot, int32_t task) const {
++        return active && saved.slot == slot && saved.task == task;
++    }
++
++    void commit(int32_t slot, int32_t task) {
++        if (!matches(slot, task)) { throw std::logic_error("decode-overlap owner changed"); }
++        active = false;
++        ++consumed;
++    }
++
++    template<class Cleanup>
++    void discard(Cleanup && cleanup) {
++        if (!active) { return; }
++        // Keep ownership if a drain/rollback throws; never silently forget live
++        // work or publish it as consumed after a failed cleanup.
++        cleanup(saved);
++        active = false;
++        ++discarded;
++    }
++
++private:
++    bool active = false;
++    checkpoint saved = {};
++};
+--- /dev/null
++++ b/tests/test-server-decode-overlap.cpp
+@@ -0,0 +1,47 @@
++#include "../tools/server/server-decode-overlap.h"
++
++#include <cstdio>
++#include <stdexcept>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++int main() {
++    try {
++        server_decode_overlap state;
++        const server_decode_overlap::checkpoint a{0, 41, 73, 73};
++        require(!state.begin({-1, 41, 73, 73}), "invalid owner admitted");
++        require(state.begin(a) && state.pending(), "ordinary step not owned");
++        require(!state.begin({0, 42, 74, 74}), "more than one step queued");
++        bool rejected = false;
++        try { state.commit(0, 42); } catch (const std::logic_error &) { rejected = true; }
++        require(rejected && state.pending() && state.consumed == 0, "cross-request commit accepted");
++        bool drained = false;
++        try {
++            state.discard([&](const auto & owner) {
++                require(owner.position == 73 && owner.prompt_tokens == 73, "rollback checkpoint changed");
++                drained = true;
++                throw std::runtime_error("injected drain failure");
++            });
++        } catch (const std::runtime_error &) {}
++        require(drained && state.pending() && state.discarded == 0, "failed drain forgot live work");
++        bool rolled_back = false;
++        state.discard([&](const auto & owner) {
++            require(drained && owner.task == 41, "rollback was not bound to drained owner");
++            rolled_back = true;
++        });
++        require(rolled_back && !state.pending() && state.discarded == 1, "cancel rollback not completed");
++        state.discard([](const auto &) { throw std::runtime_error("double rollback"); });
++        require(state.begin(a), "new request remained blocked after cleanup");
++        state.commit(0, 41);
++        require(!state.pending() && state.consumed == 1 && state.queued == 2 && state.discarded == 1,
++                "logical step counted twice or lost");
++        static_assert(sizeof(server_decode_overlap) < 128, "transaction metadata is unbounded");
++        std::puts("DECODE_OVERLAP_TRANSACTION one_step_bound=1 owner_isolation=1 failed_drain_retains=1 cancel_rollback=1 no_duplicate_commit=1 PASS");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "decode overlap: FAIL: %s\n", error.what());
++        return 1;
++    }
++}

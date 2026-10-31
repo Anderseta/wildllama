@@ -1,0 +1,19 @@
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1467,6 +1467,16 @@
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}));
+     add_opt(common_arg(
++        {"--wildllama-runtime-features"},
++        "print supported WildLlama runtime environment keys as JSON and exit",
++        [](common_params &) {
++            // Feature discovery must describe this native executable rather
++            // than infer support from its path or a retained wrapper version.
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP"]})json");
++            exit(0);
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
+         {"--version"},
+         "show version and build info",
+         [](common_params &) {

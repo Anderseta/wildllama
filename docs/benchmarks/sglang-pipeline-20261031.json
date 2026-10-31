@@ -1,0 +1,1079 @@
+{
+  "status": "passed",
+  "artifact": "sglang_pipeline_followups",
+  "base_commit": "a68fd5c840929188f58e860076f3ef864414cdae",
+  "sealed_at_utc": "2026-10-31T17:58:42.361821+00:00",
+  "native_base": {
+    "upstream_commit": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+    "patches": [
+      "001-llama-cpp-hooks.patch",
+      "002-moe-ram-limit.patch",
+      "003-runtime-performance.patch",
+      "004-gpu-first-moe.patch",
+      "005-live-runtime-activity.patch",
+      "006-moe-residency-pipeline.patch",
+      "007-dense-runtime.patch",
+      "008-runtime-efficiency.patch",
+      "009-bounded-copy-pipeline.patch",
+      "010-scheduler-exception-contract.patch",
+      "011-moe-read-and-execution-batching.patch",
+      "012-expert-major-and-packed-rows.patch",
+      "013-resident-gpu-tuning.patch",
+      "014-kv-reclamation-and-prompt-state.patch",
+      "015-mtp-checkpoint-state.patch",
+      "016-tuning-reuse.patch",
+      "017-sampler-output-view.patch",
+      "018-speculative-round-efficiency.patch",
+      "019-cuda-graph-reuse.patch",
+      "020-checkpoint-restore-transaction.patch",
+      "021-sampler-batch-fences-and-owned-candidates.patch",
+      "022-sampler-init-and-mtp-state-transactions.patch",
+      "023-speculative-snapshot-and-clone-ownership.patch",
+      "024-moe-binding-transaction.patch",
+      "025-prompt-prefix-index.patch",
+      "026-postverify-candidate-and-residual-work.patch",
+      "027-overlapped-admission-and-decode-metadata.patch",
+      "028-device-mtp-state.patch",
+      "029-compact-backend-sampler-outputs.patch",
+      "030-bounded-graph-variants.patch",
+      "032-retained-prefix.patch",
+      "033-graph-owned-sampler-bindings.patch",
+      "034-device-attention-mask.patch",
+      "036-paged-state-cache.patch",
+      "037-grammar-first-device-mask.patch",
+      "038-hybrid-retained-prefix.patch",
+      "039-sampler-binding-preflight.patch",
+      "040-device-mask-placement.patch",
+      "041-grammar-mask-validation.patch",
+      "042-async-prefix-writeback.patch",
+      "043-canonical-penalties.patch",
+      "044-hybrid-text-device-mask.patch",
+      "045-auto-device-mask.patch",
+      "046-shared-cache-diagnostics.patch",
+      "047-preserve-mask-execution.patch",
+      "048-conservative-extended-mask-default.patch",
+      "049-backend-sampler-extensions.patch",
+      "050-bounded-prefill-graph-arenas.patch",
+      "051-indexed-kv-prefix-sharing.patch",
+      "052-bounded-output-decode-overlap.patch",
+      "053-runtime-feature-discovery.patch"
+    ]
+  },
+  "release_decision": {
+    "approved_defaults": true,
+    "default_policy": {
+      "canonical_penalties": true,
+      "device_attention_mask": "auto",
+      "device_mask_execution_flags_preserved": true,
+      "prefix_disk_async": "opt_in",
+      "device_mask_policy": {
+        "minimum_queries_per_stream": 512,
+        "ordinary_minimum_dense_bytes": 262144,
+        "extended_inputs": "hybrid OR n_pos>1",
+        "extended_minimum_dense_bytes": 2097152,
+        "manual_enable": "WILDLLAMA_DEVICE_MASK=1",
+        "manual_minimum_queries_per_stream": 32,
+        "manual_minimum_dense_bytes": 262144,
+        "explicit_disable": "WILDLLAMA_DEVICE_MASK=0",
+        "unsupported_layouts": "original_host_path"
+      },
+      "graph_variant_library_default_mib": 0,
+      "graph_variant_profile_mib": 128,
+      "graph_variant_budget_scope": "per_context",
+      "dry_backend": "opt_in",
+      "decode_overlap": "opt_in"
+    },
+    "autonomous_gpu_feedback": false,
+    "user_models_and_logical_context_preserved": true,
+    "opt_in_dry_old_stochastic_host_rng_parity_claimed": false,
+    "trained_model_quality_not_measured": true
+  },
+  "validation": {
+    "native_cpu_ctest": {
+      "status": "passed",
+      "passed": 38,
+      "failed": 0,
+      "skipped": 0,
+      "junit": {
+        "path": ".build/sglang-pipeline-20261031/native-release/native-cpu-tests.xml",
+        "sha256": "24c899cad3c7012ea4558f0678c9055ff64c91f984c2fc5d1066a8587b186b58"
+      }
+    },
+    "native_cuda_ctest": {
+      "status": "passed",
+      "passed": 12,
+      "failed": 0,
+      "skipped": 0,
+      "junit": {
+        "path": ".build/sglang-pipeline-20261031/native-release/native-cuda-tests.xml",
+        "sha256": "2383c7845cc35bb2432fdca611dfff0f90ef3814535bc17f91d14e47336cdf72"
+      }
+    },
+    "native_components": {
+      "status": "passed",
+      "steps": 23,
+      "model_families": 7,
+      "cpu_and_cuda_graph_prefill_families": 14,
+      "server_tests": 45,
+      "server_assertions": 190,
+      "report": {
+        "path": ".build/sglang-pipeline-20261031/native-release/runner-summary-all.json",
+        "sha256": "afd12292ea1bf7b3a140dce465d68a48c131da620e390351f27a64d98fec3bad"
+      },
+      "inventory": {
+        "path": ".build/sglang-pipeline-20261031/final-runner/required-tests.json",
+        "sha256": "796aab2561c2e2e804dcbb4bb69d2f2780edbdb81453c6f90797c7d79b679ea1"
+      }
+    },
+    "patch_replay": {
+      "status": "passed",
+      "canonical_files_compared": 178,
+      "patch_count": 51,
+      "fresh_ordered_replay": true,
+      "repeat_cmake_idempotence": true,
+      "no_outside_native_changes": true,
+      "report": {
+        "path": ".build/sglang-pipeline-20261031/patch-replay.json",
+        "sha256": "bd3d74c0e1418b43c7c6f47b25063be0e484dfc90ae56bbf9c88f5af2aa1d3f6"
+      },
+      "repeat_log": {
+        "path": ".build/sglang-pipeline-20261031/patch-replay-cmake.log",
+        "sha256": "c35fb1d707c521fbbe0ee59de6e5ff84903755b2a30ccb4d955d4c1352ed84df"
+      },
+      "replay_generator": {
+        "path": ".build/sglang-pipeline-20261031/replay_final.py",
+        "sha256": "fae4fa670c3028462870cc216eb34a5aefe5e8538adabcce53079c9b0a1fdf91"
+      },
+      "materialization": "Affected paths read from compiled native upstream HEAD into a fresh partial non-Git tree",
+      "ownership": {
+        "path": ".build/sglang-pipeline-20261031/native-source-ownership.json",
+        "sha256": "5f5a01c8b8c688425c812aee61539d5bb0c99f8a9f98130197ebbd44c122d52d"
+      }
+    },
+    "source_guard": {
+      "status": "passed",
+      "native_files_rechecked": 1997,
+      "mandatory_guarded_inputs": 61,
+      "successful_snapshot_sha256": "e431aa1749ec525f36c747fb4448db658234c8ab1486dec3758a9211fab06ba3"
+    },
+    "stable_release_payloads": {
+      "status": "passed",
+      "before": {
+        "path": ".build/sglang-pipeline-20261031/release-suite-before.json",
+        "sha256": "32d54ec369bf8141c95ba7ccf69d9daa727e3dfb122e41b99310310f45a0f724"
+      },
+      "after": {
+        "path": ".build/sglang-pipeline-20261031/release-suite-after.json",
+        "sha256": "a909f55d01441e22efbc2b4e111330d47f03d1ebe6fe951d6477afa3db8fa13a"
+      },
+      "files_per_bundle": 39,
+      "unchanged_before_after_and_current": true,
+      "baseline_published_commit": "a68fd5c840929188f58e860076f3ef864414cdae"
+    },
+    "http_cases_per_payload": 300,
+    "http_equivalence": {
+      "status": "passed",
+      "cases_per_payload": 300,
+      "configurations": [
+        {
+          "configuration": "cpu-draft-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-cpu-draft-caches.json",
+            "sha256": "e18885730143dcb3fd18671991d46f833c53ab41af0ce686563bbd440771f59e"
+          }
+        },
+        {
+          "configuration": "cpu-draft",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-cpu-draft.json",
+            "sha256": "676b46cfa2eda9144005e0a4956fa3d34e178b58488647e0b7de710a39c00485"
+          }
+        },
+        {
+          "configuration": "cpu-plain-caches-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-cpu-plain-caches-device-mask.json",
+            "sha256": "7fd61a1006f3039ff6d499101c27a3d614e49523d7c7741e6c279d267e39e4bc"
+          }
+        },
+        {
+          "configuration": "cpu-plain-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-cpu-plain-caches.json",
+            "sha256": "53b49ab95700cc07c2e7abdeca2d42fccc185ff70ea82ab16697f9f2050141a3"
+          }
+        },
+        {
+          "configuration": "cpu-plain-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-cpu-plain-device-mask.json",
+            "sha256": "f9a5c9b3b2c0ec2ccb8ada8ab3ba6879800123491f55d92097271925e68e4bf4"
+          }
+        },
+        {
+          "configuration": "cpu-plain",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-cpu-plain.json",
+            "sha256": "96334de630fc783eaa590babe4eeb04778d288518b47ab15e866cbd1716f83ac"
+          }
+        },
+        {
+          "configuration": "gpu-draft-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-gpu-draft-caches.json",
+            "sha256": "c170e1f9240db8ae150265023eca9a408c65ccd334f6b0f397bba78b52452827"
+          }
+        },
+        {
+          "configuration": "gpu-draft",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-gpu-draft.json",
+            "sha256": "30d3b14928adc766294780077fd4c2e6e0566ff998a7a118630a58d812aa4007"
+          }
+        },
+        {
+          "configuration": "gpu-plain-caches-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 1,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-gpu-plain-caches-device-mask.json",
+            "sha256": "7da3799137c20dfa16e5e02d3f84c2ec0332e8f242fcda96ebbed69ba013a8af"
+          }
+        },
+        {
+          "configuration": "gpu-plain-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-gpu-plain-caches.json",
+            "sha256": "a084c5d1991999bb78944c16f450a3f5c929d16b9520d85a5767c754e5cd3ab3"
+          }
+        },
+        {
+          "configuration": "gpu-plain-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 1,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-gpu-plain-device-mask.json",
+            "sha256": "c37babbf8315a5afe6d9e750d15e967e26115d1d507e3735f3aba71206b7003d"
+          }
+        },
+        {
+          "configuration": "gpu-plain",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/sglang-pipeline-20261031/http-comparison/smoke-gpu-plain.json",
+            "sha256": "1d7ab8c06d3bbcb7be186cdb4366d9e9e9904e80ee661b8b741c14515496ffa2"
+          }
+        }
+      ],
+      "provenance": "Stable full39-file bundle snapshots surround the release HTTP matrix; existing summary harness emits semantic digests"
+    },
+    "same_payload_grammar_http_features": {
+      "cpu": {
+        "status": "passed",
+        "cases": 20,
+        "positive_feature_cases": 12,
+        "max_probability_abs_error": 2.9802322387695312e-08,
+        "report": {
+          "path": ".build/sglang-pipeline-20261031/http-features/cpu.json",
+          "sha256": "398a4f2efc07612ce96a5c1982bc66471512b99c39962c33aa2f4e8aaf533dea"
+        }
+      },
+      "gpu": {
+        "status": "passed",
+        "cases": 20,
+        "positive_feature_cases": 12,
+        "max_probability_abs_error": 2.9802322387695312e-08,
+        "report": {
+          "path": ".build/sglang-pipeline-20261031/http-features/gpu.json",
+          "sha256": "42fa7ff000a4bf2c1c70aedc23d9eddde8f023327a4580c079382e3a0e699aa0"
+        }
+      }
+    },
+    "dry_backend_http": {
+      "cpu": {
+        "status": "passed",
+        "default_cases_per_payload": 26,
+        "opt_in_cases": 25,
+        "actual_complete_backend_cases": 7,
+        "actual_loaded_core_module_pins": true,
+        "default_outputs_exact": true,
+        "opt_in_repeatable": true,
+        "old_stochastic_host_dist_seed_parity_claimed": false,
+        "report": {
+          "path": ".build/sglang-pipeline-20261031/dry-http-cpu/report.json",
+          "sha256": "48533d666f279edde0fd8560216eccfbcf214a7e30783d0a22aa42cc9cf0c228"
+        }
+      },
+      "gpu": {
+        "status": "passed",
+        "default_cases_per_payload": 26,
+        "opt_in_cases": 25,
+        "actual_complete_backend_cases": 7,
+        "actual_loaded_core_module_pins": true,
+        "default_outputs_exact": true,
+        "opt_in_repeatable": true,
+        "old_stochastic_host_dist_seed_parity_claimed": false,
+        "report": {
+          "path": ".build/sglang-pipeline-20261031/dry-http-gpu/report.json",
+          "sha256": "8b62ea12b52b3e81a2fc6331ccb82de343116ec851276154b8dd4e931fe63492"
+        }
+      }
+    },
+    "decode_overlap_http": {
+      "cpu": {
+        "status": "passed",
+        "cases": 17,
+        "exact_sse": true,
+        "cancellation_recovery_exact": true,
+        "actual_loaded_core_module_pins": true,
+        "actual_queued": 0,
+        "actual_consumed": 0,
+        "actual_cancel_discarded": 0,
+        "report": {
+          "path": ".build/sglang-pipeline-20261031/decode-overlap-cpu/report.json",
+          "sha256": "14c017fbd8855532a672ca46eb68db496eb879f260c3050348fcedf2f022b9f3"
+        },
+        "scope": "One known accepted token ahead while CPU formats streaming output; not autonomous GPU token feedback",
+        "timing": {
+          "cycles": 8,
+          "warmups_per_control": 3,
+          "median_wall_ms": {
+            "disabled": 156.00519999998141,
+            "enabled": 155.87120000009236
+          },
+          "median_native_reported_tokens_per_second": {
+            "disabled": 893.0455120385029,
+            "enabled": 893.6900657306022
+          },
+          "median_end_to_end_tokens_per_second": {
+            "disabled": 820.4856273433169,
+            "enabled": 821.1909155485198
+          },
+          "median_first_nonempty_content_ms": {
+            "disabled": 13.257049999992887,
+            "enabled": 13.208450000092853
+          },
+          "cold_first_completion_ttft_ms": {
+            "disabled": 13.024799999584502,
+            "enabled": 13.307799999893177
+          },
+          "warmup_ttft_ms": {
+            "disabled": [
+              13.44000000062806,
+              13.179000000491214
+            ],
+            "enabled": [
+              13.5126000004675,
+              13.549499999498948
+            ]
+          },
+          "ttft_definition": "Client-observed time to first parsed SSE event containing a nonempty content string; excludes empty progress events",
+          "cold_first_completion_definition": "First completion after a fresh server is health-ready; excludes model load. Native initialization may already run capability probes, so this is not fully cold CUDA startup.",
+          "latency_change_percent": -0.08589457267390577,
+          "debug_io_excluded": true,
+          "log_verbosity": 4,
+          "scope": "Tiny random-weight SSE latency and actual native-reported throughput, same binary; not trained-model TPS"
+        }
+      },
+      "gpu": {
+        "status": "passed",
+        "cases": 17,
+        "exact_sse": true,
+        "cancellation_recovery_exact": true,
+        "actual_loaded_core_module_pins": true,
+        "actual_queued": 212,
+        "actual_consumed": 211,
+        "actual_cancel_discarded": 1,
+        "report": {
+          "path": ".build/sglang-pipeline-20261031/decode-overlap-gpu/report.json",
+          "sha256": "f267dcfd6a8ba11c6dc37c74addb088d6c66f046b80993fe042893ca0f52dc8d"
+        },
+        "scope": "One known accepted token ahead while CPU formats streaming output; not autonomous GPU token feedback",
+        "timing": {
+          "cycles": 8,
+          "warmups_per_control": 3,
+          "median_wall_ms": {
+            "disabled": 86.0688000002483,
+            "enabled": 64.16225000020859
+          },
+          "median_native_reported_tokens_per_second": {
+            "disabled": 1625.9432418108818,
+            "enabled": 2148.8010151804374
+          },
+          "median_end_to_end_tokens_per_second": {
+            "disabled": 1487.2723652537934,
+            "enabled": 1994.9450106661905
+          },
+          "median_first_nonempty_content_ms": {
+            "disabled": 4.7506500000054075,
+            "enabled": 6.858199999896897
+          },
+          "cold_first_completion_ttft_ms": {
+            "disabled": 4000.13300000046,
+            "enabled": 4024.50940000017
+          },
+          "warmup_ttft_ms": {
+            "disabled": [
+              5.506000000423228,
+              4.8453999997946084
+            ],
+            "enabled": [
+              8.295700000417128,
+              7.469600000149512
+            ]
+          },
+          "ttft_definition": "Client-observed time to first parsed SSE event containing a nonempty content string; excludes empty progress events",
+          "cold_first_completion_definition": "First completion after a fresh server is health-ready; excludes model load. Native initialization may already run capability probes, so this is not fully cold CUDA startup.",
+          "latency_change_percent": -25.452370661582957,
+          "debug_io_excluded": true,
+          "log_verbosity": 4,
+          "scope": "Tiny random-weight SSE latency and actual native-reported throughput, same binary; not trained-model TPS"
+        }
+      }
+    },
+    "graph_cache_memory_performance": {
+      "status": "passed",
+      "baseline_cache_mib": 0,
+      "tested_cache_mib": 128,
+      "contexts_measured": 1,
+      "cache_budget_scope": "per_context",
+      "small_fixtures_only": true,
+      "actual_native_cache_counters": true,
+      "driver_memory_scope_disclosed": true,
+      "actual_loaded_core_module_pins": true,
+      "logits_bit_exact": true,
+      "requested_strict_native_cpu_mask": "14",
+      "trials": [
+        {
+          "trial": 0,
+          "cache_mib": 0,
+          "native_counters": {
+            "stage": "done",
+            "cache_budget_bytes": 0,
+            "peak_extra_compute_bytes": 0,
+            "peak_extra_metadata_bytes": 0,
+            "peak_extra_total_bytes": 0,
+            "peak_arenas": 0,
+            "reused": 0
+          },
+          "driver_memory": {
+            "before_process": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "loaded_idle": {
+              "global_used_mib": [
+                1753.0,
+                1753.0,
+                1753.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_warm": {
+              "global_used_mib": [
+                2207.0,
+                2207.0,
+                2207.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_measure": {
+              "global_used_mib": [
+                2207.0,
+                2207.0,
+                2207.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_exit": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "trial": 1,
+          "cache_mib": 128,
+          "native_counters": {
+            "stage": "done",
+            "cache_budget_bytes": 134217728,
+            "peak_extra_compute_bytes": 8878720,
+            "peak_extra_metadata_bytes": 1673024,
+            "peak_extra_total_bytes": 10551744,
+            "peak_arenas": 4,
+            "reused": 100
+          },
+          "driver_memory": {
+            "before_process": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "loaded_idle": {
+              "global_used_mib": [
+                1759.0,
+                1759.0,
+                1759.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_warm": {
+              "global_used_mib": [
+                2217.0,
+                2217.0,
+                2217.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_measure": {
+              "global_used_mib": [
+                2217.0,
+                2217.0,
+                2217.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_exit": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "trial": 2,
+          "cache_mib": 128,
+          "native_counters": {
+            "stage": "done",
+            "cache_budget_bytes": 134217728,
+            "peak_extra_compute_bytes": 8878720,
+            "peak_extra_metadata_bytes": 1673024,
+            "peak_extra_total_bytes": 10551744,
+            "peak_arenas": 4,
+            "reused": 100
+          },
+          "driver_memory": {
+            "before_process": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "loaded_idle": {
+              "global_used_mib": [
+                1757.0,
+                1757.0,
+                1757.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_warm": {
+              "global_used_mib": [
+                2215.0,
+                2215.0,
+                2215.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_measure": {
+              "global_used_mib": [
+                2215.0,
+                2215.0,
+                2215.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_exit": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "trial": 3,
+          "cache_mib": 0,
+          "native_counters": {
+            "stage": "done",
+            "cache_budget_bytes": 0,
+            "peak_extra_compute_bytes": 0,
+            "peak_extra_metadata_bytes": 0,
+            "peak_extra_total_bytes": 0,
+            "peak_arenas": 0,
+            "reused": 0
+          },
+          "driver_memory": {
+            "before_process": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "loaded_idle": {
+              "global_used_mib": [
+                1759.0,
+                1759.0,
+                1759.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_warm": {
+              "global_used_mib": [
+                2213.0,
+                2213.0,
+                2213.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_measure": {
+              "global_used_mib": [
+                2213.0,
+                2213.0,
+                2213.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            },
+            "after_exit": {
+              "global_used_mib": [
+                1438.0,
+                1438.0,
+                1438.0
+              ],
+              "per_process_used_mib": [
+                null,
+                null,
+                null
+              ]
+            }
+          }
+        }
+      ],
+      "paired_shape_metrics": [
+        {
+          "tokens": 32,
+          "median_wall_ms": {
+            "0": 2.08415,
+            "128": 0.48485
+          },
+          "latency_change_percent": -76.73631936280978
+        },
+        {
+          "tokens": 64,
+          "median_wall_ms": {
+            "0": 2.13345,
+            "128": 0.6016999999999999
+          },
+          "latency_change_percent": -71.79685485949987
+        },
+        {
+          "tokens": 128,
+          "median_wall_ms": {
+            "0": 2.35235,
+            "128": 0.7685
+          },
+          "latency_change_percent": -67.33054179862691
+        },
+        {
+          "tokens": 256,
+          "median_wall_ms": {
+            "0": 2.6026,
+            "128": 1.2513999999999998
+          },
+          "latency_change_percent": -51.917313455774995
+        },
+        {
+          "tokens": 512,
+          "median_wall_ms": {
+            "0": 2.9997,
+            "128": 1.7538
+          },
+          "latency_change_percent": -41.534153415341535
+        }
+      ],
+      "driver_memory_scope": "NVIDIA device-global samples may include other applications; per-process usage reported only when available",
+      "native_counter_scope": "Extra compute bytes sum all backend arena buffers; host metadata is included in extra-total accounting",
+      "interpretation": "One tiny diagnostic context.128MiB is an extra-cache quota, not128MiB automatically allocated, not a whole-process VRAM cap, and not a proportional increase of model VRAM. MTP target+draft may each have this quota.",
+      "report": {
+        "path": ".build/sglang-pipeline-20261031/graph-memory-release/report.json",
+        "sha256": "9f1ca0ad2cdc2c579653690e61ee2d295dbcade92c89e5a12a8a6be0d1687068"
+      }
+    },
+    "native_feature_discovery": {
+      "status": "passed",
+      "schema": 1,
+      "cases": 2,
+      "environment_keys": 3,
+      "no_model_loaded": true,
+      "report": {
+        "path": ".build/sglang-pipeline-20261031/native-release/feature-discovery/report.json",
+        "sha256": "585120a7eeb6b98fd0c6c915544fde71326d964997f0e265692221c3d30366f1"
+      }
+    }
+  },
+  "tracked_inputs_sha256": {
+    "LLAMA_CPP_VERSION": "e27baf5cae7a8e224d3febe87f1d7a8d49a613fa291e8ef9297ff859244454ea",
+    "README.md": "90ba54b5b9b98df1041132fb9282a269bcac35af445c4f2f564a207aac69dd67",
+    "cmake/apply-git-patches.cmake": "aae7850f2a8057c1ee0435393c62679c683cf4e9b63fca41cabcac198ab4426a",
+    "docs/dense-default-runtime.md": "f0569b5ea025acdc14dadbeed874c17ded0e91ac463fffaeca81edc93aa8891f",
+    "docs/execution-pipeline.md": "60ce53ece8a2688fcb88e3ce090aa99fbcf13ecb36901173193f9c21bc23d459",
+    "docs/resident-execution.md": "acf83f774f2fd73fe9b94a6b8abe10e9d18c052a89a9c6537046352bf952e515",
+    "docs/sglang-pipeline-followups.md": "9718afd51b0d8cbb01b880bd18e99fc1c2e568ad295085b6a06158d5df454065",
+    "integration/generate_dense_decode_fixture.py": "6164d72edca366f5a1861a9ee3dbfd567580b3fbefd8ddd0bc9dfff8bf82b991",
+    "integration/generate_dense_prefill_fixtures.py": "5a9d0b40f83ecc203fd2d0f7ecf4365700ee6ee609f16b4a6388e93be20e68c4",
+    "integration/native_decode_overlap_smoke.py": "a5c7daa0f96d63cdbfde8bc8efe96f7d90f769c7ab49c80083f89eef1d7dd8c4",
+    "integration/native_dense_decode_benchmark.py": "ff40c9567454406af1dc217d20a024f3f9bdb99e05c2929a01c4b06f0a2ca62f",
+    "integration/native_dense_logprob_smoke.py": "8ad77b35c7fc0fae62300880f002ffd18e6759bd152593d856c78e49c773327f",
+    "integration/native_dense_prefill_benchmark.py": "ac6022f569cfcff74b8e64fbd008a4556c86fb79f6d80b8d6e850562ed663ed0",
+    "integration/native_execution_features_smoke.py": "f0ece2b2077880ec9757488b41880f313d96614eeac2afd6c2edb5ad6c4be1e3",
+    "integration/native_payload_provenance.py": "ac335b0a3871aa79b16eaf81e18353c3abacd777809d186ee0e64d0b5e06aece",
+    "integration/native_prefix_disk_smoke.py": "299c476b1167fe2b650229eb506742dee83970d5abac7ade4d828bbc0741a3fb",
+    "integration/native_sglang_smoke.py": "5e550b15820eae012450b872b7442fdfb33439da858ddc4808a8435445d28641",
+    "llama/compat/001-llama-cpp-hooks.patch": "de62fe6dd48c1b19082ae234e0b21fbc3da326dc18d6c971b93953886bf3ebf7",
+    "llama/compat/002-moe-ram-limit.patch": "8485d05e3448e295d5e68bcf6951afaeb694b3ce0ed61c57f86e8eca47711f63",
+    "llama/compat/003-runtime-performance.patch": "c5c6d73983ddeb8335c3588179b765f629d15db6ad10b6a934e463e230fdc33a",
+    "llama/compat/004-gpu-first-moe.patch": "5bce41f1be9133933e70a793229d031af50e771e86799b9f047b2ec58475c36c",
+    "llama/compat/005-live-runtime-activity.patch": "26e2326f8c2593f49de9f18c14aedb52d5f9996cf2d1ca9ae197a902f5636ac6",
+    "llama/compat/006-moe-residency-pipeline.patch": "d235058da91715858ced1f9057b25fe8b49b71012437b532c50d798b1a4d5c10",
+    "llama/compat/007-dense-runtime.patch": "6c705a9a0b6476bb6a2fd04eaf7f36dfa8864d4fb75c07fea14fbccdb6b58ad8",
+    "llama/compat/008-runtime-efficiency.patch": "117dafa6e5b65932bfeff566eb80a4016f3b7dfb450b5e243311cb02e2b54656",
+    "llama/compat/009-bounded-copy-pipeline.patch": "bcf03171c2f496ebbb50d8b6871b5a2fb9e7a333c11efae096809c26ea0e4a58",
+    "llama/compat/010-scheduler-exception-contract.patch": "27cd6c45a84f83d01303fad255f729331b22d76dcd992b83b5c0fd494a9d0072",
+    "llama/compat/011-moe-read-and-execution-batching.patch": "e1a37558908d74860d8e8b94382962dd6e8d844722032d699cf2a26d6313740d",
+    "llama/compat/012-expert-major-and-packed-rows.patch": "5024e3a04816e2d2ac45b8975b8704c317922e87add5d1cea58d91a96c293bf5",
+    "llama/compat/013-resident-gpu-tuning.patch": "f0a3563d5125b7858feb76aab2aa0555cf21b7132169aff8c604f44b937f7184",
+    "llama/compat/014-kv-reclamation-and-prompt-state.patch": "08e586d6efd8556cb293909a5848c22de722f2e9d7d0d8336c9aa97d047d18df",
+    "llama/compat/015-mtp-checkpoint-state.patch": "1f7c1f571181c49177d7c4755eafc9aea7a2afd180449891c60434fd328ab6a1",
+    "llama/compat/016-tuning-reuse.patch": "3e3b41c883b9daaccd6a594f2f7c8d97a494d915024646ba8ff5b1a3d2c4733b",
+    "llama/compat/017-sampler-output-view.patch": "802e2050a6dded02a7907ccb6cd6c3d56338572ccc0d3e173937d8ff8874799d",
+    "llama/compat/018-speculative-round-efficiency.patch": "d0dc4b31e7d5d5a018bda5488ac92034cf080a2f16c813e90429c1b20907f53d",
+    "llama/compat/019-cuda-graph-reuse.patch": "6b34e48f7e1178131f80e42bb9ab3c32bc818fdbad01183b502e521046961a18",
+    "llama/compat/020-checkpoint-restore-transaction.patch": "1a11670075bdd1a1ff39d1e3490e0d6dd6bc01215d7d4be8d36aad1059c70627",
+    "llama/compat/021-sampler-batch-fences-and-owned-candidates.patch": "a2d6b09b62c72c66701ce0171643830f9cd180634aca5945da9a58142c9fffff",
+    "llama/compat/022-sampler-init-and-mtp-state-transactions.patch": "aec56568d045f0f4bccda8dcc0776437fab8abad52584d4c5ddae1e36480a545",
+    "llama/compat/023-speculative-snapshot-and-clone-ownership.patch": "dd9844d6c00b48d46c7d49aff57c04b10e869c4feb3ffd443592d2bad01d806e",
+    "llama/compat/024-moe-binding-transaction.patch": "f652aa79595e58126f5a5dddddf85edc76832ddec76c61807df7148778d12851",
+    "llama/compat/025-prompt-prefix-index.patch": "f61cea4f7e83a126a9e87321f453bf4c457f24f62de89fecaf484a539a71eef9",
+    "llama/compat/026-postverify-candidate-and-residual-work.patch": "1cfc44df1cc2d2a7c0a203a65fdbcda01bc14810d4329f7ec170100eb948c0a3",
+    "llama/compat/027-overlapped-admission-and-decode-metadata.patch": "451494cd9cbdeb80cae49dffbd6056071114da6dc258c782cf0ad46c48f73cc3",
+    "llama/compat/028-device-mtp-state.patch": "4ecd423c8590c352a7cd5ef78970953a9b49a4a68a483dc9af0565c2549dd23c",
+    "llama/compat/029-compact-backend-sampler-outputs.patch": "84cbf27957cfd79e7ee9abc23ddd7ff3a42c11878cad16d1d4b5743aa0378572",
+    "llama/compat/030-bounded-graph-variants.patch": "51b618b7dc58f7d353e63b28daf17ff3adf6f3f7ac0e0d2d91925e464a4c101d",
+    "llama/compat/032-retained-prefix.patch": "ad0e339346baf4f39247f6842f2f680189f1200d3a0f7a6bdf6027ddfde53281",
+    "llama/compat/033-graph-owned-sampler-bindings.patch": "c42b6036590db9d78f5404fab9efd0eb2ec206625f21303ab2aef3191e56c69a",
+    "llama/compat/034-device-attention-mask.patch": "a1828741b99b5c7d6849cd20be5b246188bd2ec31538d65d0ebf03ce1799edc7",
+    "llama/compat/036-paged-state-cache.patch": "206bdfc1f7c9ee66dd5dd83f1f63a749cb2fcff0d7722bf205d07acdd18a3d98",
+    "llama/compat/037-grammar-first-device-mask.patch": "49e572c59882e5df6ea385c6d7368295862570ae43edb44be6bda9e81dce20a6",
+    "llama/compat/038-hybrid-retained-prefix.patch": "31c5d2787f01bacbfa13b2235a49a44ac4c3bac884bede878be650ed8dc028db",
+    "llama/compat/039-sampler-binding-preflight.patch": "a0f722ccaf01fd55dc69c6dc747f7b7ffddb19c76d3b28c6d61a5681804b7c71",
+    "llama/compat/040-device-mask-placement.patch": "b41c11f70ff0da68b46d73e7748d6f3eb043253eebfcdb2cab07ec338c87c856",
+    "llama/compat/041-grammar-mask-validation.patch": "8921e176f94ea0942dac65dc960d8a360de9c16a55b8ed7be0341803e3ea5f27",
+    "llama/compat/042-async-prefix-writeback.patch": "05455200ea6e4f830b2d2cb534faf5625c2d783776ffdaf23dd676193f4395c3",
+    "llama/compat/043-canonical-penalties.patch": "14c528f02201d768b4b391d8d17ae5a77a5f58d3ac313effdb96e5bd35090f94",
+    "llama/compat/044-hybrid-text-device-mask.patch": "2e57d95a2ea79dfce97c8d6d4552ff1c593720a1554bdb14d759acd7e6cf75cb",
+    "llama/compat/045-auto-device-mask.patch": "14cdda2537ccbc5f94cfb2f87b72c29c1137978998cf7d227aef7ca8c6cfe825",
+    "llama/compat/046-shared-cache-diagnostics.patch": "b0205b8a65f33c7e988aa79bd66f1cb4ce389db286df66cb98757b72a44d7834",
+    "llama/compat/047-preserve-mask-execution.patch": "7bf31f5dadb71d3da5d924f7de3a1d93e828114edfeb8e9755ee61b03efe3c4a",
+    "llama/compat/048-conservative-extended-mask-default.patch": "761139f0a431f151e500e49a78250d06321cad2893a6ab2ca168f3519ecbb577",
+    "llama/compat/049-backend-sampler-extensions.patch": "cf3970018b46e8c83b11d1997a9f7a9358af8dfa64564f7c3fd5111d9ba63e02",
+    "llama/compat/050-bounded-prefill-graph-arenas.patch": "9f49d93cb6ba1e2a1eca8891fe90e611352cc15dc982f06d0c81a5a3cf436110",
+    "llama/compat/051-indexed-kv-prefix-sharing.patch": "d71a4b1d136d3a2d8df07976388322810fd84a0ab3acfa3037cd6ed67c02e5b3",
+    "llama/compat/052-bounded-output-decode-overlap.patch": "5ef6b550c2be08b96fcdc80fb7acf9e926a2047e88846ee1ec2629449645a2ff",
+    "llama/compat/053-runtime-feature-discovery.patch": "58aee7c90cba9a03b59f888e48b3b6ddab33620848c371d401f8024da538c245",
+    "llama/compat/compat.cmake": "ee23efb755b0aafceda8070cb90ab1124797418ffc017303187a8ac56e382e74",
+    "llama/compat/llama-ollama-compat-util.cpp": "9dbf99715d8d9ca5d4417a0374ea7f31fb1541b9c233f507fd19efaae0bbbddc",
+    "llama/compat/llama-ollama-compat-util.h": "88936749149a3f9378858918e738af7f631ea096366ee3dae83cad5057a880d0",
+    "llama/compat/llama-ollama-compat.cpp": "122d5463b47ba5bb53dda7ed888cf924822d671fa6c842aa3ca1a867296ab2b9",
+    "llama/compat/llama-ollama-compat.h": "07d214fc541440118ab0c219a95e48c21ff824c0cc4e9b1a0441cbef0c576c00",
+    "llama/server/CMakeLists.txt": "59734d4dd425f9c36ca3fdf081a3233a1edc33fa285350b2f601890ff289560f",
+    "scripts/gpu-first/CMakeLists.txt": "69f38a0a134d5b3f86ca2f1c5c127c9985a67e932fe72fd7c23a06543ab80f7f",
+    "scripts/gpu-first/build-integrity.ps1": "ec5e966dc5fbd0613dec8f2deae331afe041e8299269bf4f4231a903b449ee8b",
+    "scripts/gpu-first/build-windows.ps1": "4d2cba2d4b22ff0096de0028404bd3f0727ced36af1428d5e278dc781383c8c6"
+  },
+  "payload_sha256": {
+    "lib/ollama/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/CPP_HTTPLIB_LICENSE": "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+    "lib/ollama/cuda_v12/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/cuda_v12/cublas64_12.dll": "0a60a7ecbf906f7f3842826fecaf412f1587ff6269729339245a1ec224364161",
+    "lib/ollama/cuda_v12/cublaslt64_12.dll": "a21ddfc1c9cd090ab07d2c6aad235aa4f15fe60fe896d5db28adf7a279c09ef3",
+    "lib/ollama/cuda_v12/cudart64_12.dll": "9d9b868955149875ac4ef43442aaaa8913d4a7b3e4d6dd60ee871626aa045768",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "6365461e141100388970a5719a6e6a6c2630617bc5c2eab0d70f79fe50fce5cb",
+    "lib/ollama/cuda_v12/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/cuda_v12/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/cuda_v12/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/cuda_v12/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/cuda_v12/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/cuda_v12/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/cuda_v12/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/cuda_v12/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/cuda_v12/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/cuda_v12/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "lib/ollama/ggml-base.dll": "0eef4b6bdc6e2def2414584dce0dd51c51318214d055f10ac9faa6336fd6a8e7",
+    "lib/ollama/ggml-cpu.dll": "b8f80ddae7822f5d2e38b8b9225ee9dbafd2b3dd79d9246c1a79771653f45c95",
+    "lib/ollama/ggml.dll": "1866e693361de2bce4ef5ae85454da132ce372b5b6a2a3e328da3f87f31b91bb",
+    "lib/ollama/llama-common.dll": "2d3c5db390a8e130d21e72b7203f593fa4aadbafc2525943b58b05403571d708",
+    "lib/ollama/llama-quantize-impl.dll": "44f44f27e4e82cff84db0b2b34c702a879ad3cf1bb221824c595f0a82d1d86f8",
+    "lib/ollama/llama-quantize.exe": "0e273ee92b0e2524c2f1518d7f6b856082b946bf0918c94cc7b7f8e43a7a81cd",
+    "lib/ollama/llama-server-impl.dll": "efebff8203ec1815727cff59a6a724abf6a8ba119c7120975ec4fbe4182ea20d",
+    "lib/ollama/llama-server.exe": "fb4b877a346d893313a7f63319d626348b0a8975db073acbb4a8c091341e6a94",
+    "lib/ollama/llama.dll": "113787b86d5eb8727a2a2a207ae4f9eb6fb4221e0fc263dfd39573e316e3f2a6",
+    "lib/ollama/LLAMA_CPP_LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "lib/ollama/LLAMA_CPP_VENDORS_LICENSE": "7547ae6372a35e7382898dd9f5519ebc16e93095f69c2466b5b74b617c33d4da",
+    "lib/ollama/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/mtmd.dll": "ab64e00eef1bc92ce56925488354e21051cf2c090512d7d2c2ba4837b986df7c",
+    "lib/ollama/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715"
+  },
+  "private_artifacts": {
+    "root": ".build/sglang-pipeline-20261031",
+    "sha256": {
+      "release-suite-before.json": "32d54ec369bf8141c95ba7ccf69d9daa727e3dfb122e41b99310310f45a0f724",
+      "release-suite-after.json": "a909f55d01441e22efbc2b4e111330d47f03d1ebe6fe951d6477afa3db8fa13a",
+      "patch-replay.json": "bd3d74c0e1418b43c7c6f47b25063be0e484dfc90ae56bbf9c88f5af2aa1d3f6",
+      "patch-replay-cmake.log": "c35fb1d707c521fbbe0ee59de6e5ff84903755b2a30ccb4d955d4c1352ed84df",
+      "replay_final.py": "fae4fa670c3028462870cc216eb34a5aefe5e8538adabcce53079c9b0a1fdf91",
+      "native-release/runner-summary-all.json": "afd12292ea1bf7b3a140dce465d68a48c131da620e390351f27a64d98fec3bad",
+      "native-release/native-cpu-tests.log": "19a650f2c2f21a2b619238580761159a8c22496ab9c2a8a27b877d2312666447",
+      "native-release/native-cuda-tests.log": "f3e4ca08ad0bdc88b44c8d30d1c513fb3169d2186a0510e8160587748154b053",
+      "native-release/runtime-feature-discovery.log": "ba6f1dce5bc79df4ee69ba70de6743962ed8fc5e1989408e31ee03dc701b3ce9",
+      "native-release/sampling-probability.log": "7fa521d2100524ee349c91f46a1efffe777602421b3def9fc63e88bb980b8acd",
+      "native-release/native-server-tests.log": "758cb8bcd21f7019d592d4d3861f6f4c5eb504a56f7d0728da7bba88c1f54740",
+      "native-release/graph-variants-llama-tied-wide.log": "a2184ce1d80fa2c6f9dc447eaa0a9ede2ac99e64390d5efbc89b3dd8f2a21af2",
+      "native-release/graph-variants-llama-tied-wide-Q8_0.log": "cc27694cb9286278364d99415324178895fb82b1198700dd8700ff26ce8811fa",
+      "native-release/graph-variants-llama-tied-wide-Q4_K_M.log": "602c72268066aa5dead8125203c4d9346bf9aece9ccd5d1b94ce222b33104957",
+      "native-release/graph-variants-qwen3moe-q4.log": "74510375e79bded205dbec62e1fb765aac1131681a45ff65ada2b01a98e22731",
+      "native-release/graph-variants-gpt-oss-wide-Q8_0.log": "07de883a25a863003b00b4f02fee53f0925070ab1fe7d9fc83f5867c3e81bf92",
+      "native-release/graph-variants-gemma4-q4.log": "9eb6c3a1006f73117883505845455e7b071aa91d2289e0afa71e7b6b56ecf22a",
+      "native-release/graph-variants-nemotron_h_moe-q4.log": "c79a4434c09ab218c461b5795a5cc3b3a8732879ac519910d252ab60a87ea0e1",
+      "native-release/graph-prefill-cuda-llama-tied-wide.log": "4584d3376b1da6035b13f01eacb7a5f3457a0b6cadc204ac06f6dd2444391763",
+      "native-release/graph-prefill-cuda-llama-tied-wide-Q8_0.log": "65bfe73b80defbe0f74f12a7d600f363a00b825fd12e3abdce3e596767ec7843",
+      "native-release/graph-prefill-cuda-llama-tied-wide-Q4_K_M.log": "14a17d8c574c4b92f58c4549d942dddab3210a97e2aa980cd8cc3cbb23d448f8",
+      "native-release/graph-prefill-cuda-qwen3moe-q4.log": "432dd074d5cc96707b60c3d36b25039e457807dbdee12a46fefcabac426ce42d",
+      "native-release/graph-prefill-cuda-gpt-oss-wide-Q8_0.log": "8511096a9bab9de0ab24060f26c2dfe75d290f48d527a5006f008a64ed294732",
+      "native-release/graph-prefill-cuda-gemma4-q4.log": "39e483e82696b1fd2f85a074c0bbd78df14dfe95a9c119ab5daa3f11c3e56264",
+      "native-release/graph-prefill-cuda-nemotron_h_moe-q4.log": "c1f2d29bdde5ff0beb97441c427d4bc59b1b714a16efe4fb59327034f067beb1",
+      "native-release/mtp-graph-variants-cpu.log": "f10a3214c5346bce233c102d0e40a2064920fddcff3f46408839c62bb82f5e7f",
+      "native-release/mtp-graph-variants-cuda.log": "ae3e00bab7e456285258575ecdc4c6630b3901eb274f9dec1921cbb43631c8e2",
+      "native-release/native-custom-test.log": "c62e8581ae3a6ab4dcf1b13300d0e21183858c533ca7ebbc1d417bf3e817040c",
+      "native-release/native-moe-cache-gpu.log": "71bdbcccc38a732cda789c96acc002e2b58786e7597dac9ab606048ff9613d3b",
+      "native-release/native-cpu-tests.xml": "24c899cad3c7012ea4558f0678c9055ff64c91f984c2fc5d1066a8587b186b58",
+      "native-release/native-cuda-tests.xml": "2383c7845cc35bb2432fdca611dfff0f90ef3814535bc17f91d14e47336cdf72",
+      "final-runner/required-tests.json": "796aab2561c2e2e804dcbb4bb69d2f2780edbdb81453c6f90797c7d79b679ea1",
+      "http-comparison/smoke-cpu-draft-caches.json": "e18885730143dcb3fd18671991d46f833c53ab41af0ce686563bbd440771f59e",
+      "http-comparison/smoke-cpu-draft.json": "676b46cfa2eda9144005e0a4956fa3d34e178b58488647e0b7de710a39c00485",
+      "http-comparison/smoke-cpu-plain-caches-device-mask.json": "7fd61a1006f3039ff6d499101c27a3d614e49523d7c7741e6c279d267e39e4bc",
+      "http-comparison/smoke-cpu-plain-caches.json": "53b49ab95700cc07c2e7abdeca2d42fccc185ff70ea82ab16697f9f2050141a3",
+      "http-comparison/smoke-cpu-plain-device-mask.json": "f9a5c9b3b2c0ec2ccb8ada8ab3ba6879800123491f55d92097271925e68e4bf4",
+      "http-comparison/smoke-cpu-plain.json": "96334de630fc783eaa590babe4eeb04778d288518b47ab15e866cbd1716f83ac",
+      "http-comparison/smoke-gpu-draft-caches.json": "c170e1f9240db8ae150265023eca9a408c65ccd334f6b0f397bba78b52452827",
+      "http-comparison/smoke-gpu-draft.json": "30d3b14928adc766294780077fd4c2e6e0566ff998a7a118630a58d812aa4007",
+      "http-comparison/smoke-gpu-plain-caches-device-mask.json": "7da3799137c20dfa16e5e02d3f84c2ec0332e8f242fcda96ebbed69ba013a8af",
+      "http-comparison/smoke-gpu-plain-caches.json": "a084c5d1991999bb78944c16f450a3f5c929d16b9520d85a5767c754e5cd3ab3",
+      "http-comparison/smoke-gpu-plain-device-mask.json": "c37babbf8315a5afe6d9e750d15e967e26115d1d507e3735f3aba71206b7003d",
+      "http-comparison/smoke-gpu-plain.json": "1d7ab8c06d3bbcb7be186cdb4366d9e9e9904e80ee661b8b741c14515496ffa2",
+      "http-features/cpu.json": "398a4f2efc07612ce96a5c1982bc66471512b99c39962c33aa2f4e8aaf533dea",
+      "http-features/gpu.json": "42fa7ff000a4bf2c1c70aedc23d9eddde8f023327a4580c079382e3a0e699aa0",
+      "dry-http-cpu/report.json": "48533d666f279edde0fd8560216eccfbcf214a7e30783d0a22aa42cc9cf0c228",
+      "dry-http-cpu/responses.json": "188f453ddbef605dee604cca3db844778805a7a6ab0bed319670866cb016a172",
+      "dry-http-gpu/report.json": "8b62ea12b52b3e81a2fc6331ccb82de343116ec851276154b8dd4e931fe63492",
+      "dry-http-gpu/responses.json": "69facca2cae20737f4da6d9fc0b6a4e51c91fa8261d158c628a89ea489ab36fe",
+      "decode-overlap-cpu/report.json": "14c017fbd8855532a672ca46eb68db496eb879f260c3050348fcedf2f022b9f3",
+      "decode-overlap-cpu/responses.json": "bb5caaf2db5f4787fc06e352cf7492e88588a625b950a443f38501705237a717",
+      "decode-overlap-cpu/disabled/cpu-server.log": "cb5b08136eedf7ee1f25a7daca0b956b969799febc209aa3698265e9eb012075",
+      "decode-overlap-cpu/disabled/modules.json": "dfb3182e3a3cf4db3f22385331e9543959dd2d4a3f1055ec5a5cc59434653904",
+      "decode-overlap-cpu/enabled/cpu-server.log": "6376149d8829c3a7fd3d1abc8afd381e11674973622d0c863980c7643ba9808d",
+      "decode-overlap-cpu/enabled/modules.json": "fd0c9d6209c7c87c0c4d35685346349e0697550e59bc1218006d9b838a47ef25",
+      "decode-overlap-cpu/timing-disabled/cpu-server.log": "14ce2fa6bd2e5b591816d1b5aa7ea0a876f9067b1291c016b69a178a5dbfbc3f",
+      "decode-overlap-cpu/timing-disabled/modules.json": "30b6ec0d533cca7430925fce646a648f5b1567b6e400ccd9c0170e62b1cf6574",
+      "decode-overlap-cpu/timing-enabled/cpu-server.log": "c3a888aa7fea235d16d8804e70a2e66dcf800e08153a3cde325c3218e029027e",
+      "decode-overlap-cpu/timing-enabled/modules.json": "c4e8b2d7acb8993212e13b0edf48adfcf16ca4839d03e03bc6f8a8a2d4300fe0",
+      "decode-overlap-gpu/report.json": "f267dcfd6a8ba11c6dc37c74addb088d6c66f046b80993fe042893ca0f52dc8d",
+      "decode-overlap-gpu/responses.json": "ced1a0e510f9e63b8cf1608ff309dd426bd85eaec982dfa2115e09d3c50828cf",
+      "decode-overlap-gpu/disabled/gpu-server.log": "b67bd7882d8f28332e12a7b715afd2e228cc899816d2e1ccb7211b932523ebc4",
+      "decode-overlap-gpu/disabled/modules.json": "9f371eb32c8e40b62425cda9afa4f8e0296345d3aa5d5b3591ad9131b70ee32c",
+      "decode-overlap-gpu/enabled/gpu-server.log": "a502897c9dca2c9f745e55cfcdf59c778773b3224a3a4898cd8dad58e52157dc",
+      "decode-overlap-gpu/enabled/modules.json": "cdb30253a9428878836e5fbcdb29ba879d502176c921910f77a8bcee4af07d32",
+      "decode-overlap-gpu/timing-disabled/gpu-server.log": "f1eda5d0b424a432f676d5bb21492db17a8af129040f3b1f17d808408f7f3603",
+      "decode-overlap-gpu/timing-disabled/modules.json": "f32f63ca89c38b95af773c6034a5bf2afac49c719f0f8d0c87cb18c90fe2da31",
+      "decode-overlap-gpu/timing-enabled/gpu-server.log": "d08db80fdfb1320706f09a0409659c2db7ef64afb3ba77e5c489b38a87cc050e",
+      "decode-overlap-gpu/timing-enabled/modules.json": "d224340ac8a8b06f430440e83f6675716daa4407f2ead021516d3044050a134c",
+      "graph-memory-release/report.json": "9f1ca0ad2cdc2c579653690e61ee2d295dbcade92c89e5a12a8a6be0d1687068",
+      "graph-memory/measure.py": "e639b98dbb5cbeaa9187d5824db783a083f00b16689eff5cf28fbdf138bd25cc",
+      "graph-memory/driver.cpp": "28e1512c0542b7d5692c394e0b90997fd748ef2b30733874b73f3e2dc7bc122e",
+      "graph-memory/driver.exe": "aeb10143437b67a5b034c477e25d6a93f858249afb5ce5b0d8fc3a8786c7d7ac",
+      "graph-memory/driver-build.json": "a572e8147e8d1a2bd2b6e543ff5247b3c3f58b8137b09804ad7391537e46ed0b",
+      "graph-memory/driver-dependencies.json": "69baeb85a283cd3993699f2aeb890fb0b3ed57ffe88d151e0ca7421f148248ab",
+      "graph-memory/build-driver.log": "9ae4899f12c109a71fdfbe07204a1b272222f1d14245538c4103c31a36ab09c1",
+      "graph-memory-release/0-cache-0/logits.raw": "3f021b35bbf548f29056346025a590efe4251a1603924119b1e78d7e49b747a1",
+      "graph-memory-release/0-cache-0/stdout.ndjson": "6f20408138df21545058d328485ad0e7f9cb98a4fcecf67b664aba19975912d0",
+      "graph-memory-release/0-cache-0/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "graph-memory-release/1-cache-128/logits.raw": "3f021b35bbf548f29056346025a590efe4251a1603924119b1e78d7e49b747a1",
+      "graph-memory-release/1-cache-128/stdout.ndjson": "4805b5de8b5b338486c429dca549a4d55b1c405096ac4b185828e484ec0e16de",
+      "graph-memory-release/1-cache-128/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "graph-memory-release/2-cache-128/logits.raw": "3f021b35bbf548f29056346025a590efe4251a1603924119b1e78d7e49b747a1",
+      "graph-memory-release/2-cache-128/stdout.ndjson": "a19dbbd774c8284cfa4fe42271c1154ec803f60226a089d66ea8147a5dc2dfb0",
+      "graph-memory-release/2-cache-128/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "graph-memory-release/3-cache-0/logits.raw": "3f021b35bbf548f29056346025a590efe4251a1603924119b1e78d7e49b747a1",
+      "graph-memory-release/3-cache-0/stdout.ndjson": "79b2075acd3b5ebf3054c44a8d079065cc2e05855573a217d2fcad2752bbb225",
+      "graph-memory-release/3-cache-0/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "native-release/feature-discovery/report.json": "585120a7eeb6b98fd0c6c915544fde71326d964997f0e265692221c3d30366f1",
+      "native-release/feature-discovery/flag-only.stdout.log": "a2c15b0d1807828cedf74a2b2f0c6be2c0a45c5e925d0b69aed7ea5e2f3348ff",
+      "native-release/feature-discovery/flag-only.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "native-release/feature-discovery/missing-model.stdout.log": "a2c15b0d1807828cedf74a2b2f0c6be2c0a45c5e925d0b69aed7ea5e2f3348ff",
+      "native-release/feature-discovery/missing-model.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "_record_shared.py": "d3923bbc3dfb632d5e5b592f90cf698d4322dd4baf7a442e29dda6ac373479b8",
+      "make_record.py": "66c177582c0e19a28aac0e1f9e9eae28b20ff4196fff6a5f38ba5020941662d5",
+      "payload_provenance.py": "e8fadc92345a09c709dc4d860f02b12bb7afe30b00daaa294a2dd39f2ca5e074",
+      "dry_http.py": "84b3909a22189629e334bed3e85d5bab62250e8967bf6f11c36b6b6faa9cd5e1",
+      "feature_discovery.py": "9b7bbbbe9bc0c03b9a649e5b9a471ca6d6ca601adf073593332ec37c42ba731a",
+      "final-runner/run_final.py": "5e196b0bbcaf857fb1cbce64bcfdf4d5ef7bb91044b5dc6bfb965a8bbf5f85bc"
+    }
+  },
+  "scope": "Windows CPU/CUDA and local synthetic fixtures<=64MiB. No trained-model throughput or SGLang parity claim. Cache128MiB is a separately authorized experiment PER context; target+draft may each use it. Other model/KV/buffer and driver allocations are outside that cache accounting."
+}
