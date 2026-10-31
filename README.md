@@ -37,6 +37,8 @@ Further implementation details are available in [runtime efficiency](docs/runtim
 
 Further [bounded pipeline extensions](docs/sglang-pipeline-followups.md) add indexed KV work, broader optional prefix/graph reuse, explicit DRY backend penalties, and experimental overlap of streaming-response work with a normal forward. Their memory budgets and activation rules are documented separately.
 
+The [memory-neutral follow-ups](docs/memory-neutral-runtime.md) remove server callback type erasure and fuse eligible top-p mask work without adding persistent GPU workspace. Candidate sets remain unchanged, and larger CUDA candidate sets retain the original mask graph under the automatic policy.
+
 ## Large MoE models on smaller machines
 
 A MoE model uses only its router-selected experts for each token, but the full set of expert weights can still be much larger than VRAM or available RAM. WildLlama's selective-weight path keeps bounded working sets in memory and reads missing weights from the original GGUF files on SSD.

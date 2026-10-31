@@ -1,0 +1,374 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,6 +1,7 @@
+ #include "server-context.h"
+ #include "server-admission.h"
+ #include "server-decode-overlap.h"
++#include "server-slot-iteration.h"
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
+@@ -1028,8 +1029,9 @@
+ // server_context_impl (private implementation)
+ //
+ 
+-struct server_context_impl {
++struct server_context_impl : server_slot_iteration<server_context_impl, server_slot> {
+     friend struct server_context;
++    friend struct server_slot_iteration<server_context_impl, server_slot>;
+ 
+ public:
+     // only use these pointers outside of this class:
+@@ -3448,28 +3450,10 @@
+         return true;
+     }
+ 
+-    void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
+-        for (auto & slot : slots) {
+-            try {
+-                callback(slot);
+-            } catch (const std::exception & e) {
+-                SLT_ERR(slot, "got exception: %s\n", e.what());
+-                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+-                slot.release();
+-            }
+-        }
+-    }
+-
+-    void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
+-        for (auto & slot : slots) {
+-            try {
+-                callback(*slot);
+-            } catch (const std::exception & e) {
+-                SLT_ERR(*slot, "got exception: %s\n", e.what());
+-                send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+-                slot->release();
+-            }
+-        }
++    void on_slot_iteration_error(server_slot & slot, const std::exception & error) {
++        SLT_ERR(slot, "got exception: %s\n", error.what());
++        send_error(slot, std::string("got exception: ") + error.what(), ERROR_TYPE_SERVER);
++        slot.release();
+     }
+ 
+     void abort_all_slots(const std::string & reason) {
+diff --git a/tools/server/server-slot-iteration.h b/tools/server/server-slot-iteration.h
+new file mode 100644
+--- /dev/null
++++ b/tools/server/server-slot-iteration.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <exception>
++#include <type_traits>
++#include <vector>
++
++// Concrete callbacks keep their by-value ownership without a type-erasure allocation.
++template <typename Context, typename Slot>
++struct server_slot_iteration {
++    template <typename Callback>
++    void iterate(std::vector<Slot> & slots, Callback callback) {
++        static_assert(std::is_copy_constructible<Callback>::value, "slot callbacks retain copyable by-value ownership");
++        for (auto & slot : slots) {
++            try {
++                callback(slot);
++            } catch (const std::exception & error) {
++                static_cast<Context *>(this)->on_slot_iteration_error(slot, error);
++            }
++        }
++    }
++
++    template <typename Callback>
++    void iterate(std::vector<Slot *> & slots, Callback callback) {
++        static_assert(std::is_copy_constructible<Callback>::value, "slot callbacks retain copyable by-value ownership");
++        for (auto * slot : slots) {
++            try {
++                callback(*slot);
++            } catch (const std::exception & error) {
++                static_cast<Context *>(this)->on_slot_iteration_error(*slot, error);
++            }
++        }
++    }
++};
+diff --git a/tests/test-server-slot-iteration.cpp b/tests/test-server-slot-iteration.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-server-slot-iteration.cpp
+@@ -0,0 +1,276 @@
++#include "../tools/server/server-slot-iteration.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <functional>
++#include <new>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace allocations {
++static thread_local bool enabled = false;
++static thread_local size_t count = 0;
++}
++
++void * operator new(std::size_t size) {
++    if (void * memory = std::malloc(size ? size : 1)) {
++        if (allocations::enabled) { ++allocations::count; }
++        return memory;
++    }
++    throw std::bad_alloc();
++}
++void * operator new[](std::size_t size) { return ::operator new(size); }
++void operator delete(void * memory) noexcept { std::free(memory); }
++void operator delete[](void * memory) noexcept { std::free(memory); }
++void operator delete(void * memory, std::size_t) noexcept { std::free(memory); }
++void operator delete[](void * memory, std::size_t) noexcept { std::free(memory); }
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++struct test_slot {
++    int id;
++    uint64_t value = 0;
++    bool released = false;
++    bool operator == (const test_slot & other) const {
++        return id == other.id && value == other.value && released == other.released;
++    }
++};
++
++struct test_event {
++    int id;
++    int kind;
++    uint64_t value;
++    bool operator == (const test_event & other) const {
++        return id == other.id && kind == other.kind && value == other.value;
++    }
++};
++
++struct test_context;
++static void legacy_iterate(test_context & context, std::vector<test_slot> & slots,
++                           std::function<void(test_slot &)> callback);
++static void legacy_iterate(test_context & context, std::vector<test_slot *> & slots,
++                           std::function<void(test_slot &)> callback);
++
++struct test_context : server_slot_iteration<test_context, test_slot> {
++    friend struct server_slot_iteration<test_context, test_slot>;
++    friend void legacy_iterate(test_context &, std::vector<test_slot> &,
++                               std::function<void(test_slot &)>);
++    friend void legacy_iterate(test_context &, std::vector<test_slot *> &,
++                               std::function<void(test_slot &)>);
++
++    std::vector<test_event> events;
++    bool handler_throws = false;
++
++private:
++    void on_slot_iteration_error(test_slot & slot, const std::exception & error) {
++        events.push_back({ slot.id, 1, std::string(error.what()).size() });
++        if (handler_throws) { throw std::logic_error("handler failed"); }
++        slot.released = true;
++    }
++};
++static_assert(std::is_empty<server_slot_iteration<test_context, test_slot>>::value,
++              "the iteration helper must not introduce storage");
++
++// These are the original two server-context.cpp algorithms, including the
++// type-erasure conversion before entry and the handler's exception boundary.
++static void legacy_iterate(test_context & context, std::vector<test_slot> & slots,
++                           std::function<void(test_slot &)> callback) {
++    for (auto & slot : slots) {
++        try { callback(slot); }
++        catch (const std::exception & error) { context.on_slot_iteration_error(slot, error); }
++    }
++}
++static void legacy_iterate(test_context & context, std::vector<test_slot *> & slots,
++                           std::function<void(test_slot &)> callback) {
++    for (auto & slot : slots) {
++        try { callback(*slot); }
++        catch (const std::exception & error) { context.on_slot_iteration_error(*slot, error); }
++    }
++}
++
++struct copy_visitor {
++    std::array<uint64_t, 48> payload {};
++    test_context * context;
++    int * copies;
++    int calls = 0;
++    int throw_at;
++    bool nonstandard;
++
++    copy_visitor(test_context & context_, int & copies_, int throw_at_, bool nonstandard_)
++        : context(&context_), copies(&copies_), throw_at(throw_at_), nonstandard(nonstandard_) {
++        for (size_t i = 0; i < payload.size(); ++i) { payload[i] = 13 + i * 7; }
++    }
++    copy_visitor(const copy_visitor & other)
++        : payload(other.payload), context(other.context), copies(other.copies), calls(other.calls),
++          throw_at(other.throw_at), nonstandard(other.nonstandard) {
++        ++*copies;
++    }
++    void operator () (test_slot & slot) {
++        ++calls;
++        context->events.push_back({ slot.id, 0, static_cast<uint64_t>(calls) });
++        if (slot.id % 3 == 1) { return; }
++        slot.value += payload[slot.id % payload.size()] + static_cast<uint64_t>(calls);
++        if (slot.id == throw_at) {
++            if (nonstandard) { throw 41; }
++            throw std::runtime_error("slot failed");
++        }
++    }
++};
++
++static void functional_contract() {
++    size_t checked = 0;
++    for (int range = 0; range < 4; ++range) {
++        for (int throw_at : { -1, 0, 3, 8 }) {
++            for (bool nonstandard : { false, true }) {
++                for (bool handler_throws : { false, true }) {
++                    std::vector<test_slot> before, after;
++                    for (int i = 0; i < 9; ++i) { before.push_back({ i }); after.push_back({ i }); }
++                    test_context old_context, new_context;
++                    old_context.handler_throws = new_context.handler_throws = handler_throws;
++                    old_context.events.reserve(32); new_context.events.reserve(32);
++                    std::vector<test_slot *> old_selected, new_selected;
++                    if (range == 1) {
++                        for (int index : { 8, 3, 0, 3, 1, 5 }) {
++                            old_selected.push_back(&before[index]);
++                            new_selected.push_back(&after[index]);
++                        }
++                    }
++                    if (range == 2) { before.clear(); after.clear(); }
++                    int old_copies = 0, new_copies = 0;
++                    copy_visitor old_visitor(old_context, old_copies, throw_at, nonstandard);
++                    copy_visitor new_visitor(new_context, new_copies, throw_at, nonstandard);
++                    int old_exception = 0, new_exception = 0;
++                    try {
++                        if (range == 0 || range == 2) { legacy_iterate(old_context, before, old_visitor); }
++                        else { legacy_iterate(old_context, old_selected, old_visitor); }
++                    } catch (const std::exception &) { old_exception = 1; }
++                      catch (int value) { old_exception = value; }
++                    try {
++                        if (range == 0 || range == 2) { new_context.iterate(after, new_visitor); }
++                        else { new_context.iterate(new_selected, new_visitor); }
++                    } catch (const std::exception &) { new_exception = 1; }
++                      catch (int value) { new_exception = value; }
++                    require(before == after, "slot state or unselected slots changed");
++                    require(old_context.events == new_context.events, "slot/error visitation order changed");
++                    require(old_exception == new_exception, "exception boundary changed");
++                    require(old_visitor.calls == 0 && new_visitor.calls == 0, "caller callback was mutated");
++                    require(old_copies == 1 && new_copies == 1, "lvalue callback ownership is not one by-value copy");
++                    ++checked;
++                }
++            }
++        }
++    }
++    {
++        std::vector<test_slot> before { { 0 }, { 2 }, { 3 } }, after = before;
++        test_context old_context, new_context;
++        old_context.events.reserve(8); new_context.events.reserve(8);
++        int old_copies = 0, new_copies = 0;
++        copy_visitor old_visitor(old_context, old_copies, -1, false);
++        copy_visitor new_visitor(new_context, new_copies, -1, false);
++        std::function<void(test_slot &)> old_erased = old_visitor, new_erased = new_visitor;
++        old_copies = new_copies = 0;
++        legacy_iterate(old_context, before, old_erased);
++        new_context.iterate(after, new_erased);
++        require(before == after && old_context.events == new_context.events, "existing erased callback results changed");
++        require(old_erased.target<copy_visitor>()->calls == 0 && new_erased.target<copy_visitor>()->calls == 0,
++                "existing erased callback owner was mutated");
++        require(old_copies == 1 && new_copies == 1, "existing erased callback ownership changed");
++    }
++    require(checked == 64, "functional matrix incomplete");
++    std::printf("SERVER_SLOT_ITERATION cases=%zu value_and_pointer_ranges=1 selected_and_duplicate_slots=1 "
++                "by_value_lvalue_copy=1 erased_lvalue_copy=1 mutable_owner_unchanged=1 exception_order=1 handler_throw=1 nonstd_propagation=1 PASS\n", checked);
++}
++
++struct large_callback {
++    std::array<uint64_t, 48> payload {};
++    void operator () (test_slot & slot) {
++        slot.value += payload[slot.id % payload.size()] + static_cast<uint64_t>(slot.id);
++    }
++};
++static_assert(sizeof(large_callback) > sizeof(std::function<void(test_slot &)>),
++              "allocation proof requires a callback beyond type-erasure inline storage");
++
++static large_callback callback_fixture() {
++    large_callback value;
++    for (size_t i = 0; i < value.payload.size(); ++i) { value.payload[i] = 11 + 13 * i; }
++    return value;
++}
++
++static void allocation_contract() {
++    constexpr size_t loops = 4096;
++    std::vector<test_slot> before, after;
++    for (int i = 0; i < 8; ++i) { before.push_back({ i }); after.push_back({ i }); }
++    test_context context;
++    const auto callback = callback_fixture();
++    allocations::count = 0; allocations::enabled = true;
++    for (size_t i = 0; i < loops; ++i) { legacy_iterate(context, before, callback); }
++    allocations::enabled = false;
++    const size_t legacy_allocations = allocations::count;
++    allocations::count = 0; allocations::enabled = true;
++    for (size_t i = 0; i < loops; ++i) { context.iterate(after, callback); }
++    allocations::enabled = false;
++    const size_t concrete_allocations = allocations::count;
++    require(before == after, "allocation proof changed callback results");
++    require(legacy_allocations >= loops, "reference did not exercise type-erasure heap ownership");
++    require(concrete_allocations == 0, "concrete visitor allocated during iteration");
++    std::printf("SERVER_SLOT_ITERATION_ALLOCATIONS loops=%zu legacy=%zu concrete=%zu gpu_buffers_added=0 PASS\n",
++                loops, legacy_allocations, concrete_allocations);
++}
++
++static double bench(bool legacy, size_t loops, uint64_t & checksum) {
++    test_context context;
++    std::vector<test_slot> slots;
++    for (int i = 0; i < 8; ++i) { slots.push_back({ i }); }
++    const auto callback = callback_fixture();
++    const auto begin = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < loops; ++i) {
++        if (legacy) { legacy_iterate(context, slots, callback); }
++        else { context.iterate(slots, callback); }
++    }
++    const auto end = std::chrono::steady_clock::now();
++    checksum = 0;
++    for (const auto & slot : slots) { checksum += slot.value; }
++    return std::chrono::duration<double, std::micro>(end - begin).count();
++}
++
++static void benchmark() {
++    constexpr size_t loops = 20000;
++    uint64_t reference = 0, candidate = 0;
++    (void) bench(true, 1000, reference); (void) bench(false, 1000, candidate);
++    std::vector<double> old_times, new_times;
++    for (int cycle = 0; cycle < 8; ++cycle) {
++        for (bool old : { true, false, false, true }) {
++            const double elapsed = bench(old, loops, old ? reference : candidate);
++            (old ? old_times : new_times).push_back(elapsed);
++        }
++        require(reference == candidate, "benchmark changed callback results");
++    }
++    std::sort(old_times.begin(), old_times.end());
++    std::sort(new_times.begin(), new_times.end());
++    const double old_median = (old_times[7] + old_times[8]) / 2;
++    const double new_median = (new_times[7] + new_times[8]) / 2;
++    std::printf("SERVER_SLOT_ITERATION_BENCH cycles=8 order=ABBA loops=%zu slots=8 legacy_us=%.3f concrete_us=%.3f "
++                "checksum=%llu component_only=1 model_tokens_per_second_not_measured=1\n",
++                loops, old_median, new_median, static_cast<unsigned long long>(candidate));
++}
++
++int main(int argc, char ** argv) {
++    try {
++        functional_contract();
++        allocation_contract();
++        if (argc == 2 && std::string(argv[1]) == "--bench") { benchmark(); }
++        else if (argc != 1) { throw std::runtime_error("usage: test-server-slot-iteration [--bench]"); }
++        return 0;
++    } catch (const std::exception & error) {
++        allocations::enabled = false;
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}

@@ -1,0 +1,703 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1828,6 +1828,14 @@
+             struct ggml_tensor  * pre_filter_logits,
+             int32_t               n_vocab);
+ 
++    // Apply the inclusive top-p mask from an existing CDF. Inputs are contiguous
++    // F32 vectors with 1..1024 elements; p must be finite and in [0, 1].
++    GGML_API struct ggml_tensor * ggml_top_p_mask(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * cdf,
++            float                 p);
++
+     // in-place, returns view(a)
+     GGML_API struct ggml_tensor * ggml_clamp_inplace(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -4217,6 +4217,23 @@
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_top_p_mask(
++        struct ggml_context * ctx, struct ggml_tensor * logits,
++        struct ggml_tensor * cdf, float p) {
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && cdf->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_vector(logits) && ggml_is_vector(cdf));
++    GGML_ASSERT(ggml_is_contiguous(logits) && ggml_is_contiguous(cdf));
++    GGML_ASSERT(ggml_are_same_shape(logits, cdf) && logits->ne[0] > 0 && logits->ne[0] <= 1024);
++    GGML_ASSERT(isfinite(p) && p >= 0.0f && p <= 1.0f);
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, logits);
++    result->op = GGML_OP_TOKEN_MASK;
++    result->src[0] = logits;
++    result->src[1] = cdf;
++    ggml_set_op_params_f32(result, 0, p);
++    ggml_set_op_params_i32(result, 1, 2);
++    return result;
++}
++
+ struct ggml_tensor * ggml_clamp_inplace(
+     struct ggml_context * ctx,
+     struct ggml_tensor  * a,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1738,6 +1738,26 @@
+ /////////////////////////////////
+ 
+ static void ggml_compute_forward_token_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 1) == 2) {
++        if (params->ith != 0) { return; }
++        const float * logits = (const float *) dst->src[0]->data;
++        const float * cdf = (const float *) dst->src[1]->data;
++        float * output = (float *) dst->data;
++        const float p = ggml_get_op_params_f32(dst, 0);
++        const int64_t n = ggml_nelements(dst);
++        int64_t count = 0;
++        for (int64_t i = 0; i < n; ++i) {
++            count += (-1.0f*cdf[i] + p) > 0.0f;
++        }
++        const int64_t inclusive = MIN(count, n - 1);
++        for (int64_t i = 0; i < n; ++i) {
++            const bool keep = (-1.0f*cdf[i] + p) > 0.0f || i == inclusive;
++            // Keep the addition: +INF + -INF and -0 + +0 have observable results.
++            const volatile float bias = keep ? 0.0f : -INFINITY;
++            output[i] = logits[i] + bias;
++        }
++        return;
++    }
+     if(ggml_get_op_params_i32(dst,1)==1) {
+         if(params->ith!=0) {return;}
+         const int32_t id=*(const int32_t *)dst->src[2]->data;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -7,6 +7,7 @@
+ #include "amx/amx.h"
+ 
+ #include <cctype>
++#include <cmath>
+ #include <string>
+ #include <vector>
+ 
+@@ -440,6 +441,17 @@
+     }
+ 
+     switch (op->op) {
++        case GGML_OP_TOKEN_MASK:
++            if (ggml_get_op_params_i32(op, 1) == 2) {
++                const float p = ggml_get_op_params_f32(op, 0);
++                return src0 && src1 && op->type == GGML_TYPE_F32 &&
++                    src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
++                    ggml_is_vector(op) && ggml_is_vector(src0) && ggml_is_vector(src1) &&
++                    ggml_is_contiguous(op) && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
++                    ggml_are_same_shape(op, src0) && ggml_are_same_shape(op, src1) &&
++                    op->ne[0] > 0 && op->ne[0] <= 1024 && std::isfinite(p) && p >= 0.0f && p <= 1.0f && !op->src[2];
++            }
++            return ggml_get_op_params_i32(op, 1) == 0 || ggml_get_op_params_i32(op, 1) == 1;
+         case GGML_OP_CPY:
+         case GGML_OP_SET_ROWS:
+             return
+diff --git a/ggml/src/ggml-cuda/token-mask.cu b/ggml/src/ggml-cuda/token-mask.cu
+--- a/ggml/src/ggml-cuda/token-mask.cu
++++ b/ggml/src/ggml-cuda/token-mask.cu
+@@ -29,7 +29,93 @@
+     if(threadIdx.x==0) {*output=valid && !invalid ? id : -1;}
+ }
+ 
++template<int threads>
++static __global__ void top_p_mask_kernel(const float * logits, const float * cdf,
++        float * output, int n, float p) {
++    __shared__ int counts[threads];
++    int count = 0;
++    for (int i = threadIdx.x; i < n; i += threads) {
++        count += (-1.0f*cdf[i] + p) > 0.0f;
++    }
++    counts[threadIdx.x] = count;
++    __syncthreads();
++    for (int stride = threads/2; stride > 0; stride /= 2) {
++        if (threadIdx.x < stride) { counts[threadIdx.x] += counts[threadIdx.x + stride]; }
++        __syncthreads();
++    }
++    const int inclusive = counts[0] < n ? counts[0] : n - 1;
++    for (int i = threadIdx.x; i < n; i += threads) {
++        const bool keep = (-1.0f*cdf[i] + p) > 0.0f || i == inclusive;
++        // The legacy graph adds a bias; it does not replace rejected logits.
++        output[i] = __fadd_rn(logits[i], keep ? 0.0f : -INFINITY);
++    }
++}
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static __global__ void top_p_mask_warp_kernel(const float * logits, const float * cdf,
++        float * output, int n, float p) {
++    int count = 0;
++    for (int i = threadIdx.x; i < n; i += 32) {
++        count += (-1.0f*cdf[i] + p) > 0.0f;
++    }
++    count = warp_reduce_sum<32>(count);
++    // Finish all CDF reads before the result can reuse either input.
++    __syncwarp(0xffffffff);
++    const int inclusive = count < n ? count : n - 1;
++    for (int i = threadIdx.x; i < n; i += 32) {
++        const bool keep = (-1.0f*cdf[i] + p) > 0.0f || i == inclusive;
++        output[i] = __fadd_rn(logits[i], keep ? 0.0f : -INFINITY);
++    }
++}
++
++static __global__ void top_p_mask_warps_kernel(const float * logits, const float * cdf,
++        float * output, int n, float p) {
++    __shared__ int warp_counts[8];
++    const int lane = threadIdx.x % 32;
++    const int warp = threadIdx.x / 32;
++    int count = 0;
++    for (int i = threadIdx.x; i < n; i += 256) {
++        count += (-1.0f*cdf[i] + p) > 0.0f;
++    }
++    count = warp_reduce_sum<32>(count);
++    if (lane == 0) { warp_counts[warp] = count; }
++    __syncthreads();
++    if (warp == 0) {
++        count = warp_reduce_sum<32>(lane < 8 ? warp_counts[lane] : 0);
++        if (lane == 0) { warp_counts[0] = count < n ? count : n - 1; }
++    }
++    __syncthreads();
++    const int inclusive = warp_counts[0];
++    for (int i = threadIdx.x; i < n; i += 256) {
++        const bool keep = (-1.0f*cdf[i] + p) > 0.0f || i == inclusive;
++        output[i] = __fadd_rn(logits[i], keep ? 0.0f : -INFINITY);
++    }
++}
++#endif
++
+ void ggml_cuda_op_token_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 1) == 2) {
++        const int n = int(ggml_nelements(dst));
++        const float p = ggml_get_op_params_f32(dst, 0);
++        const float * logits = (const float *) dst->src[0]->data;
++        const float * cdf = (const float *) dst->src[1]->data;
++        float * output = (float *) dst->data;
++        GGML_ASSERT(n > 0 && n <= 1024);
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        if (n <= 128) {
++            top_p_mask_warp_kernel<<<1,32,0,ctx.stream()>>>(logits,cdf,output,n,p);
++        } else {
++            top_p_mask_warps_kernel<<<1,256,0,ctx.stream()>>>(logits,cdf,output,n,p);
++        }
++#else
++        if (n <= 32) {
++            top_p_mask_kernel<32><<<1,32,0,ctx.stream()>>>(logits,cdf,output,n,p);
++        } else {
++            top_p_mask_kernel<256><<<1,256,0,ctx.stream()>>>(logits,cdf,output,n,p);
++        }
++#endif
++        return;
++    }
+     if(ggml_get_op_params_i32(dst,1)==1) {
+         GGML_ASSERT(dst->type==GGML_TYPE_I32);
+         token_mask_validate_kernel<<<1,256,0,ctx.stream()>>>((const float *)dst->src[0]->data,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6,6 +6,8 @@
+ #include "ggml-cuda-tuning.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
++
++#include <cmath>
+ 
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
+@@ -6923,6 +6925,18 @@
+         case GGML_OP_CLAMP:
+             return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_TOKEN_MASK:
++            if (ggml_get_op_params_i32(op, 1) == 2) {
++                const auto * logits = op->src[0];
++                const auto * cdf = op->src[1];
++                const float p = ggml_get_op_params_f32(op, 0);
++                return logits && cdf && op->type == GGML_TYPE_F32 &&
++                    logits->type == GGML_TYPE_F32 && cdf->type == GGML_TYPE_F32 &&
++                    ggml_is_vector(op) && ggml_is_vector(logits) && ggml_is_vector(cdf) &&
++                    ggml_is_contiguous(op) && ggml_is_contiguous(logits) && ggml_is_contiguous(cdf) &&
++                    ggml_are_same_shape(op, logits) && ggml_are_same_shape(op, cdf) &&
++                    op->ne[0] > 0 && op->ne[0] <= 1024 && std::isfinite(p) && p >= 0.0f && p <= 1.0f && !op->src[2];
++            }
++            if (ggml_get_op_params_i32(op, 1) != 0 && ggml_get_op_params_i32(op, 1) != 1) { return false; }
+             return (op->type == GGML_TYPE_F32 || (op->type==GGML_TYPE_I32 && ggml_get_op_params_i32(op,1)==1)) && op->src[0]->type == GGML_TYPE_F32 &&
+                 op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                 (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[2])));
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -629,7 +629,9 @@
+         assert(hn->addr.offset == 0);
+ 
+         // try to reuse a parent's buffer (inplace)
+-        if (ggml_op_can_inplace(node->op)) {
++        // Only mode 2 reads the complete CDF before it writes either input.
++        const bool top_p_mask = node->op == GGML_OP_TOKEN_MASK && ggml_get_op_params_i32(node, 1) == 2;
++        if (ggml_op_can_inplace(node->op) || top_p_mask) {
+             for (int i = 0; i < GGML_MAX_SRC; i++) {
+                 struct ggml_tensor * parent = node->src[i];
+                 if (parent == NULL) {
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1628,6 +1628,7 @@
+ struct llama_sampler_top_p : public llama_sampler_backend {
+     const float  p;
+     const size_t min_keep;
++    int64_t fused_mask_limit;
+ 
+     std::vector<llama_token_data> buf_sort;
+ };
+@@ -1708,6 +1709,34 @@
+     auto * sctx = (llama_sampler_top_p *) smpl->ctx;
+     GGML_UNUSED(n_outputs_max_per_seq);
+ 
++    const char * requested = std::getenv("WILDLLAMA_TOP_P_MASK_FUSION");
++    const bool explicit_fusion = requested && std::strcmp(requested, "1") == 0;
++    sctx->fused_mask_limit = 0;
++    if ((!requested || explicit_fusion) &&
++            std::isfinite(sctx->p) && sctx->p >= 0.0f && sctx->p <= 1.0f && sctx->min_keep <= 1) {
++        // This probe allocates tensor metadata only, without a device buffer.
++        ggml_context_ptr probe(ggml_init({3*ggml_tensor_overhead(), nullptr, true}));
++        auto * logits = ggml_new_tensor_1d(probe.get(), GGML_TYPE_F32, 32);
++        auto * cdf = ggml_new_tensor_1d(probe.get(), GGML_TYPE_F32, 32);
++        auto * mask = ggml_top_p_mask(probe.get(), logits, cdf, sctx->p);
++        const bool standard_cpu = buft == ggml_backend_cpu_buffer_type();
++        auto * device = ggml_backend_buft_get_device(buft);
++        if (!device && standard_cpu) {
++            // The shared standard CPU buffer has no device owner.
++            device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        }
++        if (device && ggml_backend_dev_supports_op(device, mask)) {
++            if (explicit_fusion || standard_cpu) {
++                sctx->fused_mask_limit = 1024;
++            } else {
++                auto * reg = ggml_backend_dev_backend_reg(device);
++                const char * name = reg ? ggml_backend_reg_name(reg) : nullptr;
++                if (name && std::strcmp(name, "CUDA") == 0) {
++                    sctx->fused_mask_limit = 256;
++                }
++            }
++        }
++    }
+     const bool res = llama_sampler_backend_support(smpl, buft);
+ 
+     sctx->init(res);
+@@ -1758,6 +1787,12 @@
+     // Compute Cumulative Distribution Function (CDF) by means of GGML_OP_CUMSUM.
+     struct ggml_tensor * cdf = ggml_cumsum(ctx, softmax);
+     ggml_set_name(cdf, "top_p_cdf");
++
++    if (sctx->fused_mask_limit > 0 && cdf->ne[0] > 0 && cdf->ne[0] <= sctx->fused_mask_limit) {
++        data->logits = ggml_top_p_mask(ctx, sorted_logits, cdf, sctx->p);
++        ggml_set_name(data->logits, "top_p_logits");
++        return;
++    }
+ 
+     // Invert CDF and add top-p value so that ggml_step yields 1 for values we want to keep
+     struct ggml_tensor * cdf_scaled = ggml_scale_bias(ctx, cdf, -1.0f, sctx->p);
+@@ -1821,9 +1856,10 @@
+         /* .iface = */ &llama_sampler_top_p_i,
+         /* .ctx   = */ new llama_sampler_top_p {
+             ("top-p"),
+-            /* .p        = */ p,
+-            /* .min_keep = */ min_keep,
+-            /* .buf_sort = */ {},
++            /* .p                = */ p,
++            /* .min_keep         = */ min_keep,
++            /* .fused_mask_limit = */ 0,
++            /* .buf_sort         = */ {},
+         }
+     );
+ }
+diff --git a/tests/test-top-p-mask-fusion.cpp b/tests/test-top-p-mask-fusion.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-top-p-mask-fusion.cpp
+@@ -0,0 +1,379 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "../src/llama-sampler.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool ok, const char * message) {
++    if (!ok) { throw std::runtime_error(message); }
++}
++
++static void same(float a, float b) {
++    if (std::isnan(a) && std::isnan(b)) { return; }
++    require(std::memcmp(&a, &b, sizeof(a)) == 0, "legacy/fused float bits differ");
++}
++
++struct fusion_switch {
++    bool had;
++    std::string old;
++    static int set(const char * value) {
++#ifdef _WIN32
++        return _putenv_s("WILDLLAMA_TOP_P_MASK_FUSION", value ? value : "");
++#else
++        return value ? setenv("WILDLLAMA_TOP_P_MASK_FUSION", value, 1) : unsetenv("WILDLLAMA_TOP_P_MASK_FUSION");
++#endif
++    }
++    explicit fusion_switch(const char * value) {
++        const char * before = std::getenv("WILDLLAMA_TOP_P_MASK_FUSION");
++        had = before != nullptr;
++        if (before) { old = before; }
++        require(set(value) == 0, "could not set isolated fusion control");
++    }
++    ~fusion_switch() { set(had ? old.c_str() : nullptr); }
++};
++
++static ggml_tensor * legacy_mask(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * cdf, float p) {
++    auto * mask = ggml_step(ctx, ggml_scale_bias(ctx, cdf, -1.0f, p));
++    auto * idx = ggml_clamp(ctx, ggml_sum(ctx, mask), 0.0f, float(mask->ne[0] - 1));
++    auto * ones = ggml_scale_bias(ctx, idx, 0.0f, 1.0f);
++    auto * rows = ggml_set_rows(ctx, ggml_reshape_2d(ctx, mask, 1, mask->ne[0]), ones, ggml_cast(ctx, idx, GGML_TYPE_I32));
++    return ggml_add(ctx, logits, ggml_log(ctx, ggml_reshape_1d(ctx, rows, mask->ne[0])));
++}
++
++struct mask_graph {
++    ggml_context_ptr ctx{ggml_init({2*1024*1024, nullptr, true})};
++    ggml_gallocr_ptr alloc;
++    ggml_cgraph * graph;
++    ggml_tensor * scores;
++    ggml_tensor * cdf = nullptr;
++    ggml_tensor * output;
++    ggml_tensor * consumer = nullptr;
++    size_t bytes;
++    mask_graph(ggml_backend_t backend, int n, float p, bool fused, bool full = false, int protect = 0)
++        : alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))) {
++        require(bool(ctx), "metadata allocation failed");
++        graph = ggml_new_graph_custom(ctx.get(), 256, false);
++        scores = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
++        ggml_set_input(scores);
++        if (full && protect) { ggml_set_output(scores); }
++        auto * logits = scores;
++        if (full) {
++            auto * ids = ggml_argsort(ctx.get(), scores, GGML_SORT_ORDER_DESC);
++            logits = ggml_get_rows(ctx.get(), ggml_reshape_2d(ctx.get(), scores, 1, n), ids);
++            logits = ggml_reshape_1d(ctx.get(), logits, n);
++            cdf = ggml_cumsum(ctx.get(), ggml_soft_max(ctx.get(), logits));
++        } else {
++            cdf = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
++            ggml_set_input(cdf);
++            if (protect == 1 || protect == 2) { ggml_set_output(scores); }
++            if (protect == 2) { ggml_set_output(cdf); }
++        }
++        output = fused ? ggml_top_p_mask(ctx.get(), logits, cdf, p) : legacy_mask(ctx.get(), logits, cdf, p);
++        ggml_set_output(output);
++        ggml_build_forward_expand(graph, output);
++        if (protect == 3) {
++            consumer = ggml_add(ctx.get(), scores, cdf);
++            ggml_set_output(consumer);
++            ggml_build_forward_expand(graph, consumer);
++        }
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            require(ggml_backend_supports_op(backend, ggml_graph_node(graph, i)), "backend does not support mask fixture");
++        }
++        require(ggml_gallocr_alloc_graph(alloc.get(), graph), "compute allocation failed");
++        bytes = ggml_gallocr_get_buffer_size(alloc.get(), 0);
++        require(bytes < 1024*1024, "fixture escaped bounded compute allocation");
++        if (fused && !full) {
++            if (protect == 0) { require(output->data == scores->data, "mode2 did not reuse logits"); }
++            if (protect == 1) { require(output->data == cdf->data, "mode2 did not reuse CDF"); }
++            if (protect >= 2) { require(output->data != scores->data && output->data != cdf->data, "mode2 overwrote live graph output"); }
++        }
++    }
++    void input(const std::vector<float> & logits, const std::vector<float> & cdf_values = {}) {
++        ggml_backend_tensor_set(scores, logits.data(), 0, logits.size()*sizeof(float));
++        if (!cdf_values.empty()) { ggml_backend_tensor_set(cdf, cdf_values.data(), 0, cdf_values.size()*sizeof(float)); }
++    }
++    std::vector<float> run(ggml_backend_t backend) {
++        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "mask compute failed");
++        std::vector<float> values(ggml_nelements(output));
++        ggml_backend_tensor_get(output, values.data(), 0, values.size()*sizeof(float));
++        return values;
++    }
++};
++
++static void direct_masks(ggml_backend_t backend) {
++    int cases = 0;
++    size_t old_peak = 0, new_peak = 0;
++    for (int n : {1, 2, 10, 20, 31, 32, 33, 40, 64, 127, 128, 129, 255, 256, 257, 512, 1024}) {
++        for (float p : {0.0f, std::numeric_limits<float>::denorm_min(), 0.1f, 0.5f, 0.95f, 1.0f}) {
++            for (int protect = 0; protect < 4; ++protect) {
++                mask_graph before(backend, n, p, false, false, protect), after(backend, n, p, true, false, protect);
++                require(after.bytes <= before.bytes, "fused compute allocation exceeds legacy");
++                require(ggml_graph_n_nodes(after.graph) < ggml_graph_n_nodes(before.graph), "fusion did not reduce graph nodes");
++                old_peak = std::max(old_peak, before.bytes); new_peak = std::max(new_peak, after.bytes);
++                for (int pattern = 0; pattern < 4; ++pattern) {
++                    std::vector<float> logits(n), cdf(n);
++                    for (int i = 0; i < n; ++i) {
++                        logits[i] = float((i*17)%37 - 18)/8.0f;
++                        cdf[i] = float(i + 1)/n;
++                        if (pattern == 1) { cdf[i] = i%3 == 0 ? std::nextafter(p, -INFINITY) : (i%3 == 1 ? p : std::nextafter(p, INFINITY)); }
++                        if (pattern == 2) {
++                            const float special[] = {NAN, INFINITY, -INFINITY, -0.0f, 0.0f, 0.5f, std::numeric_limits<float>::denorm_min(), -std::numeric_limits<float>::denorm_min()};
++                            cdf[i] = special[i%8]; logits[i] = special[(i + 2)%8];
++                        }
++                        if (pattern == 3) { cdf[i] = i%2 ? -0.5f : 2.0f; logits[i] = i%2 ? -0.0f : 0.0f; }
++                    }
++                    before.input(logits, cdf); after.input(logits, cdf);
++                    const auto a = before.run(backend), b = after.run(backend);
++                    for (int i = 0; i < n; ++i) { same(a[i], b[i]); }
++                    if (protect == 3) {
++                        std::vector<float> a_consumer(n), b_consumer(n);
++                        ggml_backend_tensor_get(before.consumer, a_consumer.data(), 0, n*sizeof(float));
++                        ggml_backend_tensor_get(after.consumer, b_consumer.data(), 0, n*sizeof(float));
++                        for (int i = 0; i < n; ++i) { same(a_consumer[i], b_consumer[i]); }
++                    }
++                    ++cases;
++                }
++            }
++        }
++        for (float p : {0.1f, 0.5f, 0.95f}) {
++            mask_graph before(backend, n, p, false, true), after(backend, n, p, true, true);
++            require(after.bytes <= before.bytes, "fused complete graph allocation exceeds legacy");
++            std::vector<float> logits(n);
++            for (int i = 0; i < n; ++i) { logits[i] = float((i*13)%23 - 11)/4.0f; }
++            before.input(logits); after.input(logits);
++            const auto a = before.run(backend), b = after.run(backend);
++            for (int i = 0; i < n; ++i) { same(a[i], b[i]); }
++            ++cases;
++        }
++    }
++    std::printf("TOP_P_MASK exact_cases=%d logits_alias=1 CDF_alias=1 live_outputs_preserved=1 nonmonotonic_CDF=1 nonfinite=1 signed_zero=1 legacy_peak=%zu fused_peak=%zu PASS\n", cases, old_peak, new_peak);
++}
++
++static void capability(ggml_backend_t backend) {
++    ggml_context_ptr ctx(ggml_init({16*ggml_tensor_overhead(), nullptr, true}));
++    auto * logits = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 20);
++    auto * cdf = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 20);
++    auto * op = ggml_top_p_mask(ctx.get(), logits, cdf, 0.5f);
++    require(!logits->data && !cdf->data && !op->data, "capability probe allocated tensor storage");
++    require(ggml_backend_supports_op(backend, op), "valid mode2 probe rejected");
++    for (float p : {-1.0f, 1.01f, INFINITY, NAN}) {
++        std::memcpy(op->op_params, &p, sizeof(p));
++        require(!ggml_backend_supports_op(backend, op), "unsupported top-p value admitted");
++    }
++    const float p = 0.5f; std::memcpy(op->op_params, &p, sizeof(p));
++    cdf->ne[0] = 19;
++    require(!ggml_backend_supports_op(backend, op), "mismatched CDF shape admitted");
++    cdf->ne[0] = logits->ne[0] = op->ne[0] = 1025;
++    require(!ggml_backend_supports_op(backend, op), "oversized mode2 admitted");
++    cdf->ne[0] = logits->ne[0] = op->ne[0] = 20;
++    const int32_t unknown = 3; std::memcpy(op->op_params + 1, &unknown, sizeof(unknown));
++    require(!ggml_backend_supports_op(backend, op), "unknown token-mask mode admitted");
++    std::puts("TOP_P_MASK_CAPABILITY metadata_only=1 invalid_p=1 shape_guard=1 unknown_mode=1 PASS");
++}
++
++struct sample_graph {
++    llama_sampler_ptr sampler;
++    ggml_context_ptr ctx{ggml_init({2*1024*1024, nullptr, true})};
++    ggml_gallocr_ptr alloc;
++    ggml_cgraph * graph;
++    ggml_tensor * scores;
++    llama_sampler_data output{};
++    std::unique_ptr<llama_sampler_graph_binding> binding;
++    int fused_nodes = 0;
++    sample_graph(ggml_backend_t backend, const char * control, int n, int k, float p, size_t min_keep, bool constrained)
++        : sampler(llama_sampler_chain_init(llama_sampler_chain_default_params())),
++          alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))) {
++        fusion_switch mode(control);
++        if (constrained) {
++            auto * mask = llama_sampler_init_token_mask(n);
++            std::vector<uint32_t> words((n + 31)/32, 0);
++            for (int i = 0; i < n; ++i) { if (i%3 != 1) { words[i/32] |= uint32_t(1) << (i%32); } }
++            require(llama_sampler_set_token_mask(mask, words.data(), words.size()), "constraint mask setup failed");
++            llama_sampler_chain_add(sampler.get(), mask);
++        }
++        if (k) { llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_k(k)); }
++        llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_p(p, min_keep));
++        llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(0.8f));
++        llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(1234567));
++        require(sampler->iface->backend_init(sampler.get(), ggml_backend_get_default_buffer_type(backend), 1), "complete sampler backend unavailable");
++        scores = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n); ggml_set_input(scores);
++        graph = ggml_new_graph_custom(ctx.get(), 256, false);
++        output = {scores, nullptr, nullptr, nullptr};
++        sampler->iface->backend_reset(sampler.get());
++        sampler->iface->backend_apply(sampler.get(), ctx.get(), graph, &output);
++        require(output.sampled && output.probs && output.candidates, "complete sampler output contract changed");
++        ggml_build_forward_expand(graph, output.sampled);
++        ggml_build_forward_expand(graph, output.probs); ggml_set_output(output.probs);
++        ggml_build_forward_expand(graph, output.candidates); ggml_set_output(output.candidates);
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            auto * node = ggml_graph_node(graph, i);
++            int32_t kind; std::memcpy(&kind, node->op_params + 1, sizeof(kind));
++            fused_nodes += node->op == GGML_OP_TOKEN_MASK && kind == 2;
++        }
++        require(ggml_gallocr_alloc_graph(alloc.get(), graph), "complete sampler allocation failed");
++        binding = llama_sampler_backend_capture_bindings(sampler.get());
++        require(binding && binding->matches(sampler.get()), "top-p graph binding unavailable");
++    }
++    llama_token run(ggml_backend_t backend, const std::vector<float> & logits, std::vector<float> & probs, std::vector<int32_t> & ids) {
++        ggml_backend_tensor_set(scores, logits.data(), 0, logits.size()*sizeof(float));
++        binding->swap_bindings(sampler.get());
++        sampler->iface->backend_set_input(sampler.get());
++        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "sampler compute failed");
++        binding->swap_bindings(sampler.get());
++        probs.resize(ggml_nelements(output.probs)); ids.resize(ggml_nelements(output.candidates));
++        ggml_backend_tensor_get(output.probs, probs.data(), 0, probs.size()*sizeof(float));
++        ggml_backend_tensor_get(output.candidates, ids.data(), 0, ids.size()*sizeof(int32_t));
++        llama_token selected; ggml_backend_tensor_get(output.sampled, &selected, 0, sizeof(selected));
++        llama_sampler_accept(sampler.get(), selected);
++        return selected;
++    }
++};
++
++static void samplers(ggml_backend_t backend, bool bench) {
++    int repetitions = 0;
++    for (int k : {10, 20, 0}) for (bool constrained : {false, true}) {
++        sample_graph before(backend, "0", 256, k, 0.9f, 1, constrained);
++        sample_graph after(backend, "1", 256, k, 0.9f, 1, constrained);
++        require(before.fused_nodes == 0 && after.fused_nodes == 1, "sampler control did not select actual mask graph");
++        const size_t old_bytes = ggml_gallocr_get_buffer_size(before.alloc.get(), 0);
++        const size_t new_bytes = ggml_gallocr_get_buffer_size(after.alloc.get(), 0);
++        require(new_bytes <= old_bytes, "complete sampler increased compute storage");
++        if (bench) {
++            std::printf("TOP_P_MASK_CHAIN_MEMORY n=256 k=%d constrained=%d legacy_bytes=%zu fused_bytes=%zu\n", k, int(constrained), old_bytes, new_bytes);
++        }
++        for (int repeat = 0; repeat < 48; ++repeat) {
++            if (repeat == 24) { llama_sampler_reset(before.sampler.get()); llama_sampler_reset(after.sampler.get()); }
++            std::vector<float> scores(256), a, b; std::vector<int32_t> ai, bi;
++            for (int i = 0; i < 256; ++i) { scores[i] = float((i*17 + repeat*19)%43 - 21)/8.0f; }
++            require(before.run(backend, scores, a, ai) == after.run(backend, scores, b, bi), "fusion changed seeded selected token");
++            require(ai == bi && a.size() == b.size(), "fusion changed candidate order");
++            for (size_t i = 0; i < a.size(); ++i) { same(a[i], b[i]); }
++            ++repetitions;
++        }
++    }
++    for (const char * control : {"0", "true", "yes"}) {
++        sample_graph fallback(backend, control, 20, 10, 0.9f, 1, false);
++        require(fallback.fused_nodes == 0, "unknown control enabled fusion");
++    }
++    sample_graph many(backend, "1", 2048, 0, 0.9f, 1, false);
++    sample_graph minimum(backend, "1", 20, 0, 0.9f, 2, false);
++    sample_graph negative(backend, "1", 20, 0, -0.1f, 1, false);
++    require(many.fused_nodes == 0 && minimum.fused_nodes == 0 && negative.fused_nodes == 0, "unsupported sampler did not retain legacy graph");
++    std::printf("TOP_P_MASK_SAMPLER seeded_repetitions=%d topK10_20=1 candidate_order=1 probabilities=1 constraint_mask=1 reset=1 graph_bindings=1 legacy_fallback=1 PASS\n", repetitions);
++}
++
++static void defaults(ggml_backend_t backend, bool cuda) {
++    const int limit = cuda ? 256 : 1024;
++    int repetitions = 0;
++    for (int n : {256, 257, 512, 1024}) {
++        sample_graph before(backend, "0", n, 0, 0.9f, 1, false);
++        sample_graph automatic(backend, nullptr, n, 0, 0.9f, 1, false);
++        require(before.fused_nodes == 0 && automatic.fused_nodes == int(n <= limit), "unset environment selected an incorrect automatic range");
++        require(ggml_gallocr_get_buffer_size(automatic.alloc.get(), 0) <= ggml_gallocr_get_buffer_size(before.alloc.get(), 0), "automatic sampler increased compute storage");
++        for (int repeat = 0; repeat < 32; ++repeat) {
++            if (repeat == 16) { llama_sampler_reset(before.sampler.get()); llama_sampler_reset(automatic.sampler.get()); }
++            std::vector<float> scores(n), a, b; std::vector<int32_t> ai, bi;
++            for (int i = 0; i < n; ++i) { scores[i] = float((i*17 + repeat*19)%43 - 21)/8.0f; }
++            require(before.run(backend, scores, a, ai) == automatic.run(backend, scores, b, bi), "automatic mask changed seeded selected token");
++            require(ai == bi && a.size() == b.size(), "automatic mask changed candidate order");
++            for (size_t i = 0; i < a.size(); ++i) { same(a[i], b[i]); }
++            ++repetitions;
++        }
++    }
++    // Windows CRT deletes this variable for an empty value; POSIX retains it.
++    {
++        fusion_switch empty("");
++        const char * observed = std::getenv("WILDLLAMA_TOP_P_MASK_FUSION");
++        const bool deleted = observed == nullptr;
++#ifdef _WIN32
++        require(!observed, "Windows empty environment control did not delete the variable");
++#else
++        require(observed && observed[0] == '\0', "POSIX empty environment control was not retained");
++#endif
++        sample_graph actual(backend, "", 20, 10, 0.9f, 1, false);
++        require(actual.fused_nodes == int(deleted), "empty environment control did not follow observed CRT semantics");
++        std::printf("TOP_P_MASK_EMPTY_ENV deleted=%d retained_empty=%d fused_nodes=%d PASS\n", int(deleted), int(!deleted), actual.fused_nodes);
++    }
++    std::printf("TOP_P_MASK_DEFAULT candidate_limit=%d boundaries_256_257_512_1024=1 seeded_repetitions=%d probabilities=1 candidate_order=1 reset=1 allocation_not_increased=1 PASS\n", limit, repetitions);
++}
++
++static double median(std::vector<double> samples) {
++    std::sort(samples.begin(), samples.end());
++    return (samples[samples.size()/2 - 1] + samples[samples.size()/2])/2;
++}
++
++static void print_samples(const char * name, const std::vector<double> & samples) {
++    std::printf(",\"%s\":[", name);
++    for (size_t i = 0; i < samples.size(); ++i) { std::printf("%s%.6f", i ? "," : "", samples[i]); }
++    std::printf("]");
++}
++
++static void benchmark(ggml_backend_t backend) {
++    constexpr int paired_rounds = 16;
++    constexpr int iterations = 400;
++    for (int n : {10, 20, 40, 64, 128, 256, 512, 1024}) for (bool full : {false, true}) {
++        // Keep both component inputs live so repeated evaluation sees identical data.
++        mask_graph before(backend, n, 0.9f, false, full, 2), after(backend, n, 0.9f, true, full, 2);
++        std::vector<float> scores(n), cdf(n);
++        for (int i = 0; i < n; ++i) { scores[i] = float((i*17)%37 - 18)/8.0f; cdf[i] = float(i + 1)/n; }
++        before.input(scores, full ? std::vector<float>{} : cdf); after.input(scores, full ? std::vector<float>{} : cdf);
++        for (int warm = 0; warm < 10; ++warm) { before.run(backend); after.run(backend); }
++        std::vector<double> old_samples, new_samples;
++        for (int round = 0; round < paired_rounds; ++round) {
++            for (int side = 0; side < 2; ++side) {
++                const bool fused = (round%2 == 0) ? side == 1 : side == 0;
++                auto & fixture = fused ? after : before;
++                ggml_backend_synchronize(backend);
++                const auto begin = std::chrono::steady_clock::now();
++                for (int i = 0; i < iterations; ++i) { require(ggml_backend_graph_compute(backend, fixture.graph) == GGML_STATUS_SUCCESS, "benchmark compute failed"); }
++                ggml_backend_synchronize(backend);
++                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count()/iterations;
++                (fused ? new_samples : old_samples).push_back(us);
++            }
++        }
++        require(old_samples.size() == paired_rounds && new_samples.size() == paired_rounds, "benchmark sample count changed");
++        const double old_us = median(old_samples), new_us = median(new_samples);
++        const int old_nodes = ggml_graph_n_nodes(before.graph), new_nodes = ggml_graph_n_nodes(after.graph);
++        std::printf("TOP_P_MASK_BENCH n=%d full=%d legacy_us=%.6f fused_us=%.6f ratio=%.6f legacy_nodes=%d fused_nodes=%d legacy_bytes=%zu fused_bytes=%zu\n", n, int(full), old_us, new_us, new_us/old_us, old_nodes, new_nodes, before.bytes, after.bytes);
++        std::printf("TOP_P_MASK_BENCH_JSON {\"n\":%d,\"full\":%d,\"paired_rounds\":%d,\"abba_cycles\":%d,\"iterations\":%d,\"samples_per_control\":%d,\"statistic\":\"median\",\"order\":\"ABBA\",\"legacy_us\":%.6f,\"fused_us\":%.6f,\"ratio\":%.6f,\"legacy_nodes\":%d,\"fused_nodes\":%d,\"legacy_bytes\":%zu,\"fused_bytes\":%zu", n, int(full), paired_rounds, paired_rounds/2, iterations, paired_rounds, old_us, new_us, new_us/old_us, old_nodes, new_nodes, before.bytes, after.bytes);
++        print_samples("legacy_samples_us", old_samples); print_samples("fused_samples_us", new_samples);
++        std::printf("}\n");
++    }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        bool cuda = false, bench = false;
++        for (int i = 1; i < argc; ++i) {
++            const std::string arg(argv[i]);
++            require(arg == "--cuda" || arg == "--bench", "use --cuda and/or --bench");
++            cuda |= arg == "--cuda"; bench |= arg == "--bench";
++        }
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        if (cuda) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++#else
++            std::puts("SKIP: CUDA backend not built"); return 77;
++#endif
++        }
++        auto * device = ggml_backend_dev_by_type(cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU);
++        require(device && (!cuda || std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device))) == "CUDA"), "isolated requested backend unavailable");
++        ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr)); require(bool(backend), "backend initialization failed");
++        capability(backend.get()); direct_masks(backend.get()); samplers(backend.get(), bench); defaults(backend.get(), cuda);
++        if (bench) { benchmark(backend.get()); }
++        std::printf("TOP_P_MASK_FUSION device=%s zero_model_weights=1 no_extra_workspace=1 PASS\n", cuda ? "CUDA" : "CPU");
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

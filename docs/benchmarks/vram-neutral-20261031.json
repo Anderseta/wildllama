@@ -1,0 +1,2149 @@
+{
+  "status": "passed",
+  "artifact": "memory_neutral_runtime",
+  "base_commit": "a2453666be18348e89bf0cdc806f36349626e889",
+  "sealed_at_utc": "2026-10-31T21:43:08.337203+00:00",
+  "native_base": {
+    "upstream_commit": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+    "patches": [
+      "001-llama-cpp-hooks.patch",
+      "002-moe-ram-limit.patch",
+      "003-runtime-performance.patch",
+      "004-gpu-first-moe.patch",
+      "005-live-runtime-activity.patch",
+      "006-moe-residency-pipeline.patch",
+      "007-dense-runtime.patch",
+      "008-runtime-efficiency.patch",
+      "009-bounded-copy-pipeline.patch",
+      "010-scheduler-exception-contract.patch",
+      "011-moe-read-and-execution-batching.patch",
+      "012-expert-major-and-packed-rows.patch",
+      "013-resident-gpu-tuning.patch",
+      "014-kv-reclamation-and-prompt-state.patch",
+      "015-mtp-checkpoint-state.patch",
+      "016-tuning-reuse.patch",
+      "017-sampler-output-view.patch",
+      "018-speculative-round-efficiency.patch",
+      "019-cuda-graph-reuse.patch",
+      "020-checkpoint-restore-transaction.patch",
+      "021-sampler-batch-fences-and-owned-candidates.patch",
+      "022-sampler-init-and-mtp-state-transactions.patch",
+      "023-speculative-snapshot-and-clone-ownership.patch",
+      "024-moe-binding-transaction.patch",
+      "025-prompt-prefix-index.patch",
+      "026-postverify-candidate-and-residual-work.patch",
+      "027-overlapped-admission-and-decode-metadata.patch",
+      "028-device-mtp-state.patch",
+      "029-compact-backend-sampler-outputs.patch",
+      "030-bounded-graph-variants.patch",
+      "032-retained-prefix.patch",
+      "033-graph-owned-sampler-bindings.patch",
+      "034-device-attention-mask.patch",
+      "036-paged-state-cache.patch",
+      "037-grammar-first-device-mask.patch",
+      "038-hybrid-retained-prefix.patch",
+      "039-sampler-binding-preflight.patch",
+      "040-device-mask-placement.patch",
+      "041-grammar-mask-validation.patch",
+      "042-async-prefix-writeback.patch",
+      "043-canonical-penalties.patch",
+      "044-hybrid-text-device-mask.patch",
+      "045-auto-device-mask.patch",
+      "046-shared-cache-diagnostics.patch",
+      "047-preserve-mask-execution.patch",
+      "048-conservative-extended-mask-default.patch",
+      "049-backend-sampler-extensions.patch",
+      "050-bounded-prefill-graph-arenas.patch",
+      "051-indexed-kv-prefix-sharing.patch",
+      "052-bounded-output-decode-overlap.patch",
+      "053-runtime-feature-discovery.patch",
+      "055-top-p-mask-fusion.patch",
+      "056-server-slot-iteration.patch"
+    ]
+  },
+  "release_decision": {
+    "approved_defaults": true,
+    "default_policy": {
+      "canonical_penalties": true,
+      "device_attention_mask": "auto",
+      "device_mask_execution_flags_preserved": true,
+      "prefix_disk_async": "opt_in",
+      "device_mask_policy": {
+        "minimum_queries_per_stream": 512,
+        "ordinary_minimum_dense_bytes": 262144,
+        "extended_inputs": "hybrid OR n_pos>1",
+        "extended_minimum_dense_bytes": 2097152,
+        "manual_enable": "WILDLLAMA_DEVICE_MASK=1",
+        "manual_minimum_queries_per_stream": 32,
+        "manual_minimum_dense_bytes": 262144,
+        "explicit_disable": "WILDLLAMA_DEVICE_MASK=0",
+        "unsupported_layouts": "original_host_path"
+      },
+      "graph_variant_library_default_mib": 0,
+      "graph_variant_profile_mib": 128,
+      "graph_variant_budget_scope": "per_context",
+      "dry_backend": "opt_in",
+      "decode_overlap": "opt_in",
+      "top_p_fusion": "bounded_automatic_cpu1024_cuda256",
+      "top_p_fusion_bounds": {
+        "standard_cpu_max_candidates": 1024,
+        "nvidia_cuda_max_candidates": 256,
+        "other_backends": "legacy_by_default",
+        "explicit_1_diagnostic_max_candidates": 1024,
+        "explicit_0_and_unknown_values": "legacy"
+      },
+      "top_p_fusion_diagnostic_note": "Explicit WILDLLAMA_TOP_P_MASK_FUSION=1 permits supported fused graphs through1024 candidates. Expanded CUDA diagnostics are not automatic-default performance claims.",
+      "new_persistent_gpu_storage_bytes": 0
+    },
+    "autonomous_gpu_feedback": false,
+    "public_feature_document": "docs/memory-neutral-runtime.md",
+    "user_models_and_logical_context_preserved": true,
+    "opt_in_dry_old_stochastic_host_rng_parity_claimed": false,
+    "trained_model_quality_not_measured": true
+  },
+  "validation": {
+    "native_cpu_ctest": {
+      "status": "passed",
+      "passed": 40,
+      "failed": 0,
+      "skipped": 0,
+      "junit": {
+        "path": ".build/vram-neutral-20261031/native-release/native-cpu-tests.xml",
+        "sha256": "3672d336d827f8de6a18e76a054db0e125f22c1ded37695908f82c4c4454cecb"
+      }
+    },
+    "native_cuda_ctest": {
+      "status": "passed",
+      "passed": 13,
+      "failed": 0,
+      "skipped": 0,
+      "junit": {
+        "path": ".build/vram-neutral-20261031/native-release/native-cuda-tests.xml",
+        "sha256": "d9645eb8b006f3967a4981366f9d857d2c268ec77053b317d72bed0b28c56b08"
+      }
+    },
+    "native_components": {
+      "status": "passed",
+      "steps": 23,
+      "model_families": 7,
+      "cpu_and_cuda_graph_prefill_families": 14,
+      "server_tests": 45,
+      "server_assertions": 190,
+      "report": {
+        "path": ".build/vram-neutral-20261031/native-release/runner-summary-all.json",
+        "sha256": "43b4749da467425292f273bffe352008556defe0736bbd9e4b523f34ff2a6412"
+      },
+      "inventory": {
+        "path": ".build/vram-neutral-20261031/final-runner/required-tests.json",
+        "sha256": "c358e899f2636ef7104b10527ae74fe75b3018852325c6e6ad7ce47ab4be0f85"
+      }
+    },
+    "patch_replay": {
+      "status": "passed",
+      "canonical_files_compared": 183,
+      "patch_count": 53,
+      "fresh_ordered_replay": true,
+      "repeat_cmake_idempotence": true,
+      "no_outside_native_changes": true,
+      "report": {
+        "path": ".build/vram-neutral-20261031/patch-replay.json",
+        "sha256": "be3697a22b35cdb5a9a001e65700545ef6cde5750aa415b588844c850662e14c"
+      },
+      "repeat_log": {
+        "path": ".build/vram-neutral-20261031/patch-replay-cmake.log",
+        "sha256": "fc9ba7c40d0eba9cdc85ac08f35a8e95e4634951bf1326cdd2bbbe228f9dad47"
+      },
+      "replay_generator": {
+        "path": ".build/vram-neutral-20261031/replay_final.py",
+        "sha256": "fae4fa670c3028462870cc216eb34a5aefe5e8538adabcce53079c9b0a1fdf91"
+      },
+      "materialization": "Affected paths read from compiled native upstream HEAD into a fresh partial non-Git tree",
+      "ownership": {
+        "path": ".build/vram-neutral-20261031/native-source-ownership.json",
+        "sha256": "bade57cc6231fb2172ca35c61e2166c24380ab2b8d44699606c9e3ff676e7397"
+      }
+    },
+    "source_guard": {
+      "status": "passed",
+      "native_files_rechecked": 2000,
+      "mandatory_guarded_inputs": 63,
+      "successful_snapshot_sha256": "e84dc79baf3f997ea8aadf477d0d20c618c5aac23cbdf72374d738fd3d796588"
+    },
+    "stable_release_payloads": {
+      "status": "passed",
+      "before": {
+        "path": ".build/vram-neutral-20261031/release-suite-before.json",
+        "sha256": "a85e3fec495a21cb65f2c2fbbc991c90e33fec555376d8eb618f3ecd036f661b"
+      },
+      "after": {
+        "path": ".build/vram-neutral-20261031/release-suite-after.json",
+        "sha256": "f86cb3661dec50a54bfcaaae8fd5448bbfa6a3c98467138a32813349599d6e4b"
+      },
+      "files_per_bundle": 39,
+      "unchanged_before_after_and_current": true,
+      "baseline_published_commit": "a2453666be18348e89bf0cdc806f36349626e889"
+    },
+    "http_cases_per_payload": 300,
+    "http_equivalence": {
+      "status": "passed",
+      "cases_per_payload": 300,
+      "configurations": [
+        {
+          "configuration": "cpu-draft-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-cpu-draft-caches.json",
+            "sha256": "e18885730143dcb3fd18671991d46f833c53ab41af0ce686563bbd440771f59e"
+          }
+        },
+        {
+          "configuration": "cpu-draft",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-cpu-draft.json",
+            "sha256": "676b46cfa2eda9144005e0a4956fa3d34e178b58488647e0b7de710a39c00485"
+          }
+        },
+        {
+          "configuration": "cpu-plain-caches-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-cpu-plain-caches-device-mask.json",
+            "sha256": "7fd61a1006f3039ff6d499101c27a3d614e49523d7c7741e6c279d267e39e4bc"
+          }
+        },
+        {
+          "configuration": "cpu-plain-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-cpu-plain-caches.json",
+            "sha256": "53b49ab95700cc07c2e7abdeca2d42fccc185ff70ea82ab16697f9f2050141a3"
+          }
+        },
+        {
+          "configuration": "cpu-plain-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-cpu-plain-device-mask.json",
+            "sha256": "f9a5c9b3b2c0ec2ccb8ada8ab3ba6879800123491f55d92097271925e68e4bf4"
+          }
+        },
+        {
+          "configuration": "cpu-plain",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-cpu-plain.json",
+            "sha256": "96334de630fc783eaa590babe4eeb04778d288518b47ab15e866cbd1716f83ac"
+          }
+        },
+        {
+          "configuration": "gpu-draft-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-gpu-draft-caches.json",
+            "sha256": "c170e1f9240db8ae150265023eca9a408c65ccd334f6b0f397bba78b52452827"
+          }
+        },
+        {
+          "configuration": "gpu-draft",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-gpu-draft.json",
+            "sha256": "30d3b14928adc766294780077fd4c2e6e0566ff998a7a118630a58d812aa4007"
+          }
+        },
+        {
+          "configuration": "gpu-plain-caches-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 1,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-gpu-plain-caches-device-mask.json",
+            "sha256": "7da3799137c20dfa16e5e02d3f84c2ec0332e8f242fcda96ebbed69ba013a8af"
+          }
+        },
+        {
+          "configuration": "gpu-plain-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-gpu-plain-caches.json",
+            "sha256": "a084c5d1991999bb78944c16f450a3f5c929d16b9520d85a5767c754e5cd3ab3"
+          }
+        },
+        {
+          "configuration": "gpu-plain-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 1,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-gpu-plain-device-mask.json",
+            "sha256": "c37babbf8315a5afe6d9e750d15e967e26115d1d507e3735f3aba71206b7003d"
+          }
+        },
+        {
+          "configuration": "gpu-plain",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/vram-neutral-20261031/http-comparison/smoke-gpu-plain.json",
+            "sha256": "1d7ab8c06d3bbcb7be186cdb4366d9e9e9904e80ee661b8b741c14515496ffa2"
+          }
+        }
+      ],
+      "provenance": "Stable full39-file bundle snapshots surround the release HTTP matrix; existing summary harness emits semantic digests"
+    },
+    "same_payload_grammar_http_features": {
+      "cpu": {
+        "status": "passed",
+        "cases": 20,
+        "positive_feature_cases": 12,
+        "max_probability_abs_error": 2.9802322387695312e-08,
+        "report": {
+          "path": ".build/vram-neutral-20261031/http-features/cpu.json",
+          "sha256": "192481381cc24c61bac3131e6c07b9593051bae3ce22ae52d71c570becd67196"
+        }
+      },
+      "gpu": {
+        "status": "passed",
+        "cases": 20,
+        "positive_feature_cases": 12,
+        "max_probability_abs_error": 2.9802322387695312e-08,
+        "report": {
+          "path": ".build/vram-neutral-20261031/http-features/gpu.json",
+          "sha256": "461dcb50bb1dde1ecf6573ba70ae7a9053844c6cab35aab20727b8588212d1a1"
+        }
+      }
+    },
+    "dry_backend_http": {
+      "cpu": {
+        "status": "passed",
+        "raw_requests": 127,
+        "default_cases_per_payload": 26,
+        "opt_in_cases": 25,
+        "actual_complete_backend_cases": 7,
+        "actual_loaded_core_module_pins": true,
+        "default_outputs_exact": true,
+        "opt_in_repeatable": true,
+        "old_stochastic_host_dist_seed_parity_claimed": false,
+        "report": {
+          "path": ".build/vram-neutral-20261031/dry-http-cpu/report.json",
+          "sha256": "072f14014eb8bc9ba320c1c1630beba25601c3ee4e89e42b2f457f63bd36cfee"
+        }
+      },
+      "gpu": {
+        "status": "passed",
+        "raw_requests": 127,
+        "default_cases_per_payload": 26,
+        "opt_in_cases": 25,
+        "actual_complete_backend_cases": 7,
+        "actual_loaded_core_module_pins": true,
+        "default_outputs_exact": true,
+        "opt_in_repeatable": true,
+        "old_stochastic_host_dist_seed_parity_claimed": false,
+        "report": {
+          "path": ".build/vram-neutral-20261031/dry-http-gpu/report.json",
+          "sha256": "77c9e0282a5e2b437b78deb4f7987020685899425b6d0792c58801b9a5e1b631"
+        }
+      }
+    },
+    "decode_overlap_http": {
+      "cpu": {
+        "status": "passed",
+        "cases": 17,
+        "exact_sse": true,
+        "cancellation_recovery_exact": true,
+        "actual_loaded_core_module_pins": true,
+        "actual_queued": 0,
+        "actual_consumed": 0,
+        "actual_cancel_discarded": 0,
+        "report": {
+          "path": ".build/vram-neutral-20261031/decode-overlap-cpu/report.json",
+          "sha256": "bbd9c8b5d27ee86bebde4eace9cc6ebe7fdd2b942dd3b3509fc292f070defd9e"
+        },
+        "scope": "One known accepted token ahead while CPU formats streaming output; not autonomous GPU token feedback",
+        "timing": {
+          "cycles": 4,
+          "warmups_per_control": 3,
+          "median_wall_ms": {
+            "disabled": 165.94154999984312,
+            "enabled": 164.74840000046242
+          },
+          "median_native_reported_tokens_per_second": {
+            "disabled": 836.9954692614613,
+            "enabled": 841.402398695705
+          },
+          "median_end_to_end_tokens_per_second": {
+            "disabled": 771.4198688026675,
+            "enabled": 776.9422950929048
+          },
+          "median_first_nonempty_content_ms": {
+            "disabled": 13.736049999351962,
+            "enabled": 13.644799999383395
+          },
+          "cold_first_completion_ttft_ms": {
+            "disabled": 13.551100000768201,
+            "enabled": 13.852500000211876
+          },
+          "warmup_ttft_ms": {
+            "disabled": [
+              13.666399998328416,
+              15.365600000222912
+            ],
+            "enabled": [
+              14.965099999244558,
+              14.138099999399856
+            ]
+          },
+          "ttft_definition": "Client-observed time to first parsed SSE event containing a nonempty content string; excludes empty progress events",
+          "cold_first_completion_definition": "First completion after a fresh server is health-ready; excludes model load. Native initialization may already run capability probes, so this is not fully cold CUDA startup.",
+          "latency_change_percent": -0.7190182322521554,
+          "debug_io_excluded": true,
+          "log_verbosity": 4,
+          "scope": "Tiny random-weight SSE latency and actual native-reported throughput, same binary; not trained-model TPS"
+        }
+      },
+      "gpu": {
+        "status": "passed",
+        "cases": 17,
+        "exact_sse": true,
+        "cancellation_recovery_exact": true,
+        "actual_loaded_core_module_pins": true,
+        "actual_queued": 212,
+        "actual_consumed": 211,
+        "actual_cancel_discarded": 1,
+        "report": {
+          "path": ".build/vram-neutral-20261031/decode-overlap-gpu/report.json",
+          "sha256": "f7ab0a11012e25a88a7cdd025dcac77d90cdb9fbc77eb53d0cdc4fe2a1c63033"
+        },
+        "scope": "One known accepted token ahead while CPU formats streaming output; not autonomous GPU token feedback",
+        "timing": {
+          "cycles": 4,
+          "warmups_per_control": 3,
+          "median_wall_ms": {
+            "disabled": 89.99380000022938,
+            "enabled": 82.0531999997911
+          },
+          "median_native_reported_tokens_per_second": {
+            "disabled": 1528.0330673770395,
+            "enabled": 1677.8356264766358
+          },
+          "median_end_to_end_tokens_per_second": {
+            "disabled": 1422.6682505405324,
+            "enabled": 1559.9706073502634
+          },
+          "median_first_nonempty_content_ms": {
+            "disabled": 7.299150000108057,
+            "enabled": 8.381049998206436
+          },
+          "cold_first_completion_ttft_ms": {
+            "disabled": 5732.133600002271,
+            "enabled": 7487.82299999948
+          },
+          "warmup_ttft_ms": {
+            "disabled": [
+              9.770799999387236,
+              9.297699998569442
+            ],
+            "enabled": [
+              32.34639999936917,
+              11.012300001311814
+            ]
+          },
+          "ttft_definition": "Client-observed time to first parsed SSE event containing a nonempty content string; excludes empty progress events",
+          "cold_first_completion_definition": "First completion after a fresh server is health-ready; excludes model load. Native initialization may already run capability probes, so this is not fully cold CUDA startup.",
+          "latency_change_percent": -8.823496730239244,
+          "debug_io_excluded": true,
+          "log_verbosity": 4,
+          "scope": "Tiny random-weight SSE latency and actual native-reported throughput, same binary; not trained-model TPS"
+        }
+      }
+    },
+    "memory_neutral_components": {
+      "status": "passed",
+      "all_required_roles_checked": true,
+      "components": {
+        "server_visitor_cpu": {
+          "status": "passed",
+          "device": "cpu",
+          "report": {
+            "path": ".build/vram-neutral-20261031/components/visitor.json",
+            "sha256": "a63ce2c9298e90afb4c1780c9accec6bf4b40d8b0f5e3156281bbb1289cb60f6"
+          },
+          "assertions": [
+            {
+              "role": "exact_output",
+              "left": "/exact_output_verified_from_raw_exit_and_markers",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "allocation_count",
+              "left": "/raw_markers/allocations/concrete",
+              "op": "lte",
+              "left_observed": 0,
+              "right": "/raw_markers/allocations/legacy",
+              "right_observed": 4096
+            },
+            {
+              "role": "allocation_count",
+              "left": "/raw_markers/allocations/legacy",
+              "op": "eq",
+              "left_observed": 4096,
+              "value": 4096,
+              "right_observed": 4096
+            },
+            {
+              "role": "allocation_count",
+              "left": "/raw_markers/allocations/concrete",
+              "op": "eq",
+              "left_observed": 0,
+              "value": 0,
+              "right_observed": 0
+            }
+          ],
+          "pins": [
+            {
+              "category": "harness",
+              "path": ".build/vram-neutral-20261031/run_components.py",
+              "sha256": "fa24f2353839035dda942279fa67a8abeb057f7fa8aee9fb2c4e1d883d207da6"
+            },
+            {
+              "category": "raw_log",
+              "path": ".build/vram-neutral-20261031/components/visitor.stdout.log",
+              "sha256": "ce159c405694c58dfd2e8357237354775385202e670183278941867050b005e8"
+            },
+            {
+              "category": "binary",
+              "root": "build",
+              "path": "bin/test-server-slot-iteration.exe",
+              "sha256": "3e3434cb9a85d073819d33f41f7902455db99a78678127ea0ce43b9c29392389"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "tools/server/server-slot-iteration.h",
+              "sha256": "10996e19c97c8a6ff6a41142230d26081841a6817dfc82372ec8276bd6a23282"
+            },
+            {
+              "category": "harness",
+              "root": "native",
+              "path": "tests/test-server-slot-iteration.cpp",
+              "sha256": "cf28eca86bdf239ebb4aa50e2a62c86c311984e33542e2d524ceea01b7b85d3c"
+            }
+          ],
+          "timings": [
+            {
+              "name": "slot-visitor",
+              "legacy": 1473.2,
+              "optimized": 337.15,
+              "paired_rounds_or_cycles": 8,
+              "sampling": "8 ABBA cycles; 16 timing samples per control",
+              "unit": "us",
+              "component_only": true
+            }
+          ],
+          "model_tokens_per_second_not_measured": true
+        },
+        "top_p_fusion_cpu": {
+          "status": "passed",
+          "device": "cpu",
+          "report": {
+            "path": ".build/vram-neutral-20261031/components/fusion-cpu.json",
+            "sha256": "b33f0a7e29835a30f36cf5cbc87e6bf1e3ed8f4643f83653556cab9a382e23c2"
+          },
+          "assertions": [
+            {
+              "role": "exact_output",
+              "left": "/exact_output_verified_from_raw_exit_and_markers",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "old_graph_reference",
+              "left": "/old_graph_reference_verified_from_raw_exit_and_markers",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/direct/fused_peak",
+              "op": "lte",
+              "left_observed": 12288,
+              "right": "/raw_markers/direct/legacy_peak",
+              "right_observed": 16384
+            },
+            {
+              "role": "exact_output",
+              "left": "/raw_markers/timing_medians_independently_recomputed",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/0/fused_bytes",
+              "op": "lte",
+              "left_observed": 192,
+              "right": "/raw_markers/timings/0/legacy_bytes",
+              "right_observed": 288
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/1/fused_bytes",
+              "op": "lte",
+              "left_observed": 256,
+              "right": "/raw_markers/timings/1/legacy_bytes",
+              "right_observed": 288
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/2/fused_bytes",
+              "op": "lte",
+              "left_observed": 288,
+              "right": "/raw_markers/timings/2/legacy_bytes",
+              "right_observed": 384
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/3/fused_bytes",
+              "op": "lte",
+              "left_observed": 384,
+              "right": "/raw_markers/timings/3/legacy_bytes",
+              "right_observed": 384
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/4/fused_bytes",
+              "op": "lte",
+              "left_observed": 480,
+              "right": "/raw_markers/timings/4/legacy_bytes",
+              "right_observed": 640
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/5/fused_bytes",
+              "op": "lte",
+              "left_observed": 640,
+              "right": "/raw_markers/timings/5/legacy_bytes",
+              "right_observed": 640
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/6/fused_bytes",
+              "op": "lte",
+              "left_observed": 768,
+              "right": "/raw_markers/timings/6/legacy_bytes",
+              "right_observed": 1024
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/7/fused_bytes",
+              "op": "lte",
+              "left_observed": 1024,
+              "right": "/raw_markers/timings/7/legacy_bytes",
+              "right_observed": 1024
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/8/fused_bytes",
+              "op": "lte",
+              "left_observed": 1536,
+              "right": "/raw_markers/timings/8/legacy_bytes",
+              "right_observed": 2048
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/9/fused_bytes",
+              "op": "lte",
+              "left_observed": 2048,
+              "right": "/raw_markers/timings/9/legacy_bytes",
+              "right_observed": 2048
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/10/fused_bytes",
+              "op": "lte",
+              "left_observed": 3072,
+              "right": "/raw_markers/timings/10/legacy_bytes",
+              "right_observed": 4096
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/11/fused_bytes",
+              "op": "lte",
+              "left_observed": 4096,
+              "right": "/raw_markers/timings/11/legacy_bytes",
+              "right_observed": 4096
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/12/fused_bytes",
+              "op": "lte",
+              "left_observed": 6144,
+              "right": "/raw_markers/timings/12/legacy_bytes",
+              "right_observed": 8192
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/13/fused_bytes",
+              "op": "lte",
+              "left_observed": 8192,
+              "right": "/raw_markers/timings/13/legacy_bytes",
+              "right_observed": 8192
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/14/fused_bytes",
+              "op": "lte",
+              "left_observed": 12288,
+              "right": "/raw_markers/timings/14/legacy_bytes",
+              "right_observed": 16384
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/timings/15/fused_bytes",
+              "op": "lte",
+              "left_observed": 16384,
+              "right": "/raw_markers/timings/15/legacy_bytes",
+              "right_observed": 16384
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/chain_memory/0/fused_bytes",
+              "op": "lte",
+              "left_observed": 1184,
+              "right": "/raw_markers/chain_memory/0/legacy_bytes",
+              "right_observed": 1184
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/chain_memory/1/fused_bytes",
+              "op": "lte",
+              "left_observed": 2112,
+              "right": "/raw_markers/chain_memory/1/legacy_bytes",
+              "right_observed": 2112
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/chain_memory/2/fused_bytes",
+              "op": "lte",
+              "left_observed": 1248,
+              "right": "/raw_markers/chain_memory/2/legacy_bytes",
+              "right_observed": 1248
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/chain_memory/3/fused_bytes",
+              "op": "lte",
+              "left_observed": 2112,
+              "right": "/raw_markers/chain_memory/3/legacy_bytes",
+              "right_observed": 2112
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/chain_memory/4/fused_bytes",
+              "op": "lte",
+              "left_observed": 4128,
+              "right": "/raw_markers/chain_memory/4/legacy_bytes",
+              "right_observed": 4128
+            },
+            {
+              "role": "managed_compute_limit",
+              "left": "/raw_markers/chain_memory/5/fused_bytes",
+              "op": "lte",
+              "left_observed": 5184,
+              "right": "/raw_markers/chain_memory/5/legacy_bytes",
+              "right_observed": 5184
+            },
+            {
+              "role": "exact_output",
+              "left": "/raw_markers/automatic_default/PASS",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "automatic_default_policy",
+              "left": "/raw_markers/automatic_default/candidate_limit",
+              "op": "eq",
+              "left_observed": 1024,
+              "value": 1024,
+              "right_observed": 1024
+            },
+            {
+              "role": "exact_output",
+              "left": "/raw_markers/empty_environment/PASS",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            }
+          ],
+          "pins": [
+            {
+              "category": "harness",
+              "path": ".build/vram-neutral-20261031/run_components.py",
+              "sha256": "fa24f2353839035dda942279fa67a8abeb057f7fa8aee9fb2c4e1d883d207da6"
+            },
+            {
+              "category": "raw_log",
+              "path": ".build/vram-neutral-20261031/components/fusion-cpu.stdout.log",
+              "sha256": "e45f8e750cf02a50a12d5d8a12c61c1e1f20ac539d0cf1ef95bb26ad1f47c8c4"
+            },
+            {
+              "category": "binary",
+              "root": "build",
+              "path": "bin/test-top-p-mask-fusion.exe",
+              "sha256": "f9e70aea14b20615ef9a462eddff5a309d2c45df8694468cba5787d4fe1f669e"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "src/llama-sampler.cpp",
+              "sha256": "639423e07e40ce1858b008faa879dd3522c0d5cfd8386fe53c57854331f15999"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "ggml/src/ggml.c",
+              "sha256": "93db71374e13ec0f596391ea1f8504f2c4d6eec1c14db80944555e1d8340dcea"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "ggml/src/ggml-cpu/ops.cpp",
+              "sha256": "2acd99f71d48cef802cc2edac944cd03db6993dffedf1b3d10b44a3e7bbac1dc"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "ggml/src/ggml-cuda/token-mask.cu",
+              "sha256": "3a00f59f6e1eb0e503228c172f44946cf079594a933c598912a0e0c5c779bafe"
+            },
+            {
+              "category": "harness",
+              "root": "native",
+              "path": "tests/test-top-p-mask-fusion.cpp",
+              "sha256": "be7940ca39c26c5f62461d13e0707db72cdf000808dafc605593458b25c9ff37"
+            }
+          ],
+          "timings": [
+            {
+              "name": "top-p-mask-n10-full0",
+              "legacy": 7.1295,
+              "optimized": 0.471125,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n10-full1",
+              "legacy": 16.69675,
+              "optimized": 9.38775,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n20-full0",
+              "legacy": 12.941,
+              "optimized": 0.63325,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n20-full1",
+              "legacy": 17.025125,
+              "optimized": 9.01575,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n40-full0",
+              "legacy": 12.812,
+              "optimized": 0.673125,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n40-full1",
+              "legacy": 17.32625,
+              "optimized": 10.0215,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n64-full0",
+              "legacy": 16.543125,
+              "optimized": 0.714625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n64-full1",
+              "legacy": 17.791625,
+              "optimized": 9.54225,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n128-full0",
+              "legacy": 13.7325,
+              "optimized": 0.878875,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n128-full1",
+              "legacy": 22.79375,
+              "optimized": 11.477625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n256-full0",
+              "legacy": 14.7215,
+              "optimized": 1.1035,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n256-full1",
+              "legacy": 28.152,
+              "optimized": 15.33375,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n512-full0",
+              "legacy": 21.69225,
+              "optimized": 2.17425,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n512-full1",
+              "legacy": 45.054875,
+              "optimized": 24.503625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n1024-full0",
+              "legacy": 25.303625,
+              "optimized": 2.9935,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n1024-full1",
+              "legacy": 66.5605,
+              "optimized": 34.968625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            }
+          ],
+          "model_tokens_per_second_not_measured": true
+        },
+        "top_p_fusion_cuda": {
+          "status": "passed",
+          "device": "cuda",
+          "report": {
+            "path": ".build/vram-neutral-20261031/components/fusion-cuda.json",
+            "sha256": "315ccfba922dd9d1afdacf605a6bd4777415d80e9c412f5f86bb96117a8e19c3"
+          },
+          "assertions": [
+            {
+              "role": "exact_output",
+              "left": "/exact_output_verified_from_raw_exit_and_markers",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "old_graph_reference",
+              "left": "/old_graph_reference_verified_from_raw_exit_and_markers",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/direct/fused_peak",
+              "op": "lte",
+              "left_observed": 12288,
+              "right": "/raw_markers/direct/legacy_peak",
+              "right_observed": 16384
+            },
+            {
+              "role": "no_persistent_gpu_storage",
+              "left": "/new_persistent_gpu_storage_bytes",
+              "op": "eq",
+              "left_observed": 0,
+              "value": 0,
+              "right_observed": 0
+            },
+            {
+              "role": "exact_output",
+              "left": "/raw_markers/timing_medians_independently_recomputed",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/0/fused_bytes",
+              "op": "lte",
+              "left_observed": 384,
+              "right": "/raw_markers/timings/0/legacy_bytes",
+              "right_observed": 768
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/1/fused_bytes",
+              "op": "lte",
+              "left_observed": 512,
+              "right": "/raw_markers/timings/1/legacy_bytes",
+              "right_observed": 768
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/2/fused_bytes",
+              "op": "lte",
+              "left_observed": 384,
+              "right": "/raw_markers/timings/2/legacy_bytes",
+              "right_observed": 768
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/3/fused_bytes",
+              "op": "lte",
+              "left_observed": 512,
+              "right": "/raw_markers/timings/3/legacy_bytes",
+              "right_observed": 768
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/4/fused_bytes",
+              "op": "lte",
+              "left_observed": 768,
+              "right": "/raw_markers/timings/4/legacy_bytes",
+              "right_observed": 1152
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/5/fused_bytes",
+              "op": "lte",
+              "left_observed": 1024,
+              "right": "/raw_markers/timings/5/legacy_bytes",
+              "right_observed": 1152
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/6/fused_bytes",
+              "op": "lte",
+              "left_observed": 768,
+              "right": "/raw_markers/timings/6/legacy_bytes",
+              "right_observed": 1152
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/7/fused_bytes",
+              "op": "lte",
+              "left_observed": 1024,
+              "right": "/raw_markers/timings/7/legacy_bytes",
+              "right_observed": 1152
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/8/fused_bytes",
+              "op": "lte",
+              "left_observed": 1536,
+              "right": "/raw_markers/timings/8/legacy_bytes",
+              "right_observed": 2048
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/9/fused_bytes",
+              "op": "lte",
+              "left_observed": 2048,
+              "right": "/raw_markers/timings/9/legacy_bytes",
+              "right_observed": 2048
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/10/fused_bytes",
+              "op": "lte",
+              "left_observed": 3072,
+              "right": "/raw_markers/timings/10/legacy_bytes",
+              "right_observed": 4096
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/11/fused_bytes",
+              "op": "lte",
+              "left_observed": 4096,
+              "right": "/raw_markers/timings/11/legacy_bytes",
+              "right_observed": 4096
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/12/fused_bytes",
+              "op": "lte",
+              "left_observed": 6144,
+              "right": "/raw_markers/timings/12/legacy_bytes",
+              "right_observed": 8192
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/13/fused_bytes",
+              "op": "lte",
+              "left_observed": 8192,
+              "right": "/raw_markers/timings/13/legacy_bytes",
+              "right_observed": 8192
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/14/fused_bytes",
+              "op": "lte",
+              "left_observed": 12288,
+              "right": "/raw_markers/timings/14/legacy_bytes",
+              "right_observed": 16384
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/timings/15/fused_bytes",
+              "op": "lte",
+              "left_observed": 16384,
+              "right": "/raw_markers/timings/15/legacy_bytes",
+              "right_observed": 16384
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/chain_memory/0/fused_bytes",
+              "op": "lte",
+              "left_observed": 1408,
+              "right": "/raw_markers/chain_memory/0/legacy_bytes",
+              "right_observed": 1408
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/chain_memory/1/fused_bytes",
+              "op": "lte",
+              "left_observed": 2304,
+              "right": "/raw_markers/chain_memory/1/legacy_bytes",
+              "right_observed": 2304
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/chain_memory/2/fused_bytes",
+              "op": "lte",
+              "left_observed": 1408,
+              "right": "/raw_markers/chain_memory/2/legacy_bytes",
+              "right_observed": 1408
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/chain_memory/3/fused_bytes",
+              "op": "lte",
+              "left_observed": 2304,
+              "right": "/raw_markers/chain_memory/3/legacy_bytes",
+              "right_observed": 2304
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/chain_memory/4/fused_bytes",
+              "op": "lte",
+              "left_observed": 4224,
+              "right": "/raw_markers/chain_memory/4/legacy_bytes",
+              "right_observed": 4224
+            },
+            {
+              "role": "cuda_managed_compute_limit",
+              "left": "/raw_markers/chain_memory/5/fused_bytes",
+              "op": "lte",
+              "left_observed": 5376,
+              "right": "/raw_markers/chain_memory/5/legacy_bytes",
+              "right_observed": 5376
+            },
+            {
+              "role": "exact_output",
+              "left": "/raw_markers/automatic_default/PASS",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            },
+            {
+              "role": "automatic_default_policy",
+              "left": "/raw_markers/automatic_default/candidate_limit",
+              "op": "eq",
+              "left_observed": 256,
+              "value": 256,
+              "right_observed": 256
+            },
+            {
+              "role": "exact_output",
+              "left": "/raw_markers/empty_environment/PASS",
+              "op": "eq",
+              "left_observed": true,
+              "value": true,
+              "right_observed": true
+            }
+          ],
+          "pins": [
+            {
+              "category": "harness",
+              "path": ".build/vram-neutral-20261031/run_components.py",
+              "sha256": "fa24f2353839035dda942279fa67a8abeb057f7fa8aee9fb2c4e1d883d207da6"
+            },
+            {
+              "category": "raw_log",
+              "path": ".build/vram-neutral-20261031/components/fusion-cuda.stdout.log",
+              "sha256": "511d56345934f0536cebbfc3a26814f91333942b4c900328892852e592db63b3"
+            },
+            {
+              "category": "binary",
+              "root": "build",
+              "path": "bin/test-top-p-mask-fusion.exe",
+              "sha256": "f9e70aea14b20615ef9a462eddff5a309d2c45df8694468cba5787d4fe1f669e"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "src/llama-sampler.cpp",
+              "sha256": "639423e07e40ce1858b008faa879dd3522c0d5cfd8386fe53c57854331f15999"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "ggml/src/ggml.c",
+              "sha256": "93db71374e13ec0f596391ea1f8504f2c4d6eec1c14db80944555e1d8340dcea"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "ggml/src/ggml-cpu/ops.cpp",
+              "sha256": "2acd99f71d48cef802cc2edac944cd03db6993dffedf1b3d10b44a3e7bbac1dc"
+            },
+            {
+              "category": "production_source",
+              "root": "native",
+              "path": "ggml/src/ggml-cuda/token-mask.cu",
+              "sha256": "3a00f59f6e1eb0e503228c172f44946cf079594a933c598912a0e0c5c779bafe"
+            },
+            {
+              "category": "harness",
+              "root": "native",
+              "path": "tests/test-top-p-mask-fusion.cpp",
+              "sha256": "be7940ca39c26c5f62461d13e0707db72cdf000808dafc605593458b25c9ff37"
+            }
+          ],
+          "timings": [
+            {
+              "name": "top-p-mask-n10-full0",
+              "legacy": 20.61825,
+              "optimized": 18.1305,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n10-full1",
+              "legacy": 30.5325,
+              "optimized": 21.197625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n20-full0",
+              "legacy": 20.031625,
+              "optimized": 18.147125,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n20-full1",
+              "legacy": 32.430875,
+              "optimized": 24.94625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n40-full0",
+              "legacy": 21.028125,
+              "optimized": 20.915625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n40-full1",
+              "legacy": 38.911625,
+              "optimized": 28.39775,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n64-full0",
+              "legacy": 22.8855,
+              "optimized": 20.4335,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n64-full1",
+              "legacy": 37.76575,
+              "optimized": 29.712625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n128-full0",
+              "legacy": 22.75525,
+              "optimized": 20.511375,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n128-full1",
+              "legacy": 40.709375,
+              "optimized": 30.761625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n256-full0",
+              "legacy": 20.644875,
+              "optimized": 19.508125,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n256-full1",
+              "legacy": 38.236875,
+              "optimized": 32.728,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n512-full0",
+              "legacy": 21.446,
+              "optimized": 18.789125,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n512-full1",
+              "legacy": 77.228375,
+              "optimized": 65.210625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n1024-full0",
+              "legacy": 47.55975,
+              "optimized": 35.915625,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            },
+            {
+              "name": "top-p-mask-n1024-full1",
+              "legacy": 114.653625,
+              "optimized": 105.4955,
+              "paired_rounds_or_cycles": 16,
+              "sampling": "16 alternating paired rounds; 8 ABBA cycles; 16 raw samples/control; median; 400 graph evaluations/sample",
+              "unit": "us",
+              "component_only": true
+            }
+          ],
+          "model_tokens_per_second_not_measured": true
+        }
+      },
+      "new_persistent_gpu_storage_bytes": 0,
+      "automatic_top_p_fusion_policy": {
+        "standard_cpu_max_candidates": 1024,
+        "nvidia_cuda_max_candidates": 256,
+        "other_backends": "legacy_by_default",
+        "explicit_1_diagnostic_max_candidates": 1024,
+        "explicit_0_and_unknown_values": "legacy"
+      },
+      "automatic_default_timing_gate": {
+        "cpu": {
+          "status": "passed",
+          "maximum_automatic_candidates": 1024,
+          "automatic_rows": [
+            {
+              "n": 10,
+              "full": 0,
+              "legacy_us": 7.1295,
+              "fused_us": 0.471125,
+              "ratio": 0.066081,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 10,
+              "full": 1,
+              "legacy_us": 16.69675,
+              "fused_us": 9.38775,
+              "ratio": 0.56225,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 20,
+              "full": 0,
+              "legacy_us": 12.941,
+              "fused_us": 0.63325,
+              "ratio": 0.048934,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 20,
+              "full": 1,
+              "legacy_us": 17.025125,
+              "fused_us": 9.01575,
+              "ratio": 0.529556,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 40,
+              "full": 0,
+              "legacy_us": 12.812,
+              "fused_us": 0.673125,
+              "ratio": 0.052539,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 40,
+              "full": 1,
+              "legacy_us": 17.32625,
+              "fused_us": 10.0215,
+              "ratio": 0.5784,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 64,
+              "full": 0,
+              "legacy_us": 16.543125,
+              "fused_us": 0.714625,
+              "ratio": 0.043198,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 64,
+              "full": 1,
+              "legacy_us": 17.791625,
+              "fused_us": 9.54225,
+              "ratio": 0.536334,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 128,
+              "full": 0,
+              "legacy_us": 13.7325,
+              "fused_us": 0.878875,
+              "ratio": 0.064,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 128,
+              "full": 1,
+              "legacy_us": 22.79375,
+              "fused_us": 11.477625,
+              "ratio": 0.503543,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 256,
+              "full": 0,
+              "legacy_us": 14.7215,
+              "fused_us": 1.1035,
+              "ratio": 0.074958,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 256,
+              "full": 1,
+              "legacy_us": 28.152,
+              "fused_us": 15.33375,
+              "ratio": 0.544677,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 512,
+              "full": 0,
+              "legacy_us": 21.69225,
+              "fused_us": 2.17425,
+              "ratio": 0.100232,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 512,
+              "full": 1,
+              "legacy_us": 45.054875,
+              "fused_us": 24.503625,
+              "ratio": 0.543862,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 1024,
+              "full": 0,
+              "legacy_us": 25.303625,
+              "fused_us": 2.9935,
+              "ratio": 0.118303,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 1024,
+              "full": 1,
+              "legacy_us": 66.5605,
+              "fused_us": 34.968625,
+              "ratio": 0.525366,
+              "nonregressing": true,
+              "root_noise_review": null
+            }
+          ],
+          "diagnostic_only_rows": [],
+          "diagnostic_scope": "Explicit fused graphs may be benchmarked through1024; larger CUDA range remains legacy automatically"
+        },
+        "cuda": {
+          "status": "passed",
+          "maximum_automatic_candidates": 256,
+          "automatic_rows": [
+            {
+              "n": 10,
+              "full": 0,
+              "legacy_us": 20.61825,
+              "fused_us": 18.1305,
+              "ratio": 0.879342,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 10,
+              "full": 1,
+              "legacy_us": 30.5325,
+              "fused_us": 21.197625,
+              "ratio": 0.694264,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 20,
+              "full": 0,
+              "legacy_us": 20.031625,
+              "fused_us": 18.147125,
+              "ratio": 0.905924,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 20,
+              "full": 1,
+              "legacy_us": 32.430875,
+              "fused_us": 24.94625,
+              "ratio": 0.769213,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 40,
+              "full": 0,
+              "legacy_us": 21.028125,
+              "fused_us": 20.915625,
+              "ratio": 0.99465,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 40,
+              "full": 1,
+              "legacy_us": 38.911625,
+              "fused_us": 28.39775,
+              "ratio": 0.729801,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 64,
+              "full": 0,
+              "legacy_us": 22.8855,
+              "fused_us": 20.4335,
+              "ratio": 0.892858,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 64,
+              "full": 1,
+              "legacy_us": 37.76575,
+              "fused_us": 29.712625,
+              "ratio": 0.786761,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 128,
+              "full": 0,
+              "legacy_us": 22.75525,
+              "fused_us": 20.511375,
+              "ratio": 0.901391,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 128,
+              "full": 1,
+              "legacy_us": 40.709375,
+              "fused_us": 30.761625,
+              "ratio": 0.75564,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 256,
+              "full": 0,
+              "legacy_us": 20.644875,
+              "fused_us": 19.508125,
+              "ratio": 0.944938,
+              "nonregressing": true,
+              "root_noise_review": null
+            },
+            {
+              "n": 256,
+              "full": 1,
+              "legacy_us": 38.236875,
+              "fused_us": 32.728,
+              "ratio": 0.855928,
+              "nonregressing": true,
+              "root_noise_review": null
+            }
+          ],
+          "diagnostic_only_rows": [
+            {
+              "n": 512,
+              "full": 0,
+              "ratio": 0.876113,
+              "default_nonregression_claimed": false
+            },
+            {
+              "n": 512,
+              "full": 1,
+              "ratio": 0.844387,
+              "default_nonregression_claimed": false
+            },
+            {
+              "n": 1024,
+              "full": 0,
+              "ratio": 0.755168,
+              "default_nonregression_claimed": false
+            },
+            {
+              "n": 1024,
+              "full": 1,
+              "ratio": 0.920124,
+              "default_nonregression_claimed": false
+            }
+          ],
+          "diagnostic_scope": "Explicit fused graphs may be benchmarked through1024; larger CUDA range remains legacy automatically"
+        }
+      },
+      "scope": "Reviewed component correctness/allocation/CPU or CUDA managed compute evidence; no model TPS claim"
+    },
+    "native_feature_discovery": {
+      "status": "passed",
+      "schema": 1,
+      "cases": 2,
+      "environment_keys": 3,
+      "no_model_loaded": true,
+      "report": {
+        "path": ".build/vram-neutral-20261031/native-release/feature-discovery/report.json",
+        "sha256": "6b1ec84c5eeae9b700539d8a7d0be14a4123a5202db51fe98215e515cc3f5e6f"
+      }
+    },
+    "sampler_scratch_withdrawal": {
+      "status": "passed",
+      "decision": "withdrawn",
+      "production_helper_exact_a245": true,
+      "original_helper_sha256": "fb756ddbd03dfc8dfc5ec9441e1a0703890202be3a78955048a5f519ffb187d6",
+      "literal_helper_comparison": "Function text identical; only universal newline handling, no whitespace/code normalization",
+      "reason": "The final large-vocabulary CPU component regressed; previous processes improved, so performance was not reliably nonregressing. Do not ship054. Candidate bits/allocation checks passed but do not override performance rejection.",
+      "observations": [
+        {
+          "run": "final-run",
+          "report": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/final-run.json",
+            "sha256": "ef28a59eaf3ed223eb9a2c78f50f6c7fc3aa056d6776ef414402eaad5c0d01cb"
+          },
+          "raw_log": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/final-run.log",
+            "sha256": "b921fa0446562ac469bfeec353f7f762bcceb3bd5dba035e1e329eb3a1b5416e"
+          },
+          "n": 248320,
+          "legacy_ms": 0.66438125,
+          "rejected_ms": 0.72214375,
+          "ratio": 1.0869417973490372,
+          "change_percent": 8.694179734903717,
+          "performance_accepted": false
+        },
+        {
+          "run": "prior-01",
+          "report": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/prior-01.json",
+            "sha256": "0b15d9db9d99865f4d83db367ec60abdb202c339fe17680f5621dff582e0115a"
+          },
+          "raw_log": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/prior-01.log",
+            "sha256": "ccbef1fc0ee5ffb1cf87a10c726427918e12258e186aea183404dd68490a0627"
+          },
+          "n": 248320,
+          "legacy_ms": 0.887240625,
+          "rejected_ms": 0.739611328,
+          "ratio": 0.8336085016395636,
+          "change_percent": -16.639149836043643,
+          "performance_accepted": false
+        },
+        {
+          "run": "prior-02",
+          "report": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/prior-02.json",
+            "sha256": "d250e9f5952e60533ee0895ca74d03066c2ea58d3008abbb5a9a4b772e1adb9a"
+          },
+          "raw_log": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/prior-02.log",
+            "sha256": "84d207fd9d1aeecd4c5b1ec9a8c6fe9e3bf27410b42300c02ca3d4b6522db2b2"
+          },
+          "n": 248320,
+          "legacy_ms": 1.004362891,
+          "rejected_ms": 0.764892969,
+          "ratio": 0.7615703207019424,
+          "change_percent": -23.84296792980576,
+          "performance_accepted": false
+        },
+        {
+          "run": "prior-03",
+          "report": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/prior-03.json",
+            "sha256": "487b03ea0e410a04a45e14b7d4b4b5d48191b16cd082fb6c973ee6978781cf19"
+          },
+          "raw_log": {
+            "path": ".build/vram-neutral-20261031/rejected-054-evidence/prior-03.log",
+            "sha256": "11276e27530d434d752ba88fccae88c886dcc1561a936aeea60fc0eb386da1d4"
+          },
+          "n": 248320,
+          "legacy_ms": 0.973863281,
+          "rejected_ms": 0.705675781,
+          "ratio": 0.7246148353343655,
+          "change_percent": -27.538516466563443,
+          "performance_accepted": false
+        }
+      ],
+      "withdrawal_receipt": {
+        "path": ".build/vram-neutral-20261031/rejected-054-evidence/withdraw054-receipt.json",
+        "sha256": "2e650829b9bdcafa4bfa5ffb294c1461d0825609e02bc472fae22ff8fb242227"
+      },
+      "candidate_output_and_allocation_tests_overrode_performance_rejection": false,
+      "trained_model_tokens_per_second_claimed": false,
+      "evidence_manifest": {
+        "path": ".build/vram-neutral-20261031/rejected-054-evidence/rejection-evidence.json",
+        "sha256": "162d28bc3ffff68bc0dd18eef649704e22f4863b4f04f13b93ce1fcbf041f405"
+      }
+    }
+  },
+  "tracked_inputs_sha256": {
+    "LLAMA_CPP_VERSION": "e27baf5cae7a8e224d3febe87f1d7a8d49a613fa291e8ef9297ff859244454ea",
+    "README.md": "3c0dcb4e29014c6caa60cd0379d01de28460d239bb93386bc35626c6c168f4c9",
+    "cmake/apply-git-patches.cmake": "aae7850f2a8057c1ee0435393c62679c683cf4e9b63fca41cabcac198ab4426a",
+    "docs/dense-default-runtime.md": "f0569b5ea025acdc14dadbeed874c17ded0e91ac463fffaeca81edc93aa8891f",
+    "docs/execution-pipeline.md": "60ce53ece8a2688fcb88e3ce090aa99fbcf13ecb36901173193f9c21bc23d459",
+    "docs/memory-neutral-runtime.md": "822a0b4f189ada34b50fc16c9a69e137733dc260552ef3d0d1c4469a1b27108c",
+    "docs/resident-execution.md": "acf83f774f2fd73fe9b94a6b8abe10e9d18c052a89a9c6537046352bf952e515",
+    "docs/sglang-pipeline-followups.md": "9718afd51b0d8cbb01b880bd18e99fc1c2e568ad295085b6a06158d5df454065",
+    "integration/generate_dense_decode_fixture.py": "6164d72edca366f5a1861a9ee3dbfd567580b3fbefd8ddd0bc9dfff8bf82b991",
+    "integration/generate_dense_prefill_fixtures.py": "5a9d0b40f83ecc203fd2d0f7ecf4365700ee6ee609f16b4a6388e93be20e68c4",
+    "integration/native_decode_overlap_smoke.py": "a5c7daa0f96d63cdbfde8bc8efe96f7d90f769c7ab49c80083f89eef1d7dd8c4",
+    "integration/native_dense_decode_benchmark.py": "ff40c9567454406af1dc217d20a024f3f9bdb99e05c2929a01c4b06f0a2ca62f",
+    "integration/native_dense_logprob_smoke.py": "8ad77b35c7fc0fae62300880f002ffd18e6759bd152593d856c78e49c773327f",
+    "integration/native_dense_prefill_benchmark.py": "ac6022f569cfcff74b8e64fbd008a4556c86fb79f6d80b8d6e850562ed663ed0",
+    "integration/native_execution_features_smoke.py": "f0ece2b2077880ec9757488b41880f313d96614eeac2afd6c2edb5ad6c4be1e3",
+    "integration/native_payload_provenance.py": "ac335b0a3871aa79b16eaf81e18353c3abacd777809d186ee0e64d0b5e06aece",
+    "integration/native_prefix_disk_smoke.py": "299c476b1167fe2b650229eb506742dee83970d5abac7ade4d828bbc0741a3fb",
+    "integration/native_sglang_smoke.py": "5e550b15820eae012450b872b7442fdfb33439da858ddc4808a8435445d28641",
+    "llama/compat/001-llama-cpp-hooks.patch": "de62fe6dd48c1b19082ae234e0b21fbc3da326dc18d6c971b93953886bf3ebf7",
+    "llama/compat/002-moe-ram-limit.patch": "8485d05e3448e295d5e68bcf6951afaeb694b3ce0ed61c57f86e8eca47711f63",
+    "llama/compat/003-runtime-performance.patch": "c5c6d73983ddeb8335c3588179b765f629d15db6ad10b6a934e463e230fdc33a",
+    "llama/compat/004-gpu-first-moe.patch": "5bce41f1be9133933e70a793229d031af50e771e86799b9f047b2ec58475c36c",
+    "llama/compat/005-live-runtime-activity.patch": "26e2326f8c2593f49de9f18c14aedb52d5f9996cf2d1ca9ae197a902f5636ac6",
+    "llama/compat/006-moe-residency-pipeline.patch": "d235058da91715858ced1f9057b25fe8b49b71012437b532c50d798b1a4d5c10",
+    "llama/compat/007-dense-runtime.patch": "6c705a9a0b6476bb6a2fd04eaf7f36dfa8864d4fb75c07fea14fbccdb6b58ad8",
+    "llama/compat/008-runtime-efficiency.patch": "117dafa6e5b65932bfeff566eb80a4016f3b7dfb450b5e243311cb02e2b54656",
+    "llama/compat/009-bounded-copy-pipeline.patch": "bcf03171c2f496ebbb50d8b6871b5a2fb9e7a333c11efae096809c26ea0e4a58",
+    "llama/compat/010-scheduler-exception-contract.patch": "27cd6c45a84f83d01303fad255f729331b22d76dcd992b83b5c0fd494a9d0072",
+    "llama/compat/011-moe-read-and-execution-batching.patch": "e1a37558908d74860d8e8b94382962dd6e8d844722032d699cf2a26d6313740d",
+    "llama/compat/012-expert-major-and-packed-rows.patch": "5024e3a04816e2d2ac45b8975b8704c317922e87add5d1cea58d91a96c293bf5",
+    "llama/compat/013-resident-gpu-tuning.patch": "f0a3563d5125b7858feb76aab2aa0555cf21b7132169aff8c604f44b937f7184",
+    "llama/compat/014-kv-reclamation-and-prompt-state.patch": "08e586d6efd8556cb293909a5848c22de722f2e9d7d0d8336c9aa97d047d18df",
+    "llama/compat/015-mtp-checkpoint-state.patch": "1f7c1f571181c49177d7c4755eafc9aea7a2afd180449891c60434fd328ab6a1",
+    "llama/compat/016-tuning-reuse.patch": "3e3b41c883b9daaccd6a594f2f7c8d97a494d915024646ba8ff5b1a3d2c4733b",
+    "llama/compat/017-sampler-output-view.patch": "802e2050a6dded02a7907ccb6cd6c3d56338572ccc0d3e173937d8ff8874799d",
+    "llama/compat/018-speculative-round-efficiency.patch": "d0dc4b31e7d5d5a018bda5488ac92034cf080a2f16c813e90429c1b20907f53d",
+    "llama/compat/019-cuda-graph-reuse.patch": "6b34e48f7e1178131f80e42bb9ab3c32bc818fdbad01183b502e521046961a18",
+    "llama/compat/020-checkpoint-restore-transaction.patch": "1a11670075bdd1a1ff39d1e3490e0d6dd6bc01215d7d4be8d36aad1059c70627",
+    "llama/compat/021-sampler-batch-fences-and-owned-candidates.patch": "a2d6b09b62c72c66701ce0171643830f9cd180634aca5945da9a58142c9fffff",
+    "llama/compat/022-sampler-init-and-mtp-state-transactions.patch": "aec56568d045f0f4bccda8dcc0776437fab8abad52584d4c5ddae1e36480a545",
+    "llama/compat/023-speculative-snapshot-and-clone-ownership.patch": "dd9844d6c00b48d46c7d49aff57c04b10e869c4feb3ffd443592d2bad01d806e",
+    "llama/compat/024-moe-binding-transaction.patch": "f652aa79595e58126f5a5dddddf85edc76832ddec76c61807df7148778d12851",
+    "llama/compat/025-prompt-prefix-index.patch": "f61cea4f7e83a126a9e87321f453bf4c457f24f62de89fecaf484a539a71eef9",
+    "llama/compat/026-postverify-candidate-and-residual-work.patch": "1cfc44df1cc2d2a7c0a203a65fdbcda01bc14810d4329f7ec170100eb948c0a3",
+    "llama/compat/027-overlapped-admission-and-decode-metadata.patch": "451494cd9cbdeb80cae49dffbd6056071114da6dc258c782cf0ad46c48f73cc3",
+    "llama/compat/028-device-mtp-state.patch": "4ecd423c8590c352a7cd5ef78970953a9b49a4a68a483dc9af0565c2549dd23c",
+    "llama/compat/029-compact-backend-sampler-outputs.patch": "84cbf27957cfd79e7ee9abc23ddd7ff3a42c11878cad16d1d4b5743aa0378572",
+    "llama/compat/030-bounded-graph-variants.patch": "51b618b7dc58f7d353e63b28daf17ff3adf6f3f7ac0e0d2d91925e464a4c101d",
+    "llama/compat/032-retained-prefix.patch": "ad0e339346baf4f39247f6842f2f680189f1200d3a0f7a6bdf6027ddfde53281",
+    "llama/compat/033-graph-owned-sampler-bindings.patch": "c42b6036590db9d78f5404fab9efd0eb2ec206625f21303ab2aef3191e56c69a",
+    "llama/compat/034-device-attention-mask.patch": "a1828741b99b5c7d6849cd20be5b246188bd2ec31538d65d0ebf03ce1799edc7",
+    "llama/compat/036-paged-state-cache.patch": "206bdfc1f7c9ee66dd5dd83f1f63a749cb2fcff0d7722bf205d07acdd18a3d98",
+    "llama/compat/037-grammar-first-device-mask.patch": "49e572c59882e5df6ea385c6d7368295862570ae43edb44be6bda9e81dce20a6",
+    "llama/compat/038-hybrid-retained-prefix.patch": "31c5d2787f01bacbfa13b2235a49a44ac4c3bac884bede878be650ed8dc028db",
+    "llama/compat/039-sampler-binding-preflight.patch": "a0f722ccaf01fd55dc69c6dc747f7b7ffddb19c76d3b28c6d61a5681804b7c71",
+    "llama/compat/040-device-mask-placement.patch": "b41c11f70ff0da68b46d73e7748d6f3eb043253eebfcdb2cab07ec338c87c856",
+    "llama/compat/041-grammar-mask-validation.patch": "8921e176f94ea0942dac65dc960d8a360de9c16a55b8ed7be0341803e3ea5f27",
+    "llama/compat/042-async-prefix-writeback.patch": "05455200ea6e4f830b2d2cb534faf5625c2d783776ffdaf23dd676193f4395c3",
+    "llama/compat/043-canonical-penalties.patch": "14c528f02201d768b4b391d8d17ae5a77a5f58d3ac313effdb96e5bd35090f94",
+    "llama/compat/044-hybrid-text-device-mask.patch": "2e57d95a2ea79dfce97c8d6d4552ff1c593720a1554bdb14d759acd7e6cf75cb",
+    "llama/compat/045-auto-device-mask.patch": "14cdda2537ccbc5f94cfb2f87b72c29c1137978998cf7d227aef7ca8c6cfe825",
+    "llama/compat/046-shared-cache-diagnostics.patch": "b0205b8a65f33c7e988aa79bd66f1cb4ce389db286df66cb98757b72a44d7834",
+    "llama/compat/047-preserve-mask-execution.patch": "7bf31f5dadb71d3da5d924f7de3a1d93e828114edfeb8e9755ee61b03efe3c4a",
+    "llama/compat/048-conservative-extended-mask-default.patch": "761139f0a431f151e500e49a78250d06321cad2893a6ab2ca168f3519ecbb577",
+    "llama/compat/049-backend-sampler-extensions.patch": "cf3970018b46e8c83b11d1997a9f7a9358af8dfa64564f7c3fd5111d9ba63e02",
+    "llama/compat/050-bounded-prefill-graph-arenas.patch": "9f49d93cb6ba1e2a1eca8891fe90e611352cc15dc982f06d0c81a5a3cf436110",
+    "llama/compat/051-indexed-kv-prefix-sharing.patch": "d71a4b1d136d3a2d8df07976388322810fd84a0ab3acfa3037cd6ed67c02e5b3",
+    "llama/compat/052-bounded-output-decode-overlap.patch": "5ef6b550c2be08b96fcdc80fb7acf9e926a2047e88846ee1ec2629449645a2ff",
+    "llama/compat/053-runtime-feature-discovery.patch": "58aee7c90cba9a03b59f888e48b3b6ddab33620848c371d401f8024da538c245",
+    "llama/compat/055-top-p-mask-fusion.patch": "1b6e51dc57be24eac859fd78acfefd66efbc780ad5a4fbe02d7e455dcf2a624d",
+    "llama/compat/056-server-slot-iteration.patch": "455f0ed7bbaae70b386b9fe7b64cce9b8be68ee364538492d915007f62370892",
+    "llama/compat/compat.cmake": "ee23efb755b0aafceda8070cb90ab1124797418ffc017303187a8ac56e382e74",
+    "llama/compat/llama-ollama-compat-util.cpp": "9dbf99715d8d9ca5d4417a0374ea7f31fb1541b9c233f507fd19efaae0bbbddc",
+    "llama/compat/llama-ollama-compat-util.h": "88936749149a3f9378858918e738af7f631ea096366ee3dae83cad5057a880d0",
+    "llama/compat/llama-ollama-compat.cpp": "122d5463b47ba5bb53dda7ed888cf924822d671fa6c842aa3ca1a867296ab2b9",
+    "llama/compat/llama-ollama-compat.h": "07d214fc541440118ab0c219a95e48c21ff824c0cc4e9b1a0441cbef0c576c00",
+    "llama/server/CMakeLists.txt": "59734d4dd425f9c36ca3fdf081a3233a1edc33fa285350b2f601890ff289560f",
+    "scripts/gpu-first/CMakeLists.txt": "b945818f2eb7b0b7f73b26cc0619b93012df42973e3aa9929450f2afb544aed5",
+    "scripts/gpu-first/build-integrity.ps1": "ec5e966dc5fbd0613dec8f2deae331afe041e8299269bf4f4231a903b449ee8b",
+    "scripts/gpu-first/build-windows.ps1": "f6f55a089cc29d8aa8c0d8462391e701aad73fa7cc3a29d2ff3c9538f7222e7d"
+  },
+  "payload_sha256": {
+    "lib/ollama/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/CPP_HTTPLIB_LICENSE": "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+    "lib/ollama/cuda_v12/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/cuda_v12/cublas64_12.dll": "0a60a7ecbf906f7f3842826fecaf412f1587ff6269729339245a1ec224364161",
+    "lib/ollama/cuda_v12/cublaslt64_12.dll": "a21ddfc1c9cd090ab07d2c6aad235aa4f15fe60fe896d5db28adf7a279c09ef3",
+    "lib/ollama/cuda_v12/cudart64_12.dll": "9d9b868955149875ac4ef43442aaaa8913d4a7b3e4d6dd60ee871626aa045768",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "f9f073a1bbd5cd2c261805a54135ee978d8e9dea266ab79d361bedec29674d85",
+    "lib/ollama/cuda_v12/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/cuda_v12/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/cuda_v12/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/cuda_v12/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/cuda_v12/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/cuda_v12/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/cuda_v12/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/cuda_v12/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/cuda_v12/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/cuda_v12/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "lib/ollama/ggml-base.dll": "43a0cfd6d8eace1cb1b991a9dc8dcdacd5a1df6823f58e46133acbd00906697f",
+    "lib/ollama/ggml-cpu.dll": "06e0d132efe13978c19801c3cb82f0a0a72707dd7e842f7c5639afd0327b01c9",
+    "lib/ollama/ggml.dll": "65703886bb4dacb6f8050bdc02f25b96c379d488af951ab07a3d2288d031895a",
+    "lib/ollama/llama-common.dll": "7c7c900f935f5139bf84adf844a9b55bcc80d824b7976306cff27cff449c6c91",
+    "lib/ollama/llama-quantize-impl.dll": "7e6445ff4699b3be08188728e083e78c65aa30c77ab7ab474776738445a7f1b2",
+    "lib/ollama/llama-quantize.exe": "81f370984ab437fe687c008031cbcf3e917f9c8c1c0bf172a93186a3e15e7bca",
+    "lib/ollama/llama-server-impl.dll": "ad0efe974b1021c3510d6e5b1e242e2d9f43afdfa2fb43ba0a426d3494f10585",
+    "lib/ollama/llama-server.exe": "d2415fb75a9fe57a46374ac466d442f8570720aaf6c54376775981c6dbf98e63",
+    "lib/ollama/llama.dll": "3dc6fd00ed1eaa965507be1a71471c5d9c9bdc8e770f776e3f2abf1df2d02642",
+    "lib/ollama/LLAMA_CPP_LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "lib/ollama/LLAMA_CPP_VENDORS_LICENSE": "7547ae6372a35e7382898dd9f5519ebc16e93095f69c2466b5b74b617c33d4da",
+    "lib/ollama/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/mtmd.dll": "29033d36a14c04cbd6d74dda8431854884e358515b2f536f65e1887675c1d823",
+    "lib/ollama/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715"
+  },
+  "baseline_payload_sha256": {
+    "lib/ollama/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/CPP_HTTPLIB_LICENSE": "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+    "lib/ollama/cuda_v12/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/cuda_v12/cublas64_12.dll": "0a60a7ecbf906f7f3842826fecaf412f1587ff6269729339245a1ec224364161",
+    "lib/ollama/cuda_v12/cublaslt64_12.dll": "a21ddfc1c9cd090ab07d2c6aad235aa4f15fe60fe896d5db28adf7a279c09ef3",
+    "lib/ollama/cuda_v12/cudart64_12.dll": "9d9b868955149875ac4ef43442aaaa8913d4a7b3e4d6dd60ee871626aa045768",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "6365461e141100388970a5719a6e6a6c2630617bc5c2eab0d70f79fe50fce5cb",
+    "lib/ollama/cuda_v12/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/cuda_v12/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/cuda_v12/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/cuda_v12/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/cuda_v12/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/cuda_v12/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/cuda_v12/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/cuda_v12/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/cuda_v12/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/cuda_v12/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "lib/ollama/ggml-base.dll": "0eef4b6bdc6e2def2414584dce0dd51c51318214d055f10ac9faa6336fd6a8e7",
+    "lib/ollama/ggml-cpu.dll": "b8f80ddae7822f5d2e38b8b9225ee9dbafd2b3dd79d9246c1a79771653f45c95",
+    "lib/ollama/ggml.dll": "1866e693361de2bce4ef5ae85454da132ce372b5b6a2a3e328da3f87f31b91bb",
+    "lib/ollama/llama-common.dll": "2d3c5db390a8e130d21e72b7203f593fa4aadbafc2525943b58b05403571d708",
+    "lib/ollama/llama-quantize-impl.dll": "44f44f27e4e82cff84db0b2b34c702a879ad3cf1bb221824c595f0a82d1d86f8",
+    "lib/ollama/llama-quantize.exe": "0e273ee92b0e2524c2f1518d7f6b856082b946bf0918c94cc7b7f8e43a7a81cd",
+    "lib/ollama/llama-server-impl.dll": "efebff8203ec1815727cff59a6a724abf6a8ba119c7120975ec4fbe4182ea20d",
+    "lib/ollama/llama-server.exe": "fb4b877a346d893313a7f63319d626348b0a8975db073acbb4a8c091341e6a94",
+    "lib/ollama/llama.dll": "113787b86d5eb8727a2a2a207ae4f9eb6fb4221e0fc263dfd39573e316e3f2a6",
+    "lib/ollama/LLAMA_CPP_LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "lib/ollama/LLAMA_CPP_VENDORS_LICENSE": "7547ae6372a35e7382898dd9f5519ebc16e93095f69c2466b5b74b617c33d4da",
+    "lib/ollama/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/mtmd.dll": "ab64e00eef1bc92ce56925488354e21051cf2c090512d7d2c2ba4837b986df7c",
+    "lib/ollama/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715"
+  },
+  "private_artifacts": {
+    "root": ".build/vram-neutral-20261031",
+    "sha256": {
+      "release-suite-before.json": "a85e3fec495a21cb65f2c2fbbc991c90e33fec555376d8eb618f3ecd036f661b",
+      "release-suite-after.json": "f86cb3661dec50a54bfcaaae8fd5448bbfa6a3c98467138a32813349599d6e4b",
+      "patch-replay.json": "be3697a22b35cdb5a9a001e65700545ef6cde5750aa415b588844c850662e14c",
+      "patch-replay-cmake.log": "fc9ba7c40d0eba9cdc85ac08f35a8e95e4634951bf1326cdd2bbbe228f9dad47",
+      "replay_final.py": "fae4fa670c3028462870cc216eb34a5aefe5e8538adabcce53079c9b0a1fdf91",
+      "native-release/runner-summary-all.json": "43b4749da467425292f273bffe352008556defe0736bbd9e4b523f34ff2a6412",
+      "native-release/native-cpu-tests.log": "cf714d4f8ffc8d64a10e09f292fcac34bfcff31dc067936dc2bca954e65b73ca",
+      "native-release/native-cuda-tests.log": "509ebc692cd08334ec81743f234679c701a3b651340bbe3134228493c7431733",
+      "native-release/runtime-feature-discovery.log": "ba6f1dce5bc79df4ee69ba70de6743962ed8fc5e1989408e31ee03dc701b3ce9",
+      "native-release/sampling-probability.log": "f27b19f833b1b40509b259f6e8c3c35661016e4a987b6dd6f4569ea9742626c8",
+      "native-release/native-server-tests.log": "758cb8bcd21f7019d592d4d3861f6f4c5eb504a56f7d0728da7bba88c1f54740",
+      "native-release/graph-variants-llama-tied-wide.log": "4f71ca4714abe4f1ef9bdc6ba6bbcb71f4dabb84fe0920774d0a9a17c8cfc98c",
+      "native-release/graph-variants-llama-tied-wide-Q8_0.log": "43f08855b117370c0cbf8d31c45fd0c42410f25a52a848321c94ffd3a95ee755",
+      "native-release/graph-variants-llama-tied-wide-Q4_K_M.log": "3e117034f8051cc306d1b2c41bb5c80cf76c50e8847b20ae16821272adbaa0bd",
+      "native-release/graph-variants-qwen3moe-q4.log": "ba8599aba9cd291a0b3f18f9bd15d1a6b8eadd74d55bff287c06921de33587c0",
+      "native-release/graph-variants-gpt-oss-wide-Q8_0.log": "29229571b32403bf4ebad05a3edd4c9e7629e08d5df87bd7cd00ebedd7304213",
+      "native-release/graph-variants-gemma4-q4.log": "83dc3a6faa1a12522b26e976060304bab0507a32b1c89e47a95eb27a71e730e8",
+      "native-release/graph-variants-nemotron_h_moe-q4.log": "c7be2892267ed33b161a50064889c975542792ec2af2cfcee4580c41e2297fba",
+      "native-release/graph-prefill-cuda-llama-tied-wide.log": "d025a27ba6d8f2ca59b704ee37e64e7119442c2c697d4144d766e96283f51b8c",
+      "native-release/graph-prefill-cuda-llama-tied-wide-Q8_0.log": "87bb8a11b72c1cb46b77f657e02bc38ebcce54c32f672abb746e139e52a1112a",
+      "native-release/graph-prefill-cuda-llama-tied-wide-Q4_K_M.log": "c32840afdf748bf0b76ae46f714ba49b44468fb46b0403c7efbed51b96d3ef55",
+      "native-release/graph-prefill-cuda-qwen3moe-q4.log": "b59891bd80576ad1058636cac13642810c93626f7493be1fa4077ddd289084ee",
+      "native-release/graph-prefill-cuda-gpt-oss-wide-Q8_0.log": "416d15111983b8920482ca3044869edffffb0b731a2cb307c05528b747571fee",
+      "native-release/graph-prefill-cuda-gemma4-q4.log": "c0ec1d7a3556c2d91392915dde7b78f043aadf754689aeed3129662ea22f59b9",
+      "native-release/graph-prefill-cuda-nemotron_h_moe-q4.log": "5f8fb48d351a0b3c2fb46aac86f3a13e7595f484a4366749c6a747eff2e1c63c",
+      "native-release/mtp-graph-variants-cpu.log": "448001b25169b0ba3458932599392b9a855f97888bc6477958d0c635cd35ce89",
+      "native-release/mtp-graph-variants-cuda.log": "f2b704f42d084fd6d382ceaa034941a04b8d79d42a0b74bb4c457e74a401c46a",
+      "native-release/native-custom-test.log": "c62e8581ae3a6ab4dcf1b13300d0e21183858c533ca7ebbc1d417bf3e817040c",
+      "native-release/native-moe-cache-gpu.log": "71bdbcccc38a732cda789c96acc002e2b58786e7597dac9ab606048ff9613d3b",
+      "native-release/native-cpu-tests.xml": "3672d336d827f8de6a18e76a054db0e125f22c1ded37695908f82c4c4454cecb",
+      "native-release/native-cuda-tests.xml": "d9645eb8b006f3967a4981366f9d857d2c268ec77053b317d72bed0b28c56b08",
+      "final-runner/required-tests.json": "c358e899f2636ef7104b10527ae74fe75b3018852325c6e6ad7ce47ab4be0f85",
+      "http-comparison/smoke-cpu-draft-caches.json": "e18885730143dcb3fd18671991d46f833c53ab41af0ce686563bbd440771f59e",
+      "http-comparison/smoke-cpu-draft.json": "676b46cfa2eda9144005e0a4956fa3d34e178b58488647e0b7de710a39c00485",
+      "http-comparison/smoke-cpu-plain-caches-device-mask.json": "7fd61a1006f3039ff6d499101c27a3d614e49523d7c7741e6c279d267e39e4bc",
+      "http-comparison/smoke-cpu-plain-caches.json": "53b49ab95700cc07c2e7abdeca2d42fccc185ff70ea82ab16697f9f2050141a3",
+      "http-comparison/smoke-cpu-plain-device-mask.json": "f9a5c9b3b2c0ec2ccb8ada8ab3ba6879800123491f55d92097271925e68e4bf4",
+      "http-comparison/smoke-cpu-plain.json": "96334de630fc783eaa590babe4eeb04778d288518b47ab15e866cbd1716f83ac",
+      "http-comparison/smoke-gpu-draft-caches.json": "c170e1f9240db8ae150265023eca9a408c65ccd334f6b0f397bba78b52452827",
+      "http-comparison/smoke-gpu-draft.json": "30d3b14928adc766294780077fd4c2e6e0566ff998a7a118630a58d812aa4007",
+      "http-comparison/smoke-gpu-plain-caches-device-mask.json": "7da3799137c20dfa16e5e02d3f84c2ec0332e8f242fcda96ebbed69ba013a8af",
+      "http-comparison/smoke-gpu-plain-caches.json": "a084c5d1991999bb78944c16f450a3f5c929d16b9520d85a5767c754e5cd3ab3",
+      "http-comparison/smoke-gpu-plain-device-mask.json": "c37babbf8315a5afe6d9e750d15e967e26115d1d507e3735f3aba71206b7003d",
+      "http-comparison/smoke-gpu-plain.json": "1d7ab8c06d3bbcb7be186cdb4366d9e9e9904e80ee661b8b741c14515496ffa2",
+      "http-features/cpu.json": "192481381cc24c61bac3131e6c07b9593051bae3ce22ae52d71c570becd67196",
+      "http-features/gpu.json": "461dcb50bb1dde1ecf6573ba70ae7a9053844c6cab35aab20727b8588212d1a1",
+      "dry-http-cpu/report.json": "072f14014eb8bc9ba320c1c1630beba25601c3ee4e89e42b2f457f63bd36cfee",
+      "dry-http-cpu/responses.json": "21e25b9a559bbf21b6541c4fa9821b77a6168e99f7e7dbca8b6ec4e8a49c890e",
+      "dry-http-gpu/report.json": "77c9e0282a5e2b437b78deb4f7987020685899425b6d0792c58801b9a5e1b631",
+      "dry-http-gpu/responses.json": "52f894982c49b823d7290dc37099b7b6967dc2f0204ea72511ab15d7b7fa5c63",
+      "decode-overlap-cpu/report.json": "bbd9c8b5d27ee86bebde4eace9cc6ebe7fdd2b942dd3b3509fc292f070defd9e",
+      "decode-overlap-cpu/responses.json": "c7011c0c41cafd0bf22d46ee514706c71e0c8e0a69f78ac3b82bd8e088455c8c",
+      "decode-overlap-cpu/disabled/cpu-server.log": "43de6a83b92df8a13a80d602585c89f900c9194019bcfca8c5896f033f36ab81",
+      "decode-overlap-cpu/disabled/modules.json": "38b201f7f0e187b2323165a9df21bf33363a93c65c777c651437a88675a9112c",
+      "decode-overlap-cpu/enabled/cpu-server.log": "02b5902c48c8eddb6f09d666a989fcc0ad939020e78d809fa26cd6a5c080947c",
+      "decode-overlap-cpu/enabled/modules.json": "51fadc3b7f8f0f7fac0f7fd9f08ba6a98dabedfe9d066be33fcaeada60005d0b",
+      "decode-overlap-cpu/timing-disabled/cpu-server.log": "eca3345924c2241d607d1032226d0c9bfbe8dd736d775cc23f6196ec5a8491b3",
+      "decode-overlap-cpu/timing-disabled/modules.json": "e646f1073a8fccfde7cefbe90de7fa9f4d8fc7463be94c07b9b137fd31005507",
+      "decode-overlap-cpu/timing-enabled/cpu-server.log": "44b7a08860c6630f623e3f07fc4d0c55b3edfe8c202a1b850edfdba5ca3420cc",
+      "decode-overlap-cpu/timing-enabled/modules.json": "ce96132a4665b905b88b245bf4757a986f146bfef642662d2057cce3d73abf7a",
+      "decode-overlap-gpu/report.json": "f7ab0a11012e25a88a7cdd025dcac77d90cdb9fbc77eb53d0cdc4fe2a1c63033",
+      "decode-overlap-gpu/responses.json": "7d688197324c0d2e1d9a0873726272ed4f3666015e202aa037bdbbb5e8a5542f",
+      "decode-overlap-gpu/disabled/gpu-server.log": "9810126e98fba773beae817cc148999c7fec6c322ba1484b6336940db8111800",
+      "decode-overlap-gpu/disabled/modules.json": "e2bed14bfb3cde5dcd071f5db8cc53394510d00af6b3e846032530ae429a889a",
+      "decode-overlap-gpu/enabled/gpu-server.log": "8b073fa9dad64e0e9491aab2caa0cb5908d01a0980922760a1d936b1f8979c92",
+      "decode-overlap-gpu/enabled/modules.json": "0b79f426b635747643c6fea7c1873415de761da7d031265b99cf901874ba4c7f",
+      "decode-overlap-gpu/timing-disabled/gpu-server.log": "fa85d1b2a4f89b376846a0bbe05dacaa1fe72803e358b40a94f8bde60c5fda54",
+      "decode-overlap-gpu/timing-disabled/modules.json": "47b7a601f2e6326c1c4c013adeb3c3830c5e6301bad9e1b9a7563152b814895b",
+      "decode-overlap-gpu/timing-enabled/gpu-server.log": "2583a5619559196294eda7d9a1aa56a6f315fccfa27dfeb04be6b807cbc88d77",
+      "decode-overlap-gpu/timing-enabled/modules.json": "9d359a5062c83381bd087a493043bb1a20409276d39d5295ef21b196dd24d758",
+      "components/visitor.json": "a63ce2c9298e90afb4c1780c9accec6bf4b40d8b0f5e3156281bbb1289cb60f6",
+      "run_components.py": "fa24f2353839035dda942279fa67a8abeb057f7fa8aee9fb2c4e1d883d207da6",
+      "components/visitor.stdout.log": "ce159c405694c58dfd2e8357237354775385202e670183278941867050b005e8",
+      "components/fusion-cpu.json": "b33f0a7e29835a30f36cf5cbc87e6bf1e3ed8f4643f83653556cab9a382e23c2",
+      "components/fusion-cpu.stdout.log": "e45f8e750cf02a50a12d5d8a12c61c1e1f20ac539d0cf1ef95bb26ad1f47c8c4",
+      "components/fusion-cuda.json": "315ccfba922dd9d1afdacf605a6bd4777415d80e9c412f5f86bb96117a8e19c3",
+      "components/fusion-cuda.stdout.log": "511d56345934f0536cebbfc3a26814f91333942b4c900328892852e592db63b3",
+      "native-release/feature-discovery/report.json": "6b1ec84c5eeae9b700539d8a7d0be14a4123a5202db51fe98215e515cc3f5e6f",
+      "native-release/feature-discovery/flag-only.stdout.log": "a2c15b0d1807828cedf74a2b2f0c6be2c0a45c5e925d0b69aed7ea5e2f3348ff",
+      "native-release/feature-discovery/flag-only.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "native-release/feature-discovery/missing-model.stdout.log": "a2c15b0d1807828cedf74a2b2f0c6be2c0a45c5e925d0b69aed7ea5e2f3348ff",
+      "native-release/feature-discovery/missing-model.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "rejected-054-evidence/final-run.json": "ef28a59eaf3ed223eb9a2c78f50f6c7fc3aa056d6776ef414402eaad5c0d01cb",
+      "rejected-054-evidence/final-run.log": "b921fa0446562ac469bfeec353f7f762bcceb3bd5dba035e1e329eb3a1b5416e",
+      "rejected-054-evidence/prior-01.json": "0b15d9db9d99865f4d83db367ec60abdb202c339fe17680f5621dff582e0115a",
+      "rejected-054-evidence/prior-01.log": "ccbef1fc0ee5ffb1cf87a10c726427918e12258e186aea183404dd68490a0627",
+      "rejected-054-evidence/prior-02.json": "d250e9f5952e60533ee0895ca74d03066c2ea58d3008abbb5a9a4b772e1adb9a",
+      "rejected-054-evidence/prior-02.log": "84d207fd9d1aeecd4c5b1ec9a8c6fe9e3bf27410b42300c02ca3d4b6522db2b2",
+      "rejected-054-evidence/prior-03.json": "487b03ea0e410a04a45e14b7d4b4b5d48191b16cd082fb6c973ee6978781cf19",
+      "rejected-054-evidence/prior-03.log": "11276e27530d434d752ba88fccae88c886dcc1561a936aeea60fc0eb386da1d4",
+      "rejected-054-evidence/prior-comparison.json": "bff93e9b7bea4820a746b17b68c5c116b58a342e911bf7caa96f679fc29a53e3",
+      "rejected-054-evidence/a245-preimage.json": "bb7e61fc7d9e4c92177723373248ef5227221f8b27a3fc53816d91b585056ba6",
+      "rejected-054-evidence/a245-llama-sampler.cpp": "7826c13716f5b05182d3c5d4b98e550aa9fb38896021db313f9c2da27cd8b4fb",
+      "rejected-054-evidence/source-pins.json": "db621e458563fbede154d509776f7fd079c138a58017707ab5ec05e86aaa7854",
+      "rejected-054-evidence/final-build.json": "66826440460c171a2ca35692edc159bfae011b47ebff55afd39bf54a076a3b57",
+      "rejected-054-evidence/benchmark_body.cpp": "28fcca35eea7c625d6dc78dbc12a8224b7e5b79b2271a898646ed48164dc0327",
+      "rejected-054-evidence/sampler-scratch-bench.cpp": "6d35958d05cc8c0b64b5477f6fbe85bb129fba13ff651465527c8055cf1dc081",
+      "rejected-054-evidence/run-benchmark.ps1": "ab963be4cc70e71c0d58688dda0fdb268e9cda5695ce426604e1fd5fd0f39fd8",
+      "rejected-054-evidence/build-benchmark.ps1": "d797d8b7c184daed80bfba068a11acb02323311301f9f2c90392a41a6e08fd92",
+      "rejected-054-evidence/054-packed-sampler-scratch.patch": "c360acc3eb4e2fa6c50077589bace8255a58c9e8b8171999498a215d7040123e",
+      "rejected-054-evidence/withdraw054-receipt.json": "2e650829b9bdcafa4bfa5ffb294c1461d0825609e02bc472fae22ff8fb242227",
+      "rejected-054-evidence/rejection-evidence.json": "162d28bc3ffff68bc0dd18eef649704e22f4863b4f04f13b93ce1fcbf041f405",
+      "_record_shared.py": "cccccbadf4d07ba4af5ea5764a8baa2ba0b7c601e6d1a711cc544c5d918ab25e",
+      "make_record.py": "5c8fb0de3e37f422ee27eee0a479c6b2ab3020f23199c35a730b77aa96148c11",
+      "payload_provenance.py": "e8fadc92345a09c709dc4d860f02b12bb7afe30b00daaa294a2dd39f2ca5e074",
+      "dry_http.py": "84b3909a22189629e334bed3e85d5bab62250e8967bf6f11c36b6b6faa9cd5e1",
+      "feature_discovery.py": "ff44f66ea98d0387bc6502aad797103b24a22863c873e85a0a13e6153cb4e9e3",
+      "final-runner/run_final.py": "056aa5312efc807e0f6283720e5ea896a993b9937a5c23e2af1a1b3a3a256b4a",
+      "release-plan.json": "71aaadf4f3b08b5b521a06a02e6d08c5d8103d15b691a4010c64e474c4ab0605",
+      "release_contract.py": "c6ea993d6d41e4b73452fe7db52a05cda12131e0712f85f05427cb11c62405a4",
+      "before-task-install.json": "010d87c88ffaebfc9a1c8341cec2e0385bc62f3a6a679cf1301147680a5a42cb"
+    }
+  },
+  "scope": "Windows CPU/CUDA and local synthetic fixtures<=64MiB. No trained-model throughput or SGLang parity claim. Cache128MiB is a separately authorized experiment PER context; target+draft may each use it. Other model/KV/buffer and driver allocations are outside that cache accounting."
+}
