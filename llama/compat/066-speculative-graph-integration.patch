@@ -1,0 +1,737 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -177,6 +177,17 @@
+ 
+ using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
+ 
++struct common_speculative_submit_hook {
++    const std::function<void()> & callback;
++    bool called = false;
++
++    void fire() {
++        if (called) { return; }
++        called = true;
++        callback();
++    }
++};
++
+ // state of an implementation of speculative decoding
+ //
+ // each implementation has a unique type and a state that is implementation-specific
+@@ -208,6 +219,9 @@
+     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
+ 
+     virtual ~common_speculative_impl() = default;
++
++    common_speculative_submit_hook * submit_hook = nullptr;
++    void submitted() { if (submit_hook) { submit_hook->fire(); } }
+ 
+     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
+ 
+@@ -400,6 +414,7 @@
+             SPC_ERR("llama_process returned %d\n", ret);
+             return;
+         }
++        submitted();
+ 
+         int i = 0;
+ 
+@@ -556,6 +571,7 @@
+     std::vector<int32_t> i_batch_beg;
+     std::vector<int32_t> i_batch_end;
+     std::vector<bool> drafting;
++    uint32_t graph_capabilities_previous = 0;
+ 
+     common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq, params.draft.n_max)
+@@ -635,10 +651,13 @@
+         i_batch_beg.assign(n_seq, -1);
+         i_batch_end.assign(n_seq, -1);
+         drafting.assign(n_seq, false);
++        graph_capabilities_previous = llama_set_speculative_graph_capabilities(ctx_dft,
++                LLAMA_SPEC_GRAPH_TOKEN_EMBD | LLAMA_SPEC_GRAPH_FEATURE_ENCODER);
+     }
+ 
+     ~common_speculative_impl_draft_eagle3() override {
+         auto * ctx_dft = this->params.ctx_dft;
++        llama_set_speculative_graph_capabilities(ctx_dft, graph_capabilities_previous);
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+                 continue;
+@@ -850,6 +869,7 @@
+             SPC_ERR("llama_process returned %d\n", ret);
+             return;
+         }
++        submitted();
+ 
+         int i = 0;
+ 
+@@ -1341,6 +1361,7 @@
+             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+             return;
+         }
++        submitted();
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             if (i_block_beg[seq_id] < 0) {
+@@ -1893,6 +1914,11 @@
+ 
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
++        struct restore_head {
++            llama_context * context;
++            bool enabled;
++            ~restore_head() { if (enabled) { llama_set_nextn_layer_offset(context, 0); } }
++        } reset_head{ctx_dft, chain_heads};
+ 
+         batch.clear();
+         device_inputs.clear();
+@@ -1960,6 +1986,7 @@
+                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                 break;
+             }
++            submitted();
+ 
+             // rebuild the batch for the next step: the growing-KV paths re-add only the
+             // new token (the KV already holds the prefix), while chained heads re-add the
+@@ -2045,10 +2072,6 @@
+             }
+ 
+             ++i;
+-        }
+-
+-        if (chain_heads) {
+-            llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+         }
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -3196,6 +3219,11 @@
+ }
+ 
+ void common_speculative_draft(common_speculative * spec) {
++    common_speculative_draft(spec, {});
++}
++
++void common_speculative_draft(common_speculative * spec, const std::function<void()> & on_first_submit) {
++    common_speculative_submit_hook hook{on_first_submit};
+     if (spec == nullptr) {
+         return;
+     }
+@@ -3232,6 +3260,12 @@
+     for (auto & impl : spec->impls) {
+         {
+             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
++            struct submit_scope {
++                common_speculative_impl & implementation;
++                common_speculative_submit_hook * previous;
++                ~submit_scope() { implementation.submit_hook = previous; }
++            } scope{*impl, impl->submit_hook};
++            impl->submit_hook = on_first_submit ? &hook : nullptr;
+             impl->draft(dparams);
+             impl->n_call_draft++;
+         }
+diff --git a/common/speculative.h b/common/speculative.h
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -2,6 +2,7 @@
+ 
+ #include "llama.h"
+ #include "common.h"
++#include <functional>
+ 
+ struct common_speculative;
+ 
+@@ -115,6 +116,12 @@
+ // generate drafts for the sequences specified with `common_speculative_get_draft_params`
+ void common_speculative_draft(common_speculative * spec);
+ 
++// Invoke once after the first successful neural draft submission, before its
++// sampling/output synchronization. The callback may format/publish independent
++// already-owned responses; it must not mutate this drafter or either context.
++// Lookup-only, zero-width and failed submissions do not invoke it.
++void common_speculative_draft(common_speculative * spec, const std::function<void()> & on_first_submit);
++
+ // informs the speculative context that n_accepted tokens were accepted by the target model
+ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+ 
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1040,18 +1040,28 @@
+ }
+ 
+ 
+-bool llama_context::output_overlap_supported() const {
++bool llama_context::output_overlap_supported(bool allow_multiple_sequences) const {
+     if (!memory || typeid(*memory) != typeid(llama_kv_cache) || !sched || sched_need_reserve ||
+-            !gf_res_prev_active || n_outputs != 1 || cparams.training || cparams.pipeline_parallel ||
+-            cparams.embeddings || cparams.n_seq_max != 1 || model.hparams.n_pos_per_embd() != 1 ||
++            !gf_res_prev_active || n_outputs < 1 || (!allow_multiple_sequences && n_outputs != 1) ||
++            cparams.training || cparams.pipeline_parallel || cparams.embeddings ||
++            (!allow_multiple_sequences && cparams.n_seq_max != 1) || model.hparams.n_pos_per_embd() != 1 ||
+             model.hparams.ple_n_heads || moe_cache || model.ram_cache || model.hparams.no_alloc ||
+             model.n_devices() != 1 || model.has_tensor_overrides()) { return false; }
+     if (output_overlap_checked == gf_res_prev_active) { return output_overlap_cached; }
+     output_overlap_checked = gf_res_prev_active;
+     output_overlap_cached = false;
+     const auto * result = gf_res_prev_active;
+-    if (result->t_sampled.size() != 1 || !result->t_sampled[0]) { return false; }
+-    auto * target = ggml_backend_sched_get_tensor_backend(sched.get(), result->t_sampled[0]);
++    ggml_backend_t target = nullptr;
++    uint32_t sampled_outputs = 0;
++    for (auto * sampled : result->t_sampled) {
++        if (!sampled) { continue; }
++        if (ggml_nelements(sampled) != 1) { return false; }
++        auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), sampled);
++        if (!backend || (target && target != backend)) { return false; }
++        target = backend;
++        ++sampled_outputs;
++    }
++    if (!target || sampled_outputs != n_outputs) { return false; }
+     auto * device = target ? ggml_backend_get_device(target) : nullptr;
+     auto * registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+     if (!registry || std::strcmp(ggml_backend_reg_name(registry), "CUDA") != 0 ||
+@@ -1078,6 +1088,64 @@
+     return true;
+ }
+ 
++bool llama_context::draft_response_overlap_supported() const {
++    if (!sched || sched_need_reserve || !gf_res_prev_active || cparams.training || cparams.warmup ||
++        cparams.pipeline_parallel || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
++        model.hparams.ple_n_heads || moe_cache || model.ram_cache || model.hparams.no_alloc ||
++        model.n_devices() != 1 || model.has_tensor_overrides() ||
++        gf_res_prev_active->get_graph_type() == LLM_GRAPH_TYPE_ENCODER) { return false; }
++    // Text M-RoPE uses aligned coordinates. Tokenless/media inputs and embedded
++    // rows without an explicit neural-drafter contract retain normal responses.
++    const auto & batch = balloc->get_batch();
++    if (batch.n_tokens <= 0 || !batch.token || !batch.pos || (batch.embd &&
++            !(speculative_graph_capabilities & LLAMA_SPEC_GRAPH_TOKEN_EMBD))) { return false; }
++    const uint32_t coordinates = model.hparams.n_pos_per_embd();
++    if (coordinates > 4) { return false; }
++    for (int32_t i = 0; i < batch.n_tokens; ++i) {
++        if (batch.token[i] == LLAMA_TOKEN_NULL) { return false; }
++        for (uint32_t coordinate = 1; coordinate < coordinates; ++coordinate) {
++            const llama_pos position = batch.pos[size_t(coordinate)*batch.n_tokens + i];
++            if (position != batch.pos[i] && !(coordinate == 3 && position == 0)) { return false; }
++        }
++    }
++    if (draft_overlap_checked == gf_res_prev_active) { return draft_overlap_cached; }
++    draft_overlap_checked = gf_res_prev_active;
++    draft_overlap_cached = false;
++    ggml_backend_t target = nullptr;
++    for (auto * backend : backend_ptrs) {
++        auto * device = ggml_backend_get_device(backend);
++        auto * registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++        if (registry && std::strcmp(ggml_backend_reg_name(registry), "CUDA") == 0 &&
++            ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            if (target) { return false; }
++            target = backend;
++        }
++    }
++    if (!target) { return false; }
++    auto * graph = gf_res_prev_active->get_gf();
++    size_t operations = 0;
++    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++        auto * node = ggml_graph_node(graph, i);
++        if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE)) { continue; }
++        switch (node->op) {
++            case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE:
++            case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE: continue;
++            default: break;
++        }
++        auto * actual = ggml_backend_sched_get_tensor_backend(sched.get(), node);
++        if (actual == target) { ++operations; continue; }
++        if (node->op == GGML_OP_GET_ROWS && node->src[0] == model.tok_embd && actual &&
++            ggml_backend_dev_type(ggml_backend_get_device(actual)) == GGML_BACKEND_DEVICE_TYPE_CPU) { continue; }
++        return false;
++    }
++    draft_overlap_cached = operations > 0;
++    return draft_overlap_cached;
++}
++
++bool llama_draft_response_overlap_supported(const llama_context * ctx) {
++    return ctx && ctx->draft_response_overlap_supported();
++}
++
+ bool llama_context::adaptive_prefill_supported(bool allow_pending_reservation) const {
+     // The first scheduling policy only alternates ordinary pure-decode and
+     // original prompt rounds. Unknown memory/provider layouts retain admission.
+@@ -1092,6 +1160,14 @@
+ 
+ bool llama_output_overlap_supported(const llama_context * ctx) {
+     return ctx && ctx->output_overlap_supported();
++}
++
++bool llama_output_overlap_supported(const llama_context * ctx, bool allow_multiple_sequences) {
++    return ctx && ctx->output_overlap_supported(allow_multiple_sequences);
++}
++
++uint32_t llama_set_speculative_graph_capabilities(llama_context * ctx, uint32_t capabilities) {
++    return ctx ? ctx->set_speculative_graph_capabilities(capabilities) : 0;
+ }
+ 
+ const llama_model & llama_context::get_model() const {
+@@ -1813,6 +1889,7 @@
+ 
+ void llama_context::graph_variant_evict(size_t index) {
+     output_overlap_checked = nullptr;
++    draft_overlap_checked = nullptr;
+     auto & variant = graph_variants[index];
+     GGML_ASSERT(index && index != graph_variant_active);
+     if (variant.sched) {
+@@ -1832,6 +1909,7 @@
+ 
+ void llama_context::graph_variants_clear() {
+     output_overlap_checked = nullptr;
++    draft_overlap_checked = nullptr;
+     graph_prefill_admission.clear();
+     if (graph_variant_active) {
+         ggml_backend_sched_synchronize(sched.get());
+@@ -1886,14 +1964,21 @@
+     // original arena. Fully resident dense and MoE models need no name list.
+     // Only complete builtin chains have an explicit graph-binding contract.
+     // Custom/partially supported chains stay on the original arena.
++    const bool token_embedding = (speculative_graph_capabilities & LLAMA_SPEC_GRAPH_TOKEN_EMBD) &&
++        ubatch.token && ubatch.embd && !ubatch.is_mixed() && mctx && cparams.causal_attn &&
++        gtype != LLM_GRAPH_TYPE_ENCODER;
++    const bool feature_encoder = (speculative_graph_capabilities & LLAMA_SPEC_GRAPH_FEATURE_ENCODER) &&
++        !ubatch.token && ubatch.embd && !ubatch.is_mixed() && !mctx && !cparams.causal_attn &&
++        cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && cparams.embeddings_nextn &&
++        gtype == LLM_GRAPH_TYPE_ENCODER;
++    const bool ordinary_decode = ubatch.token && !ubatch.embd && cparams.causal_attn &&
++        gtype != LLM_GRAPH_TYPE_ENCODER;
+     const bool eligible = graph_variant_budget && !graph_reuse_disable && !cparams.training &&
+         !cparams.pipeline_parallel && !cparams.warmup && !model.hparams.no_alloc && !moe_cache &&
+         !model.ram_cache && (sampling.samplers.empty() || graph_sampler_bindings_enabled()) &&
+         !cparams.cb_eval && model.hparams.causal_attn &&
+-        cparams.causal_attn &&
+-        ubatch.token && !ubatch.embd &&
+         ubatch.n_tokens && ubatch.n_tokens <= llama_graph_variant_policy::max_tokens &&
+-        gtype != LLM_GRAPH_TYPE_ENCODER;
++        (ordinary_decode || token_embedding || feature_encoder);
+ 
+     if (eligible) {
+         for (size_t i = 0; i < graph_variants.size(); ++i) {
+@@ -1908,6 +1993,9 @@
+             graph_variant_save();
+             graph_variant_restore(i);
+             graph_variant_last_used = ++graph_variant_clock;
++            ++graph_variant_retained_hits;
++            if (feature_encoder) { ++graph_variant_encoder_hits; }
++            if (token_embedding) { ++graph_variant_token_embedding_hits; }
+             if (graph_variant_reuse_only) { ++graph_variant_reuse_hits; }
+             return graph_variant_selection::reused;
+         }
+@@ -1947,8 +2035,11 @@
+         position_bucket = uint32_t(maximum) / 256;
+     }
+     const llama_graph_variant_policy::prefill_shape shape = {
+-        ubatch.n_tokens, n_outputs, position_bucket, ubatch.n_seqs_unq, uint32_t(gtype)};
++        ubatch.n_tokens, n_outputs, position_bucket, ubatch.n_seqs_unq, uint32_t(gtype),
++        uint32_t(bool(ubatch.token)) | (uint32_t(bool(ubatch.embd)) << 1) |
++            (uint32_t(bool(ubatch.embd_state)) << 2), cparams.nextn_layer_offset};
+     if (!graph_prefill_admission.observe(shape)) { return graph_variant_selection::none; }
++    ++graph_variant_build_attempts;
+ 
+     // Short decode keeps its previous metadata bound. Coarse metadata capacity
+     // buckets limit node-address churn; actual tokens/tensors are never padded.
+@@ -2001,6 +2092,7 @@
+         }
+         auto create = [&]() -> ggml_cgraph * {
+             output_overlap_checked = nullptr;
++            draft_overlap_checked = nullptr;
+             sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
+                     backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+             if (!sched) { return nullptr; }
+@@ -2106,7 +2198,7 @@
+     }
+     // An optional snapshot may have failed while a new arena was preflighted.
+     // Refresh even when we restored the same primary result pointer.
+-    gparams.sampler_bindings = graph_sampler_bindings_enabled();
++    gparams.sampler_bindings = gtype != LLM_GRAPH_TYPE_ENCODER && graph_sampler_bindings_enabled();
+ 
+     if (reuse_current || selected != graph_variant_selection::none) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+@@ -2121,6 +2213,7 @@
+         if (reuse_current || selected == graph_variant_selection::reused) { n_reused++; }
+     } else {
+         output_overlap_checked = nullptr;
++        draft_overlap_checked = nullptr;
+         gf_res_prev_active = nullptr;
+         res->reset();
+ 
+@@ -3387,7 +3480,7 @@
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
+         /*.nextn_input_backend =*/ nextn_input_backend(),
+-        /*.sampler_bindings    =*/ res != gf_res_reserve.get() && graph_sampler_bindings_enabled(),
++        /*.sampler_bindings    =*/ gtype != LLM_GRAPH_TYPE_ENCODER && res != gf_res_reserve.get() && graph_sampler_bindings_enabled(),
+         /*.sampler_bindings_limit =*/ graph_variant_budget,
+     };
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -62,7 +62,13 @@
+     void sched_reserve();
+ 
+     void synchronize();
+-    bool output_overlap_supported() const;
++    bool output_overlap_supported(bool allow_multiple_sequences = false) const;
++    bool draft_response_overlap_supported() const;
++    uint32_t set_speculative_graph_capabilities(uint32_t capabilities) {
++        const uint32_t previous = speculative_graph_capabilities;
++        speculative_graph_capabilities = capabilities;
++        return previous;
++    }
+     // Internal server scheduling capability; this is not a new public C API.
+     LLAMA_API bool adaptive_prefill_supported(bool allow_pending_reservation = false) const;
+ 
+@@ -113,11 +119,19 @@
+         size_t arenas = 0;
+         size_t compute_bytes = 0;
+         size_t metadata_bytes = 0;
++        uint64_t retained_hits = 0;
++        uint64_t build_attempts = 0;
++        uint64_t encoder_hits = 0;
++        uint64_t token_embedding_hits = 0;
+     };
+     // Internal diagnostic: secondary buffers and host graph metadata,
+     // excluding the primary reservation. No graph/scheduler pointers escape.
+     graph_variant_stats get_graph_variant_stats() const {
+         graph_variant_stats stats;
++        stats.retained_hits = graph_variant_retained_hits;
++        stats.build_attempts = graph_variant_build_attempts;
++        stats.encoder_hits = graph_variant_encoder_hits;
++        stats.token_embedding_hits = graph_variant_token_embedding_hits;
+         // The primary tensor arena is baseline memory, but its new sampler
+         // snapshots exist only for the optional cache and count towards it.
+         const auto & primary = graph_variant_active ? graph_variants[0].results : gf_res_prev;
+@@ -531,12 +545,19 @@
+     std::array<graph_variant_runtime, 5> graph_variants;
+     size_t graph_variant_active = 0;
+     size_t graph_variant_budget = 0;
++    uint32_t speculative_graph_capabilities = 0;
++    uint64_t graph_variant_retained_hits = 0;
++    uint64_t graph_variant_build_attempts = 0;
++    uint64_t graph_variant_encoder_hits = 0;
++    uint64_t graph_variant_token_embedding_hits = 0;
+     bool graph_variant_reuse_only = false;
+     uint64_t graph_variant_reuse_scopes = 0;
+     uint64_t graph_variant_reuse_hits = 0;
+     uint64_t graph_variant_reuse_misses = 0;
+     mutable const llm_graph_result * output_overlap_checked = nullptr;
+     mutable bool output_overlap_cached = false;
++    mutable const llm_graph_result * draft_overlap_checked = nullptr;
++    mutable bool draft_overlap_cached = false;
+     llama_graph_variant_policy::prefill_admission graph_prefill_admission;
+     bool graph_sampler_bindings_failed = false;
+     size_t graph_variant_bytes = 0;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -39,6 +39,18 @@
+ // overlap CPU response formatting with the next ordinary known-token decode;
+ // it neither queues speculative work nor creates an autonomous token pipeline.
+ LLAMA_API bool llama_output_overlap_supported(const llama_context * ctx);
++LLAMA_API bool llama_output_overlap_supported(const llama_context * ctx, bool allow_multiple_sequences);
++LLAMA_API bool llama_draft_response_overlap_supported(const llama_context * ctx);
++
++enum llama_speculative_graph_capability : uint32_t {
++    LLAMA_SPEC_GRAPH_TOKEN_EMBD = 1u,
++    LLAMA_SPEC_GRAPH_FEATURE_ENCODER = 2u,
++};
++
++// Granted only by a drafter that owns these input/encoder semantics. This
++// changes optional arena admission, never graph construction or draft width.
++// Return the previous capabilities so the owner can restore them on destruction.
++LLAMA_API uint32_t llama_set_speculative_graph_capabilities(llama_context * ctx, uint32_t capabilities);
+ 
+ // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
+ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -953,6 +953,7 @@
+     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+ 
+     ggml_cgraph  * get_gf()  const { return gf; }
++    llm_graph_type get_graph_type() const { return params.gtype; }
+     ggml_context * get_ctx() const { return ctx_compute.get(); }
+ 
+     int64_t get_max_nodes() const;
+diff --git a/src/llama-graph-variant-policy.h b/src/llama-graph-variant-policy.h
+--- a/src/llama-graph-variant-policy.h
++++ b/src/llama-graph-variant-policy.h
+@@ -25,10 +25,13 @@
+     uint32_t position_bucket;
+     uint32_t sequences;
+     uint32_t graph_type;
++    uint32_t input_kind = 0;
++    int32_t mtp_head = 0;
+ 
+     bool operator==(const prefill_shape & other) const {
+         return tokens == other.tokens && outputs == other.outputs && position_bucket == other.position_bucket &&
+-            sequences == other.sequences && graph_type == other.graph_type;
++            sequences == other.sequences && graph_type == other.graph_type &&
++            input_kind == other.input_kind && mtp_head == other.mtp_head;
+     }
+ };
+ 
+@@ -40,7 +43,7 @@
+     struct entry {
+         prefill_shape shape = {};
+         bool occupied = false;
+-        bool denied = false;
++        uint16_t denied_observations = 0;
+     };
+     std::array<entry, 8> entries = {};
+     size_t next = 0;
+@@ -49,22 +52,25 @@
+     bool observe(const prefill_shape & shape) {
+         if (!shape.tokens || shape.tokens > max_tokens || shape.outputs > shape.tokens ||
+                 !shape.sequences || shape.sequences > shape.tokens) { return false; }
+-        if (shape.tokens <= max_decode_tokens) { return true; }
+-        for (const auto & item : entries) {
+-            if (item.occupied && item.shape == shape) { return !item.denied; }
++        for (auto & item : entries) {
++            if (item.occupied && item.shape == shape) {
++                if (item.denied_observations) { --item.denied_observations; return false; }
++                return true;
++            }
+         }
+-        entries[next] = {shape, true, false};
++        entries[next] = {shape, true, 0};
+         next = (next + 1) % entries.size();
+-        return false;
++        return shape.tokens <= max_decode_tokens;
+     }
+ 
+     // An optional allocation/preflight failure retains the primary path. Avoid
+     // retrying the same expensive failure until invalidation or bounded aging.
+     void deny(const prefill_shape & shape) {
+-        if (shape.tokens <= max_decode_tokens) { return; }
+         for (auto & item : entries) {
+-            if (item.occupied && item.shape == shape) { item.denied = true; return; }
++            if (item.occupied && item.shape == shape) { item.denied_observations = 64; return; }
+         }
++        entries[next] = {shape, true, 64};
++        next = (next + 1) % entries.size();
+     }
+ 
+     void clear() { entries = {}; next = 0; }
+diff --git a/tests/test-graph-variants.cpp b/tests/test-graph-variants.cpp
+--- a/tests/test-graph-variants.cpp
++++ b/tests/test-graph-variants.cpp
+@@ -52,6 +52,14 @@
+     }
+     admit.deny(cold);
+     require(!admit.observe(cold), "failed large shape retried optional allocation");
++    const prefill_shape verify{3, 3, 0, 1, 0, 5, 0};
++    require(admit.observe(verify), "first short verification shape was deferred");
++    admit.deny(verify);
++    for (int i = 0; i < 64; ++i) { require(!admit.observe(verify), "short denied arena retried before cooldown"); }
++    require(admit.observe(verify), "transient allocation denial suppressed a shape permanently");
++    admit.deny(verify);
++    require(admit.observe({3, 3, 0, 1, 0, 5, 1}) && admit.observe({3, 3, 0, 1, 0, 3, 0}),
++            "a denied MTP head/input kind suppressed a different graph");
+     admit.clear();
+     require(!admit.observe(cold) && admit.observe(cold), "invalidation did not reset admission");
+     for (uint32_t i = 0; i < 8; ++i) { require(!admit.observe({65+i, 1, 256, 1, 0}), "cold shape admitted"); }
+diff --git a/tests/test-speculative-graphs.cpp b/tests/test-speculative-graphs.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-speculative-graphs.cpp
+@@ -0,0 +1,179 @@
++// Reuse the bounded nonzero fixtures and state transaction helpers. This target
++// always selects the CPU backend and never downloads or opens model files.
++#define main mtp_state_original_regression
++#include "test-mtp-state.cpp"
++#undef main
++
++#include "../src/llama-context.h"
++#include <cstdlib>
++
++static void graph_budget(const char * value) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_GRAPH_VARIANTS_MIB", value) == 0 &&
++            _putenv_s("WILDLLAMA_MTP_DEVICE_STATE", "0") == 0, "cannot set graph fixture options");
++#else
++    require(setenv("WILDLLAMA_GRAPH_VARIANTS_MIB", value, 1) == 0 &&
++            setenv("WILDLLAMA_MTP_DEVICE_STATE", "0", 1) == 0, "cannot set graph fixture options");
++#endif
++}
++
++struct graph_outcome {
++    std::vector<float> logits;
++    std::vector<llama_token> proposals;
++    std::vector<std::vector<uint8_t>> states;
++    uint64_t target_hits = 0;
++    uint64_t encoder_hits = 0;
++    uint64_t embedded_hits = 0;
++    uint64_t attempts = 0;
++    size_t peak_bytes = 0;
++};
++
++static graph_outcome real_rounds(llama_model * target, llama_model * head,
++                                 common_speculative_type type, const char * budget, bool backend = false) {
++    graph_budget(budget);
++    session run(target, 1, head, type);
++    struct optional_sampler {
++        llama_context * context;
++        llama_sampler * chain = nullptr;
++        ~optional_sampler() {
++            if (chain) { llama_set_sampler(context, 0, nullptr); llama_sampler_free(chain); }
++        }
++    } sampler{run.draft.get()};
++    if (backend) {
++        sampler.chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
++        llama_sampler_chain_add(sampler.chain, llama_sampler_init_top_k(10));
++        require(llama_set_sampler(run.draft.get(), 0, sampler.chain), "cannot attach neural draft backend chain");
++    }
++    graph_outcome out;
++    const size_t limit = llama_graph_variant_policy::parse_budget(budget);
++    auto check_memory = [&] {
++        for (auto * context : {run.target.get(), run.draft.get()}) {
++            const auto stats = context->get_graph_variant_stats();
++            require(stats.arenas <= 4 && stats.compute_bytes <= limit &&
++                    stats.metadata_bytes <= limit - stats.compute_bytes,
++                    "speculative graph arenas exceeded the selected per-context allowance");
++            out.peak_bytes = std::max(out.peak_bytes, stats.compute_bytes + stats.metadata_bytes);
++            require(!llama_draft_response_overlap_supported(context) &&
++                    !llama_output_overlap_supported(context, true), "CPU graph was advertised as CUDA overlap");
++        }
++    };
++    for (int round = 0; round < 8; ++round) {
++        run.clear();
++        const int count = round%2 ? 6 : 4;
++        common_batch prefix(run.target.get());
++        for (int i = 0; i < count; ++i) { prefix.add(3 + (round + i)%11, i, 0, true); }
++        require(llama_process(run.target.get(), LLAMA_PROCESS_TYPE_DECODE, prefix.get()) == 0 &&
++                common_speculative_process(run.spec.get(), prefix), "graph fixture prefill failed");
++        const auto before = run.logits();
++        out.logits.insert(out.logits.end(), before.begin(), before.end());
++        check_memory();
++
++        llama_tokens proposed;
++        auto & dp = common_speculative_get_draft_params(run.spec.get(), 0);
++        dp.drafting = true; dp.n_max = round%2 ? 2 : 1; dp.pos0 = count; dp.id_last = 7;
++        dp.result = &proposed; dp.result_q = nullptr; dp.prompt = nullptr;
++        int callbacks = 0;
++        common_speculative_draft(run.spec.get(), [&] {
++            ++callbacks;
++            require(proposed.empty(), "first-submit hook ran after sampling a proposal");
++        });
++        require(callbacks == 1 && proposed.size() == size_t(dp.n_max), "neural submit hook/depth contract changed");
++        require(run.logits() == before, "draft graph reuse mutated the target logits");
++        out.proposals.insert(out.proposals.end(), proposed.begin(), proposed.end());
++        check_memory();
++
++        // Mirror the normal target verification and draft catch-up boundary.
++        const int trim = type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ? count - 1 : count;
++        require(llama_memory_seq_rm(llama_get_memory(run.draft.get()), 0, trim, -1), "draft trim failed");
++        common_batch verify(run.target.get()); verify.add(7, count, 0, true);
++        for (size_t i = 0; i < proposed.size(); ++i) { verify.add(proposed[i], count + 1 + int(i), 0, true); }
++        require(llama_process(run.target.get(), LLAMA_PROCESS_TYPE_DECODE, verify.get()) == 0 &&
++                common_speculative_process(run.spec.get(), verify), "graph fixture verification failed");
++        common_speculative_accept(run.spec.get(), 0, uint16_t(round%(proposed.size()+1)));
++        const auto verified = run.logits();
++        out.logits.insert(out.logits.end(), verified.begin(), verified.end());
++        std::vector<uint8_t> state;
++        require(common_speculative_get_state(run.spec.get(), 0, state), "verified carry state unavailable");
++        out.states.push_back(std::move(state));
++        check_memory();
++    }
++    const auto target_stats = run.target->get_graph_variant_stats();
++    const auto draft_stats = run.draft->get_graph_variant_stats();
++    out.target_hits = target_stats.retained_hits;
++    out.encoder_hits = draft_stats.encoder_hits;
++    out.embedded_hits = draft_stats.token_embedding_hits;
++    out.attempts = target_stats.build_attempts + draft_stats.build_attempts;
++    std::printf("SPEC_GRAPHS type=%s budget=%s target_hits=%llu encoder_hits=%llu token_embd_hits=%llu attempts=%llu peak_extra=%zu\n",
++            common_speculative_type_to_str(type).c_str(), budget,
++            (unsigned long long) out.target_hits, (unsigned long long) out.encoder_hits,
++            (unsigned long long) out.embedded_hits, (unsigned long long) out.attempts, out.peak_bytes);
++    return out;
++}
++
++static void callback_lifetime(llama_model * model) {
++    graph_budget("0");
++    session run(model);
++    auto prepare = [&] {
++        run.clear(); run.prefill({3,4,5,6});
++    };
++    prepare();
++    llama_tokens result;
++    auto configure = [&] (int maximum) {
++        result.clear();
++        auto & dp = common_speculative_get_draft_params(run.spec.get(), 0);
++        dp.drafting = true; dp.n_max = maximum; dp.pos0 = 4; dp.id_last = 7;
++        dp.prompt = nullptr; dp.result_q = nullptr; dp.result = &result;
++    };
++    configure(0);
++    int calls = 0;
++    common_speculative_draft(run.spec.get(), [&] { ++calls; });
++    require(calls == 0 && result.empty(), "zero-width draft invoked submit hook");
++    common_speculative_draft(nullptr, [&] { ++calls; });
++    configure(2);
++    bool threw = false;
++    try { common_speculative_draft(run.spec.get(), [&] { ++calls; throw std::runtime_error("hook injection"); }); }
++    catch (const std::runtime_error &) { threw = true; }
++    require(threw && calls == 1 && result.empty(), "throwing submit hook was swallowed or ran after sampling");
++    prepare(); configure(2);
++    common_speculative_draft(run.spec.get());
++    require(calls == 1 && result.size() == 2, "failed draft retained a dangling submit hook");
++}
++
++int main() {
++    try {
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH) != nullptr, "CPU backend unavailable");
++#else
++        ggml_backend_load_all();
++#endif
++        llama_backend_init();
++        auto mtp = tiny_model();
++        auto target = tiny_dense_model();
++        auto eagle = tiny_eagle_fixture("eagle3");
++        for (const auto type : {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3}) {
++            auto * target_model = type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ? mtp.get() : target.get();
++            auto * draft_model = type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ? mtp.get() : eagle.get();
++            const auto reference = real_rounds(target_model, draft_model, type, "0");
++            for (const char * budget : {"1", "32"}) {
++                const auto retained = real_rounds(target_model, draft_model, type, budget);
++                require(retained.logits == reference.logits && retained.proposals == reference.proposals &&
++                        retained.states == reference.states, "speculative graph retention changed logits/proposals/accepted carry");
++                if (std::strcmp(budget, "32") == 0) {
++                    require(retained.target_hits > 0, "verification fixture did not actually reuse a retained arena");
++                    if (type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) {
++                        require(retained.encoder_hits > 0 && retained.embedded_hits > 0,
++                                "EAGLE fixture did not actually reuse encoder and token/embedding decoder graphs");
++                    }
++                }
++            }
++        }
++        const auto backend_reference = real_rounds(target.get(), eagle.get(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, "0", true);
++        const auto backend_retained = real_rounds(target.get(), eagle.get(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, "32", true);
++        require(backend_reference.logits == backend_retained.logits && backend_reference.proposals == backend_retained.proposals &&
++                backend_reference.states == backend_retained.states && backend_retained.encoder_hits > 0 && backend_retained.embedded_hits > 0,
++                "encoder/decoder transitions corrupted attached sampler graph bindings");
++        callback_lifetime(mtp.get());
++        std::puts("PASS: real CPU MTP verification/EAGLE encoder+decoder graph reuse; exact logits/proposals/carry; bounded arenas; submit-hook lifetime");
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

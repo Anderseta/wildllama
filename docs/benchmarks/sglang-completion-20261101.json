@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "date": "2026-11-01",
+  "source_base": "1d4431a5e5cd27f14cafd59ae84235fcf390a083",
+  "native_base": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "patches": [
+    {
+      "sha256": "8f92073f730237bd3625acdb03bee359fc3a33cdec44d75724ab0189f9731424",
+      "file": "064-batched-draft-response-overlap.patch"
+    },
+    {
+      "sha256": "60a87a51f8a80d4022ceae82fc056f98aec71e27dc3ba302ba9b1d4701a936b5",
+      "file": "065-affine-and-activation-fusions.patch"
+    },
+    {
+      "sha256": "f6411722710328be80b83c73dc58d7240c7db742da574b035e234a3b196a5bae",
+      "file": "066-speculative-graph-integration.patch"
+    }
+  ],
+  "build": "Windows x64 CUDA compilation passed with stable source guard",
+  "tests": {
+    "cpu_targets": [
+      "test-server-batch-overlap",
+      "test-graph-variants",
+      "test-speculative-graphs",
+      "test-sampler-overlap",
+      "test-mtp-state",
+      "test-cuda-dense --host-only"
+    ],
+    "rollback_token_comparisons": 384,
+    "actual_mtp_retained_target_hits": 12,
+    "actual_eagle_retained_target_hits": 12,
+    "actual_eagle_retained_encoder_hits": 3,
+    "actual_eagle_retained_decoder_hits": 6,
+    "mtp_peak_extra_cpu_bytes_at_32mib_budget": 8091232,
+    "eagle_peak_extra_cpu_bytes_with_backend_sampler": 3595264,
+    "graph_budgets_mib": [
+      0,
+      1,
+      32
+    ],
+    "speculative_logits_proposals_and_carry": "bit-exact in tested CPU fixtures",
+    "http_cpu": {
+      "fixture_sha256": "efd68eddb2424f2fc0c21a55024f6a3b1aa58b7758c9ff8b6cfeb9720cd3fea4",
+      "baseline": "1d4431a5 staged native",
+      "cases_per_payload": 6,
+      "responses": "identical text/tokens/stop/decoded/probability SSE fields",
+      "fixture_bytes": 28628288,
+      "gpu_overlap_activated": false,
+      "status": "passed"
+    },
+    "wildgoose_focused_tests": 70,
+    "wildgoose_final_profile_tests": 11,
+    "typescript": "passed"
+  },
+  "memory": {
+    "new_persistent_gpu_buffers_for_fusions": 0,
+    "ordinary_ahead_batches_max": 1,
+    "ordinary_ahead_sequences_max": 32,
+    "host_entropy_checkpoints": "Lazy, at most 512 KiB, freed after unload drain",
+    "response_descriptors_max": 128,
+    "response_descriptor_bytes": 5144,
+    "response_text_span_bound_bytes": 65536,
+    "graph_cache": "existing per-context budget plus authoritative managed CUDA quota",
+    "moe_ram_limit": "existing weight-cache allowance; not a process RSS cap",
+    "profiles": "unchanged by build"
+  },
+  "deferred": [
+    "actual CUDA overlap/streaming/cancel behavior",
+    "CUDA numerical and throughput validation of new fusion candidates",
+    "CUDA speculative graph transitions and quota pressure",
+    "trained-model language quality and end-to-end throughput",
+    "Linux/HIP/Metal execution"
+  ],
+  "defaults": "No additional default GPU reservation; experimental opt-ins and saved profiles unchanged",
+  "installed": false,
+  "patch_replay": {
+    "status": "passed",
+    "patches": 63,
+    "files": 199
+  },
+  "go_reused": {
+    "go_inputs_unchanged": true,
+    "source_commit": "1d4431a5e5cd27f14cafd59ae84235fcf390a083",
+    "sha256": "f09506c6291f3989b79277e24be0456be83bab06415c95a9e042f080da51e435"
+  }
+}

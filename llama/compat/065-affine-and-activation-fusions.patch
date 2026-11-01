@@ -1,0 +1,628 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -43,6 +43,7 @@
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/dense-reuse.h"
+ #include "ggml-cuda/residual-norm.h"
++#include "ggml-cuda/affine-fusion.h"
+ #include "ggml-cuda/graph-reuse.h"
+ #include "ggml-cuda/resident-tuning-policy.h"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+@@ -4594,9 +4595,19 @@
+ // try and fuse nodes and return the number of nodes to skip
+ static std::atomic<uint64_t> ggml_cuda_norm_silu_fusions{0};
+ static std::atomic<uint64_t> ggml_cuda_residual_norm_fusions{0};
++static std::atomic<uint64_t> ggml_cuda_norm_affine_fusions{0};
++static std::atomic<uint64_t> ggml_cuda_bias_activation_fusions{0};
+ 
+ static uint64_t ggml_backend_cuda_test_residual_norm_fusions() {
+     return ggml_cuda_residual_norm_fusions.load(std::memory_order_relaxed);
++}
++
++static uint64_t ggml_backend_cuda_test_norm_affine_fusions() {
++    return ggml_cuda_norm_affine_fusions.load(std::memory_order_relaxed);
++}
++
++static uint64_t ggml_backend_cuda_test_bias_activation_fusions() {
++    return ggml_cuda_bias_activation_fusions.load(std::memory_order_relaxed);
+ }
+ 
+ // Private test hook: counts host submissions/captures, not graph replays.
+@@ -4614,10 +4625,25 @@
+ 
+     if (node->op == GGML_OP_ADD && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_dense_opt_enabled() &&
+-            ggml_cuda_match_residual_norm(cgraph, i, true)) {
+-        ggml_cuda_op_residual_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++            ggml_cuda_match_residual_norm(cgraph, i, true) &&
++            ggml_cuda_op_residual_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+         ggml_cuda_residual_norm_fusions.fetch_add(1, std::memory_order_relaxed);
+         return 2;
++    }
++
++    if (cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_dense_opt_enabled()) {
++        if (node->op == GGML_OP_NORM && ggml_cuda_match_norm_affine(cgraph, i, true)) {
++            ggml_cuda_op_norm_affine_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++            ggml_cuda_norm_affine_fusions.fetch_add(1, std::memory_order_relaxed);
++            return 2;
++        }
++        if (node->op == GGML_OP_ADD && ggml_cuda_match_bias_activation(cgraph, i, true) &&
++                // Preserve the existing SiLU/MUL fusion when it can already run.
++                !ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU })) {
++            ggml_cuda_op_bias_activation_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
++            ggml_cuda_bias_activation_fusions.fetch_add(1, std::memory_order_relaxed);
++            return 1;
++        }
+     }
+ 
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+@@ -7280,6 +7306,12 @@
+     if (strcmp(name,"ggml_backend_cuda_moe_api")==0) {
+         return const_cast<ggml_backend_cuda_moe_api *>(&ggml_cuda_moe_api);
+     }
++    if (strcmp(name, "ggml_backend_cuda_test_norm_affine_fusions") == 0) {
++        return (void *) ggml_backend_cuda_test_norm_affine_fusions;
++    }
++    if (strcmp(name, "ggml_backend_cuda_test_bias_activation_fusions") == 0) {
++        return (void *) ggml_backend_cuda_test_bias_activation_fusions;
++    }
+     if (strcmp(name, "ggml_backend_cuda_test_residual_norm_fusions") == 0) {
+         return (void *) ggml_backend_cuda_test_residual_norm_fusions;
+     }
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -2,10 +2,11 @@
+ #include "unary.cuh"
+ #include <cstdint>
+ 
+-template <int block_size>
++template <int block_size, bool affine = false>
+ static __global__ void norm_f32(
+         const float * x, float * dst, const int ncols, const int nchannels, const int nsamples,
+-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
++        const float * weight = nullptr, const float * bias = nullptr) {
+     const int nrows = gridDim.x;
+     const int row   = blockIdx.x;
+     const int tid   = threadIdx.x;
+@@ -36,7 +37,13 @@
+             const float inv_std = rsqrtf(var + eps);
+ 
+             for (int col = tid; col < ncols; col += block_size) {
+-                dstc[col] = (xc[col] - mean) * inv_std;
++                const float normalized = (xc[col] - mean) * inv_std;
++                if constexpr (affine) {
++                    // MUL and ADD are separate F32 graph nodes in the original path.
++                    dstc[col] = __fadd_rn(__fmul_rn(normalized, weight[col]), bias[col]);
++                } else {
++                    dstc[col] = normalized;
++                }
+             }
+ 
+             if constexpr (block_size > WARP_SIZE) {
+@@ -111,7 +118,8 @@
+                                     const float   scale_out            = 1.0f,
+                                     const float * gate                 = nullptr,
+                                     const float * residual             = nullptr,
+-                                    float * residual_out               = nullptr) {
++                                    float * residual_out               = nullptr,
++                                    const bool residual_broadcast      = false) {
+     ggml_cuda_pdl_lc();
+     const int nrows = gridDim.x;
+     const int row   = blockIdx.x;
+@@ -131,7 +139,7 @@
+             float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+             const float * gatec = do_silu ? gate + ((sample*nchannels + channel)*nrows + row)*ncols : nullptr;
+             const int64_t residual_offset = int64_t((sample*nchannels + channel)*nrows + row)*ncols;
+-            const float * residualc = do_residual ? residual + residual_offset : nullptr;
++            const float * residualc = do_residual ? residual + (residual_broadcast ? 0 : residual_offset) : nullptr;
+             float * residual_dst = do_residual ? residual_out + residual_offset : nullptr;
+ 
+             [[maybe_unused]] const float * mulc = nullptr;
+@@ -422,11 +430,11 @@
+             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
+             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
+             add, add_stride_row, add_stride_channel, add_stride_sample, \
+-            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, gate, residual, residual_out); \
++            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, gate, residual, residual_out, residual_broadcast); \
+     } while (0)
+ 
+ template <bool do_multiply, bool do_add, bool do_scale, bool do_silu = false, bool do_residual = false>
+-static void rms_norm_f32_dispatch(
++static bool rms_norm_f32_dispatch(
+         const dim3     blocks_num,
+         const ggml_tensor * x_t,   float * dst,   const int ncols, const int nchannels, const int nsamples,
+         const int64_t  stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+@@ -435,7 +443,7 @@
+         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
+         cudaStream_t   stream, const float scale_out = 1.0f, const float * gate = nullptr,
+-        const float * residual = nullptr, float * residual_out = nullptr) {
++        const float * residual = nullptr, float * residual_out = nullptr, bool residual_broadcast = false) {
+     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
+ 
+@@ -457,6 +465,7 @@
+     if constexpr (do_silu) { vec = vec && ((uintptr_t) gate & 15) == 0; }
+     if constexpr (do_residual) {
+         vec = vec && ((uintptr_t) residual & 15) == 0 && ((uintptr_t) residual_out & 15) == 0;
++        if (!vec || ncols > 16384) { return false; }
+     }
+ 
+     const int n4 = ncols / 4;
+@@ -481,6 +490,7 @@
+     } else {
+         RMS_NORM_LAUNCH(1024, 1, false);
+     }
++    return true;
+ }
+ #undef RMS_NORM_LAUNCH
+ 
+@@ -604,6 +614,27 @@
+     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+ }
+ 
++void ggml_cuda_op_norm_affine_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm,
++                                   ggml_tensor * mul, ggml_tensor * output) {
++    const auto * input = norm->src[0];
++    const auto * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
++    const auto * bias = output->src[0] == mul ? output->src[1] : output->src[0];
++    const float eps = ggml_get_op_params_f32(norm, 0);
++    const dim3 blocks(input->ne[1], MIN(input->ne[2], UINT16_MAX), MIN(input->ne[3], UINT16_MAX));
++    const auto stride_row = input->nb[1]/sizeof(float);
++    const auto stride_channel = input->nb[2]/sizeof(float);
++    const auto stride_sample = input->nb[3]/sizeof(float);
++    if (input->ne[0] < 1024) {
++        norm_f32<WARP_SIZE, true><<<blocks, WARP_SIZE, 0, ctx.stream()>>>(
++            (const float *) input->data, (float *) output->data, input->ne[0], input->ne[2], input->ne[3],
++            stride_row, stride_channel, stride_sample, eps, (const float *) weight->data, (const float *) bias->data);
++    } else {
++        norm_f32<1024, true><<<blocks, 1024, 32*sizeof(float2), ctx.stream()>>>(
++            (const float *) input->data, (float *) output->data, input->ne[0], input->ne[2], input->ne[3],
++            stride_row, stride_channel, stride_sample, eps, (const float *) weight->data, (const float *) bias->data);
++    }
++}
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const float * src0_d = (const float *)src0->data;
+@@ -829,7 +860,7 @@
+         nullptr, 0, 0, 0, zero, zero, zero, zero, ctx.stream(), 1.0f, (const float *) gate->data);
+ }
+ 
+-void ggml_cuda_op_residual_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add,
++bool ggml_cuda_op_residual_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add,
+                                       ggml_tensor * norm, ggml_tensor * output) {
+     const auto * input = add->src[0];
+     const auto * residual = add->src[1];
+@@ -837,14 +868,14 @@
+     const auto one = init_fastdiv_values(1);
+     const auto zero = make_uint3(0, 0, 0);
+     const dim3 blocks(input->ne[1], MIN(input->ne[2], UINT16_MAX), MIN(input->ne[3], UINT16_MAX));
+-    rms_norm_f32_dispatch<true, false, false, false, true>(
++    return rms_norm_f32_dispatch<true, false, false, false, true>(
+         blocks, input, (float *) output->data, input->ne[0], input->ne[2], input->ne[3],
+         input->nb[1]/sizeof(float), input->nb[2]/sizeof(float), input->nb[3]/sizeof(float),
+         ggml_get_op_params_f32(norm, 0),
+         weight, weight->nb[1]/sizeof(float), weight->nb[2]/sizeof(float), weight->nb[3]/sizeof(float),
+         init_fastdiv_values(weight->ne[0]), one, one, one,
+         nullptr, 0, 0, 0, zero, zero, zero, zero, ctx.stream(), 1.0f, nullptr,
+-        (const float *) residual->data, (float *) add->data);
++        (const float *) residual->data, (float *) add->data, !ggml_are_same_shape(input, residual));
+ }
+ 
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -22,5 +22,8 @@
+ 
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+-void ggml_cuda_op_residual_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add,
++bool ggml_cuda_op_residual_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add,
+                                       ggml_tensor * norm, ggml_tensor * output);
++
++void ggml_cuda_op_norm_affine_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm,
++                                   ggml_tensor * mul, ggml_tensor * output);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -778,3 +778,39 @@
+         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
+     }
+ }
++
++// Same activation functions and separately rounded F32 sum as the ordinary nodes.
++template <float (*op)(float)>
++static __global__ void bias_activation_f32(const float * input, const float * bias,
++        float * output, const int count, const bool broadcast, const uint3 bias_columns) {
++    ggml_cuda_pdl_lc();
++    const int i = blockDim.x*blockIdx.x + threadIdx.x;
++    if (i >= count) { return; }
++    ggml_cuda_pdl_sync();
++    const int bias_index = broadcast ? fastmodulo(i, bias_columns) : i;
++    output[i] = op(__fadd_rn(input[i], bias[bias_index]));
++}
++
++template <float (*op)(float)>
++static void bias_activation_f32_launch(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * input, const ggml_tensor * bias, ggml_tensor * output) {
++    const int count = int(ggml_nelements(output));
++    const bool broadcast = ggml_nelements(bias) != count;
++    const dim3 blocks((int64_t(count) + 255)/256);
++    const ggml_cuda_kernel_launch_params launch_params{ blocks, dim3(256), 0, ctx.stream() };
++    ggml_cuda_kernel_launch(bias_activation_f32<op>, launch_params,
++        (const float *) input->data, (const float *) bias->data, (float *) output->data,
++        count, broadcast, init_fastdiv_values(bias->ne[0]));
++}
++
++void ggml_cuda_op_bias_activation_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * output) {
++    const auto * input = add->src[0];
++    const auto * bias = add->src[1];
++    switch (ggml_get_unary_op(output)) {
++        case GGML_UNARY_OP_SILU:     bias_activation_f32_launch<op_silu>(ctx, input, bias, output); break;
++        case GGML_UNARY_OP_GELU:     bias_activation_f32_launch<op_gelu>(ctx, input, bias, output); break;
++        case GGML_UNARY_OP_GELU_ERF: bias_activation_f32_launch<op_gelu_erf>(ctx, input, bias, output); break;
++        case GGML_UNARY_OP_RELU:     bias_activation_f32_launch<op_relu>(ctx, input, bias, output); break;
++        default: GGML_ABORT("unsupported fused bias activation");
++    }
++}
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -121,3 +121,5 @@
+ 
+     return ggml_cuda_op_silu_single(gate) * up;
+ }
++
++void ggml_cuda_op_bias_activation_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * output);
+diff --git a/ggml/src/ggml-cuda/residual-norm.h b/ggml/src/ggml-cuda/residual-norm.h
+--- a/ggml/src/ggml-cuda/residual-norm.h
++++ b/ggml/src/ggml-cuda/residual-norm.h
+@@ -33,7 +33,11 @@
+         weight->ne[0] != input->ne[0] || weight->ne[1] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1) {
+         return false;
+     }
+-    for (const auto * tensor : { input, residual, add, norm, output }) {
++    const bool residual_vector = residual->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) &&
++        residual->ne[0] == input->ne[0] && residual->ne[1] == 1 && residual->ne[2] == 1 && residual->ne[3] == 1;
++    if (!residual_vector && (residual->type != GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
++            !ggml_are_same_shape(input, residual))) { return false; }
++    for (const auto * tensor : { input, add, norm, output }) {
+         if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+             !ggml_are_same_shape(input, tensor)) { return false; }
+     }
+@@ -44,10 +48,15 @@
+         if (!tensor->data || (reinterpret_cast<uintptr_t>(tensor->data) & 15) != 0) { return false; }
+     }
+     if (!ggml_cuda_residual_norm_disjoint(add, output)) { return false; }
+-    for (const auto * dst : { add, output }) {
+-        for (const auto * src : { input, residual, weight }) {
+-            if (!ggml_cuda_residual_norm_disjoint(dst, src)) { return false; }
+-        }
++    if (!ggml_cuda_residual_norm_disjoint(add, weight)) { return false; }
++    for (const auto * src : { input, residual, weight }) {
++        if (!ggml_cuda_residual_norm_disjoint(output, src)) { return false; }
++    }
++    for (const auto * src : { input, residual }) {
++        // The vectorized kernel retains each thread's rounded sum in registers.
++        // Exact element-wise ADD aliases are safe; shifted/broadcast aliases are not.
++        const bool same_elements = add->data == src->data && ggml_are_same_shape(add, src);
++        if (!same_elements && !ggml_cuda_residual_norm_disjoint(add, src)) { return false; }
+     }
+     return true;
+ }
+diff --git a/ggml/src/ggml-cuda/affine-fusion.h b/ggml/src/ggml-cuda/affine-fusion.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/affine-fusion.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include "residual-norm.h"
++
++inline bool ggml_cuda_same_element_storage(const ggml_tensor * a, const ggml_tensor * b) {
++    return a && b && a->data && a->data == b->data && a->type == b->type &&
++        ggml_are_same_shape(a, b) && ggml_is_contiguous(a) && ggml_is_contiguous(b);
++}
++
++inline bool ggml_cuda_column_vector(const ggml_tensor * tensor, int64_t width) {
++    return tensor && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor) &&
++        tensor->ne[0] == width && tensor->ne[1] == 1 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
++}
++
++inline bool ggml_cuda_affine_output_safe(const ggml_tensor * output, const ggml_tensor * input,
++        const ggml_tensor * weight, const ggml_tensor * bias) {
++    return (ggml_cuda_residual_norm_disjoint(output, input) || ggml_cuda_same_element_storage(output, input)) &&
++        ggml_cuda_residual_norm_disjoint(output, weight) && ggml_cuda_residual_norm_disjoint(output, bias);
++}
++
++inline bool ggml_cuda_match_norm_affine(const ggml_cgraph * graph, int i, bool allocated) {
++    if (i < 0 || graph->n_nodes < 3 || i > graph->n_nodes - 3 ||
++        !ggml_can_fuse_subgraph(graph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) { return false; }
++    const auto * norm = graph->nodes[i];
++    const auto * mul = graph->nodes[i + 1];
++    const auto * output = graph->nodes[i + 2];
++    if ((mul->src[0] != norm && mul->src[1] != norm) ||
++        (output->src[0] != mul && output->src[1] != mul)) { return false; }
++    const auto * input = norm->src[0];
++    const auto * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
++    const auto * bias = output->src[0] == mul ? output->src[1] : output->src[0];
++    if (!input || input->ne[0] <= 0 || input->ne[0] > 16384 ||
++        ggml_nelements(input)/input->ne[0] > 512 ||
++        !ggml_cuda_column_vector(weight, input->ne[0]) || !ggml_cuda_column_vector(bias, input->ne[0]) ||
++        !std::isfinite(ggml_get_op_params_f32(norm, 0)) || ggml_get_op_params_f32(norm, 0) < 0.0f) { return false; }
++    for (const auto * tensor : { input, norm, mul, output }) {
++        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
++            !ggml_are_same_shape(input, tensor)) { return false; }
++    }
++    return !allocated || ggml_cuda_affine_output_safe(output, input, weight, bias);
++}
++
++inline bool ggml_cuda_bias_activation_supported(ggml_unary_op op) {
++    return op == GGML_UNARY_OP_SILU || op == GGML_UNARY_OP_GELU ||
++        op == GGML_UNARY_OP_GELU_ERF || op == GGML_UNARY_OP_RELU;
++}
++
++inline bool ggml_cuda_match_bias_activation(const ggml_cgraph * graph, int i, bool allocated) {
++    if (i < 0 || graph->n_nodes < 2 || i > graph->n_nodes - 2 ||
++        !ggml_can_fuse_subgraph(graph, i, { GGML_OP_ADD, GGML_OP_UNARY }, { i + 1 })) { return false; }
++    const auto * add = graph->nodes[i];
++    const auto * output = graph->nodes[i + 1];
++    const auto * input = add->src[0];
++    const auto * bias = add->src[1];
++    if (!input || !bias || output->src[0] != add ||
++        !ggml_cuda_bias_activation_supported(ggml_get_unary_op(output)) ||
++        input->ne[0] <= 0 || ggml_nelements(input) <= 0 || ggml_nelements(input) > INT32_MAX ||
++        !(ggml_cuda_column_vector(bias, input->ne[0]) ||
++          (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_are_same_shape(input, bias)))) { return false; }
++    for (const auto * tensor : { input, add, output }) {
++        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
++            !ggml_are_same_shape(input, tensor)) { return false; }
++    }
++    if (!allocated) { return true; }
++    // Exact element-wise aliases are safe; shifted or broadcast aliases are not.
++    return (ggml_cuda_residual_norm_disjoint(output, input) || ggml_cuda_same_element_storage(output, input)) &&
++        (ggml_cuda_residual_norm_disjoint(output, bias) || ggml_cuda_same_element_storage(output, bias));
++}
+diff --git a/tests/test-cuda-dense.cpp b/tests/test-cuda-dense.cpp
+--- a/tests/test-cuda-dense.cpp
++++ b/tests/test-cuda-dense.cpp
+@@ -1,6 +1,7 @@
+ #include "ggml-cpp.h"
+ #include "../ggml/src/ggml-cuda/dense-reuse.h"
+ #include "../ggml/src/ggml-cuda/residual-norm.h"
++#include "../ggml/src/ggml-cuda/affine-fusion.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -137,7 +138,9 @@
+     output->data = saved;
+     saved = add->data;
+     add->data = input->data;
+-    require(!ggml_cuda_match_residual_norm(graph, 0, true), "in-place residual add admitted");
++    require(ggml_cuda_match_residual_norm(graph, 0, true), "exact element-wise residual alias rejected");
++    add->data = static_cast<char *>(input->data) + 16;
++    require(!ggml_cuda_match_residual_norm(graph, 0, true), "shifted residual alias admitted");
+     add->data = saved;
+     const auto stride = residual->nb[1];
+     residual->nb[1] += sizeof(float);
+@@ -156,6 +159,125 @@
+     require(!ggml_cuda_match_residual_norm(graph, 0, false), "NaN normalization epsilon admitted");
+ }
+ 
++static void set_test_addresses(std::initializer_list<ggml_tensor *> tensors) {
++    uintptr_t address = 0x100000;
++    for (auto * tensor : tensors) {
++        tensor->data = reinterpret_cast<void *>(address);
++        address += 0x100000;
++    }
++}
++
++static void test_affine_plans() {
++    for (int width : { 4, 128, 512, 1024, 2048, 4096, 4097, 16384, 16388 }) {
++        for (int rows : { 1, 3, 512, 513 }) {
++            auto ctx = context();
++            auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, rows);
++            auto * bias = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, width);
++            auto * gamma = ggml_dup_tensor(ctx.get(), bias);
++            auto * add = ggml_add(ctx.get(), input, bias);
++            auto * norm = ggml_rms_norm(ctx.get(), add, 1e-6f);
++            auto * output = ggml_mul(ctx.get(), norm, gamma);
++            auto * graph = ggml_new_graph(ctx.get());
++            ggml_set_output(add);
++            ggml_build_forward_expand(graph, output);
++            // Widely spaced fake allocations only; no tensor payload is allocated.
++            uintptr_t address = 0x10000000;
++            for (auto * tensor : { input, bias, gamma, add, output }) {
++                tensor->data = reinterpret_cast<void *>(address);
++                address += 0x10000000;
++            }
++            add->data = input->data;
++            const bool expected = width % 4 == 0 && width <= 16384 && rows <= 512;
++            require(ggml_cuda_match_residual_norm(graph, 0, true) == expected,
++                    "register-retained residual dispatch width/row boundary changed");
++        }
++    }
++    {
++        auto ctx = context();
++        auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 128, 3);
++        auto * weight = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 128);
++        auto * bias = ggml_dup_tensor(ctx.get(), weight);
++        auto * norm = ggml_norm(ctx.get(), input, 1e-5f);
++        auto * mul = ggml_mul(ctx.get(), norm, weight);
++        auto * output = ggml_add(ctx.get(), mul, bias);
++        auto * graph = ggml_new_graph(ctx.get());
++        ggml_build_forward_expand(graph, output);
++        require(ggml_cuda_match_norm_affine(graph, 0, false), "affine LayerNorm pattern rejected");
++        require(!ggml_cuda_match_norm_affine(graph, 0, true), "unallocated affine graph admitted");
++        set_test_addresses({ input, weight, bias, norm, mul, output });
++        require(ggml_cuda_match_norm_affine(graph, 0, true), "disjoint affine graph rejected");
++        void * saved = output->data;
++        output->data = input->data;
++        require(ggml_cuda_match_norm_affine(graph, 0, true), "exact affine input alias rejected");
++        for (const auto * source : { input, weight, bias }) {
++            output->data = static_cast<char *>(source->data) + sizeof(float);
++            require(!ggml_cuda_match_norm_affine(graph, 0, true), "shifted affine alias admitted");
++        }
++        output->data = weight->data;
++        require(!ggml_cuda_match_norm_affine(graph, 0, true), "affine parameter overwrite admitted");
++        output->data = saved;
++        std::swap(mul->src[0], mul->src[1]);
++        std::swap(output->src[0], output->src[1]);
++        require(ggml_cuda_match_norm_affine(graph, 0, true), "commuted affine parameters rejected");
++        norm->flags |= GGML_TENSOR_FLAG_OUTPUT;
++        require(!ggml_cuda_match_norm_affine(graph, 0, false), "live LayerNorm intermediate elided");
++        norm->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
++        mul->flags |= GGML_TENSOR_FLAG_OUTPUT;
++        require(!ggml_cuda_match_norm_affine(graph, 0, false), "live affine multiply elided");
++        mul->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
++        bias->type = GGML_TYPE_F16;
++        require(!ggml_cuda_match_norm_affine(graph, 0, false), "affine bias precision changed");
++        bias->type = GGML_TYPE_F32;
++        input->nb[1] += sizeof(float);
++        require(!ggml_cuda_match_norm_affine(graph, 0, false), "strided affine normalization admitted");
++    }
++    for (bool broadcast : { false, true }) {
++        auto ctx = context();
++        auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 128, 3);
++        auto * bias = broadcast ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 128) : ggml_dup_tensor(ctx.get(), input);
++        auto * add = ggml_add(ctx.get(), input, bias);
++        auto * output = ggml_silu(ctx.get(), add);
++        auto * graph = ggml_new_graph(ctx.get());
++        ggml_build_forward_expand(graph, output);
++        set_test_addresses({ input, bias, add, output });
++        for (const auto op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_GELU, GGML_UNARY_OP_GELU_ERF, GGML_UNARY_OP_RELU }) {
++            ggml_set_op_params_i32(output, 0, op);
++            require(ggml_cuda_match_bias_activation(graph, 0, true), "supported bias activation rejected");
++        }
++        ggml_set_op_params_i32(output, 0, GGML_UNARY_OP_TANH);
++        require(!ggml_cuda_match_bias_activation(graph, 0, false), "unsupported bias activation admitted");
++        ggml_set_op_params_i32(output, 0, GGML_UNARY_OP_SILU);
++        void * saved = output->data;
++        output->data = input->data;
++        require(ggml_cuda_match_bias_activation(graph, 0, true), "element-wise activation alias rejected");
++        output->data = bias->data;
++        require(ggml_cuda_match_bias_activation(graph, 0, true) == !broadcast, "broadcast activation alias admission changed");
++        output->data = static_cast<char *>(input->data) + sizeof(float);
++        require(!ggml_cuda_match_bias_activation(graph, 0, true), "shifted activation alias admitted");
++        output->data = saved;
++        add->flags |= GGML_TENSOR_FLAG_OUTPUT;
++        require(!ggml_cuda_match_bias_activation(graph, 0, false), "live bias intermediate elided");
++    }
++    {
++        auto ctx = context();
++        auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 128, 3);
++        auto * bias = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 128);
++        auto * weight = ggml_dup_tensor(ctx.get(), bias);
++        auto * add = ggml_add(ctx.get(), input, bias);
++        auto * norm = ggml_rms_norm(ctx.get(), add, 1e-6f);
++        auto * output = ggml_mul(ctx.get(), norm, weight);
++        auto * graph = ggml_new_graph(ctx.get());
++        ggml_set_output(add);
++        ggml_build_forward_expand(graph, output);
++        set_test_addresses({ input, bias, weight, add, output });
++        require(ggml_cuda_match_residual_norm(graph, 0, true), "column-bias RMS fusion rejected");
++        add->data = input->data;
++        require(ggml_cuda_match_residual_norm(graph, 0, true), "column-bias exact ADD alias rejected");
++        add->data = bias->data;
++        require(!ggml_cuda_match_residual_norm(graph, 0, true), "column bias overwritten before later rows");
++    }
++}
++
+ struct fixture {
+     ggml_backend_t backend;
+     ggml_backend_ptr cpu_fallback;
+@@ -317,6 +439,36 @@
+     ggml_backend_tensor_set(gamma, values.data(), 0, ggml_nbytes(gamma));
+ }
+ 
++static void affine_normalization(fixture & f, int width, int tokens, bool keep_norm) {
++    f.input = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_F32, width, tokens);
++    auto * gamma = ggml_new_tensor_1d(f.inputs.get(), GGML_TYPE_F32, width);
++    f.gate = ggml_dup_tensor(f.inputs.get(), gamma);
++    ggml_set_input(f.input);
++    ggml_set_input(f.gate);
++    auto * norm = ggml_norm(f.compute.get(), f.input, 1e-5f);
++    auto * mul = ggml_mul(f.compute.get(), norm, gamma);
++    auto * output = ggml_add(f.compute.get(), mul, f.gate);
++    if (keep_norm) { f.add_output(norm); }
++    f.add_output(output);
++    f.allocate();
++    std::vector<float> values(width);
++    for (int i = 0; i < width; ++i) { values[i] = 0.7f + i*0.0003f; }
++    ggml_backend_tensor_set(gamma, values.data(), 0, ggml_nbytes(gamma));
++}
++
++static void bias_activation(fixture & f, ggml_unary_op op, bool broadcast, bool keep_add) {
++    constexpr int width = 128;
++    f.input = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_F32, width, 3);
++    f.gate = broadcast ? ggml_new_tensor_1d(f.inputs.get(), GGML_TYPE_F32, width) : ggml_dup_tensor(f.inputs.get(), f.input);
++    ggml_set_input(f.input);
++    ggml_set_input(f.gate);
++    auto * add = ggml_add(f.compute.get(), f.input, f.gate);
++    auto * output = ggml_unary(f.compute.get(), add, op);
++    if (keep_add) { f.add_output(add); }
++    f.add_output(output);
++    f.allocate();
++}
++
+ static void compare(const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b, float tolerance) {
+     require(a.size() == b.size(), "output count changed");
+     for (size_t i = 0; i < a.size(); ++i) {
+@@ -336,6 +488,7 @@
+         test_plan();
+         test_gate_order();
+         test_residual_norm_plan();
++        test_affine_plans();
+         if (argc > 1 && std::string(argv[1]) == "--host-only") {
+             std::puts("PASS: dense input planner guards immutable values and fallbacks");
+             return 0;
+@@ -349,9 +502,44 @@
+         auto residual_fusion_count = reinterpret_cast<uint64_t (*)()>(
+             ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_residual_norm_fusions"));
+         require(residual_fusion_count != nullptr, "CUDA residual fusion-activation test hook unavailable");
++        auto affine_fusion_count = reinterpret_cast<uint64_t (*)()>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_norm_affine_fusions"));
++        auto bias_activation_count = reinterpret_cast<uint64_t (*)()>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_bias_activation_fusions"));
++        require(affine_fusion_count && bias_activation_count, "CUDA affine fusion test hooks unavailable");
+         ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+         ggml_backend_ptr gpu(ggml_backend_dev_init(ggml_backend_reg_dev_get(registry, 0), nullptr));
+         require(cpu && gpu, "cannot create reference/CUDA backends");
++        for (const auto test : { std::array<int, 3>{127, 3, 0}, {128, 1, 0}, {1024, 1, 0}, {128, 2, 1} }) {
++            const auto before = affine_fusion_count();
++            fixture reference(cpu.get()), candidate(gpu.get());
++            affine_normalization(reference, test[0], test[1], test[2]);
++            affine_normalization(candidate, test[0], test[1], test[2]);
++            for (int iteration = 0; iteration < 3; ++iteration) {
++                compare(reference.run(iteration), candidate.run(iteration), 3e-5f);
++            }
++            const bool expected = explicit_dense_opt() && !test[2];
++            const auto submitted = affine_fusion_count() - before;
++            require(expected ? submitted > 0 : submitted == 0, "affine LayerNorm fusion/fallback mismatch");
++        }
++        for (const auto op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_GELU, GGML_UNARY_OP_GELU_ERF, GGML_UNARY_OP_RELU }) {
++            for (bool broadcast : { false, true }) for (bool keep_add : { false, true }) {
++                const auto before = bias_activation_count();
++                fixture reference(cpu.get()), candidate(gpu.get());
++                bias_activation(reference, op, broadcast, keep_add);
++                bias_activation(candidate, op, broadcast, keep_add);
++                for (int iteration = 0; iteration < 3; ++iteration) {
++                    compare(reference.run(iteration), candidate.run(iteration), 3e-5f);
++                }
++                const bool expected = explicit_dense_opt() && !keep_add;
++                const auto submitted = bias_activation_count() - before;
++                require(expected ? submitted > 0 : submitted == 0, "bias activation fusion/fallback mismatch");
++            }
++        }
++        if (argc > 1 && std::string(argv[1]) == "--affine-only") {
++            std::puts("PASS: small CUDA affine LayerNorm and bias activation replay/fallback cases");
++            return 0;
++        }
+         for (const auto test : {std::array<int, 3>{128, 1, 0}, {128, 3, 0}, {4096, 1, 0}, {128, 2, 1}, {257, 1, 0}}) {
+             const auto before = residual_fusion_count();
+             fixture reference(cpu.get()), candidate(gpu.get());

@@ -43,6 +43,8 @@ The [sampling and prefill controls](docs/sampling-prefill-runtime.md) extend exa
 
 The [execution follow-ups](docs/sglang-execution-followups.md) broaden transactional response overlap, add an experimental residual-normalization CUDA fusion using existing allocations, and reduce MTP/EAGLE3 staging work. Optional MTP device transport now has a configurable 0–32 MiB allowance per context, inside the existing managed CUDA quota. GPU throughput comparisons for these additions remain pending; their experimental activation defaults are unchanged.
 
+The next extensions add bounded multi-sequence and neural draft-response overlap, more residual/LayerNorm/activation fusion patterns, and graph reuse for EAGLE3 encoders and token-plus-feature decoders. MTP short-shape admission avoids repeated allocation attempts under pressure. Existing graph budgets and CUDA quotas remain authoritative; proposal depth, weights, quantization and context are preserved. See [broader execution coverage](docs/sglang-execution-followups.md#broader-execution-coverage) for support boundaries and the small CPU validation results.
+
 ## Large MoE models on smaller machines
 
 A MoE model uses only its router-selected experts for each token, but the full set of expert weights can still be much larger than VRAM or available RAM. WildLlama's selective-weight path keeps bounded working sets in memory and reads missing weights from the original GGUF files on SSD.

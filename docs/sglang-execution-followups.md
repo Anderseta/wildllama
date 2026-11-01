@@ -54,3 +54,25 @@ Related SGLang designs: [overlap scheduling](https://github.com/sgl-project/sgla
 and [adaptive speculative decoding](https://docs.sglang.io/docs/advanced_features/adaptive_speculative_decoding).
 This implementation adapts execution principles to the existing native engine;
 it does not copy SGLang kernels or introduce its Python/CUDA dependencies.
+
+## Broader execution coverage
+
+Patches 064–066 implement the next three fronts:
+
+| Front | Implemented execution | Conservative boundary |
+| --- | --- | --- |
+| CPU/GPU overlap | [Batched ordinary generation and neural draft-response overlap](batched-draft-overlap.md), with one transactional batch for up to 32 ordinary sequences and a one-shot first-submit hook for eligible MTP/neural drafts. | Resident CUDA placement, owned verified partials, bounded descriptors and rollback. First response stays immediate; streaming-weight providers, media and unsupported layouts retain the ordinary path. Existing hybrid parallelism restrictions are unchanged. |
+| Native fusions | [Additional residual/bias RMS, LayerNorm affine and bias/activation patterns](residual-normalization.md), selected by tensor operations and layout. | Existing allocations and explicit dense-opt activation. Unsupported aliases/layouts retain the original kernels. Actual CUDA numerical/performance validation is deferred. |
+| Speculative graphs | [EAGLE3 encoder/decoder arenas and MTP shape admission](speculative-graphs.md), including backend draft sampler binding transitions. | Existing per-context graph allowance and CUDA quota. Exact shapes and proposal depth remain unchanged. Short denied shapes retry after a bounded cooldown. |
+
+There is no new VRAM reservation outside the selected graph/transport budgets.
+Multi-sequence entropy checkpoints are allocated only on the first eligible
+batch and released after draining on unload; disabled or single-slot-only
+runners do not reserve that checkpoint array.
+
+The [second validation record](benchmarks/sglang-completion-20261101.json)
+records small CPU fixtures with actual retained verification/encoder/decoder
+hits, exact logits/proposals/carry, six before/after HTTP SSE cases per payload,
+bounded memory contracts and UI configuration checks. It does not establish
+trained-model throughput, GPU numerical correctness, universal model coverage
+or performance parity with SGLang. These measurements remain a separate phase.
