@@ -4,7 +4,7 @@ import "testing"
 
 func TestRuntimeFeatureRunnerEnvironment(t *testing.T) {
 	keys := []string{
-		"WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP",
+		"WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP", "WILDLLAMA_MTP_DEVICE_STATE",
 	}
 	for _, key := range keys {
 		t.Run(key, func(t *testing.T) {
@@ -34,6 +34,16 @@ func TestRuntimeFeatureRunnerEnvironment(t *testing.T) {
 	for _, value := range []string{"-1", "1025", "1.5", "128\n"} {
 		if _, err := ParseRunnerEnvironment(map[string]string{"WILDLLAMA_GRAPH_VARIANTS_MIB": value}); err == nil {
 			t.Fatalf("accepted invalid graph budget %q", value)
+		}
+	}
+	for _, value := range []string{"", "0", "1", "32"} {
+		if _, err := ParseRunnerEnvironment(map[string]string{"WILDLLAMA_MTP_DEVICE_STATE_MIB": value}); err != nil {
+			t.Fatalf("MTP state budget %q: %v", value, err)
+		}
+	}
+	for _, value := range []string{"-1", "33", "1.5", "32\n"} {
+		if _, err := ParseRunnerEnvironment(map[string]string{"WILDLLAMA_MTP_DEVICE_STATE_MIB": value}); err == nil {
+			t.Fatalf("accepted invalid MTP state budget %q", value)
 		}
 	}
 	for _, key := range []string{"WILDLLAMA_PREFILL_TRACE", "WILDLLAMA_PREFILL_LATENCY_US", "PATH", "HF_TOKEN"} {

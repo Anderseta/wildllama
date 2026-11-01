@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "date": "2026-11-01",
+  "native_base": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "source_base": "cc99c6d533df179f61893c398f98c98649942281",
+  "changes": [
+    "060-overlap-entropy-transactions",
+    "061-residual-norm-fusion",
+    "062-speculative-staging-budget",
+    "063-mtp-aligned-admission"
+  ],
+  "build": "Windows x64 CUDA native compilation passed with source-integrity guard; Go executable compiled",
+  "tests": {
+    "cpu_contracts": [
+      "speculative-input",
+      "sampler-overlap",
+      "cuda-dense --host-only",
+      "server-decode-overlap",
+      "mtp-device-state CPU"
+    ],
+    "rollback_token_comparisons": 384,
+    "transactional_counter_rounds": 16,
+    "go_api_and_environment_tests": "passed",
+    "wildgoose_ui_tests": 114,
+    "typescript": "passed"
+  },
+  "memory": {
+    "extra_overlap_checkpoint_bytes": 10056,
+    "extra_overlap_gpu_buffers": 0,
+    "extra_residual_fusion_gpu_buffers": 0,
+    "mtp_transport_budget_mib": {
+      "minimum": 0,
+      "scope": "per inference context, inside managed CUDA quota",
+      "default": 32,
+      "zero": "host transport",
+      "maximum": 32
+    },
+    "moe_ram_scope": "managed locked model weights, not process RSS",
+    "cuda_quota_scope": "tracked native allocations, not driver or other programs"
+  },
+  "performance": {
+    "measured_model_tokens_per_second": null,
+    "gpu_tests_performed": false,
+    "trained_models_tested": false,
+    "deferred": [
+      "actual CUDA overlap and cancellation",
+      "CUDA residual numeric/replay/performance validation",
+      "CUDA MTP transport and quota-denial scenarios",
+      "trained-model quality and throughput"
+    ],
+    "defaults": "Existing experimental opt-ins remain unchanged; no profile or model replacement"
+  },
+  "platform_runtime_tested": [
+    "Windows x64 CPU"
+  ],
+  "patches": [
+    {
+      "sha256": "262c6939b59ad6cb98f887d89cc211796db7eadfe5dfdd108c2098da6406a539",
+      "file": "060-overlap-entropy-transactions.patch"
+    },
+    {
+      "sha256": "0fd27bf642d1564d9230733b4dc9d7993985d171ff0ba063c68894c5cee02022",
+      "file": "061-residual-norm-fusion.patch"
+    },
+    {
+      "sha256": "1cb1cf07e80242914c4ec8d74b0fe09af4da9108462fcebe7f5fa2f5db58848c",
+      "file": "062-speculative-staging-budget.patch"
+    },
+    {
+      "sha256": "44dde700e0ca70b241f5baabfca032e417f2a72a381e4f052a33f526ceda0b15",
+      "file": "063-mtp-aligned-admission.patch"
+    }
+  ],
+  "patch_replay": {
+    "ordered_patches": 60,
+    "status": "passed",
+    "native_files": 193
+  },
+  "go_artifact": {
+    "version": "0.40.11-rc0-wildllama.execution3.protocol1.download1.profiles1",
+    "sha256": "f09506c6291f3989b79277e24be0456be83bab06415c95a9e042f080da51e435"
+  }
+}

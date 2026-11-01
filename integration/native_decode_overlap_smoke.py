@@ -253,13 +253,15 @@ def main():
                 ("eos", {"ignore_eos": False, "logit_bias": [[2, 100.0]]}, False),
                 ("stop-word", {"stop": ["A"]}, False),
                 ("cpu-sampling", {"backend_sampling": False}, False),
-                ("history", {"repeat_penalty": 1.1}, False),
-                ("stochastic", {"temperature": .7}, False),
+                ("history", {"repeat_penalty": 1.1}, True),
+                ("stochastic", {"temperature": .7}, True),
                 ("probabilities", {"n_probs": 5}, False),
                 ("indentation-control", {"n_indent": 1}, False),
                 ("non-streaming", {"stream": False}, False),
                 ("grammar", {"grammar": 'root ::= "AAA"\n', "grammar_first": True,
-                             "ignore_eos": False}, False),
+                             "ignore_eos": False}, True),
+                ("grammar-stochastic-history", {"grammar": 'root ::= "AAA"\n', "grammar_first": True,
+                             "temperature": .7, "repeat_penalty": 1.1, "ignore_eos": False}, True),
             ]
             for name, change, expected in cases:
                 body = dict(base, **change)

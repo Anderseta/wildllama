@@ -1,0 +1,329 @@
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -4,6 +4,7 @@
+ 
+ #include <vector>
+ #include <memory>
++#include <random>
+ 
+ struct llama_vocab;
+ struct llama_grammar;
+@@ -73,6 +74,24 @@
+ // SIZE_MAX means unsupported/overflow; query before copying large scratch.
+ LLAMA_API size_t llama_sampler_backend_binding_size_bound(const llama_sampler * sampler);
+ 
++// One ordinary forward can advance backend entropy before a response is sent.
++// Keep just that entropy, rather than cloning vocabulary/history/grammar state.
++class llama_sampler_overlap_checkpoint;
++LLAMA_API bool llama_sampler_backend_can_overlap_output(const llama_sampler * sampler);
++LLAMA_API bool llama_sampler_backend_overlap_save(const llama_sampler * sampler, llama_sampler_overlap_checkpoint & saved);
++LLAMA_API bool llama_sampler_backend_overlap_restore(llama_sampler * sampler, const llama_sampler_overlap_checkpoint & saved);
++class llama_sampler_overlap_checkpoint {
++    friend LLAMA_API bool llama_sampler_backend_overlap_save(const llama_sampler *, llama_sampler_overlap_checkpoint &);
++    friend LLAMA_API bool llama_sampler_backend_overlap_restore(llama_sampler *, const llama_sampler_overlap_checkpoint &);
++    const llama_sampler * owner = nullptr;
++    const llama_sampler * terminal = nullptr;
++    uint64_t identity = 0, revision = 0;
++    bool stochastic = false;
++    std::mt19937 rng, rng_backend;
++    size_t generated = 0, committed = 0;
++};
++static_assert(sizeof(llama_sampler_overlap_checkpoint) <= 16*1024, "overlap entropy checkpoint exceeds its fixed RAM allowance");
++
+ // An owned allow-mask, applied before probability/selection stages. State
+ // copies/clone own their words; graph bindings never borrow caller memory.
+ // Backend application requires one output per sequence, because successive
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -5220,6 +5220,58 @@
+     return llama_sampler_backend_can_bind_graph(sampler) ? sampler_graph_binding::size_bound(sampler) : std::numeric_limits<size_t>::max();
+ }
+ 
++bool llama_sampler_backend_can_overlap_output(const llama_sampler * sampler) {
++    if (!sampler || sampler->iface != &llama_sampler_chain_i || !llama_sampler_backend_can_bind_graph(sampler)) { return false; }
++    const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++    if (!chain.backend_selects_token) { return false; }
++    const auto * terminal = chain.samplers.back().ptr;
++    if (terminal->iface != &llama_sampler_dist_i && terminal->iface != &llama_sampler_greedy_i) { return false; }
++    for (size_t i = 0; i < chain.samplers.size(); ++i) {
++        const auto * leaf = chain.samplers[i].ptr;
++        // Only the terminal selector may consume entropy. Nested/custom
++        // chains need their own explicit input-transaction contract.
++        if (!graph_binding_leaf(leaf->iface) || (i+1 < chain.samplers.size() &&
++                (leaf->iface == &llama_sampler_dist_i || leaf->iface == &llama_sampler_greedy_i))) { return false; }
++    }
++    return true;
++}
++
++bool llama_sampler_backend_overlap_save(const llama_sampler * sampler, llama_sampler_overlap_checkpoint & saved) {
++    if (!llama_sampler_backend_can_overlap_output(sampler)) { return false; }
++    const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++    const auto * terminal = chain.samplers.back().ptr;
++    saved.owner = sampler;
++    saved.terminal = terminal;
++    saved.identity = chain.graph_binding_id;
++    saved.revision = chain.graph_binding_revision;
++    saved.stochastic = terminal->iface == &llama_sampler_dist_i;
++    if (saved.stochastic) {
++        const auto & state = *static_cast<const llama_sampler_dist *>(terminal->ctx);
++        saved.rng = state.rng;
++        saved.rng_backend = state.rng_backend;
++        saved.generated = state.n_backend_draws_generated;
++        saved.committed = state.n_backend_draws_committed;
++    }
++    return true;
++}
++
++bool llama_sampler_backend_overlap_restore(llama_sampler * sampler, const llama_sampler_overlap_checkpoint & saved) {
++    if (!sampler || sampler != saved.owner || sampler->iface != &llama_sampler_chain_i) { return false; }
++    const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++    if (chain.graph_binding_id != saved.identity || chain.graph_binding_revision != saved.revision ||
++            chain.samplers.empty() || chain.samplers.back().ptr != saved.terminal) { return false; }
++    if (saved.stochastic) {
++        auto * terminal = chain.samplers.back().ptr;
++        if (terminal->iface != &llama_sampler_dist_i) { return false; }
++        auto & state = *static_cast<llama_sampler_dist *>(terminal->ctx);
++        state.rng = saved.rng;
++        state.rng_backend = saved.rng_backend;
++        state.n_backend_draws_generated = saved.generated;
++        state.n_backend_draws_committed = saved.committed;
++    }
++    return true;
++}
++
+ // perf
+ 
+ struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * chain) {
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -66,8 +66,9 @@
+ // candidates. Unsupported/partial chains retain their normal output. This is
+ // unsuitable for draft/rejection verification or candidate inspection.
+ struct llama_sampler * common_sampler_get_backend_selected_only(const struct common_sampler * gsmpl);
+-// A completed compact builtin greedy result with no mutable RNG/history or
+-// grammar/controller dependency. No sampler or output configuration is changed.
++// A completed builtin backend result. Accepted history and explicit grammar
++// masks are ready before launch; backend entropy needs an overlap checkpoint.
++// No sampler or output configuration is changed.
+ bool common_sampler_can_overlap_output(const struct common_sampler * gsmpl);
+ 
+ // extended sampling implementation:
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -671,16 +671,14 @@
+ 
+ 
+ bool common_sampler_can_overlap_output(const common_sampler * gsmpl) {
+-    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || !gsmpl->params.backend_sampling ||
+-            gsmpl->params.n_probs || gsmpl->cur_p.data || gsmpl->cur_p.size ||
+-            gsmpl->params.penalty_repeat != 1.0f || gsmpl->params.penalty_freq != 0.0f ||
+-            gsmpl->params.penalty_present != 0.0f || gsmpl->params.dry_multiplier != 0.0f ||
++    if (!gsmpl || (gsmpl->grmr && (!gsmpl->token_mask || !gsmpl->params.grammar_first)) ||
++            gsmpl->rbudget || !gsmpl->params.backend_sampling ||
++            gsmpl->params.n_probs ||
+             gsmpl->params.xtc_probability != 0.0f || gsmpl->params.reasoning_control ||
+-            !llama_sampler_backend_selected_only_ready(gsmpl->chain) ||
+-            !llama_sampler_backend_can_bind_graph(gsmpl->chain)) { return false; }
+-    const int count = llama_sampler_chain_n(gsmpl->chain);
+-    const auto * terminal = count ? llama_sampler_chain_get(gsmpl->chain, count - 1) : nullptr;
+-    return terminal && std::strcmp(llama_sampler_name(terminal), "+greedy") == 0;
++            !llama_sampler_backend_can_overlap_output(gsmpl->chain)) { return false; }
++    // Noncompact chains have already copied their candidates into owned cur;
++    // n_probs == 0 response formatting cannot inspect the context's next row.
++    return true;
+ }
+ 
+ static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first,
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4,6 +4,7 @@
+ #include "server-slot-iteration.h"
+ #include "server-prefill-budget.h"
+ #include "../../src/llama-context.h"
++#include "../../src/llama-sampler.h"
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
+@@ -1098,6 +1099,7 @@
+     server_batch batch;
+     server_batch decode_overlap_batch;
+     server_decode_overlap decode_overlap;
++    llama_sampler_overlap_checkpoint decode_overlap_entropy;
+     bool decode_overlap_enabled = false;
+     bool decode_overlap_failed = false;
+     server_decode_metadata decode_metadata;
+@@ -3598,6 +3600,9 @@
+             if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), saved.slot, saved.position, -1)) {
+                 throw std::runtime_error("decode-overlap rollback failed");
+             }
++            if (!llama_sampler_backend_overlap_restore(common_sampler_get_backend(slot->smpl.get()), decode_overlap_entropy)) {
++                throw std::runtime_error("decode-overlap sampler owner changed");
++            }
+             slot->prompt.tokens.keep_first(saved.prompt_tokens);
+             slot->i_batch = -1;
+             SLT_DBG(*slot, "decode-overlap discarded position=%d\n", saved.position);
+@@ -3607,6 +3612,7 @@
+ 
+     void start_decode_overlap(server_slot & slot) {
+         try {
++            if (!llama_sampler_backend_overlap_save(common_sampler_get_backend(slot.smpl.get()), decode_overlap_entropy)) { return; }
+             decode_overlap_batch.clear();
+             decode_overlap_batch.slot_batched = &slot;
+             const auto position = slot.prompt.tokens.pos_next();
+--- /dev/null
++++ b/tests/test-sampler-overlap.cpp
+@@ -0,0 +1,154 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "../src/llama-sampler.h"
++
++#include <cstdio>
++#include <array>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++// No model weights or CUDA backend: only a 32-token CPU sampling graph.
++struct sampling_graph {
++    llama_sampler_ptr sampler{llama_sampler_chain_init(llama_sampler_chain_default_params())};
++    ggml_context_ptr context{ggml_init({1024*1024, nullptr, true})};
++    ggml_backend_buffer_ptr storage;
++    ggml_tensor * scores = nullptr;
++    ggml_tensor * selected = nullptr;
++    ggml_cgraph * graph = nullptr;
++    const std::array<float, 32> logits = {{
++        -.9f, -.8f, -.7f, -.6f, .1f, .4f, -.1f, .8f,
++        .2f, .6f, .9f, .3f, -.2f, -.3f, -.4f, -.5f,
++        -.9f, -.8f, -.7f, -.6f, -.5f, -.4f, -.3f, -.2f,
++        -.1f, .0f, .1f, .2f, .3f, .4f, .5f, .6f}};
++
++    sampling_graph(ggml_backend_t backend, bool stochastic, bool penalties, bool mask, int outputs = 1) {
++        require(bool(context), "sampling metadata allocation failed");
++        if (mask) {
++            auto * allow = llama_sampler_init_token_mask(32);
++            const uint32_t words[] = {0x00000ff0};
++            require(llama_sampler_set_token_mask(allow, words, 1), "allow-mask setup failed");
++            llama_sampler_chain_add(sampler.get(), allow);
++        }
++        if (penalties) { llama_sampler_chain_add(sampler.get(), llama_sampler_init_penalties(32, 8, 1.1f, .1f, .2f)); }
++        if (stochastic) {
++            llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_k(8));
++            llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(.8f));
++        }
++        llama_sampler_chain_add(sampler.get(), stochastic ? llama_sampler_init_dist(12345) : llama_sampler_init_greedy());
++        const bool compact = llama_sampler_backend_set_selected_only(sampler.get());
++        // Penalty accept can allocate/throw. Preserve its existing full-output
++        // contract rather than weakening compact-output ownership guarantees.
++        require(compact == !penalties, "legacy penalty compact-output contract changed");
++        require(sampler->iface->backend_init(sampler.get(), ggml_backend_get_default_buffer_type(backend), outputs),
++                "CPU backend sampling unavailable");
++        graph = ggml_new_graph_custom(context.get(), 256, false);
++        scores = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 32);
++        ggml_set_input(scores);
++        llama_sampler_data output{scores, nullptr, nullptr, nullptr};
++        sampler->iface->backend_reset(sampler.get());
++        sampler->iface->backend_apply(sampler.get(), context.get(), graph, &output);
++        selected = output.sampled;
++        require(selected && llama_sampler_backend_can_overlap_output(sampler.get()), "complete backend not eligible for input transaction");
++        require(llama_sampler_backend_selected_only_ready(sampler.get()) == compact, "compact/full backend output contract changed");
++        ggml_build_forward_expand(graph, selected);
++        storage.reset(ggml_backend_alloc_ctx_tensors(context.get(), backend));
++        require(bool(storage) && ggml_backend_buffer_get_size(storage.get()) < 256*1024, "sampling compute allowance exceeded");
++    }
++
++    llama_token run(ggml_backend_t backend) {
++        // Penalty scatter can update source logits in place. A real model
++        // regenerates this input every forward, including discarded work.
++        ggml_backend_tensor_set(scores, logits.data(), 0, logits.size()*sizeof(float));
++        llama_sampler_backend_begin(sampler.get());
++        sampler->iface->backend_set_input(sampler.get());
++        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "sampling graph failed");
++        llama_token token = LLAMA_TOKEN_NULL;
++        ggml_backend_tensor_get(selected, &token, 0, sizeof(token));
++        return token;
++    }
++};
++
++static void rollback_cases(ggml_backend_t backend) {
++    size_t compared = 0;
++    for (bool stochastic : {false, true}) for (bool penalties : {false, true}) for (bool mask : {false, true}) {
++        sampling_graph baseline(backend, stochastic, penalties, mask), overlap(backend, stochastic, penalties, mask);
++        llama_sampler_overlap_checkpoint checkpoint;
++        for (int step = 0; step < 48; ++step) {
++            require(llama_sampler_backend_overlap_save(overlap.sampler.get(), checkpoint), "eligible input checkpoint rejected");
++            // Optional work can fail after its input draw, or be discarded
++            // after completion. Neither may consume the ordinary RNG stream.
++            if (step%3 == 0) { (void) overlap.run(backend); }
++            if (step%7 == 0) { (void) overlap.run(backend); }
++            require(llama_sampler_backend_overlap_restore(overlap.sampler.get(), checkpoint), "same-owner rollback failed");
++            const auto expected = baseline.run(backend), actual = overlap.run(backend);
++            if (actual != expected) {
++                std::fprintf(stderr, "SAMPLER_OVERLAP_MISMATCH stochastic=%d penalties=%d mask=%d step=%d expected=%d actual=%d\n",
++                        int(stochastic), int(penalties), int(mask), step, expected, actual);
++            }
++            require(actual == expected, "discarded forward changed selected token/RNG history");
++            if (mask) { require(actual >= 4 && actual < 12, "allow-mask was bypassed"); }
++            llama_sampler_accept(baseline.sampler.get(), expected);
++            llama_sampler_accept(overlap.sampler.get(), actual);
++            ++compared;
++        }
++        // A clone has a distinct lifetime identity even if all settings match.
++        require(!llama_sampler_backend_overlap_restore(baseline.sampler.get(), checkpoint), "cross-owner entropy restore admitted");
++        auto copied_iface = *overlap.sampler->iface;
++        llama_sampler custom{&copied_iface, overlap.sampler->ctx};
++        require(!llama_sampler_backend_overlap_save(&custom, checkpoint), "custom sampler gained builtin transaction contract");
++        auto * added = llama_sampler_init_temp(1.f);
++        llama_sampler_chain_add(overlap.sampler.get(), added);
++        require(!llama_sampler_backend_overlap_restore(overlap.sampler.get(), checkpoint), "changed topology restored stale entropy");
++    }
++    std::printf("SAMPLER_OVERLAP rollback_token_checks=%zu stochastic_greedy=1 penalties_mask=1 owner_topology_isolation=1 checkpoint_bytes=%zu no_model_weights=1 PASS\n",
++            compared, sizeof(llama_sampler_overlap_checkpoint));
++}
++
++static void unsupported_cases(ggml_backend_t backend) {
++    llama_sampler_overlap_checkpoint checkpoint;
++    llama_sampler_ptr leaf(llama_sampler_init_greedy());
++    require(!llama_sampler_backend_overlap_save(leaf.get(), checkpoint), "bare leaf bypassed chain transaction contract");
++    llama_sampler_ptr not_ready(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++    llama_sampler_chain_add(not_ready.get(), llama_sampler_init_dist(123));
++    require(!llama_sampler_backend_overlap_save(not_ready.get(), checkpoint), "uninitialized chain admitted");
++    require(!llama_sampler_backend_overlap_restore(not_ready.get(), checkpoint), "uncaptured restore admitted");
++    require(!llama_sampler_backend_overlap_save(nullptr, checkpoint), "null checkpoint admitted");
++    require(!llama_sampler_backend_overlap_restore(nullptr, checkpoint), "null restore admitted");
++
++    // Speculative multi-output use retains its own transaction. Input rollback
++    // also restores its counters without accepting an unverified proposal.
++    sampling_graph a(backend, true, false, false, 3), b(backend, true, false, false, 3);
++    for (int step = 0; step < 16; ++step) {
++        require(llama_sampler_backend_overlap_save(b.sampler.get(), checkpoint), "multi-output entropy checkpoint rejected");
++        (void) b.run(backend);
++        require(llama_sampler_backend_overlap_restore(b.sampler.get(), checkpoint), "multi-output rollback failed");
++        const auto expected = a.run(backend), actual = b.run(backend);
++        if (actual != expected) {
++            std::fprintf(stderr, "SAMPLER_OVERLAP_TRANSACTION_MISMATCH step=%d expected=%d actual=%d\n", step, expected, actual);
++        }
++        require(expected == actual, "transactional RNG/counters changed after rollback");
++        llama_sampler_accept(a.sampler.get(), expected);
++        llama_sampler_accept(b.sampler.get(), actual);
++    }
++    std::puts("SAMPLER_OVERLAP fallback_null_custom=1 transactional_counters=1 no_gpu_allocations=1 PASS");
++}
++
++int main() {
++    try {
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        ggml_backend_ptr backend(device ? ggml_backend_dev_init(device, nullptr) : nullptr);
++        require(bool(backend), "CPU backend initialization failed");
++        rollback_cases(backend.get());
++        unsupported_cases(backend.get());
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "sampler overlap: FAIL: %s\n", error.what());
++        return 1;
++    }
++}

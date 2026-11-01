@@ -31,6 +31,29 @@ func TestRunnerEnvironmentClearDoesNotPassEmptyNativeArgument(t *testing.T) {
 	}
 }
 
+func TestMTPTransportEnvironmentPreservesMemoryPolicies(t *testing.T) {
+	t.Setenv("WILDLLAMA_MTP_DEVICE_STATE_MIB", "4")
+	cmd := &exec.Cmd{}
+	SetupLlamaServerCommandEnv(cmd, "llama-server", nil, map[string]string{
+		"WILDLLAMA_MTP_DEVICE_STATE": "1", "WILDLLAMA_MTP_DEVICE_STATE_MIB": "",
+		"LLAMA_ARG_GPU_VRAM_LIMIT_MIB": "12288", "LLAMA_ARG_MOE_RAM_LIMIT_MIB": "10240",
+	})
+	policies := map[string]string{}
+	for _, entry := range cmd.Env {
+		key, value, _ := strings.Cut(entry, "=")
+		if key == "WILDLLAMA_MTP_DEVICE_STATE_MIB" {
+			t.Fatalf("cleared MTP allowance replaced the native default: %q", entry)
+		}
+		policies[key] = value
+	}
+	if policies["WILDLLAMA_MTP_DEVICE_STATE"] != "1" || policies["LLAMA_ARG_GPU_VRAM_LIMIT_MIB"] != "12288" || policies["LLAMA_ARG_MOE_RAM_LIMIT_MIB"] != "10240" {
+		t.Fatalf("transport changed memory policies: %v", policies)
+	}
+	if os.Getenv("WILDLLAMA_MTP_DEVICE_STATE_MIB") != "4" {
+		t.Fatal("runner override changed the parent process")
+	}
+}
+
 func TestLogicalAndPhysicalBatchAreIndependent(t *testing.T) {
 	opts := api.DefaultOptions()
 	opts.NumBatch = 2048

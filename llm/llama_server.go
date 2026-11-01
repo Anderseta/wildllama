@@ -533,7 +533,7 @@ func SetupLlamaServerCommandEnv(cmd *exec.Cmd, exe string, gpuLibs []string, ext
 
 	applied := make(map[string]bool, len(envUpdates))
 	clearRunnerOverride := func(key, value string) bool {
-		return value == "" && (strings.HasPrefix(key, "LLAMA_ARG_") || strings.HasPrefix(key, "OLLAMA_"))
+		return value == "" && (strings.HasPrefix(key, "LLAMA_ARG_") || strings.HasPrefix(key, "OLLAMA_") || strings.HasPrefix(key, "WILDLLAMA_"))
 	}
 	for _, entry := range inherited {
 		key, _, ok := strings.Cut(entry, "=")

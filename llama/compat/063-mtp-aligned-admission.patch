@@ -1,0 +1,15 @@
+--- a/src/llama-nextn-device.h
++++ b/src/llama-nextn-device.h
+@@ -92,7 +92,11 @@
+     result->ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+     if (!result->ctx) { return {}; }
+     result->tensor = ggml_new_tensor_2d(result->ctx.get(), GGML_TYPE_F32, int64_t(width), int64_t(count));
+-    result->buffer.reset(ggml_backend_alloc_ctx_tensors(result->ctx.get(), owner->backend.get()));
++    const auto buft = ggml_backend_get_default_buffer_type(owner->backend.get());
++    const size_t reservation = ggml_backend_alloc_ctx_tensors_from_buft_size(result->ctx.get(), buft);
++    // Include backend alignment before issuing an optional device allocation.
++    if (!reservation || reservation > owner->max_bytes - owner->bytes) { return {}; }
++    result->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(result->ctx.get(), buft));
+     if (!result->buffer || ggml_backend_buffer_is_host(result->buffer.get())) { return {}; }
+     const auto device = ggml_backend_get_device(owner->backend.get());
+     result->reuse_event.reset(ggml_backend_event_new(device));

@@ -1,0 +1,452 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,6 +1,7 @@
+ #include "speculative.h"
+ #include "mtp-state.h"
+ #include "mtp-device-state.h"
++#include "speculative-input.h"
+ #include <cstdlib>
+ 
+ #include "common.h"
+@@ -16,6 +17,7 @@
+ #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+ 
+ #include <algorithm>
++#include <array>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -548,9 +550,12 @@
+     std::vector<llama_pos>          verify_pos_first; // [n_seq] — pos of verify_g[seq][0]
+     std::vector<int32_t>            verify_g_rows;    // [n_seq] — number of rows
+ 
+-    // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
++    // Concatenation stages one encoder chunk; decoder catch-up needs all g rows.
+     std::vector<float> features_buf;
+     std::vector<float> g_embd_buf;
++    std::vector<int32_t> i_batch_beg;
++    std::vector<int32_t> i_batch_end;
++    std::vector<bool> drafting;
+ 
+     common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq, params.draft.n_max)
+@@ -627,6 +632,9 @@
+         verify_g.assign(n_seq, std::vector<float>());
+         verify_pos_first.assign(n_seq, -1);
+         verify_g_rows.assign(n_seq, 0);
++        i_batch_beg.assign(n_seq, -1);
++        i_batch_end.assign(n_seq, -1);
++        drafting.assign(n_seq, false);
+     }
+ 
+     ~common_speculative_impl_draft_eagle3() override {
+@@ -673,8 +681,8 @@
+         // i_batch_beg[seq] / i_batch_end[seq]: inclusive batch indices of this seq's
+         // first/last token in batch_in. Assumes per-seq tokens are contiguous within
+         // the ubatch (server's default ordering).
+-        std::vector<int32_t> i_batch_beg(n_seq, -1);
+-        std::vector<int32_t> i_batch_end(n_seq, -1);
++        std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
++        std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+         for (int k = 0; k < n_tokens; ++k) {
+             const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+@@ -689,22 +697,16 @@
+         auto * ctx_tgt = this->params.ctx_tgt;
+         auto * ctx_dft = this->params.ctx_dft;
+ 
+-        // Interleave each extract_layer's hidden state into a contiguous buffer of
+-        // shape [n_tokens, target_layer_ids_n * n_embd_tgt]. Then run EAGLE3 encoder
+-        // to get one g_embd row per token.
+-        features_buf.resize((size_t) n_tokens * n_embd_enc, 0.0f);
+-
++        // Target views remain owned by the independent target context while
++        // encoder chunks use the draft context. Synchronize/reorder each view
++        // once, rather than duplicate its full concatenation on the host.
++        std::array<const float *, 3> target_layers = {};
+         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+-            const float * layer = target_layer_ids[k] < n_layer_tgt
++            target_layers[k] = target_layer_ids[k] < n_layer_tgt
+                 ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
+                 : llama_get_embeddings_nextn(ctx_tgt);
+-            if (!layer) {
++            if (!target_layers[k]) {
+                 GGML_ABORT("EAGLE3: target layer %d input not extracted.", target_layer_ids[k]);
+-            }
+-            for (int32_t i = 0; i < n_tokens; ++i) {
+-                float * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+-                const float * src = layer + (size_t) i * n_embd_tgt;
+-                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+             }
+         }
+ 
+@@ -715,12 +717,14 @@
+         const int32_t n_ubatch_dft = (int32_t) llama_n_ubatch(ctx_dft);
+         for (int32_t i = 0; i < n_tokens; i += n_ubatch_dft) {
+             const int32_t n_chunk = std::min(n_ubatch_dft, n_tokens - i);
++            if (!common_speculative_pack_features(features_buf, target_layers.data(), target_layers.size(),
++                    size_t(n_embd_tgt), size_t(i), size_t(n_chunk), size_t(n_tokens))) { return false; }
+ 
+             // the per-token encoder does not use positions, generate placeholder ones from the memory state
+             batch_enc.clear();
+             llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) + 1;
+             for (int32_t j = 0; j < n_chunk; ++j) {
+-                batch_enc.add_embd({ features_buf.data() + (size_t) (i + j) * n_embd_enc, 1, (size_t) n_embd_enc }, &pos, 0, true);
++                batch_enc.add_embd({ features_buf.data() + (size_t) j * n_embd_enc, 1, (size_t) n_embd_enc }, &pos, 0, true);
+                 pos++;
+             }
+ 
+@@ -811,7 +815,7 @@
+ 
+         // keep track of which sequences are still drafting
+         int n_drafting = 0;
+-        std::vector<bool> drafting(n_seq);
++        std::fill(drafting.begin(), drafting.end(), false);
+ 
+         // Complete the deferred boundary pair (dp.id_last, pending_g_last) at memory
+         // pos pending_pos_last. dp.id_last is target's freshest sample (= corrected
+@@ -1564,6 +1568,8 @@
+ 
+     std::vector<int32_t> i_batch_beg;
+     std::vector<int32_t> i_batch_end;
++    std::vector<bool> drafting;
++    std::vector<llama_nextn_device_row> target_rows;
+ 
+     // Hidden rows from the most recent target verification batch, grouped by seq.
+     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+@@ -1645,6 +1651,7 @@
+         i_last.assign(n_seq, -1);
+         i_batch_beg.assign(n_seq, -1);
+         i_batch_end.assign(n_seq, -1);
++        drafting.assign(n_seq, false);
+ 
+         const char * device_option = std::getenv("WILDLLAMA_MTP_DEVICE_STATE");
+         // Fewer transfers do not guarantee faster decode. Keep device transport
+@@ -1718,7 +1725,11 @@
+ 
+         const int32_t n_tokens = batch_in.size();
+ 
+-        std::vector<llama_nextn_device_row> target_rows;
++        target_rows.clear();
++        struct clear_target_rows {
++            std::vector<llama_nextn_device_row> & rows;
++            ~clear_target_rows() { rows.clear(); }
++        } clear_rows{target_rows};
+         if (device_state_enabled) {
+             bool eligible = true;
+             const int64_t first = batch_in.tokens[0].pos[0];
+@@ -1741,14 +1752,11 @@
+         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+ 
+         for (int k = 0; k < n_tokens; ++k) {
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                if (batch_in.tokens[k].seq_id == seq_id) {
+-                    i_batch_end[seq_id] = k;
+-                    if (i_batch_beg[seq_id] < 0) {
+-                        i_batch_beg[seq_id] = k;
+-                    }
+-                }
+-            }
++            const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
++            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
++                (i_batch_end[seq_id] >= 0 && i_batch_end[seq_id] + 1 != k)) { return false; }
++            if (i_batch_beg[seq_id] < 0) { i_batch_beg[seq_id] = k; }
++            i_batch_end[seq_id] = k;
+         }
+ 
+         auto * ctx_tgt = this->params.ctx_tgt;
+@@ -1891,7 +1899,7 @@
+ 
+         // keep track of which sequences are still drafting
+         int n_drafting = 0;
+-        std::vector<bool> drafting(n_seq);
++        std::fill(drafting.begin(), drafting.end(), false);
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -5219,11 +5219,13 @@
+         nextn_device_row_ids.clear();
+         return true;
+     }
+-    if (model.devices.size() != 1 || !llama_nextn_cuda_device(model.devices[0].dev) ||
++    const size_t budget = llama_nextn_device_budget(std::getenv("WILDLLAMA_MTP_DEVICE_STATE_MIB"));
++    if (!budget || model.devices.size() != 1 || !llama_nextn_cuda_device(model.devices[0].dev) ||
+         !cparams.embeddings_nextn || cparams.pipeline_parallel || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) { return false; }
+     if (!nextn_device_owner) {
+         try {
+             auto owner = std::make_shared<llama_nextn_device_owner>();
++            owner->max_bytes = budget;
+             owner->backend.reset(ggml_backend_dev_init(model.devices[0].dev, nullptr));
+             if (!owner->backend) { return false; }
+             nextn_device_owner = std::move(owner);
+@@ -5236,7 +5238,7 @@
+ bool llama_context::prepare_nextn_device(size_t rows) {
+     if (!nextn_device_owner || !rows) { return false; }
+     const size_t width = model.hparams.n_embd_out();
+-    if (!width || rows > llama_nextn_device_owner::max_bytes/sizeof(float)/width) { return false; }
++    if (!width || rows > nextn_device_owner->max_bytes/sizeof(float)/width) { return false; }
+     for (size_t i = 0; i < nextn_device_pool.size(); ++i) {
+         auto & bank = nextn_device_pool[i];
+         if (bank.use_count() == 1 && bank->tensor->ne[0] == int64_t(width) && size_t(bank->tensor->ne[1]) >= rows) {
+@@ -5283,14 +5285,18 @@
+     if (!nextn_device_host_stale || nextn_device_active < 0) { return; }
+     const auto & bank = nextn_device_pool[size_t(nextn_device_active)];
+     const size_t width = model.hparams.n_embd_out();
+-    std::vector<float> host(size_t(bank->tensor->ne[1])*width);
+-    if (!llama_nextn_device_read({bank, 0}, host.data(), size_t(bank->tensor->ne[1]))) {
++    size_t captured = 0;
++    if (!llama_nextn_capture_extent(nextn_device_row_ids, size_t(bank->tensor->ne[1]), captured) ||
++        !captured || captured > embd_nextn.size/width) {
++        throw std::runtime_error("invalid device NextN output mapping");
++    }
++    // A single-token round can reuse an older prefill bank. Its unused capacity
++    // is not part of the current output and must not be downloaded or staged.
++    std::vector<float> host(captured*width);
++    if (!llama_nextn_device_read({bank, 0}, host.data(), captured)) {
+         throw std::runtime_error("cannot materialize device NextN output");
+     }
+     if (!logical_order) {
+-        size_t captured = 0;
+-        for (auto index : nextn_device_row_ids) { if (index >= 0) { captured = std::max(captured, size_t(index) + 1); } }
+-        if (captured*width > embd_nextn.size) { throw std::runtime_error("partial device NextN host output overflow"); }
+         std::memcpy(embd_nextn.data, host.data(), captured*width*sizeof(float));
+         nextn_device_host_stale = false;
+         return;
+diff --git a/src/llama-nextn-device.h b/src/llama-nextn-device.h
+--- a/src/llama-nextn-device.h
++++ b/src/llama-nextn-device.h
+@@ -2,18 +2,41 @@
+ 
+ #include "ggml-cpp.h"
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <cstring>
+ #include <limits>
+ #include <memory>
+ #include <vector>
+ 
++inline size_t llama_nextn_device_budget(const char * text) {
++    constexpr size_t mib = 1024u*1024u;
++    if (!text) { return 32u*mib; }
++    if (!*text) { return 0; }
++    size_t value = 0;
++    for (const char * p = text; *p; ++p) {
++        if (*p < '0' || *p > '9' || value > 32) { return 0; }
++        value = value*10 + size_t(*p - '0');
++    }
++    return value <= 32 ? value*mib : 0;
++}
++
++inline bool llama_nextn_capture_extent(const std::vector<int32_t> & row_ids, size_t capacity, size_t & rows) {
++    size_t extent = 0;
++    for (const int32_t row : row_ids) {
++        if (row < -1 || (row >= 0 && size_t(row) >= capacity)) { return false; }
++        if (row >= 0) { extent = std::max(extent, size_t(row) + 1); }
++    }
++    rows = extent;
++    return true;
++}
++
+ // Own the transport backend as well as its buffers: a saved row cannot borrow
+ // a stream or graph allocation that a context reset/unload may destroy.
+ struct llama_nextn_device_owner {
+     ggml_backend_ptr backend;
+     size_t bytes = 0;
+-    static constexpr size_t max_bytes = 32u*1024u*1024u;
++    size_t max_bytes = 32u*1024u*1024u;
+     uint64_t captured_bytes = 0;
+     uint64_t device_input_rows = 0;
+     uint64_t host_input_rows = 0;
+diff --git a/tests/test-mtp-device-state.cpp b/tests/test-mtp-device-state.cpp
+--- a/tests/test-mtp-device-state.cpp
++++ b/tests/test-mtp-device-state.cpp
+@@ -13,6 +13,53 @@
+ #else
+     setenv("WILDLLAMA_MTP_DEVICE_STATE", enabled ? "1" : "0", 1);
+ #endif
++}
++
++static void device_budget(const char * value) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_MTP_DEVICE_STATE_MIB", value ? value : "") == 0, "cannot set device budget");
++#else
++    require((value ? setenv("WILDLLAMA_MTP_DEVICE_STATE_MIB", value, 1) : unsetenv("WILDLLAMA_MTP_DEVICE_STATE_MIB")) == 0,
++            "cannot set device budget");
++#endif
++}
++
++static void oversized_bank_materialization(llama_model * model) {
++    auto params = llama_context_default_params();
++    params.n_ctx = 128; params.n_batch = params.n_ubatch = 64;
++    params.n_threads = params.n_threads_batch = 1;
++    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    llama_context_ptr context(llama_init_from_model(model, params));
++    require(bool(context), "oversized bank context unavailable");
++    llama_set_embeddings_nextn(context.get(), true, false);
++    device_budget("0");
++    require(!llama_set_nextn_device(context.get(), true) && !llama_get_nextn_device_owner(context.get()),
++            "zero device budget allocated optional transport");
++    device_budget("1");
++    require(llama_set_nextn_device(context.get(), true), "one MiB transport budget rejected tiny context");
++    auto owner = llama_get_nextn_device_owner(context.get());
++    require(owner && owner->max_bytes == 1024*1024, "context ignored selected transport budget");
++    common_batch large(context.get());
++    for (int i = 0; i < 64; ++i) { large.add(3 + i%9, i, 0, true); }
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, large.get()) == 0, "prefill bank decode failed");
++    auto row = llama_get_nextn_device_row(context.get(), 0);
++    require(row && row.rows->tensor->ne[1] == 64, "fixture did not allocate a prefill-sized bank");
++    auto * const allocation = row.rows.get();
++    row = {};
++    common_batch small(context.get()); small.add(7, 64, 0, true);
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, small.get()) == 0, "small bank-reuse decode failed");
++    row = llama_get_nextn_device_row(context.get(), 0);
++    require(row && row.rows.get() == allocation && row.rows->tensor->ne[1] == 64,
++            "fixture did not reuse the oversized prefill allocation");
++    const auto before = owner->materialized_bytes;
++    const float * host = llama_get_embeddings_nextn(context.get());
++    require(host && owner->materialized_bytes - before == 32*sizeof(float),
++            "one active row materialized the whole oversized bank");
++    std::vector<float> direct(32);
++    require(llama_nextn_device_read(row, direct.data()) && std::equal(direct.begin(), direct.end(), host),
++            "bounded materialization changed hidden-state values");
++    require(owner->bytes <= owner->max_bytes, "transport allocation exceeded selected aggregate quota");
++    device_budget(nullptr);
+ }
+ 
+ static void bound_model_buffers(const session & s) {
+@@ -71,6 +118,7 @@
+         }
+         llama_backend_init();
+         auto model = tiny_model(cuda);
++        if (cuda) { oversized_bank_materialization(model.get()); }
+         {
+             common_mtp_device_state malformed;
+             malformed.pending_pos = 4;
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/common/speculative-input.h b/common/speculative-input.h
+new file mode 100644
+--- /dev/null
++++ b/common/speculative-input.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <cstddef>
++#include <cstring>
++#include <limits>
++#include <vector>
++
++// Encoder chunks retain their original row order and shape. Only their host
++// concatenation workspace is chunked, rather than duplicating a full prefill.
++inline bool common_speculative_pack_features(
++        std::vector<float> & destination, const float * const * layers, size_t layer_count,
++        size_t width, size_t first, size_t count, size_t rows) {
++    if (!layers || !layer_count || !width || !count || first > rows || count > rows - first ||
++        layer_count > std::numeric_limits<size_t>::max()/width ||
++        rows > std::numeric_limits<size_t>::max()/width/sizeof(float)) { return false; }
++    const size_t row_width = layer_count*width;
++    if (count > std::numeric_limits<size_t>::max()/row_width/sizeof(float)) { return false; }
++    for (size_t layer = 0; layer < layer_count; ++layer) { if (!layers[layer]) { return false; } }
++    destination.resize(count*row_width);
++    for (size_t row = 0; row < count; ++row) {
++        for (size_t layer = 0; layer < layer_count; ++layer) {
++            std::memcpy(destination.data() + row*row_width + layer*width,
++                    layers[layer] + (first + row)*width, width*sizeof(float));
++        }
++    }
++    return true;
++}
+diff --git a/tests/test-speculative-input.cpp b/tests/test-speculative-input.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-speculative-input.cpp
+@@ -0,0 +1,74 @@
++#include "speculative-input.h"
++#include "../src/llama-nextn-device.h"
++
++#include <array>
++#include <cstdio>
++#include <stdexcept>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++int main() {
++    try {
++        constexpr size_t width = 17, rows = 67, layers = 3;
++        std::array<std::vector<float>, layers> inputs;
++        std::array<const float *, layers> pointers;
++        for (size_t layer = 0; layer < layers; ++layer) {
++            inputs[layer].resize(width*rows);
++            for (size_t row = 0; row < rows; ++row) {
++                for (size_t column = 0; column < width; ++column) {
++                    inputs[layer][row*width + column] = float(10000*layer + 100*row + column);
++                }
++            }
++            pointers[layer] = inputs[layer].data();
++        }
++        // Independent full-prefill reference, indexed by logical feature rather
++        // than reproducing the chunk packer's memory-copy loop.
++        std::vector<float> reference(rows*layers*width);
++        for (size_t index = 0; index < reference.size(); ++index) {
++            const size_t row = index/(layers*width), feature = index%(layers*width);
++            reference[index] = float(10000*(feature/width) + 100*row + feature%width);
++        }
++        for (const size_t chunk : {size_t(1), size_t(2), size_t(7), size_t(64)}) {
++            std::vector<float> staged, replay;
++            staged.reserve(chunk*layers*width);
++            auto * const allocation = staged.data();
++            const size_t capacity = staged.capacity();
++            for (size_t first = 0; first < rows; first += chunk) {
++                require(common_speculative_pack_features(staged, pointers.data(), layers, width,
++                        first, std::min(chunk, rows - first), rows), "feature chunk rejected");
++                require(staged.data() == allocation && staged.capacity() == capacity && staged.size() <= chunk*layers*width,
++                        "chunk staging allocated a full-prefill workspace");
++                replay.insert(replay.end(), staged.begin(), staged.end());
++            }
++            require(replay == reference, "chunking changed feature values or row/layer order");
++            const auto sentinel = staged;
++            require(!common_speculative_pack_features(staged, pointers.data(), layers, width, rows, 1, rows) &&
++                    !common_speculative_pack_features(staged, pointers.data(), layers, SIZE_MAX, 0, 1, rows) &&
++                    staged == sentinel, "invalid chunk range or overflow mutated staged features");
++            auto missing = pointers; missing[1] = nullptr;
++            require(!common_speculative_pack_features(staged, missing.data(), layers, width, 0, 1, rows) &&
++                    staged == sentinel, "missing layer published partial staged input");
++        }
++        constexpr size_t mib = 1024*1024;
++        require(llama_nextn_device_budget(nullptr) == 32*mib && llama_nextn_device_budget("0") == 0 &&
++                llama_nextn_device_budget("1") == mib && llama_nextn_device_budget("32") == 32*mib,
++                "MTP device budget default or valid bounds changed");
++        for (const char * invalid : {"", "-1", "+1", " 1", "1 ", "1MiB", "33", "99999999999999999999"}) {
++            require(llama_nextn_device_budget(invalid) == 0, "invalid device budget enabled allocation");
++        }
++        size_t active = 99;
++        require(llama_nextn_capture_extent({-1, 1, 0, -1, 2}, 64, active) && active == 3,
++                "oversized prefill bank forced inactive rows into host materialization");
++        require(llama_nextn_capture_extent({-1, -1}, 64, active) && active == 0, "absent outputs materialized old rows");
++        active = 99;
++        require(!llama_nextn_capture_extent({0, 64}, 64, active) && active == 99 &&
++                !llama_nextn_capture_extent({-2}, 64, active) && active == 99,
++                "invalid row mapping accepted or partially published");
++        require(llama_nextn_capture_extent({2, 0, 1}, 3, active) && active == 3,
++                "permuted logical output lost a captured row");
++        std::puts("PASS: exact EAGLE3 chunk inputs with reusable ubatch workspace; strict 0..32MiB MTP budget; active mapped rows only");
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

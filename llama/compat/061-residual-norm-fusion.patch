@@ -1,0 +1,402 @@
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -82,7 +82,7 @@
+     }
+ }
+ 
+-template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_silu = false>
++template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_silu = false, bool do_residual = false>
+ static __global__ void rms_norm_f32(const float * x,
+                                     float *       dst,
+                                     const int     ncols,
+@@ -109,7 +109,9 @@
+                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+                                     const float   scale_out            = 1.0f,
+-                                    const float * gate                 = nullptr) {
++                                    const float * gate                 = nullptr,
++                                    const float * residual             = nullptr,
++                                    float * residual_out               = nullptr) {
+     ggml_cuda_pdl_lc();
+     const int nrows = gridDim.x;
+     const int row   = blockIdx.x;
+@@ -128,6 +130,9 @@
+             const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+             float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+             const float * gatec = do_silu ? gate + ((sample*nchannels + channel)*nrows + row)*ncols : nullptr;
++            const int64_t residual_offset = int64_t((sample*nchannels + channel)*nrows + row)*ncols;
++            const float * residualc = do_residual ? residual + residual_offset : nullptr;
++            float * residual_dst = do_residual ? residual_out + residual_offset : nullptr;
+ 
+             [[maybe_unused]] const float * mulc = nullptr;
+             if constexpr (do_multiply) {
+@@ -160,6 +165,15 @@
+                     const int i = tid + k*block_size;
+                     if (i < ncols4) {
+                         xs[k] = x4[i];
++                        if constexpr (do_residual) {
++                            const float4 r = reinterpret_cast<const float4 *>(residualc)[i];
++                            // Preserve the separately materialized ADD's F32 rounding.
++                            xs[k].x = __fadd_rn(xs[k].x, r.x);
++                            xs[k].y = __fadd_rn(xs[k].y, r.y);
++                            xs[k].z = __fadd_rn(xs[k].z, r.z);
++                            xs[k].w = __fadd_rn(xs[k].w, r.w);
++                            reinterpret_cast<float4 *>(residual_dst)[i] = xs[k];
++                        }
+                         tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+                     }
+                 }
+@@ -205,7 +219,7 @@
+                 float tmp = 0.0f; // partial sum for thread in warp
+ 
+                 for (int col = tid; col < ncols; col += block_size) {
+-                    const float xi = xc[col];
++                    const float xi = do_residual ? __fadd_rn(xc[col], residualc[col]) : xc[col];
+                     tmp += xi * xi;
+                 }
+ 
+@@ -216,21 +230,23 @@
+                 const float scale = rsqrtf(mean + eps);
+ 
+                 for (int col = tid; col < ncols; col += block_size) {
++                    const float xi = do_residual ? __fadd_rn(xc[col], residualc[col]) : xc[col];
++                    if constexpr (do_residual) { residual_dst[col] = xi; }
+                     if constexpr (do_silu) {
+                         const int mul_col = fastmodulo(col, mul_ncols_packed);
+-                        const float normalized = scale * xc[col] * mulc[mul_col];
++                        const float normalized = scale * xi * mulc[mul_col];
+                         dstc[col] = normalized * ggml_cuda_op_silu_single(gatec[col]);
+                     } else if constexpr (do_multiply && do_add) {
+                         const int mul_col = fastmodulo(col, mul_ncols_packed);
+                         const int add_col = fastmodulo(col, add_ncols_packed);
+-                        dstc[col]         = scale * xc[col] * mulc[mul_col] + addc[add_col];
++                        dstc[col]         = scale * xi * mulc[mul_col] + addc[add_col];
+                     } else if constexpr (do_multiply) {
+                         const int mul_col = fastmodulo(col, mul_ncols_packed);
+-                        dstc[col]         = scale * xc[col] * mulc[mul_col];
++                        dstc[col]         = scale * xi * mulc[mul_col];
+                     } else if constexpr (do_scale) {
+-                        dstc[col] = scale_out * (scale * xc[col]);
++                        dstc[col] = scale_out * (scale * xi);
+                     } else {
+-                        dstc[col] = scale * xc[col];
++                        dstc[col] = scale * xi;
+                     }
+                 }
+             }
+@@ -401,15 +417,15 @@
+     do { \
+         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
+         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+-        ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, do_silu>, launch_params, \
++        ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, do_silu, do_residual>, launch_params, \
+             x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
+             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
+             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
+             add, add_stride_row, add_stride_channel, add_stride_sample, \
+-            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, gate); \
++            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, gate, residual, residual_out); \
+     } while (0)
+ 
+-template <bool do_multiply, bool do_add, bool do_scale, bool do_silu = false>
++template <bool do_multiply, bool do_add, bool do_scale, bool do_silu = false, bool do_residual = false>
+ static void rms_norm_f32_dispatch(
+         const dim3     blocks_num,
+         const ggml_tensor * x_t,   float * dst,   const int ncols, const int nchannels, const int nsamples,
+@@ -418,7 +434,8 @@
+         const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
+         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
+-        cudaStream_t   stream, const float scale_out = 1.0f, const float * gate = nullptr) {
++        cudaStream_t   stream, const float scale_out = 1.0f, const float * gate = nullptr,
++        const float * residual = nullptr, float * residual_out = nullptr) {
+     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
+ 
+@@ -438,6 +455,9 @@
+             && ggml_cuda_is_aligned(add_t, 16);
+     }
+     if constexpr (do_silu) { vec = vec && ((uintptr_t) gate & 15) == 0; }
++    if constexpr (do_residual) {
++        vec = vec && ((uintptr_t) residual & 15) == 0 && ((uintptr_t) residual_out & 15) == 0;
++    }
+ 
+     const int n4 = ncols / 4;
+     if (vec) {
+@@ -809,6 +829,24 @@
+         nullptr, 0, 0, 0, zero, zero, zero, zero, ctx.stream(), 1.0f, (const float *) gate->data);
+ }
+ 
++void ggml_cuda_op_residual_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add,
++                                      ggml_tensor * norm, ggml_tensor * output) {
++    const auto * input = add->src[0];
++    const auto * residual = add->src[1];
++    const auto * weight = output->src[0] == norm ? output->src[1] : output->src[0];
++    const auto one = init_fastdiv_values(1);
++    const auto zero = make_uint3(0, 0, 0);
++    const dim3 blocks(input->ne[1], MIN(input->ne[2], UINT16_MAX), MIN(input->ne[3], UINT16_MAX));
++    rms_norm_f32_dispatch<true, false, false, false, true>(
++        blocks, input, (float *) output->data, input->ne[0], input->ne[2], input->ne[3],
++        input->nb[1]/sizeof(float), input->nb[2]/sizeof(float), input->nb[3]/sizeof(float),
++        ggml_get_op_params_f32(norm, 0),
++        weight, weight->nb[1]/sizeof(float), weight->nb[2]/sizeof(float), weight->nb[3]/sizeof(float),
++        init_fastdiv_values(weight->ne[0]), one, one, one,
++        nullptr, 0, 0, 0, zero, zero, zero, zero, ctx.stream(), 1.0f, nullptr,
++        (const float *) residual->data, (float *) add->data);
++}
++
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * grad  = dst->src[0]; // gradients
+     const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -21,3 +21,6 @@
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++void ggml_cuda_op_residual_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add,
++                                      ggml_tensor * norm, ggml_tensor * output);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -42,6 +42,7 @@
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/dense-reuse.h"
++#include "ggml-cuda/residual-norm.h"
+ #include "ggml-cuda/graph-reuse.h"
+ #include "ggml-cuda/resident-tuning-policy.h"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+@@ -4592,6 +4593,11 @@
+ 
+ // try and fuse nodes and return the number of nodes to skip
+ static std::atomic<uint64_t> ggml_cuda_norm_silu_fusions{0};
++static std::atomic<uint64_t> ggml_cuda_residual_norm_fusions{0};
++
++static uint64_t ggml_backend_cuda_test_residual_norm_fusions() {
++    return ggml_cuda_residual_norm_fusions.load(std::memory_order_relaxed);
++}
+ 
+ // Private test hook: counts host submissions/captures, not graph replays.
+ static uint64_t ggml_backend_cuda_test_norm_silu_fusions() {
+@@ -4605,6 +4611,14 @@
+     }
+ 
+     ggml_tensor * node = cgraph->nodes[i];
++
++    if (node->op == GGML_OP_ADD && cuda_ctx->stream_context().concurrent_events.empty() &&
++            ggml_cuda_dense_opt_enabled() &&
++            ggml_cuda_match_residual_norm(cgraph, i, true)) {
++        ggml_cuda_op_residual_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        ggml_cuda_residual_norm_fusions.fetch_add(1, std::memory_order_relaxed);
++        return 2;
++    }
+ 
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+@@ -7266,6 +7280,9 @@
+     if (strcmp(name,"ggml_backend_cuda_moe_api")==0) {
+         return const_cast<ggml_backend_cuda_moe_api *>(&ggml_cuda_moe_api);
+     }
++    if (strcmp(name, "ggml_backend_cuda_test_residual_norm_fusions") == 0) {
++        return (void *) ggml_backend_cuda_test_residual_norm_fusions;
++    }
+     if (strcmp(name, "ggml_backend_cuda_test_norm_silu_fusions") == 0) {
+         return (void *) ggml_backend_cuda_test_norm_silu_fusions;
+     }
+diff --git a/ggml/src/ggml-cuda/residual-norm.h b/ggml/src/ggml-cuda/residual-norm.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/residual-norm.h
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include "ggml-impl.h"
++
++#include <cmath>
++#include <cstdint>
++#include <limits>
++
++// No lifetime extensions: allocator aliases simply retain the ordinary kernels.
++inline bool ggml_cuda_residual_norm_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a || !b || !a->data || !b->data) { return false; }
++    const auto x = reinterpret_cast<uintptr_t>(a->data);
++    const auto y = reinterpret_cast<uintptr_t>(b->data);
++    const auto nx = ggml_nbytes(a), ny = ggml_nbytes(b);
++    if (x > std::numeric_limits<uintptr_t>::max() - nx ||
++        y > std::numeric_limits<uintptr_t>::max() - ny) { return false; }
++    return x + nx <= y || y + ny <= x;
++}
++
++inline bool ggml_cuda_match_residual_norm(const ggml_cgraph * graph, int i, bool allocated) {
++    if (i < 0 || graph->n_nodes < 3 || i > graph->n_nodes - 3 ||
++        !ggml_can_fuse_subgraph(graph, i,
++            { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 })) { return false; }
++    const auto * add = graph->nodes[i];
++    const auto * norm = graph->nodes[i + 1];
++    const auto * output = graph->nodes[i + 2];
++    if (norm->src[0] != add || (output->src[0] != norm && output->src[1] != norm)) { return false; }
++    const auto * input = add->src[0];
++    const auto * residual = add->src[1];
++    const auto * weight = output->src[0] == norm ? output->src[1] : output->src[0];
++    if (!input || !residual || !weight || input->ne[0] <= 0 || input->ne[0] > 16384 ||
++        input->ne[0] % 4 != 0 || ggml_nelements(input) / input->ne[0] > 512 ||
++        weight->ne[0] != input->ne[0] || weight->ne[1] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1) {
++        return false;
++    }
++    for (const auto * tensor : { input, residual, add, norm, output }) {
++        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
++            !ggml_are_same_shape(input, tensor)) { return false; }
++    }
++    if (weight->type != GGML_TYPE_F32 || !ggml_is_contiguous(weight) ||
++        !std::isfinite(ggml_get_op_params_f32(norm, 0)) || ggml_get_op_params_f32(norm, 0) < 0.0f) { return false; }
++    if (!allocated) { return true; }
++    for (const auto * tensor : { input, residual, add, output, weight }) {
++        if (!tensor->data || (reinterpret_cast<uintptr_t>(tensor->data) & 15) != 0) { return false; }
++    }
++    if (!ggml_cuda_residual_norm_disjoint(add, output)) { return false; }
++    for (const auto * dst : { add, output }) {
++        for (const auto * src : { input, residual, weight }) {
++            if (!ggml_cuda_residual_norm_disjoint(dst, src)) { return false; }
++        }
++    }
++    return true;
++}
+diff --git a/tests/test-cuda-dense.cpp b/tests/test-cuda-dense.cpp
+--- a/tests/test-cuda-dense.cpp
++++ b/tests/test-cuda-dense.cpp
+@@ -1,5 +1,6 @@
+ #include "ggml-cpp.h"
+ #include "../ggml/src/ggml-cuda/dense-reuse.h"
++#include "../ggml/src/ggml-cuda/residual-norm.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -101,6 +102,60 @@
+     require(ggml_cuda_dense_plan_inputs(graph).empty(), "custom side effects were ignored");
+ }
+ 
++static void test_residual_norm_plan() {
++    auto ctx = context();
++    auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 128, 2);
++    auto * residual = ggml_dup_tensor(ctx.get(), input);
++    auto * weight = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 128);
++    auto * add = ggml_add(ctx.get(), input, residual);
++    auto * norm = ggml_rms_norm(ctx.get(), add, 1e-6f);
++    auto * output = ggml_mul(ctx.get(), norm, weight);
++    auto * graph = ggml_new_graph(ctx.get());
++    ggml_set_output(add);
++    ggml_set_output(output);
++    ggml_build_forward_expand(graph, output);
++    require(ggml_cuda_match_residual_norm(graph, 0, false), "residual output must remain externally usable");
++    require(!ggml_cuda_match_residual_norm(graph, -1, false) &&
++            !ggml_cuda_match_residual_norm(graph, 1, false), "invalid residual pattern index admitted");
++    require(!ggml_cuda_match_residual_norm(graph, 0, true), "unallocated residual graph admitted");
++    uintptr_t address = 0x100000;
++    for (auto * tensor : { input, residual, weight, add, output }) {
++        tensor->data = reinterpret_cast<void *>(address);
++        address += 0x100000;
++    }
++    require(ggml_cuda_match_residual_norm(graph, 0, true), "disjoint residual graph rejected");
++    std::swap(output->src[0], output->src[1]);
++    require(ggml_cuda_match_residual_norm(graph, 0, true), "commuted normalization weight rejected");
++    std::swap(output->src[0], output->src[1]);
++    void * saved = output->data;
++    for (const auto * tensor : { input, residual, add, weight }) {
++        output->data = tensor->data;
++        require(!ggml_cuda_match_residual_norm(graph, 0, true), "overlapping output admitted");
++    }
++    output->data = reinterpret_cast<char *>(saved) + 4;
++    require(!ggml_cuda_match_residual_norm(graph, 0, true), "unaligned output admitted");
++    output->data = saved;
++    saved = add->data;
++    add->data = input->data;
++    require(!ggml_cuda_match_residual_norm(graph, 0, true), "in-place residual add admitted");
++    add->data = saved;
++    const auto stride = residual->nb[1];
++    residual->nb[1] += sizeof(float);
++    require(!ggml_cuda_match_residual_norm(graph, 0, false), "strided residual admitted");
++    residual->nb[1] = stride;
++    const auto type = weight->type;
++    weight->type = GGML_TYPE_F16;
++    require(!ggml_cuda_match_residual_norm(graph, 0, false), "different precision weight admitted");
++    weight->type = type;
++    norm->flags |= GGML_TENSOR_FLAG_OUTPUT;
++    require(!ggml_cuda_match_residual_norm(graph, 0, false), "live intermediate norm elided");
++    norm->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
++    ggml_set_op_params_f32(norm, 0, -1.0f);
++    require(!ggml_cuda_match_residual_norm(graph, 0, false), "negative normalization epsilon admitted");
++    ggml_set_op_params_f32(norm, 0, std::numeric_limits<float>::quiet_NaN());
++    require(!ggml_cuda_match_residual_norm(graph, 0, false), "NaN normalization epsilon admitted");
++}
++
+ struct fixture {
+     ggml_backend_t backend;
+     ggml_backend_ptr cpu_fallback;
+@@ -244,6 +299,24 @@
+     ggml_backend_tensor_set(gamma, values.data(), 0, ggml_nbytes(gamma));
+ }
+ 
++static void residual_normalization(fixture & f, int width, int tokens, bool keep_norm) {
++    f.input = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_F32, width, tokens);
++    f.gate = ggml_dup_tensor(f.inputs.get(), f.input);
++    auto * gamma = ggml_new_tensor_1d(f.inputs.get(), GGML_TYPE_F32, width);
++    ggml_set_input(f.input);
++    ggml_set_input(f.gate);
++    auto * add = ggml_add(f.compute.get(), f.input, f.gate);
++    auto * norm = ggml_rms_norm(f.compute.get(), add, 1e-6f);
++    auto * output = ggml_mul(f.compute.get(), norm, gamma);
++    f.add_output(add);
++    if (keep_norm) { f.add_output(norm); }
++    f.add_output(output);
++    f.allocate();
++    std::vector<float> values(width);
++    for (int i = 0; i < width; ++i) { values[i] = 0.7f + i * 0.0003f; }
++    ggml_backend_tensor_set(gamma, values.data(), 0, ggml_nbytes(gamma));
++}
++
+ static void compare(const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b, float tolerance) {
+     require(a.size() == b.size(), "output count changed");
+     for (size_t i = 0; i < a.size(); ++i) {
+@@ -262,6 +335,7 @@
+     try {
+         test_plan();
+         test_gate_order();
++        test_residual_norm_plan();
+         if (argc > 1 && std::string(argv[1]) == "--host-only") {
+             std::puts("PASS: dense input planner guards immutable values and fallbacks");
+             return 0;
+@@ -272,9 +346,30 @@
+         auto fusion_count = reinterpret_cast<uint64_t (*)()>(
+             ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_norm_silu_fusions"));
+         require(fusion_count != nullptr, "CUDA fusion-activation test hook unavailable");
++        auto residual_fusion_count = reinterpret_cast<uint64_t (*)()>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_residual_norm_fusions"));
++        require(residual_fusion_count != nullptr, "CUDA residual fusion-activation test hook unavailable");
+         ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+         ggml_backend_ptr gpu(ggml_backend_dev_init(ggml_backend_reg_dev_get(registry, 0), nullptr));
+         require(cpu && gpu, "cannot create reference/CUDA backends");
++        for (const auto test : {std::array<int, 3>{128, 1, 0}, {128, 3, 0}, {4096, 1, 0}, {128, 2, 1}, {257, 1, 0}}) {
++            const auto before = residual_fusion_count();
++            fixture reference(cpu.get()), candidate(gpu.get());
++            residual_normalization(reference, test[0], test[1], test[2]);
++            residual_normalization(candidate, test[0], test[1], test[2]);
++            for (int iteration = 0; iteration < 3; ++iteration) {
++                compare(reference.run(iteration), candidate.run(iteration), 3e-5f);
++            }
++            const auto submitted = residual_fusion_count() - before;
++            const bool expected = explicit_dense_opt() && !test[2] && test[0] % 4 == 0;
++            std::fprintf(stderr, "residual-norm width=%d tokens=%d keep_norm=%d fused_submissions=%llu expected=%d\n",
++                test[0], test[1], test[2], (unsigned long long) submitted, int(expected));
++            require(expected ? submitted > 0 : submitted == 0, "residual normalization fusion/fallback mismatch");
++        }
++        if (argc > 1 && std::string(argv[1]) == "--residual-only") {
++            std::puts("PASS: small CUDA residual normalization and replay/fallback cases");
++            return 0;
++        }
+         for (const auto test : {std::array<int, 3>{1, 1, 0}, {8, 1, 0}, {1, 2, 0}, {1, 1, 1}}) {
+             fixture reference(cpu.get()), candidate(gpu.get()), other(gpu.get());
+             projections(reference, test[0], test[1], test[2]);

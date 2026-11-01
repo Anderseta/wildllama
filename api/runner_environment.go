@@ -37,8 +37,15 @@ func ParseRunnerEnvironment(value any) (map[string]string, error) {
 			choices = "|auto|on|off"
 		case "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_NO_WARMUP", "OLLAMA_FLASH_ATTENTION", "LLAMA_ARG_GPU_EXCLUSIVE", "LLAMA_ARG_GPU_DIAGNOSTICS", "WILDLLAMA_MOE_RUNTIME", "GGML_CUDA_DENSE_OPT":
 			choices = "|0|1"
-		case "WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP":
+		case "WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP", "WILDLLAMA_MTP_DEVICE_STATE":
 			choices = "|0|1"
+		case "WILDLLAMA_MTP_DEVICE_STATE_MIB":
+			if value != "" {
+				if err := runnerInteger(key, value, 0, 32); err != nil {
+					return nil, err
+				}
+			}
+			continue
 		case "WILDLLAMA_GRAPH_VARIANTS_MIB":
 			if value != "" {
 				if err := runnerInteger(key, value, 0, 1024); err != nil {
