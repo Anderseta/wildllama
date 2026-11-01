@@ -182,6 +182,7 @@ func describeModelFromManifest(name model.Name, mf *manifest.Manifest, runner st
 	}
 
 	summary := api.ListModelResponse{
+		Source:      manifest.ModelOrigin(name),
 		Model:       name.DisplayShortest(),
 		Name:        name.DisplayShortest(),
 		RemoteModel: cfg.RemoteModel,

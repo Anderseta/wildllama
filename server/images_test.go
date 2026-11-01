@@ -748,7 +748,7 @@ func TestPullModelManifestListDownloadsSelectedChildOnly(t *testing.T) {
 	}
 
 	n := model.ParseName(name)
-	gotParentData, err := manifest.ReadManifestData(n)
+	gotParentData, err := manifest.ReadManifestData(n.LocalName())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,7 +756,7 @@ func TestPullModelManifestListDownloadsSelectedChildOnly(t *testing.T) {
 		t.Fatal("named manifest does not contain the parent manifest list")
 	}
 
-	m, err := manifest.ParseNamedManifest(n)
+	m, err := manifest.ParseNamedManifest(n.LocalName())
 	if err != nil {
 		t.Fatal(err)
 	}

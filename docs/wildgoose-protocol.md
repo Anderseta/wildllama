@@ -1,5 +1,16 @@
 # Wildgoose interoperability
 
+## Local model identities
+
+Local API model names are `author/model:tag` (or `model:tag` in the default
+namespace). Pull requests still accept fully qualified registry/Hugging Face
+sources. The source is stored separately in model-origin metadata and returned
+as `source` in `/api/tags`; pulling a local name reuses its saved source.
+Create/copy destinations are normalized too. Startup migrates old manifest
+references without copying weights and refuses conflicting local contents.
+Old fully qualified references remain accepted for local lookups. Download pins
+continue to use the original source identity for resume and explicit cleanup.
+
 `GET /api/version` retains `version` and the existing `capabilities` array and
 adds an optional `wildllama` object. Protocol version 1 advertises boolean
 features: `tool_call_ids`, `request_id`, `structured_errors`, `prompt_progress`,

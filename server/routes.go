@@ -1590,11 +1590,13 @@ func (s *Server) PullHandler(c *gin.Context) {
 		return
 	}
 
+	sourceHost, sourceScheme := name.Host, name.ProtocolScheme
 	name, err = getExistingName(name)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	name.Host, name.ProtocolScheme = sourceHost, sourceScheme
 
 	runner, err := normalizeRunner(req.Runner)
 	if err != nil {
@@ -1680,6 +1682,8 @@ func (s *Server) PushHandler(c *gin.Context) {
 			sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 			return
 		}
+		destination := model.ParseName(mname)
+		name.Host, name.ProtocolScheme = destination.Host, destination.ProtocolScheme
 
 		if err := PushModel(ctx, name.DisplayShortest(), regOpts, fn); err != nil {
 			sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
@@ -1746,6 +1750,13 @@ func getExistingName(n model.Name) (model.Name, error) {
 		return name, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return zero, err
+	}
+	if local := n.LocalName(); !local.EqualFold(n) {
+		if name, err := manifest.FindName(local); err == nil {
+			return name, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return zero, err
+		}
 	}
 
 	existing, err := manifest.Manifests(true)
@@ -1833,6 +1844,9 @@ func (s *Server) DeleteHandler(c *gin.Context) {
 		return
 	}
 	removeGGUFMetadata(removed...)
+	if err := manifest.ReleaseModelOrigin(n); err != nil {
+		slog.Warn("could not remove model origin", "error", err)
+	}
 }
 
 func (s *Server) ShowHandler(c *gin.Context) {
@@ -2265,7 +2279,7 @@ func (s *Server) CopyHandler(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("destination %q is invalid", r.Destination)})
 		return
 	}
-	dst, err = getExistingName(dst)
+	dst, err = getExistingName(dst.LocalName())
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -2569,6 +2583,9 @@ func Serve(ln net.Listener) error {
 	}
 	if err := fixBlobs(blobsDir); err != nil {
 		return err
+	}
+	if _, err := manifest.LocalizeModelNames(); err != nil {
+		slog.Warn("could not localize all model names", "error", err)
 	}
 
 	if !envconfig.NoPrune() {

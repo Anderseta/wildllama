@@ -248,6 +248,13 @@ func (n Name) DisplayShortest() string {
 	return sb.String()
 }
 
+// LocalName separates a local model identity from the registry used to fetch it.
+func (n Name) LocalName() Name {
+	n.Host = defaultHost
+	n.ProtocolScheme = defaultProtocolScheme
+	return n
+}
+
 // IsValidNamespace reports whether the provided string is a valid
 // namespace.
 func IsValidNamespace(s string) bool {

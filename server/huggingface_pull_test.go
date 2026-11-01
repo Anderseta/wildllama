@@ -232,7 +232,7 @@ func TestHuggingFacePullRegistersBothShardsWithoutMergingAndReusesBlobs(t *testi
 	if bodies.Load() != 2 {
 		t.Fatalf("blob GETs=%d, want 2 with cache reuse", bodies.Load())
 	}
-	created, err := manifest.ParseNamedManifest(name)
+	created, err := manifest.ParseNamedManifest(name.LocalName())
 	if err != nil {
 		t.Fatal(err)
 	}

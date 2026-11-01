@@ -174,7 +174,8 @@ func pullHuggingFaceGGUF(ctx context.Context, name model.Name, runner string, op
 	if err != nil {
 		return err
 	}
-	oldDigests, _ := manifest.ReferencedBlobDigestsForName(name)
+	target := name.LocalName()
+	oldDigests, _ := manifest.ReferencedBlobDigestsForName(target)
 	local := make(map[string]string, len(files))
 	var total, completed int64
 	for _, file := range files {
@@ -236,7 +237,10 @@ func pullHuggingFaceGGUF(ctx context.Context, name model.Name, runner string, op
 	if err != nil {
 		return err
 	}
-	if err := createModel(ctx, api.CreateRequest{Model: name.String(), Files: local}, name, layers, new(model.ConfigV2), finishedDownload); err != nil {
+	if err := createModel(ctx, api.CreateRequest{Model: target.DisplayShortest(), Files: local}, target, layers, new(model.ConfigV2), finishedDownload); err != nil {
+		return err
+	}
+	if err := manifest.SetModelOrigin(target, name.DisplayShortest()); err != nil {
 		return err
 	}
 	if err := manifest.ReleaseDownloadPin(name); err != nil {

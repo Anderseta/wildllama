@@ -68,6 +68,9 @@ func TestList(t *testing.T) {
 	}
 
 	slices.Sort(actualNames)
+	for i, name := range expectNames {
+		expectNames[i] = model.ParseName(name).LocalName().DisplayShortest()
+	}
 	slices.Sort(expectNames)
 
 	if !slices.Equal(actualNames, expectNames) {

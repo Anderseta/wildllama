@@ -908,7 +908,13 @@ func CopyModel(src, dst model.Name) (string, error) {
 		return "", err
 	}
 
-	return warning, manifest.WriteManifestData(dst, data)
+	if err := manifest.WriteManifestData(dst, data); err != nil {
+		return "", err
+	}
+	if origin := manifest.ModelOrigin(src); origin != "" && src.LocalName().EqualFold(dst.LocalName()) {
+		return warning, manifest.SetModelOrigin(dst, origin)
+	}
+	return warning, manifest.ReleaseModelOrigin(dst)
 }
 
 // narrowManifestListToLocal drops manifest list children whose manifests are
@@ -1039,7 +1045,11 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return errInsecureProtocol
 	}
 
-	manifestJSON, err := manifest.ReadManifestData(n)
+	local, err := getExistingName(n)
+	if err != nil {
+		return err
+	}
+	manifestJSON, err := manifest.ReadManifestData(local)
 	if err != nil {
 		fn(api.ProgressResponse{Status: "couldn't retrieve manifest"})
 		return err
@@ -1061,7 +1071,7 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		}
 		manifestMediaType = manifest.MediaTypeManifestList
 	} else {
-		mf, err := manifest.ParseNamedManifest(n)
+		mf, err := manifest.ParseNamedManifest(local)
 		if err != nil {
 			fn(api.ProgressResponse{Status: "couldn't retrieve manifest"})
 			return err
@@ -1180,6 +1190,9 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 	downloadCleanupGate.RLock()
 	defer downloadCleanupGate.RUnlock()
 	n := model.ParseName(name)
+	if origin := manifest.ModelOrigin(n); origin != "" && n.EqualFold(n.LocalName()) {
+		n = model.ParseName(origin)
+	}
 	if regOpts.HuggingFace.explicit() {
 		if !isHuggingFaceName(n) {
 			return errors.New("Hugging Face file selection requires a huggingface.co model")
@@ -1189,7 +1202,7 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 
 	// build deleteMap to prune unused layers
 	deleteMap := make(map[string]struct{})
-	existingDigests, err := manifest.ReferencedBlobDigestsForName(n)
+	existingDigests, err := manifest.ReferencedBlobDigestsForName(n.LocalName())
 	if errors.Is(err, os.ErrNotExist) {
 		// noop
 	} else if err != nil {
@@ -1326,8 +1339,11 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := manifest.WriteManifestData(n, manifestData); err != nil {
+	if err := manifest.WriteManifestData(n.LocalName(), manifestData); err != nil {
 		slog.Info(fmt.Sprintf("couldn't write manifest for %s", n.DisplayShortest()))
+		return err
+	}
+	if err := manifest.SetModelOrigin(n.LocalName(), n.DisplayShortest()); err != nil {
 		return err
 	}
 
@@ -1573,6 +1589,7 @@ func downloadWithTransfer(ctx context.Context, n model.Name, layers []manifest.L
 // pre-manifest-list daemon can load the model and its garbage collector
 // retains the referenced blobs.
 func writePullDowngradeAnchor(n model.Name, mf *manifest.Manifest, manifestData []byte, selectedChildDigest string) {
+	n = n.LocalName()
 	manifestDigests := []string{fmt.Sprintf("sha256:%x", sha256.Sum256(manifestData))}
 	if selectedChildDigest != "" {
 		manifestDigests = append(manifestDigests, selectedChildDigest)
@@ -1596,7 +1613,10 @@ func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := manifest.WriteManifestData(n, manifestData); err != nil {
+	if err := manifest.WriteManifestData(n.LocalName(), manifestData); err != nil {
+		return err
+	}
+	if err := manifest.SetModelOrigin(n.LocalName(), n.DisplayShortest()); err != nil {
 		return err
 	}
 

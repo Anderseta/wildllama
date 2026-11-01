@@ -51,8 +51,8 @@ func TestGetExistingName(t *testing.T) {
 		{"neworg/newmodel:q8", "neworg/newmodel:q8"},
 		{"defaultmodel", "DefaultModel:latest"},
 		{"registry.ollama.ai/myorg/mymodel:q4", "MyOrg/MyModel:Q4"},
-		{"ollama.com/myorg/mymodel:q4", "ollama.com/myorg/mymodel:q4"},
-		{"registry.ollama.com/myorg/mymodel:q4", "registry.ollama.com/myorg/mymodel:q4"},
+		{"ollama.com/myorg/mymodel:q4", "MyOrg/MyModel:Q4"},
+		{"registry.ollama.com/myorg/mymodel:q4", "MyOrg/MyModel:Q4"},
 		{"LOCALHOST:12345/myorg/mymodel:q4", "localhost:12345/MyOrg/MyModel:Q4"},
 		{"sha256-" + strings.Repeat("a", 64), "sha256-" + strings.Repeat("a", 64)},
 	} {
@@ -1447,7 +1447,7 @@ func TestManifestCaseSensitivity(t *testing.T) {
 
 		g := entries[0] // raw path
 		g = filepath.ToSlash(g)
-		wp, err := manifest.V2PathForName(model.ParseName(wantStableName))
+		wp, err := manifest.V2PathForName(model.ParseName(wantStableName).LocalName())
 		if err != nil {
 			t.Fatalf("failed to resolve expected manifest path: %v", err)
 		}

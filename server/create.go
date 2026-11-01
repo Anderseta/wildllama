@@ -123,7 +123,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		return
 	}
 
-	name, err := getExistingName(name)
+	name, err := getExistingName(name.LocalName())
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
