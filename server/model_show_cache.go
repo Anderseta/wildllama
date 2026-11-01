@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
+	"golang.org/x/sync/singleflight"
 )
 
 /*
@@ -65,7 +67,8 @@ var errModelShowNoCloud = errors.New("cloud disabled")
 // handler-specific mutations, such as user-agent compatibility tweaks, cannot
 // leak back into the cache.
 type modelShowCache struct {
-	mu sync.RWMutex
+	mu           sync.RWMutex
+	localFlights singleflight.Group
 
 	local map[modelShowLocalKey]modelShowLocalEntry
 	cloud map[modelShowCloudKey]*api.ShowResponse
@@ -159,17 +162,26 @@ func (c *modelShowCache) GetLocal(req api.ShowRequest) (*api.ShowResponse, error
 		return resp, nil
 	}
 
-	req.Model = key.Model
-	resp, err := c.getModelInfo(req)
+	value, err, _ := c.localFlights.Do(key.Model+"\x00"+key.Runner+"\x00"+fmt.Sprint(key.Verbose)+"\x00"+digest, func() (any, error) {
+		if response, ok := c.getLocal(key, digest); ok {
+			return response, nil
+		}
+		req.Model = key.Model
+		response, err := c.getModelInfo(req)
+		if err != nil {
+			return nil, err
+		}
+		// An older parse must not evict a newer manifest's cache entry.
+		_, current, lookupError := modelShowLocalKeyForRequest(req)
+		if response.RemoteHost == "" && lookupError == nil && current == digest {
+			c.setLocal(key, digest, response)
+		}
+		return response, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.RemoteHost == "" {
-		c.setLocal(key, digest, resp)
-	}
-
-	return cloneShowResponse(resp), nil
+	return cloneShowResponse(value.(*api.ShowResponse)), nil
 }
 
 // GetCloudSWR returns a cached cloud show response and triggers a throttled

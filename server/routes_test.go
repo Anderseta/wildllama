@@ -798,6 +798,9 @@ func createTestFile(t *testing.T, name string) (string, string) {
 }
 
 func TestRoutes(t *testing.T) {
+	for _, key := range []string{"WILDLLAMA_MAX_REQUEST_BYTES", "WILDLLAMA_MAX_REQUEST_MEMORY_BYTES", "WILDLLAMA_MAX_IN_FLIGHT", "WILDLLAMA_MAX_PENDING_REQUESTS", "WILDLLAMA_MAX_EMBEDDING_ITEMS", "WILDLLAMA_MAX_EMBEDDING_MEDIA_BYTES", "WILDLLAMA_MAX_EMBEDDING_OUTPUT_BYTES"} {
+		t.Setenv(key, "")
+	}
 	modelsDir := t.TempDir()
 	t.Setenv("OLLAMA_MODELS", modelsDir)
 
@@ -860,7 +863,7 @@ func TestRoutes(t *testing.T) {
 				if err != nil {
 					t.Fatalf("failed to read response body: %v", err)
 				}
-				expectedBody := fmt.Sprintf(`{"capabilities":["runner_env","num_ubatch","embedding_batch","gpu_exclusive","gpu_vram_limit_mib","gpu_diagnostics","live_activity","moe_runtime","kv_cache_initial_tokens","reasoning_budget"],"version":"%s"}`, version.Version)
+				expectedBody := fmt.Sprintf(`{"capabilities":["runner_env","num_ubatch","embedding_batch","gpu_exclusive","gpu_vram_limit_mib","gpu_diagnostics","live_activity","moe_runtime","kv_cache_initial_tokens","reasoning_budget","huggingface_catalog","download_cleanup"],"version":"%s","wildllama":{"features":{"embedding_input_limits":true,"multimodal_token_budget":true,"prompt_progress":true,"request_admission":true,"request_id":true,"structured_errors":true,"tool_call_ids":true},"limits":{"embedding_decoded_bytes":50331648,"embedding_items":4096,"embedding_output_bytes":33554432,"max_in_flight":8,"max_queue":128,"request_body_bytes":67108864},"protocol_version":1}}`, version.Version)
 				if string(body) != expectedBody {
 					t.Errorf("expected body %s, got %s", expectedBody, string(body))
 				}

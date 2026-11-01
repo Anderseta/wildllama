@@ -217,10 +217,10 @@ type llamaServerLaunchConfig struct {
 
 func newLlamaServerHTTPClient() *http.Client {
 	return &http.Client{
-		Transport: &http.Transport{
+		Transport: requestIDTransport{base: &http.Transport{
 			DisableKeepAlives: true,
 			Proxy:             nil,
-		},
+		}},
 	}
 }
 
@@ -1657,6 +1657,9 @@ func (s *llamaServerRunner) convertSchemaGrammar(ctx context.Context, schema jso
 		return "", fmt.Errorf("error creating grammar request: %v", err)
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
+	if id := api.RequestID(ctx); id != "" {
+		serverReq.Header.Set("X-Request-ID", id)
+	}
 	res, err := s.httpClient().Do(serverReq)
 	if err != nil {
 		return "", fmt.Errorf("llama-server grammar request failed: %v", err)
@@ -1962,6 +1965,10 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
 
+	if id := api.RequestID(ctx); id != "" {
+		serverReq.Header.Set("X-Request-ID", id)
+	}
+
 	res, err := s.httpClient().Do(serverReq)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -2077,20 +2084,10 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	}
 
 	if hasFinalResp {
-		for scanner.Scan() {
-		}
-
-		if err := scanner.Err(); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err := llamaServerStreamLimitError("response", err); err != nil {
-				return err
-			}
-			return fmt.Errorf("error reading llama-server response: %v", err)
-		}
-
-		if err := res.Body.Close(); err != nil {
+		// A terminal frame is authoritative. Waiting for EOF here can hold the
+		// runner slot forever when a backend keeps the SSE connection alive.
+		// Close before callbacks, which may make a tokenization request.
+		if err := closeTerminalStream(ctx, res.Body, scanner); err != nil {
 			return fmt.Errorf("error closing llama-server response: %v", err)
 		}
 
@@ -2235,6 +2232,10 @@ func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatReque
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
 
+	if id := api.RequestID(ctx); id != "" {
+		serverReq.Header.Set("X-Request-ID", id)
+	}
+
 	res, err := s.httpClient().Do(serverReq)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -2308,6 +2309,10 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
 
+	if id := api.RequestID(ctx); id != "" {
+		serverReq.Header.Set("X-Request-ID", id)
+	}
+
 	res, err := s.httpClient().Do(serverReq)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -2357,7 +2362,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				evt = line
 			}
 			if bytes.Equal(evt, []byte("[DONE]")) {
-				continue
+				return errors.New("llama-server chat stream ended without a completion marker")
 			}
 
 			var lsResp llamaServerChatResponse
@@ -2439,20 +2444,9 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	}
 
 	if hasFinalResp {
-		for scanner.Scan() {
-		}
-
-		if err := scanner.Err(); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err := llamaServerStreamLimitError("chat response", err); err != nil {
-				return err
-			}
-			return fmt.Errorf("error reading llama-server chat response: %v", err)
-		}
-
-		if err := res.Body.Close(); err != nil {
+		// End the HTTP body before publishing tools/Done; the backend need not
+		// close the TCP stream for an already completed generation to finish.
+		if err := closeTerminalStream(ctx, res.Body, scanner); err != nil {
 			return fmt.Errorf("error closing llama-server chat response: %v", err)
 		}
 

@@ -89,7 +89,7 @@ func DownloadPinnedBlobs() (map[string]struct{}, error) {
 	return downloadPinnedBlobsLocked()
 }
 
-func downloadPinnedBlobsLocked() (map[string]struct{}, error) {
+func downloadPinnedBlobsLocked(exclude ...model.Name) (map[string]struct{}, error) {
 	result := map[string]struct{}{}
 	directory, err := os.Open(filepath.Join(envconfig.Models(), "metadata"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -135,11 +135,17 @@ func downloadPinnedBlobsLocked() (map[string]struct{}, error) {
 			if !name.IsFullyQualified() || !name.IsValid() || filepath.Base(downloadPinPath(name)) != entry.Name() || len(pin.Digests) > 4096 {
 				return nil, errors.New("invalid pending model download reference")
 			}
+			skip := false
+			for _, excluded := range exclude {
+				skip = skip || downloadPinPath(excluded) == path
+			}
 			for _, digest := range pin.Digests {
 				if err := ValidateDigest(digest); err != nil {
 					return nil, err
 				}
-				result[digest] = struct{}{}
+				if !skip {
+					result[NormalizeDigest(digest)] = struct{}{}
+				}
 			}
 		}
 		if errors.Is(err, io.EOF) {

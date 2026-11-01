@@ -1,0 +1,1138 @@
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -8,6 +8,7 @@
+ #include "llama-moe-work-batch.h"
+ #include "llama-moe-expert-plan.h"
+ #include "llama-moe-expert-graph.h"
++#include "llama-moe-prepare.h"
+ #include "ggml-cuda-host-op.h"
+ 
+ #include "llama-impl.h"
+@@ -825,6 +826,7 @@
+     }
+ 
+     ~impl() {
++        executor_drain();
+         log_stats();
+     }
+ 
+diff --git a/src/llama-moe-executor.inl b/src/llama-moe-executor.inl
+--- a/src/llama-moe-executor.inl
++++ b/src/llama-moe-executor.inl
+@@ -6,6 +6,7 @@
+     size_t executor_output_size = 0;
+     size_t executor_ids_size = 0;
+     std::mutex executor_mutex;
++    llama_moe_prepare::batch executor_prepared;
+     struct executor_route {
+         std::vector<int32_t> ids;
+         std::vector<llama_moe_partition::window> windows;
+@@ -25,6 +26,36 @@
+         return llama_moe_runtime::enabled() && value && std::strcmp(value, "1") == 0;
+     }
+ 
++    static bool executor_prepare_reuse_enabled() {
++        const char * value = std::getenv("WILDLLAMA_MOE_PREPARE_REUSE");
++        return value && std::strcmp(value, "1") == 0;
++    }
++
++    llama_moe_prepare::precision executor_precision(const ggml_tensor * weight) const {
++        llama_moe_prepare::precision result;
++        const auto found = model.prec_policy.prec_src1.find(weight);
++        if (found != model.prec_policy.prec_src1.end()) { result.source_set = true; result.source = found->second; }
++        result.accumulator_bf16 = weight->type == GGML_TYPE_NVFP4;
++        return result;
++    }
++
++    // Called with the executor mutex held, or during model teardown. A failed
++    // drain must not silently free graph metadata or async ID source vectors.
++    void executor_drain() noexcept {
++        if (executor_backend) { ggml_backend_synchronize(executor_backend.get()); }
++        executor_prepared.flush([] {});
++    }
++
++    void executor_prepare_trace() const {
++        const char * value = std::getenv("WILDLLAMA_MOE_PREPARE_TRACE");
++        if (!value || std::strcmp(value, "1") != 0) { return; }
++        const auto prepared = executor_prepared.stats();
++        LLAMA_LOG_INFO("moe_prepare: builds=%zu reuses=%zu invalidations=%zu key_changes=%zu "
++                       "cpu_metadata=%zu cpu_ids=%zu gpu_workspace=%zu pending=%zu\n",
++            prepared.builds, prepared.reuses, prepared.invalidations, prepared.key_changes,
++            executor_prepared.arena_bytes(), executor_prepared.ids_bytes(), executor_workspace_size, executor_prepared.size());
++    }
++
+     static size_t executor_product(size_t a, size_t b) {
+         if (b && a > std::numeric_limits<size_t>::max() / b) {
+             throw std::runtime_error("gpu-exclusive: dynamic prefill workspace overflow");
+@@ -76,6 +107,7 @@
+ 
+     void executor_begin() {
+         std::lock_guard<std::mutex> guard(executor_mutex);
++        if (executor_prepared.size()) { executor_drain(); }
+         executor_routes.clear();
+     }
+ 
+@@ -95,7 +127,8 @@
+                 throw std::runtime_error("gpu-exclusive: cannot initialize dynamic prefill CUDA backend");
+             }
+         }
+-        ggml_backend_synchronize(executor_backend.get());
++        executor_drain();
++        executor_prepared.invalidate();
+         executor_workspace.reset();
+         executor_workspace_size = 0;
+         executor_workspace.reset(ggml_backend_buft_alloc_buffer(devices[0].buft, needed));
+@@ -154,7 +187,10 @@
+         } catch (...) {
+             LLAMA_LOG_ERROR("gpu-exclusive: dynamic prefill failed\n");
+         }
+-        if (self && self->executor_backend) { ggml_backend_synchronize(self->executor_backend.get()); }
++        if (self && self->executor_backend) {
++            std::lock_guard<std::mutex> guard(self->executor_mutex);
++            self->executor_drain();
++        }
+         return false;
+     }
+ 
+@@ -197,6 +233,12 @@
+         const size_t batch_limit=llama_moe_runtime::option("WILDLLAMA_MOE_EXECUTOR_BATCH") ? 4 : 1;
+         llama_moe_work_batch<llama_moe_expert_graph::work> pending(batch_limit);
+         auto synchronize=[&] { ggml_backend_synchronize(executor_backend.get()); };
++        const bool reuse = executor_prepare_reuse_enabled();
++        if (reuse) { executor_prepared.set_limit(batch_limit); }
++        auto flush = [&] {
++            if (reuse) { executor_prepared.flush(synchronize); }
++            else { pending.flush(synchronize); }
++        };
+         const uint64_t uploaded_before=stream_stats.h2d_bytes;
+         try {
+             for (const auto & selected:plan.groups) {
+@@ -212,7 +254,8 @@
+                         group.slru.slot_map[binding->second.key];
+                     for (size_t done=0; done<selected.entry_count;) {
+                         const size_t entries=std::min(capacities[ti],selected.entry_count-done);
+-                        auto & item=pending.next(synchronize);
++                        auto * prepared = reuse ? &executor_prepared.next(synchronize) : nullptr;
++                        auto & item = prepared ? prepared->item(executor_ids_size/sizeof(int32_t), true) : pending.next(synchronize);
+                         item.input_rows.resize(entries); item.output_rows.resize(entries); item.slot_ids.resize(entries);
+                         for (size_t i=0; i<entries; ++i) {
+                             const int32_t entry=plan.entries[selected.entry_begin+done+i];
+@@ -220,17 +263,19 @@
+                             item.input_rows[i]=input->ne[1]==1 ? int32_t(size_t(entry)/k) : entry;
+                             item.slot_ids[i]=mapping[route.ids[size_t(entry)]];
+                         }
+-                        auto graph=llama_moe_expert_graph::build(item,input,output,tile.weight,size_t(tile.row),
+-                            size_t(tile.rows),k,tokens,executor_workspace.get());
+-                        const auto precision=model.prec_policy.prec_src1.find(weight);
+-                        if (precision!=model.prec_policy.prec_src1.end()) { ggml_prec_set_src(graph.part,precision->second,1); }
+-                        if (weight->type==GGML_TYPE_NVFP4) { ggml_prec_set_acc(graph.part,GGML_PREC_BF16); }
++                        const auto math = executor_precision(weight);
++                        auto graph = prepared ? prepared->expert(executor_backend.get(), input, output, tile.weight,
++                            size_t(tile.row), size_t(tile.rows), k, tokens, executor_workspace.get(), math) :
++                            llama_moe_expert_graph::build(item,input,output,tile.weight,size_t(tile.row),
++                                size_t(tile.rows),k,tokens,executor_workspace.get());
++                        if (!prepared) { math.apply(graph.part); }
+                         if (!ggml_backend_supports_op(executor_backend.get(),graph.gather) ||
+                             !ggml_backend_supports_op(executor_backend.get(),graph.part) ||
+                             !ggml_backend_supports_op(executor_backend.get(),graph.scatter)) {
+-                            pending.flush(synchronize);
++                            flush();
+                             return false; // the original token-major provider overwrites every output row
+                         }
++                        if (prepared) { prepared->mark_pending(); }
+                         ggml_backend_tensor_set_async(executor_backend.get(),graph.input_ids,item.input_rows.data(),0,entries*sizeof(int32_t));
+                         ggml_backend_tensor_set_async(executor_backend.get(),graph.slots,item.slot_ids.data(),0,entries*sizeof(int32_t));
+                         ggml_backend_tensor_set_async(executor_backend.get(),graph.output_ids,item.output_rows.data(),0,entries*sizeof(int32_t));
+@@ -241,11 +286,12 @@
+                     }
+                 }
+             }
+-            pending.flush(synchronize);
++            flush();
+         } catch (...) {
+-            pending.flush(synchronize);
++            flush();
+             throw;
+         }
++        executor_prepare_trace();
+         static const bool trace=[] {
+             const char * value=std::getenv("WILDLLAMA_MOE_EXPERT_MAJOR_TRACE");
+             return value && std::strcmp(value,"1")==0;
+@@ -312,6 +358,12 @@
+         const size_t batch_limit = llama_moe_runtime::option("WILDLLAMA_MOE_EXECUTOR_BATCH") ? 4 : 1;
+         llama_moe_work_batch<executor_work> pending(batch_limit);
+         auto synchronize = [&] { ggml_backend_synchronize(executor_backend.get()); };
++        const bool reuse = executor_prepare_reuse_enabled();
++        if (reuse) { executor_prepared.set_limit(batch_limit); }
++        auto flush = [&] {
++            if (reuse) { executor_prepared.flush(synchronize); }
++            else { pending.flush(synchronize); }
++        };
+         try {
+             for (const auto & window : route_plan.windows) {
+                 const size_t begin = executor_product(window.begin, k), end = executor_sum(begin, executor_product(window.tokens, k));
+@@ -325,67 +377,79 @@
+                     if (binding == stream_maps.end()) {
+                         throw std::runtime_error("gpu-exclusive: dynamic prefill tile mapping is missing");
+                     }
+-                    auto & work = pending.next(synchronize);
+-                    const ggml_init_params params = { 32 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true };
+-                    work.ctx.reset(ggml_init(params));
+-                    auto * ctx = work.ctx.get();
+-                    if (!ctx) { throw std::runtime_error("gpu-exclusive: dynamic prefill metadata allocation failed"); }
++                    auto * prepared = reuse ? &executor_prepared.next(synchronize) : nullptr;
++                    auto * legacy = prepared ? nullptr : &pending.next(synchronize);
++                    auto & slot_ids = prepared ? prepared->item(executor_ids_size/sizeof(int32_t)).slot_ids : legacy->slot_ids;
++                    if (legacy) {
++                        const ggml_init_params params = { 32 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true };
++                        legacy->ctx.reset(ggml_init(params));
++                        if (!legacy->ctx) { throw std::runtime_error("gpu-exclusive: dynamic prefill metadata allocation failed"); }
++                    }
+                     prepare_stream_binding(executor_backend.get(), binding->second);
+                     const auto & group = stream_groups[binding->second.group];
+                     const int32_t * mapping = group.adaptive ? group.admission.slot_map[binding->second.key] :
+                         group.slru.slot_map[binding->second.key];
+-                    work.slot_ids.resize(ids.size());
++                    slot_ids.resize(ids.size());
+                     for (size_t index = 0; index < ids.size(); ++index) {
+                         const int32_t slot = mapping[ids[index]];
+                         if (slot < 0 || slot >= tile.slots) {
+                             throw std::runtime_error("gpu-exclusive: dynamic prefill expert has no resident slot");
+                         }
+-                        work.slot_ids[index] = slot;
+-                    }
+-                    auto * input_alias = executor_alias(ctx, input);
+-                    auto * output_alias = executor_alias(ctx, output);
+-                    auto * weight_alias = executor_alias(ctx, tile.weight);
+-                    auto * input_view = ggml_view_3d(ctx, input_alias, input->ne[0], input->ne[1], int64_t(window.tokens),
+-                        input->nb[1], input->nb[2], executor_product(window.begin, input->nb[2]));
+-                    executor_view(input_view);
+-                    auto * slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, int64_t(k), int64_t(window.tokens));
+-                    auto * workspace = static_cast<uint8_t *>(ggml_backend_buffer_get_base(executor_workspace.get()));
+-                    if (ggml_backend_tensor_alloc(executor_workspace.get(), slots, workspace + executor_output_size) != GGML_STATUS_SUCCESS) {
+-                        throw std::runtime_error("gpu-exclusive: dynamic prefill ID tensor allocation failed");
+-                    }
+-                    auto * part = ggml_mul_mat_id(ctx, weight_alias, input_view, slots);
+-                    const auto precision = model.prec_policy.prec_src1.find(weight);
+-                    if (precision != model.prec_policy.prec_src1.end()) { ggml_prec_set_src(part, precision->second, 1); }
+-                    if (weight->type == GGML_TYPE_NVFP4) { ggml_prec_set_acc(part, GGML_PREC_BF16); }
+-                    if (ggml_backend_tensor_alloc(executor_workspace.get(), part, workspace) != GGML_STATUS_SUCCESS) {
+-                        throw std::runtime_error("gpu-exclusive: dynamic prefill output tensor allocation failed");
+-                    }
+-                    const size_t offset = executor_sum(executor_product(window.begin, output->nb[2]),
+-                                                       executor_product(size_t(tile.row), output->nb[0]));
+-                    auto * destination = ggml_view_3d(ctx, output_alias, tile.rows, int64_t(k), int64_t(window.tokens),
+-                        output->nb[1], output->nb[2], offset);
+-                    executor_view(destination);
+-                    auto * copy = ggml_cpy(ctx, part, destination);
+-                    executor_view(copy);
+-                    if (!ggml_backend_supports_op(executor_backend.get(), part) ||
+-                        !ggml_backend_supports_op(executor_backend.get(), copy)) {
++                        slot_ids[index] = slot;
++                    }
++                    llama_moe_expert_graph::graph child;
++                    const auto math = executor_precision(weight);
++                    if (prepared) {
++                        child = prepared->token(executor_backend.get(), input, output, tile.weight,
++                            size_t(tile.row), size_t(tile.rows), k, tokens, window.begin, window.tokens,
++                            executor_workspace.get(), executor_output_size, executor_ids_size, math);
++                    } else {
++                        auto * ctx = legacy->ctx.get();
++                        auto * input_alias = executor_alias(ctx, input);
++                        auto * output_alias = executor_alias(ctx, output);
++                        auto * weight_alias = executor_alias(ctx, tile.weight);
++                        auto * input_view = ggml_view_3d(ctx, input_alias, input->ne[0], input->ne[1], int64_t(window.tokens),
++                            input->nb[1], input->nb[2], executor_product(window.begin, input->nb[2]));
++                        executor_view(input_view);
++                        child.slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, int64_t(k), int64_t(window.tokens));
++                        auto * workspace = static_cast<uint8_t *>(ggml_backend_buffer_get_base(executor_workspace.get()));
++                        if (ggml_backend_tensor_alloc(executor_workspace.get(), child.slots, workspace + executor_output_size) != GGML_STATUS_SUCCESS) {
++                            throw std::runtime_error("gpu-exclusive: dynamic prefill ID tensor allocation failed");
++                        }
++                        child.part = ggml_mul_mat_id(ctx, weight_alias, input_view, child.slots);
++                        math.apply(child.part);
++                        if (ggml_backend_tensor_alloc(executor_workspace.get(), child.part, workspace) != GGML_STATUS_SUCCESS) {
++                            throw std::runtime_error("gpu-exclusive: dynamic prefill output tensor allocation failed");
++                        }
++                        const size_t offset = executor_sum(executor_product(window.begin, output->nb[2]),
++                                                           executor_product(size_t(tile.row), output->nb[0]));
++                        auto * destination = ggml_view_3d(ctx, output_alias, tile.rows, int64_t(k), int64_t(window.tokens),
++                            output->nb[1], output->nb[2], offset);
++                        executor_view(destination);
++                        child.scatter = ggml_cpy(ctx, child.part, destination);
++                        executor_view(child.scatter);
++                        child.value = ggml_new_graph_custom(ctx, 32, false);
++                        ggml_build_forward_expand(child.value, child.scatter);
++                    }
++                    if (!ggml_backend_supports_op(executor_backend.get(), child.part) ||
++                        !ggml_backend_supports_op(executor_backend.get(), child.scatter)) {
+                         throw std::runtime_error("gpu-exclusive: CUDA does not support a dynamic prefill operation");
+                     }
+-                    auto * graph = ggml_new_graph_custom(ctx, 32, false);
+-                    ggml_build_forward_expand(graph, copy);
+-                    ggml_backend_tensor_set_async(executor_backend.get(), slots, work.slot_ids.data(), 0,
+-                                                  executor_product(work.slot_ids.size(), sizeof(int32_t)));
+-                    if (ggml_backend_graph_compute_async(executor_backend.get(), graph) != GGML_STATUS_SUCCESS) {
++                    if (prepared) { prepared->mark_pending(); }
++                    ggml_backend_tensor_set_async(executor_backend.get(), child.slots, slot_ids.data(), 0,
++                                                  executor_product(slot_ids.size(), sizeof(int32_t)));
++                    if (ggml_backend_graph_compute_async(executor_backend.get(), child.value) != GGML_STATUS_SUCCESS) {
+                         throw std::runtime_error("gpu-exclusive: dynamic prefill CUDA execution failed");
+                     }
+                 }
+             }
+-            pending.flush(synchronize);
++            flush();
+         } catch (...) {
+             // Keep every queued graph and its async source bytes alive through
+             // draining, including when a later tile fails during preparation.
+-            pending.flush(synchronize);
++            flush();
+             throw;
+         }
++        executor_prepare_trace();
+         return true;
+     }
+diff --git a/src/llama-moe-expert-graph.h b/src/llama-moe-expert-graph.h
+--- a/src/llama-moe-expert-graph.h
++++ b/src/llama-moe-expert-graph.h
+@@ -98,9 +98,9 @@
+ // All async host index arrays belong to `item`. The caller retains it through
+ // its stream fence. The workspace is the EXISTING dynamic-prefill reservation;
+ // no tensor allocator or extra device buffer is used here.
+-inline graph build(work & item, const ggml_tensor * input, ggml_tensor * output,
+-                   const ggml_tensor * weight, size_t output_row, size_t rows,
+-                   size_t k, size_t tokens, ggml_backend_buffer_t workspace) {
++inline layout validate(const work & item, const ggml_tensor * input, const ggml_tensor * output,
++                       const ggml_tensor * weight, size_t output_row, size_t rows,
++                       size_t k, size_t tokens, ggml_backend_buffer_t workspace) {
+     const size_t entries=item.slot_ids.size();
+     if (!entries || item.input_rows.size()!=entries || item.output_rows.size()!=entries ||
+         !geometry(input,output,k,tokens) || !workspace || !weight || weight->ne[0]!=input->ne[0] ||
+@@ -118,7 +118,20 @@
+     const size_t alignment=ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(workspace));
+     const auto area=carve(size_t(input->ne[0]),rows,entries,alignment);
+     if (area.bytes>ggml_backend_buffer_get_size(workspace)) { throw std::length_error("expert-major graph exceeds existing workspace"); }
+-    item.ctx.reset(ggml_init({32*ggml_tensor_overhead()+ggml_graph_overhead_custom(32,false),nullptr,true}));
++    return area;
++}
++
++inline graph build(work & item, const ggml_tensor * input, ggml_tensor * output,
++                   const ggml_tensor * weight, size_t output_row, size_t rows,
++                   size_t k, size_t tokens, ggml_backend_buffer_t workspace,
++                   void * metadata=nullptr, size_t metadata_size=0) {
++    const auto area=validate(item,input,output,weight,output_row,rows,k,tokens,workspace);
++    const size_t entries=item.slot_ids.size();
++    const size_t source_rows=input->ne[1]==1 ? tokens : product(tokens,k);
++    const size_t needed=32*ggml_tensor_overhead()+ggml_graph_overhead_custom(32,false);
++    if (metadata && metadata_size<needed) { throw std::length_error("expert-major metadata arena is too small"); }
++    if (metadata && uintptr_t(metadata)%GGML_MEM_ALIGN) { throw std::invalid_argument("expert-major metadata arena is not aligned"); }
++    item.ctx.reset(ggml_init({needed,metadata,true}));
+     auto * ctx=item.ctx.get();
+     if (!ctx) { throw std::runtime_error("expert-major metadata allocation failed"); }
+     auto * source=alias(ctx,input);
+diff --git a/src/llama-moe-prepare.h b/src/llama-moe-prepare.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-moe-prepare.h
+@@ -0,0 +1,409 @@
++#pragma once
++
++#include "llama-moe-expert-graph.h"
++#include "../ggml/src/ggml-impl.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++
++// CPU metadata only. All result/index tensors use the caller's pre-existing
++// dynamic-prefill workspace; this helper has no device allocator or gallocr.
++namespace llama_moe_prepare {
++
++inline size_t metadata_bytes() {
++    return 32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false);
++}
++
++inline ggml_backend_buffer_t buffer_of(const ggml_tensor * tensor) {
++    auto * buffer = tensor->buffer;
++    for (const auto * root = tensor; !buffer && root->view_src;) {
++        root = root->view_src;
++        buffer = root->buffer;
++    }
++    if (!buffer || !tensor->data) { throw std::runtime_error("MoE preparation source is not allocated"); }
++    return buffer;
++}
++
++struct tensor_key {
++    ggml_type type = GGML_TYPE_F32;
++    std::array<int64_t, GGML_MAX_DIMS> ne{};
++    std::array<size_t, GGML_MAX_DIMS> nb{};
++    ggml_backend_buffer_t buffer = nullptr;
++    ggml_backend_buffer_type_t buft = nullptr;
++    void * base = nullptr;
++    void * extra = nullptr;
++    size_t bytes = 0;
++    int usage = 0;
++
++    static tensor_key capture(const ggml_tensor * tensor) {
++        if (!tensor) { throw std::invalid_argument("MoE preparation tensor is missing"); }
++        tensor_key result;
++        result.type = tensor->type;
++        std::copy(tensor->ne, tensor->ne + GGML_MAX_DIMS, result.ne.begin());
++        std::copy(tensor->nb, tensor->nb + GGML_MAX_DIMS, result.nb.begin());
++        result.buffer = buffer_of(tensor);
++        result.buft = ggml_backend_buffer_get_type(result.buffer);
++        result.base = ggml_backend_buffer_get_base(result.buffer);
++        result.bytes = ggml_backend_buffer_get_size(result.buffer);
++        result.usage = int(ggml_backend_buffer_get_usage(result.buffer));
++        result.extra = tensor->extra;
++        return result;
++    }
++
++    bool operator==(const tensor_key & other) const {
++        return type == other.type && ne == other.ne && nb == other.nb &&
++            buffer == other.buffer && buft == other.buft && base == other.base &&
++            extra == other.extra && bytes == other.bytes && usage == other.usage;
++    }
++};
++
++struct precision {
++    bool source_set = false;
++    ggml_prec source = GGML_PREC_DEFAULT;
++    bool accumulator_bf16 = false;
++
++    bool operator==(const precision & other) const {
++        return source_set == other.source_set && source == other.source &&
++            accumulator_bf16 == other.accumulator_bf16;
++    }
++    void apply(ggml_tensor * part) const {
++        if (source_set) { ggml_prec_set_src(part, source, 1); }
++        if (accumulator_bf16) { ggml_prec_set_acc(part, GGML_PREC_BF16); }
++    }
++};
++
++enum class kind { token_major, expert_major };
++
++struct key {
++    kind mode = kind::token_major;
++    tensor_key input, output, weight;
++    ggml_backend_t backend = nullptr;
++    ggml_backend_buffer_t workspace = nullptr;
++    ggml_backend_buffer_type_t workspace_buft = nullptr;
++    void * workspace_base = nullptr;
++    size_t workspace_bytes = 0;
++    size_t workspace_alignment = 0;
++    int workspace_usage = 0;
++    size_t output_bytes = 0;
++    size_t ids_bytes = 0;
++    size_t rows = 0, k = 0, tokens = 0, window_tokens = 0, entries = 0;
++    precision math;
++
++    bool operator==(const key & other) const {
++        return mode == other.mode && input == other.input && output == other.output &&
++            weight == other.weight && backend == other.backend && workspace == other.workspace &&
++            workspace_buft == other.workspace_buft && workspace_alignment == other.workspace_alignment &&
++            workspace_usage == other.workspace_usage &&
++            workspace_base == other.workspace_base && workspace_bytes == other.workspace_bytes &&
++            output_bytes == other.output_bytes && ids_bytes == other.ids_bytes && rows == other.rows &&
++            k == other.k && tokens == other.tokens && window_tokens == other.window_tokens &&
++            entries == other.entries && math == other.math;
++    }
++};
++
++struct statistics {
++    size_t builds = 0, reuses = 0, invalidations = 0, key_changes = 0;
++};
++
++class work {
++    struct alignas(GGML_MEM_ALIGN) metadata_word { unsigned char bytes[GGML_MEM_ALIGN]; };
++    struct storage {
++        // Destruction order matters: item.ctx is freed before its backing arena.
++        std::vector<metadata_word> arena;
++        llama_moe_expert_graph::work item;
++        llama_moe_expert_graph::graph graph;
++        key signature;
++        ggml_tensor * source = nullptr, * target = nullptr, * bank = nullptr;
++        ggml_tensor * source_view = nullptr, * destination = nullptr;
++        bool valid = false;
++        size_t ids_capacity = 0;
++    };
++    std::unique_ptr<storage> state;
++    bool pending = false;
++    const void * first_node = nullptr;
++    statistics counters;
++
++    storage & available() {
++        if (pending) { throw std::logic_error("MoE preparation work is still pending"); }
++        if (!state) { state = std::make_unique<storage>(); }
++        return *state;
++    }
++
++    static void alias_data(ggml_tensor * alias, const ggml_tensor * current) {
++        alias->buffer = buffer_of(current);
++        alias->data = current->data;
++        alias->extra = current->extra;
++    }
++
++    static void rebind_view(ggml_tensor * view, size_t offset) {
++        // GGML flattens nested views to the alias root. Refresh both the
++        // absolute offset and data, including CPY/SET_ROWS result views.
++        view->view_offs = offset;
++        if (view->op == GGML_OP_VIEW) { std::memcpy(view->op_params, &offset, sizeof(offset)); }
++        view->buffer = nullptr;
++        view->data = nullptr;
++        view->extra = nullptr;
++        llama_moe_expert_graph::view(view);
++    }
++
++    key signature(kind mode, ggml_backend_t backend, const ggml_tensor * input,
++                  const ggml_tensor * output, const ggml_tensor * weight,
++                  size_t rows, size_t k, size_t tokens, size_t window_tokens,
++                  size_t entries, ggml_backend_buffer_t workspace,
++                  size_t output_bytes, size_t ids_bytes, precision math) {
++        if (!backend || !workspace) { throw std::invalid_argument("MoE preparation backend/workspace is missing"); }
++        key result;
++        result.mode = mode;
++        result.input = tensor_key::capture(input);
++        result.output = tensor_key::capture(output);
++        result.weight = tensor_key::capture(weight);
++        result.backend = backend;
++        result.workspace = workspace;
++        result.workspace_buft = ggml_backend_buffer_get_type(workspace);
++        result.workspace_base = ggml_backend_buffer_get_base(workspace);
++        result.workspace_bytes = ggml_backend_buffer_get_size(workspace);
++        result.workspace_alignment = ggml_backend_buft_get_alignment(result.workspace_buft);
++        result.workspace_usage = int(ggml_backend_buffer_get_usage(workspace));
++        result.output_bytes = output_bytes;
++        result.ids_bytes = ids_bytes;
++        result.rows = rows; result.k = k; result.tokens = tokens;
++        result.window_tokens = window_tokens; result.entries = entries;
++        result.math = math;
++        return result;
++    }
++
++    static void validate_slots(const std::vector<int32_t> & ids, const ggml_tensor * weight) {
++        for (const int32_t id : ids) {
++            if (id < 0 || id >= weight->ne[2]) {
++                throw std::invalid_argument("MoE preparation contains an out-of-range resident slot");
++            }
++        }
++    }
++
++    void begin_build(storage & data) {
++        data.valid = false;
++        data.item.ctx.reset();
++        data.graph = {};
++        data.source = data.target = data.bank = data.source_view = data.destination = nullptr;
++        if (data.arena.empty()) {
++            data.arena.resize((metadata_bytes() + sizeof(metadata_word) - 1)/sizeof(metadata_word));
++        }
++    }
++
++    void publish(storage & data, const key & desired) {
++        // Nonzero graph UIDs bypass CUDA's source-pointer/property scan. This
++        // template deliberately rebinds addresses, so it must keep the scan.
++        data.graph.value->uid = 0;
++        const void * next_node = data.graph.value->nodes[0];
++        if (first_node && first_node != next_node) { ++counters.key_changes; }
++        first_node = next_node;
++        data.signature = desired;
++        data.valid = true;
++        ++counters.builds;
++    }
++
++public:
++    work() = default;
++    ~work() { GGML_ASSERT(!pending && "drain MoE preparation before destroying its async sources"); }
++    work(const work &) = delete;
++    work & operator=(const work &) = delete;
++    work(work &&) = delete;
++    work & operator=(work &&) = delete;
++
++    llama_moe_expert_graph::work & item(size_t ids_capacity, bool expert_major=false) {
++        auto & data = available();
++        if (!ids_capacity) { throw std::invalid_argument("MoE preparation ID capacity is zero"); }
++        // reserve() on an existing vector can choose a geometric capacity.
++        // Fresh vectors keep each retained capacity within the supplied
++        // existing workspace's ID allowance. Token-major only needs slot IDs.
++        for (auto * values : {&data.item.input_rows, &data.item.slot_ids, &data.item.output_rows}) {
++            if ((expert_major || values == &data.item.slot_ids) && values->capacity() < ids_capacity) {
++                std::vector<int32_t> replacement;
++                replacement.reserve(ids_capacity);
++                values->swap(replacement);
++            }
++        }
++        data.ids_capacity = std::max(data.ids_capacity, ids_capacity);
++        return data.item;
++    }
++
++    const llama_moe_expert_graph::work & item() const {
++        if (!state) { throw std::logic_error("MoE preparation work has not been initialized"); }
++        return state->item;
++    }
++
++    llama_moe_expert_graph::graph token(ggml_backend_t backend, const ggml_tensor * input,
++            ggml_tensor * output, const ggml_tensor * weight, size_t output_row, size_t rows,
++            size_t k, size_t tokens, size_t begin, size_t window_tokens,
++            ggml_backend_buffer_t workspace, size_t output_bytes, size_t ids_bytes, precision math = {}) {
++        auto & data = available();
++        if (!input || !output || !weight || !rows || !k || !tokens || !window_tokens ||
++            input->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32 ||
++            input->ne[0] <= 0 || output->ne[0] <= 0 || weight->ne[3] != 1 ||
++            begin > tokens || window_tokens > tokens - begin ||
++            input->ne[0] != weight->ne[0] || weight->ne[1] != int64_t(rows) || weight->ne[2] <= 0 ||
++            input->ne[2] != int64_t(tokens) || input->ne[3] != 1 ||
++            (input->ne[1] != 1 && input->ne[1] != int64_t(k)) ||
++            output->ne[1] != int64_t(k) || output->ne[2] != int64_t(tokens) || output->ne[3] != 1 ||
++            output_row > size_t(output->ne[0]) || rows > size_t(output->ne[0]) - output_row) {
++            throw std::invalid_argument("invalid token-major preparation geometry");
++        }
++        const size_t count = llama_moe_expert_graph::product(k, window_tokens);
++        if (count != data.item.slot_ids.size() || count > data.ids_capacity ||
++            llama_moe_expert_graph::product(count, sizeof(int32_t)) > ids_bytes ||
++            llama_moe_expert_graph::product(llama_moe_expert_graph::product(rows, count), sizeof(float)) > output_bytes ||
++            !workspace || llama_moe_expert_graph::sum(output_bytes, ids_bytes) > ggml_backend_buffer_get_size(workspace)) {
++            throw std::length_error("token-major preparation exceeds existing workspace");
++        }
++        validate_slots(data.item.slot_ids, weight);
++        const auto desired = signature(kind::token_major, backend, input, output, weight, rows, k, tokens,
++            window_tokens, count, workspace, output_bytes, ids_bytes, math);
++        const size_t input_offset = llama_moe_expert_graph::product(begin, input->nb[2]);
++        const size_t output_offset = llama_moe_expert_graph::sum(
++            llama_moe_expert_graph::product(begin, output->nb[2]),
++            llama_moe_expert_graph::product(output_row, output->nb[0]));
++        if (data.valid && data.signature == desired) {
++            data.valid = false;
++            alias_data(data.source, input); alias_data(data.target, output); alias_data(data.bank, weight);
++            rebind_view(data.source_view, input_offset);
++            rebind_view(data.destination, output_offset);
++            rebind_view(data.graph.scatter, output_offset);
++            data.graph.value->uid = 0;
++            data.valid = true;
++            ++counters.reuses;
++            return data.graph;
++        }
++        begin_build(data);
++        data.item.ctx.reset(ggml_init({metadata_bytes(), data.arena.data(), true}));
++        auto * ctx = data.item.ctx.get();
++        if (!ctx) { throw std::runtime_error("token-major preparation metadata allocation failed"); }
++        data.source = llama_moe_expert_graph::alias(ctx, input);
++        data.target = llama_moe_expert_graph::alias(ctx, output);
++        data.bank = llama_moe_expert_graph::alias(ctx, weight);
++        data.source_view = ggml_view_3d(ctx, data.source, input->ne[0], input->ne[1], int64_t(window_tokens),
++            input->nb[1], input->nb[2], input_offset);
++        llama_moe_expert_graph::view(data.source_view);
++        data.graph.slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, int64_t(k), int64_t(window_tokens));
++        llama_moe_expert_graph::allocate(workspace, data.graph.slots, output_bytes);
++        data.graph.part = ggml_mul_mat_id(ctx, data.bank, data.source_view, data.graph.slots);
++        math.apply(data.graph.part);
++        llama_moe_expert_graph::allocate(workspace, data.graph.part, 0);
++        data.destination = ggml_view_3d(ctx, data.target, rows, int64_t(k), int64_t(window_tokens),
++            output->nb[1], output->nb[2], output_offset);
++        llama_moe_expert_graph::view(data.destination);
++        data.graph.scatter = ggml_cpy(ctx, data.graph.part, data.destination);
++        llama_moe_expert_graph::view(data.graph.scatter);
++        data.graph.value = ggml_new_graph_custom(ctx, 32, false);
++        ggml_build_forward_expand(data.graph.value, data.graph.scatter);
++        publish(data, desired);
++        return data.graph;
++    }
++
++    llama_moe_expert_graph::graph expert(ggml_backend_t backend, const ggml_tensor * input,
++            ggml_tensor * output, const ggml_tensor * weight, size_t output_row, size_t rows,
++            size_t k, size_t tokens, ggml_backend_buffer_t workspace, precision math = {}) {
++        auto & data = available();
++        const size_t entries = data.item.slot_ids.size();
++        // This is the same validation used by the original builder, including
++        // every changing gather/scatter/slot index, on both hits and misses.
++        llama_moe_expert_graph::validate(data.item, input, output, weight, output_row, rows, k, tokens, workspace);
++        if (entries > data.ids_capacity) { throw std::length_error("expert-major preparation exceeds retained ID capacity"); }
++        const auto desired = signature(kind::expert_major, backend, input, output, weight, rows, k, tokens,
++            0, entries, workspace, 0, 0, math);
++        const size_t output_offset = llama_moe_expert_graph::product(output_row, sizeof(float));
++        if (data.valid && data.signature == desired) {
++            data.valid = false;
++            alias_data(data.source, input); alias_data(data.target, output); alias_data(data.bank, weight);
++            rebind_view(data.source_view, 0);
++            rebind_view(data.destination, output_offset);
++            rebind_view(data.graph.scatter, output_offset);
++            data.graph.value->uid = 0;
++            data.valid = true;
++            ++counters.reuses;
++            return data.graph;
++        }
++        begin_build(data);
++        data.graph = llama_moe_expert_graph::build(data.item, input, output, weight, output_row, rows,
++            k, tokens, workspace, data.arena.data(), metadata_bytes());
++        math.apply(data.graph.part);
++        data.source_view = data.graph.gather->src[0];
++        data.source = data.source_view->view_src;
++        data.bank = data.graph.part->src[0];
++        data.destination = data.graph.scatter->src[2];
++        data.target = data.destination->view_src;
++        publish(data, desired);
++        return data.graph;
++    }
++
++    void mark_pending() {
++        if (pending || !state || !state->valid) { throw std::logic_error("invalid pending MoE preparation work"); }
++        pending = true;
++    }
++    void drained() noexcept { pending = false; }
++    bool is_pending() const { return pending; }
++    void invalidate() {
++        if (pending) { throw std::logic_error("drain MoE preparation before invalidation"); }
++        if (!state) { return; }
++        auto & data = *state;
++        data.item.ctx.reset(); data.graph = {}; data.valid = false;
++        data.source = data.target = data.bank = data.source_view = data.destination = nullptr;
++        ++counters.invalidations;
++    }
++    statistics stats() const { return counters; }
++    size_t arena_bytes() const { return state ? state->arena.capacity()*sizeof(metadata_word) : 0; }
++    size_t ids_bytes() const {
++        return state ? (state->item.input_rows.capacity() + state->item.slot_ids.capacity() +
++                        state->item.output_rows.capacity())*sizeof(int32_t) : 0;
++    }
++    const void * graph_key() const { return state && state->valid ? state->graph.value->nodes[0] : nullptr; }
++};
++
++// A specialized retained pool: the older llama_moe_work_batch keeps its original
++// destroy-after-drain semantics. This pool never hands out a pending slot.
++class batch {
++    std::array<work, 4> slots;
++    size_t used = 0, limit = 4;
++public:
++    ~batch() { GGML_ASSERT(used == 0 && "drain MoE preparation before destroying its async sources"); }
++    void set_limit(size_t value) {
++        if (used || !value || value > slots.size()) { throw std::logic_error("invalid retained MoE batch limit/state"); }
++        limit = value;
++    }
++    template<class Synchronize> work & next(Synchronize && synchronize) {
++        if (used == limit) { flush(synchronize); }
++        return slots[used++];
++    }
++    template<class Synchronize> void flush(Synchronize && synchronize) {
++        if (!used) { return; }
++        synchronize();
++        for (size_t i = 0; i < used; ++i) { slots[i].drained(); }
++        used = 0;
++    }
++    void invalidate() {
++        if (used) { throw std::logic_error("drain MoE preparation before invalidation"); }
++        for (auto & slot : slots) { slot.invalidate(); }
++    }
++    size_t size() const { return used; }
++    statistics stats() const {
++        statistics result;
++        for (const auto & slot : slots) {
++            const auto value = slot.stats();
++            result.builds += value.builds; result.reuses += value.reuses; result.invalidations += value.invalidations;
++            result.key_changes += value.key_changes;
++        }
++        return result;
++    }
++    size_t arena_bytes() const {
++        size_t result = 0; for (const auto & slot : slots) { result += slot.arena_bytes(); } return result;
++    }
++    size_t ids_bytes() const {
++        size_t result = 0; for (const auto & slot : slots) { result += slot.ids_bytes(); } return result;
++    }
++};
++
++} // namespace llama_moe_prepare
+diff --git a/tests/test-moe-prepare.cpp b/tests/test-moe-prepare.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-moe-prepare.cpp
+@@ -0,0 +1,385 @@
++#include "../src/llama-moe-prepare.h"
++#include "../src/llama-moe-work-batch.h"
++#include "ggml-impl.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <set>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++template<class Function> void rejects(Function function) {
++    bool failed = false;
++    try { function(); } catch (const std::exception &) { failed = true; }
++    require(failed, "invalid or pending MoE preparation was accepted");
++}
++
++// Frozen token-major construction from the pre-058 provider. It uses the same
++// existing device workspace and operation/precision order, without a template.
++llama_moe_expert_graph::graph legacy_token(llama_moe_expert_graph::work & item,
++        const ggml_tensor * input, ggml_tensor * output, const ggml_tensor * weight,
++        size_t row, size_t rows, size_t k, size_t begin, size_t window,
++        ggml_backend_buffer_t workspace, size_t output_bytes, llama_moe_prepare::precision math = {}) {
++    item.ctx.reset(ggml_init({llama_moe_prepare::metadata_bytes(), nullptr, true}));
++    auto * ctx = item.ctx.get(); require(ctx, "legacy metadata allocation failed");
++    auto * source = llama_moe_expert_graph::alias(ctx, input);
++    auto * target = llama_moe_expert_graph::alias(ctx, output);
++    auto * bank = llama_moe_expert_graph::alias(ctx, weight);
++    auto * view = ggml_view_3d(ctx, source, input->ne[0], input->ne[1], int64_t(window),
++        input->nb[1], input->nb[2], begin*input->nb[2]);
++    llama_moe_expert_graph::view(view);
++    llama_moe_expert_graph::graph result;
++    result.slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, int64_t(k), int64_t(window));
++    llama_moe_expert_graph::allocate(workspace, result.slots, output_bytes);
++    result.part = ggml_mul_mat_id(ctx, bank, view, result.slots);
++    math.apply(result.part);
++    llama_moe_expert_graph::allocate(workspace, result.part, 0);
++    auto * destination = ggml_view_3d(ctx, target, rows, int64_t(k), int64_t(window), output->nb[1], output->nb[2],
++        begin*output->nb[2] + row*output->nb[0]);
++    llama_moe_expert_graph::view(destination);
++    result.scatter = ggml_cpy(ctx, result.part, destination);
++    llama_moe_expert_graph::view(result.scatter);
++    result.value = ggml_new_graph_custom(ctx, 32, false);
++    ggml_build_forward_expand(result.value, result.scatter);
++    return result;
++}
++
++struct fixture {
++    static constexpr size_t ni = 256, no = 64, rows = 32, slots = 4, k = 3, tokens = 64;
++    static constexpr float guard = -12345.0f;
++    ggml_backend_t backend;
++    ggml_context_ptr ctx{ggml_init({64*ggml_tensor_overhead(), nullptr, true})};
++    ggml_backend_buffer_ptr permanent, workspace;
++    ggml_tensor * inputs[2], * banks[2], * storage[2], * outputs[2];
++    size_t output_bytes = 0, ids_bytes = 0, workspace_bytes = 0;
++    bool down;
++    ggml_type type;
++
++    fixture(ggml_backend_t backend, bool down, ggml_type type) : backend(backend), down(down), type(type) {
++        require(bool(ctx), "fixture metadata allocation failed");
++        for (size_t index = 0; index < 2; ++index) {
++            inputs[index] = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, ni, down ? k : 1, tokens);
++            banks[index] = ggml_new_tensor_3d(ctx.get(), type, ni, rows, slots);
++            storage[index] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, no + 2, k*tokens);
++        }
++        permanent.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
++        require(bool(permanent), "fixture buffer allocation failed");
++        ggml_backend_buffer_set_usage(permanent.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++        for (size_t index = 0; index < 2; ++index) {
++            outputs[index] = ggml_view_3d(ctx.get(), storage[index], no, k, tokens,
++                (no+2)*sizeof(float), k*(no+2)*sizeof(float), sizeof(float));
++            llama_moe_expert_graph::view(outputs[index]);
++            std::vector<float> values(ggml_nelements(inputs[index]));
++            for (size_t i = 0; i < values.size(); ++i) { values[i] = float(int((i*7 + index*5)%23) - 11)/32.0f; }
++            ggml_backend_tensor_set(inputs[index], values.data(), 0, values.size()*sizeof(float));
++            values.resize(ni*rows*slots);
++            for (size_t i = 0; i < values.size(); ++i) { values[i] = float(int((i*3 + index*7)%17) - 8)/64.0f; }
++            std::vector<uint8_t> encoded(ggml_nbytes(banks[index]));
++            if (type == GGML_TYPE_F32) { std::memcpy(encoded.data(), values.data(), encoded.size()); }
++            else { require(ggml_quantize_chunk(type, values.data(), encoded.data(), 0, rows*slots, ni, nullptr) == encoded.size(),
++                           "fixture quantization size mismatch"); }
++            ggml_backend_tensor_set(banks[index], encoded.data(), 0, encoded.size());
++        }
++        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(permanent.get()));
++        output_bytes = llama_moe_expert_graph::align(rows*k*tokens*sizeof(float), alignment);
++        ids_bytes = llama_moe_expert_graph::align(k*tokens*sizeof(int32_t), alignment);
++        workspace_bytes = output_bytes + ids_bytes;
++        workspace.reset(ggml_backend_buft_alloc_buffer(ggml_backend_buffer_get_type(permanent.get()), workspace_bytes));
++        require(bool(workspace), "existing fixture workspace allocation failed");
++        ggml_backend_buffer_set_usage(workspace.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++    }
++
++    void clear_outputs() {
++        std::vector<float> values((no+2)*k*tokens, guard);
++        for (auto * tensor : storage) { ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(float)); }
++    }
++    std::vector<float> read_outputs() {
++        std::vector<float> result;
++        for (auto * tensor : storage) {
++            std::vector<float> values(ggml_nelements(tensor));
++            ggml_backend_tensor_get(tensor, values.data(), 0, values.size()*sizeof(float));
++            for (size_t i = 0; i < k*tokens; ++i) {
++                require(values[i*(no+2)] == guard && values[i*(no+2)+no+1] == guard, "output row guard changed");
++            }
++            result.insert(result.end(), values.begin(), values.end());
++        }
++        return result;
++    }
++};
++
++void fill(llama_moe_expert_graph::work & item, bool expert, size_t count, size_t iteration, bool down) {
++    item.slot_ids.resize(count);
++    for (size_t i = 0; i < count; ++i) { item.slot_ids[i] = int32_t((i + iteration*3)%fixture::slots); }
++    if (expert) {
++        item.input_rows.resize(count); item.output_rows.resize(count);
++        for (size_t i = 0; i < count; ++i) {
++            item.input_rows[i] = int32_t((iteration*11 + i*7)%(fixture::tokens*(down ? fixture::k : 1)));
++            item.output_rows[i] = int32_t((iteration*7 + i*13)%(fixture::tokens*fixture::k));
++        }
++    }
++}
++
++struct execution { std::vector<float> output; size_t builds = 0, reuses = 0, keys = 0, metadata = 0, ids = 0; };
++void same_graph_metadata(ggml_cgraph * reference, ggml_cgraph * actual) {
++    require(ggml_graph_n_nodes(reference) == ggml_graph_n_nodes(actual), "cached graph changed its operation count");
++    for (int i = 0; i < ggml_graph_n_nodes(reference); ++i) {
++        const auto * a = ggml_graph_node(reference,i), * b = ggml_graph_node(actual,i);
++        require(a->op == b->op && a->type == b->type && a->data == b->data && a->buffer == b->buffer &&
++                a->extra == b->extra && a->view_offs == b->view_offs &&
++                std::memcmp(a->ne,b->ne,sizeof(a->ne)) == 0 && std::memcmp(a->nb,b->nb,sizeof(a->nb)) == 0 &&
++                std::memcmp(a->op_params,b->op_params,sizeof(a->op_params)) == 0,
++                "cached graph metadata differs from fresh construction");
++    }
++}
++execution execute(fixture & f, bool prepared, size_t limit, int mode) {
++    f.clear_outputs();
++    const auto base = ggml_backend_buffer_get_base(f.workspace.get());
++    const auto bytes = ggml_backend_buffer_get_size(f.workspace.get());
++    llama_moe_work_batch<llama_moe_expert_graph::work> legacy(limit);
++    llama_moe_prepare::batch cache;
++    cache.set_limit(limit);
++    std::set<const void *> keys;
++    auto drain = [&] { ggml_backend_synchronize(f.backend); };
++    auto flush = [&] { if (prepared) { cache.flush(drain); } else { legacy.flush(drain); } };
++    try {
++        for (size_t i = 0; i < 48; ++i) {
++            const bool expert = mode == 2 ? (i/8)%2 != 0 : mode != 0;
++            const size_t window = i%9 == 8 ? 3 : 4;
++            const size_t entries = expert ? 4 + (i/8)%3 : fixture::k*window;
++            auto * reusable = prepared ? &cache.next(drain) : nullptr;
++            auto & item = reusable ? reusable->item(f.ids_bytes/sizeof(int32_t), expert) : legacy.next(drain);
++            fill(item, expert, entries, i, f.down);
++            const size_t row = (i%2)*fixture::rows, input = i%2, bank = (i/2)%2, output = (i/4)%2;
++            llama_moe_expert_graph::graph graph;
++            if (expert) {
++                graph = reusable ? reusable->expert(f.backend, f.inputs[input], f.outputs[output], f.banks[bank], row,
++                    fixture::rows, fixture::k, fixture::tokens, f.workspace.get()) :
++                    llama_moe_expert_graph::build(item, f.inputs[input], f.outputs[output], f.banks[bank], row,
++                        fixture::rows, fixture::k, fixture::tokens, f.workspace.get());
++            } else {
++                const size_t begin = (i*4)%(fixture::tokens - window + 1);
++                graph = reusable ? reusable->token(f.backend, f.inputs[input], f.outputs[output], f.banks[bank], row,
++                    fixture::rows, fixture::k, fixture::tokens, begin, window, f.workspace.get(), f.output_bytes, f.ids_bytes) :
++                    legacy_token(item, f.inputs[input], f.outputs[output], f.banks[bank], row, fixture::rows, fixture::k,
++                        begin, window, f.workspace.get(), f.output_bytes);
++            }
++            if (reusable) {
++                llama_moe_expert_graph::work probe;
++                probe.input_rows = item.input_rows; probe.slot_ids = item.slot_ids; probe.output_rows = item.output_rows;
++                llama_moe_expert_graph::graph reference;
++                if (expert) {
++                    reference = llama_moe_expert_graph::build(probe,f.inputs[input],f.outputs[output],f.banks[bank],row,
++                        fixture::rows,fixture::k,fixture::tokens,f.workspace.get());
++                } else {
++                    reference = legacy_token(probe,f.inputs[input],f.outputs[output],f.banks[bank],row,fixture::rows,fixture::k,
++                        (i*4)%(fixture::tokens-window+1),window,f.workspace.get(),f.output_bytes);
++                }
++                same_graph_metadata(reference.value,graph.value);
++            }
++            require(ggml_backend_supports_op(f.backend, graph.part) && ggml_backend_supports_op(f.backend, graph.scatter),
++                    "requested fixture operation unavailable");
++            require(graph.value->uid == 0, "child graph bypasses CUDA property invalidation");
++            keys.insert(graph.value->nodes[0]);
++            if (reusable) { reusable->mark_pending(); }
++            if (expert) {
++                ggml_backend_tensor_set_async(f.backend, graph.input_ids, item.input_rows.data(), 0, entries*sizeof(int32_t));
++                ggml_backend_tensor_set_async(f.backend, graph.output_ids, item.output_rows.data(), 0, entries*sizeof(int32_t));
++            }
++            ggml_backend_tensor_set_async(f.backend, graph.slots, item.slot_ids.data(), 0, entries*sizeof(int32_t));
++            require(ggml_backend_graph_compute_async(f.backend, graph.value) == GGML_STATUS_SUCCESS, "fixture compute failed");
++            require(ggml_backend_buffer_get_base(f.workspace.get()) == base &&
++                    ggml_backend_buffer_get_size(f.workspace.get()) == bytes, "existing GPU workspace changed");
++        }
++        flush();
++    } catch (...) { flush(); throw; }
++    const auto stats = cache.stats();
++    if (prepared) {
++        require(stats.reuses > 0 && stats.key_changes == 0 && keys.size() <= limit, "template or bounded stable graph key was not exercised");
++        require(cache.arena_bytes() <= 4*llama_moe_prepare::metadata_bytes() &&
++                cache.ids_bytes() <= 12*f.ids_bytes, "retained CPU storage exceeded its fixed bounds");
++    }
++    return {f.read_outputs(), stats.builds, stats.reuses, keys.size(), cache.arena_bytes(), cache.ids_bytes()};
++}
++
++void exact(ggml_backend_t backend, const char * name) {
++    size_t cases = 0, total_reuses = 0, metadata_peak = 0, ids_peak = 0, ids_limit = 0, workspace = 0;
++    for (auto type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) for (bool down : {false,true}) {
++        fixture data(backend, down, type);
++        for (size_t limit : {size_t(1),size_t(4)}) for (int mode : {0,1,2}) {
++            const auto before = execute(data, false, limit, mode), after = execute(data, true, limit, mode);
++            require(before.output.size() == after.output.size() &&
++                    std::memcmp(before.output.data(), after.output.data(), before.output.size()*sizeof(float)) == 0,
++                    "prepared execution changed output bits");
++            total_reuses += after.reuses; ++cases;
++            metadata_peak = std::max(metadata_peak, after.metadata); ids_peak = std::max(ids_peak, after.ids);
++            ids_limit = std::max(ids_limit, 12*data.ids_bytes); workspace = std::max(workspace, data.workspace_bytes);
++        }
++    }
++    std::printf("MOE_PREPARE_EXACT backend=%s cases=%zu F32_Q8=1 token_expert_mixed=1 up_down=1 rebind_data_offsets=1 partial_windows=1 guards=1 graph_metadata_exact=1 bits_exact=1 actual_reuses=%zu PASS\n", name, cases, total_reuses);
++    std::printf("MOE_PREPARE_MEMORY metadata_peak=%zu metadata_limit=%zu ids_peak=%zu ids_limit=%zu existing_workspace=%zu additional_gpu_workspace=0 PASS\n",
++        metadata_peak,4*llama_moe_prepare::metadata_bytes(),ids_peak,ids_limit,workspace);
++}
++
++void invalidation(ggml_backend_t backend) {
++    fixture f(backend, false, GGML_TYPE_F32), other(backend, false, GGML_TYPE_F32);
++    ggml_backend_ptr second(ggml_backend_dev_init(ggml_backend_get_device(backend), nullptr));
++    require(bool(second), "second metadata-only backend unavailable");
++    llama_moe_prepare::work cache;
++    auto & ids = cache.item(f.ids_bytes/sizeof(int32_t)).slot_ids;
++    ids.assign(fixture::k*4, 0);
++    auto prepare = [&](ggml_backend_t selected, ggml_tensor * input, ggml_tensor * output,
++                       ggml_tensor * weight, ggml_backend_buffer_t workspace, llama_moe_prepare::precision math = {}) {
++        return cache.token(selected,input,output,weight,0,fixture::rows,fixture::k,fixture::tokens,0,
++            ids.size()/fixture::k,workspace,f.output_bytes,f.ids_bytes,math);
++    };
++    prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get());
++    const auto first = cache.graph_key();
++    prepare(backend,f.inputs[1],f.outputs[1],f.banks[1],f.workspace.get());
++    require(cache.stats().builds == 1 && cache.stats().reuses == 1, "data-pointer rebinding rebuilt metadata");
++    ids.assign(fixture::k*3,0);
++    prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get());
++    const size_t saved_stride = f.inputs[0]->nb[1]; f.inputs[0]->nb[1] += sizeof(float);
++    prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get()); f.inputs[0]->nb[1] = saved_stride;
++    prepare(backend,other.inputs[0],f.outputs[0],f.banks[0],f.workspace.get());
++    int extra = 0; void * saved_extra = f.inputs[0]->extra; f.inputs[0]->extra = &extra;
++    prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get()); f.inputs[0]->extra = saved_extra;
++    prepare(second.get(),f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get());
++    prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],other.workspace.get());
++    llama_moe_prepare::precision math; math.source_set = true; math.source = GGML_PREC_F32;
++    const auto graph = prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get(),math);
++    require(cache.stats().builds == 8 && graph.value->uid == 0, "structural backend/precision/workspace invalidation was skipped");
++    require(cache.graph_key() == first && cache.stats().key_changes == 0, "rebuild created another CUDA graph key");
++    math.accumulator_bf16 = true;
++    const auto precision_graph = prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get(),math);
++    llama_moe_expert_graph::work reference; reference.slot_ids = ids;
++    const auto precision_reference = legacy_token(reference,f.inputs[0],f.outputs[0],f.banks[0],0,
++        fixture::rows,fixture::k,0,3,f.workspace.get(),f.output_bytes,math);
++    require(cache.stats().builds == 9 && std::memcmp(precision_graph.part->op_params,
++        precision_reference.part->op_params,sizeof(precision_graph.part->op_params)) == 0,
++        "source/accumulator precision parameters changed");
++    ids[0] = -1; rejects([&] { prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get()); });
++    ids[0] = int32_t(fixture::slots); rejects([&] { prepare(backend,f.inputs[0],f.outputs[0],f.banks[0],f.workspace.get()); });
++    ids[0] = 0;
++    rejects([&] { cache.token(backend,f.inputs[0],f.outputs[0],f.banks[0],0,fixture::rows,fixture::k,
++        fixture::tokens,fixture::tokens,3,f.workspace.get(),f.output_bytes,f.ids_bytes); });
++    rejects([&] { cache.token(backend,f.inputs[0],f.outputs[0],f.banks[0],fixture::no,fixture::rows,fixture::k,
++        fixture::tokens,0,3,f.workspace.get(),f.output_bytes,f.ids_bytes); });
++    std::printf("MOE_PREPARE_INVALIDATION shape=1 strides=1 buffer=1 extra=1 backend=1 precision=1 workspace=1 ids=1 uid_zero=1 stable_first_node=1 PASS\n");
++}
++
++void ownership(ggml_backend_t backend) {
++    fixture f(backend,false,GGML_TYPE_F32);
++    llama_moe_prepare::batch pool;
++    pool.set_limit(1);
++    auto drain = [&] { ggml_backend_synchronize(backend); };
++    auto & work = pool.next(drain);
++    auto & item = work.item(f.ids_bytes/sizeof(int32_t)); item.slot_ids.assign(fixture::k*4,0);
++    auto graph = work.token(backend,f.inputs[0],f.outputs[0],f.banks[0],0,fixture::rows,fixture::k,
++        fixture::tokens,0,4,f.workspace.get(),f.output_bytes,f.ids_bytes);
++    const auto * retained = item.slot_ids.data(); const auto key = work.graph_key();
++    work.mark_pending();
++    ggml_backend_tensor_set_async(backend,graph.slots,retained,0,item.slot_ids.size()*sizeof(int32_t));
++    rejects([&] { pool.flush([] { throw std::runtime_error("injected drain failure"); }); });
++    require(pool.size() == 1 && work.is_pending() && retained[0] == 0 && work.graph_key() == key,
++            "failed fence freed or changed queued metadata/source bytes");
++    rejects([&] { work.item(f.ids_bytes/sizeof(int32_t)); });
++    rejects([&] { work.invalidate(); }); rejects([&] { pool.invalidate(); }); rejects([&] { pool.set_limit(4); });
++    pool.flush(drain);
++    auto & again = pool.next(drain); require(&again == &work, "drained work slot was replaced");
++    auto & reused = again.item(f.ids_bytes/sizeof(int32_t)); reused.slot_ids.assign(fixture::k*4,1);
++    auto next = again.token(backend,f.inputs[1],f.outputs[1],f.banks[1],fixture::rows,fixture::rows,
++        fixture::k,fixture::tokens,4,4,f.workspace.get(),f.output_bytes,f.ids_bytes);
++    require(again.graph_key() == key && again.stats().reuses == 1, "successful fence did not permit template reuse");
++    again.mark_pending();
++    ggml_backend_tensor_set_async(backend,next.slots,reused.slot_ids.data(),0,reused.slot_ids.size()*sizeof(int32_t));
++    require(ggml_backend_graph_compute_async(backend,next.value) == GGML_STATUS_SUCCESS, "recovered graph compute failed");
++    pool.flush(drain); pool.invalidate();
++    require(pool.size() == 0 && !again.is_pending() && !again.graph_key(), "unload cleanup retained pending graph");
++    require(pool.arena_bytes() <= 4*llama_moe_prepare::metadata_bytes() && pool.ids_bytes() <= 12*f.ids_bytes,
++            "bounded retained CPU storage grew after error cleanup");
++    std::printf("MOE_PREPARE_OWNERSHIP slots=4 failed_drain_retained=1 mutation_blocked=1 reuse_after_fence=1 unload_retry=1 graph_keys_bounded=1 additional_gpu_buffers=0 PASS\n");
++}
++
++double median(std::vector<double> values) {
++    std::sort(values.begin(), values.end()); return (values[values.size()/2-1]+values[values.size()/2])/2;
++}
++void samples(const char * name, const std::vector<double> & values) {
++    std::printf(",\"%s\":[",name);
++    for (size_t i = 0; i < values.size(); ++i) { std::printf("%s%.6f",i ? "," : "",values[i]); }
++    std::printf("]");
++}
++void benchmark(ggml_backend_t backend) {
++    fixture f(backend,false,GGML_TYPE_F32);
++    for (bool expert : {false,true}) for (size_t count : {size_t(6),size_t(12)}) {
++        // The expert fixture's original workspace must hold its gathered rows.
++        if (expert && llama_moe_expert_graph::carve(fixture::ni,fixture::rows,count,
++                ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(f.workspace.get()))).bytes > f.workspace_bytes) { continue; }
++        llama_moe_expert_graph::work old;
++        fill(old,expert,count,0,false);
++        llama_moe_prepare::work reused;
++        auto & current = reused.item(f.ids_bytes/sizeof(int32_t),expert); fill(current,expert,count,0,false);
++        auto build = [&](bool optimized) {
++            if (expert) {
++                if (optimized) { reused.expert(backend,f.inputs[0],f.outputs[0],f.banks[0],0,fixture::rows,
++                    fixture::k,fixture::tokens,f.workspace.get()); }
++                else { llama_moe_expert_graph::build(old,f.inputs[0],f.outputs[0],f.banks[0],0,fixture::rows,
++                    fixture::k,fixture::tokens,f.workspace.get()); }
++            } else {
++                if (optimized) { reused.token(backend,f.inputs[0],f.outputs[0],f.banks[0],0,fixture::rows,fixture::k,
++                    fixture::tokens,0,count/fixture::k,f.workspace.get(),f.output_bytes,f.ids_bytes); }
++                else { legacy_token(old,f.inputs[0],f.outputs[0],f.banks[0],0,fixture::rows,fixture::k,0,
++                    count/fixture::k,f.workspace.get(),f.output_bytes); }
++            }
++        };
++        for (int warm = 0; warm < 100; ++warm) { build(false); build(true); }
++        std::vector<double> before, after;
++        constexpr int loops = 4096;
++        for (int cycle = 0; cycle < 8; ++cycle) for (bool optimized : {false,true,true,false}) {
++            const auto begin = std::chrono::steady_clock::now();
++            for (int i = 0; i < loops; ++i) { build(optimized); }
++            const auto end = std::chrono::steady_clock::now();
++            (optimized ? after : before).push_back(std::chrono::duration<double,std::micro>(end-begin).count()/loops);
++        }
++        std::printf("MOE_PREPARE_BENCH mode=%s entries=%zu cycles=8 loops=%d legacy_us=%.6f reused_us=%.6f ratio=%.6f builds=%zu reuses=%zu gpu_allocations=0 scope=CPU_metadata_only\n",
++            expert ? "expert" : "token",count,loops,median(before),median(after),median(after)/median(before),
++            reused.stats().builds,reused.stats().reuses);
++        std::printf("MOE_PREPARE_BENCH_JSON {\"mode\":\"%s\",\"entries\":%zu,\"cycles\":8,\"loops\":%d,\"legacy_us\":%.6f,\"reused_us\":%.6f,\"ratio\":%.6f,\"builds\":%zu,\"reuses\":%zu,\"gpu_allocations\":0",
++            expert ? "expert" : "token",count,loops,median(before),median(after),median(after)/median(before),
++            reused.stats().builds,reused.stats().reuses);
++        samples("legacy_samples_us",before); samples("reused_samples_us",after); std::printf("}\n");
++    }
++}
++}
++
++int main(int argc, char ** argv) {
++    try {
++        bool cuda = false, bench = false;
++        for (int i = 1; i < argc; ++i) {
++            const std::string argument(argv[i]);
++            require(argument == "--cuda" || argument == "--bench", "use --cuda and/or --bench");
++            cuda |= argument == "--cuda"; bench |= argument == "--bench";
++        }
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        if (cuda) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++#else
++            std::puts("SKIP: CUDA not built"); return 77;
++#endif
++        }
++        auto * device = ggml_backend_dev_by_type(cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU);
++        require(device && (!cuda || std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device))) == "CUDA"),
++                "requested isolated backend unavailable");
++        ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr)); require(bool(backend), "backend initialization failed");
++        exact(backend.get(),cuda ? "CUDA" : "CPU"); invalidation(backend.get()); ownership(backend.get());
++        if (bench) { benchmark(backend.get()); }
++        std::printf("MOE_PREPARE backend=%s zero_model_files=1 synthetic_weights=1 no_new_gpu_workspace=1 PASS\n",cuda ? "CUDA" : "CPU");
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}

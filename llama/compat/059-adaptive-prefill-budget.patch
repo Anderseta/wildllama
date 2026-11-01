@@ -1,0 +1,1130 @@
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -14,6 +14,7 @@
+ #include "ggml-opt.h"
+ 
+ #include <array>
++#include <limits>
+ #include <map>
+ #include <vector>
+ 
+@@ -62,6 +63,45 @@
+ 
+     void synchronize();
+     bool output_overlap_supported() const;
++    // Internal server scheduling capability; this is not a new public C API.
++    LLAMA_API bool adaptive_prefill_supported(bool allow_pending_reservation = false) const;
++
++    bool set_graph_variant_reuse_only(bool value) {
++        const bool previous = graph_variant_reuse_only;
++        graph_variant_reuse_only = value;
++        if (value && !previous) { ++graph_variant_reuse_scopes; }
++        return previous;
++    }
++
++    struct graph_variant_admission_stats {
++        uint64_t reuse_scopes;
++        uint64_t reuse_hits;
++        uint64_t reuse_misses;
++        size_t primary_compute_bytes;
++        size_t primary_gpu_bytes;
++        bool reuse_only;
++    };
++
++    graph_variant_admission_stats get_graph_variant_admission_stats() const {
++        auto * primary = graph_variant_active ? graph_variants[0].sched.get() : sched.get();
++        size_t bytes = 0;
++        size_t gpu_bytes = 0;
++        if (primary) {
++            for (auto * backend : backend_ptrs) {
++                const size_t current = ggml_backend_sched_get_buffer_size(primary, backend);
++                auto * device = ggml_backend_get_device(backend);
++                if (!llama_graph_variant_policy::add_size(bytes, current) ||
++                        (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU &&
++                         !llama_graph_variant_policy::add_size(gpu_bytes, current))) {
++                    bytes = std::numeric_limits<size_t>::max();
++                    gpu_bytes = std::numeric_limits<size_t>::max();
++                    break;
++                }
++            }
++        }
++        return {graph_variant_reuse_scopes, graph_variant_reuse_hits, graph_variant_reuse_misses,
++                bytes, gpu_bytes, graph_variant_reuse_only};
++    }
+ 
+     const llama_model   & get_model()   const;
+     const llama_cparams & get_cparams() const;
+@@ -491,6 +531,10 @@
+     std::array<graph_variant_runtime, 5> graph_variants;
+     size_t graph_variant_active = 0;
+     size_t graph_variant_budget = 0;
++    bool graph_variant_reuse_only = false;
++    uint64_t graph_variant_reuse_scopes = 0;
++    uint64_t graph_variant_reuse_hits = 0;
++    uint64_t graph_variant_reuse_misses = 0;
+     mutable const llm_graph_result * output_overlap_checked = nullptr;
+     mutable bool output_overlap_cached = false;
+     llama_graph_variant_policy::prefill_admission graph_prefill_admission;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1078,6 +1078,18 @@
+     return true;
+ }
+ 
++bool llama_context::adaptive_prefill_supported(bool allow_pending_reservation) const {
++    // The first scheduling policy only alternates ordinary pure-decode and
++    // original prompt rounds. Unknown memory/provider layouts retain admission.
++    if (!memory || typeid(*memory) != typeid(llama_kv_cache) || !sched || (!allow_pending_reservation && sched_need_reserve) ||
++            cparams.training || cparams.pipeline_parallel || cparams.warmup || cparams.embeddings ||
++            cparams.embeddings_nextn || !cparams.causal_attn || !cparams.kv_unified || cparams.n_seq_max < 2 ||
++            model.hparams.n_pos_per_embd() != 1 || model.hparams.ple_n_heads || model.hparams.n_swa ||
++            moe_cache || model.ram_cache || model.hparams.no_alloc || model.n_devices() > 1 ||
++            model.has_tensor_overrides()) { return false; }
++    return static_cast<const llama_kv_cache *>(memory.get())->get_n_stream() == 1;
++}
++
+ bool llama_output_overlap_supported(const llama_context * ctx) {
+     return ctx && ctx->output_overlap_supported();
+ }
+@@ -1896,6 +1908,7 @@
+             graph_variant_save();
+             graph_variant_restore(i);
+             graph_variant_last_used = ++graph_variant_clock;
++            if (graph_variant_reuse_only) { ++graph_variant_reuse_hits; }
+             return graph_variant_selection::reused;
+         }
+     }
+@@ -1909,8 +1922,15 @@
+         auto * previous = get_gf_res_prev();
+         const auto params = graph_params(previous, ubatch, mctx, gtype);
+         if (!graph_reuse_disable && gf_res_prev_active == previous && previous->can_reuse(params)) {
++            if (graph_variant_reuse_only) { ++graph_variant_reuse_hits; }
+             return graph_variant_selection::reused;
+         }
++    }
++    // An adaptive scheduling round may use an existing arena, but may not add
++    // another retained compute reservation or mutate the normal admission history.
++    if (graph_variant_reuse_only) {
++        ++graph_variant_reuse_misses;
++        return graph_variant_selection::none;
+     }
+     if (!eligible) { return graph_variant_selection::none; }
+ 
+@@ -2070,6 +2090,7 @@
+     const auto state_backend = nextn_input_backend();
+ 
+     const bool reuse_current = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
++    if (graph_variant_reuse_only && reuse_current) { ++graph_variant_reuse_hits; }
+     const auto selected = reuse_current ? graph_variant_selection::none : graph_variant_select(ubatch, mctx, gtype);
+     if (graph_sampler_bindings_failed) { graph_variants_clear(); }
+     if (selected != graph_variant_selection::none) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2,6 +2,8 @@
+ #include "server-admission.h"
+ #include "server-decode-overlap.h"
+ #include "server-slot-iteration.h"
++#include "server-prefill-budget.h"
++#include "../../src/llama-context.h"
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
+@@ -1100,6 +1102,17 @@
+     bool decode_overlap_failed = false;
+     server_decode_metadata decode_metadata;
+     server_admission admission;
++    server_prefill_budget prefill_budget;
++    bool prefill_budget_enabled = false;
++    bool prefill_budget_failed = false;
++    bool prefill_round_eligible = false;
++    bool prefill_round_reuse_only = false;
++    bool prefill_round_deferred = false;
++    bool prefill_episode_active = false;
++    uint64_t prefill_summary_deferred = 0;
++    server_prefill_memory prefill_memory;
++    bool prefill_memory_trace = false;
++    uint64_t prefill_memory_reported = 0;
+ 
+     llama_model   * model_dft = nullptr;
+     llama_context * ctx_dft   = nullptr;
+@@ -1153,6 +1166,9 @@
+ 
+     void destroy() {
+         discard_decode_overlap();
++        prefill_budget.reset();
++        prefill_round_eligible = prefill_round_reuse_only = prefill_round_deferred = false;
++        prefill_episode_active = false;
+         admission.clear();
+         spec.reset();
+         spec_init.reset();
+@@ -1615,6 +1631,15 @@
+             const char * option = std::getenv("WILDLLAMA_DECODE_OVERLAP");
+             decode_overlap_enabled = option && std::strcmp(option, "1") == 0;
+             decode_overlap_failed = false;
++            prefill_budget_enabled = server_prefill_budget::enabled(std::getenv("WILDLLAMA_ADAPTIVE_PREFILL"));
++            prefill_budget.reset(server_prefill_budget::parse_target(std::getenv("WILDLLAMA_PREFILL_LATENCY_US")));
++            prefill_budget_failed = false;
++            prefill_round_eligible = prefill_round_reuse_only = prefill_round_deferred = false;
++            prefill_episode_active = false;
++            prefill_summary_deferred = 0;
++            prefill_memory.reset();
++            prefill_memory_trace = server_prefill_budget::enabled(std::getenv("WILDLLAMA_PREFILL_TRACE"));
++            prefill_memory_reported = 0;
+         }
+ 
+         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
+@@ -2392,6 +2417,7 @@
+         auto res = std::make_unique<server_task_result_cmpl_partial>();
+ 
+         res->id    = slot.task->id;
++        res->id_slot = slot.id;
+         res->index = slot.task->index;
+ 
+         if (is_progress) {
+@@ -3457,6 +3483,9 @@
+     }
+ 
+     void abort_all_slots(const std::string & reason) {
++        prefill_budget.clear_learning();
++        prefill_round_eligible = prefill_round_reuse_only = prefill_round_deferred = false;
++        prefill_episode_active = false;
+         for (auto & slot : slots) {
+             if (slot.is_processing()) {
+                 send_error(slot, reason, ERROR_TYPE_SERVER);
+@@ -3665,6 +3694,7 @@
+                 SRV_TRC("%s", "all slots are idle\n");
+ 
+                 metrics_flush_idle();
++                prefill_budget_idle();
+ 
+                 return; // skip further processing
+ 
+@@ -3906,6 +3936,7 @@
+ 
+         // start populating the batch for this iteration
+         batch.clear();
++        prefill_round_eligible = prefill_round_reuse_only = prefill_round_deferred = false;
+ 
+         // track if given slot can be batched with slots already in the batch
+         auto & slot_batched = batch.slot_batched;
+@@ -4061,11 +4092,50 @@
+         int32_t n_batch  = llama_n_batch(ctx_tgt);
+         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+ 
++        if (prefill_budget_enabled) {
++            bool supported = !prefill_budget_failed && params_base.cont_batching && !mctx && !spec && !ctx_dft &&
++                !params_base.embedding && ctx_tgt->adaptive_prefill_supported(true);
++            const bool reservation_pending = supported && !ctx_tgt->adaptive_prefill_supported();
++            uint32_t pending_prompts = 0;
++            for (const auto & slot : slots) {
++                if (!slot.is_processing()) { continue; }
++                if (!slot.task) { supported = false; continue; }
++                if ((slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) &&
++                        slot.prompt.n_tokens() < slot.task->n_tokens()) { ++pending_prompts; }
++                if (slot.task->type != SERVER_TASK_TYPE_COMPLETION ||
++                        slot.task->is_parent() || slot.task->is_child() || slot.task->tokens.has_mtmd ||
++                        slot.need_embd() || !slot.can_split() || !slot.lora.empty() ||
++                        !slot.task->params.sampling.grammar.empty() || slot.spec_control.enabled || slot.audio_stream) {
++                    supported = false;
++                }
++            }
++            prefill_round_eligible = supported && !reservation_pending;
++            const uint32_t generation_rows = uint32_t(batch.size());
++            if (supported && generation_rows && pending_prompts && uint32_t(n_batch) > generation_rows) {
++                if (!prefill_episode_active) { prefill_memory.begin_episode(); }
++                prefill_episode_active = true;
++            }
++            if (!pending_prompts) { prefill_episode_active = false; }
++            // Keep the complete contention episode reuse-only, including
++            // warmup and forced prompt rounds. Otherwise the normal followup
++            // could retain a new arena because an earlier deferral changed the
++            // primary graph. Unsupported new work admits normally but cannot
++            // turn this episode's shape alternation into extra cache storage.
++            prefill_round_reuse_only = prefill_episode_active && pending_prompts;
++            prefill_round_deferred = prefill_budget.defer(uint32_t(n_batch), generation_rows, pending_prompts,
++                prefill_round_eligible, supported && reservation_pending);
++            if (prefill_round_deferred) { prefill_memory.mark_deferred(); }
++            if (prefill_round_deferred && prefill_budget.stats().deferred == 1) {
++                SRV_INF("ADAPTIVE_PREFILL_ACTIVE generation_rows=%u pending_prompts=%u target_us=%" PRIu64 " max_consecutive_deferrals=1\n",
++                    generation_rows, pending_prompts, prefill_budget.target_latency_us());
++            }
++        }
++
+         auto & alora_scale       = batch.alora_scale;
+         auto & alora_disabled_id = batch.alora_disabled_id;
+ 
+         // next, batch any pending prompts without exceeding n_batch
+-        if (params_base.cont_batching || batch.size() == 0) {
++        if (!prefill_round_deferred && (params_base.cont_batching || batch.size() == 0)) {
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+ 
+             iterate(slots, [&](server_slot & slot) {
+@@ -4798,7 +4868,14 @@
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
+-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
++            const bool observe_memory = prefill_round_reuse_only || prefill_memory_trace;
++            const auto before_primary = observe_memory ? ctx_tgt->get_graph_variant_admission_stats() :
++                llama_context::graph_variant_admission_stats{};
++            const auto before_secondary = observe_memory ? ctx_tgt->get_graph_variant_stats().compute_bytes : 0;
++            {
++                server_prefill_reuse_scope<llama_context> reuse_only(ctx_tgt, prefill_round_reuse_only);
++                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
++            }
+             if (ret == 0) {
+                 try {
+                     // Host-only work overlaps the asynchronous forward; the batch stays immutable.
+@@ -4810,6 +4887,29 @@
+                 }
+                 if (has_output) {
+                     llama_synchronize(ctx_tgt);
++                }
++            }
++            if (observe_memory) {
++                // The ordinary output fence above is also the observation
++                // boundary. No additional device synchronization is introduced.
++                const auto after_primary = ctx_tgt->get_graph_variant_admission_stats();
++                const auto after_secondary = ctx_tgt->get_graph_variant_stats().compute_bytes;
++                const auto growth = prefill_memory.observe(before_primary.primary_compute_bytes, after_primary.primary_compute_bytes,
++                    before_primary.primary_gpu_bytes, after_primary.primary_gpu_bytes, before_secondary, after_secondary,
++                    prefill_round_reuse_only);
++                if (growth.baseline_changed) {
++                    prefill_budget.reservation_changed();
++                    prefill_round_eligible = false; // relearn pressure only after an ordinary stable reservation
++                    SRV_DBG("ADAPTIVE_PREFILL_BASELINE_GROWTH primary_before_bytes=%zu primary_after_bytes=%zu primary_gpu_before_bytes=%zu primary_gpu_after_bytes=%zu\n",
++                        before_primary.primary_compute_bytes, after_primary.primary_compute_bytes,
++                        before_primary.primary_gpu_bytes, after_primary.primary_gpu_bytes);
++                }
++                if (growth.unexpected && !prefill_budget_failed) {
++                    prefill_budget_failed = true;
++                    SRV_WRN("adaptive prefill disabled after unexpected reservation growth: primary_delta=%zu primary_gpu_delta=%zu secondary_delta=%zu primary_before=%zu primary_after=%zu primary_gpu_before=%zu primary_gpu_after=%zu\n",
++                        growth.primary_delta, growth.primary_gpu_delta, growth.secondary_delta,
++                        before_primary.primary_compute_bytes, after_primary.primary_compute_bytes,
++                        before_primary.primary_gpu_bytes, after_primary.primary_gpu_bytes);
+                 }
+             }
+         });
+@@ -5261,6 +5361,7 @@
+ 
+     // has_output is computed by the caller, which also already synchronized the context if it is set
+     void metrics_post_decode(bool has_output) {
++        const bool prefill_timing_clean = n_prompt_queued == 0;
+         metrics.n_decode++;
+         for (size_t i = 0; i < slots.size(); ++i) {
+             auto & slot = slots[i];
+@@ -5284,6 +5385,14 @@
+         // advance the prompt timing of the slots that had tokens in this batch
+         // note: a second pass, it must run after the sync to reflect the compute
+         const int64_t t_now = ggml_time_us();
++        if (prefill_budget_enabled && !prefill_budget_failed) {
++            const uint64_t prompt_rows = decode_metadata.n_prompt;
++            const uint64_t total_rows = uint64_t(batch.view.size());
++            if (prompt_rows <= total_rows) {
++                prefill_budget.observe(t_now - t_decode_start, uint32_t(total_rows - prompt_rows),
++                    uint32_t(prompt_rows), prefill_round_eligible && prefill_timing_clean && has_output);
++            }
++        }
+         for (size_t i : decode_metadata.prompt_slots) {
+             auto & slot = slots[i];
+             if (slot.stats.is_set()) {
+@@ -5300,6 +5409,40 @@
+ 
+         llama_synchronize(ctx_tgt);
+         metrics_flush_prompt();
++    }
++
++    void prefill_budget_idle() {
++        const auto memory = prefill_memory.stats();
++        if (prefill_memory_trace && memory.calls != prefill_memory_reported) {
++            const auto cache = ctx_tgt->get_graph_variant_admission_stats();
++            SRV_INF("ADAPTIVE_PREFILL_MEMORY calls=%" PRIu64 " primary_peak_bytes=%zu primary_gpu_peak_bytes=%zu secondary_peak_bytes=%zu scope_restored=%d\n",
++                memory.calls, memory.primary_peak_bytes, memory.primary_gpu_peak_bytes, memory.secondary_peak_bytes, int(!cache.reuse_only));
++            prefill_memory_reported = memory.calls;
++        }
++        if (!prefill_budget_enabled) { return; }
++        const auto stats = prefill_budget.stats();
++        if (stats.deferred != prefill_summary_deferred) {
++            const auto cache = ctx_tgt->get_graph_variant_admission_stats();
++            SRV_INF("ADAPTIVE_PREFILL_SUMMARY decisions=%" PRIu64 " deferred=%" PRIu64 " forced_admissions=%" PRIu64
++                    " pure_samples=%" PRIu64 " mixed_samples=%" PRIu64 " reserve_admissions=%" PRIu64 " reuse_scopes=%" PRIu64
++                    " reuse_hits=%" PRIu64 " reuse_misses=%" PRIu64
++                    " primary_growth_bytes=%zu primary_gpu_growth_bytes=%zu secondary_growth_bytes=%zu"
++                    " ordinary_primary_growth_bytes=%zu ordinary_primary_gpu_growth_bytes=%zu"
++                    " ordinary_primary_before_bytes=%zu ordinary_primary_after_bytes=%zu"
++                    " ordinary_primary_gpu_before_bytes=%zu ordinary_primary_gpu_after_bytes=%zu"
++                    " primary_peak_bytes=%zu primary_gpu_peak_bytes=%zu secondary_peak_bytes=%zu scope_restored=%d\n",
++                stats.decisions, stats.deferred, stats.forced_admissions, stats.pure_samples, stats.mixed_samples, stats.reserve_admissions,
++                cache.reuse_scopes, cache.reuse_hits, cache.reuse_misses,
++                memory.primary_growth_bytes, memory.primary_gpu_growth_bytes, memory.secondary_growth_bytes,
++                memory.ordinary_primary_growth_bytes, memory.ordinary_primary_gpu_growth_bytes,
++                memory.ordinary_primary_before_bytes, memory.ordinary_primary_after_bytes,
++                memory.ordinary_primary_gpu_before_bytes, memory.ordinary_primary_gpu_after_bytes,
++                memory.primary_peak_bytes, memory.primary_gpu_peak_bytes, memory.secondary_peak_bytes, int(!cache.reuse_only));
++            prefill_summary_deferred = stats.deferred;
++        }
++        prefill_budget.clear_learning();
++        prefill_round_eligible = prefill_round_reuse_only = prefill_round_deferred = false;
++        prefill_episode_active = false;
+     }
+ 
+     void metrics_on_prediction(const server_slot & slot) {
+diff --git a/tools/server/server-prefill-budget.h b/tools/server/server-prefill-budget.h
+new file mode 100644
+--- /dev/null
++++ b/tools/server/server-prefill-budget.h
+@@ -0,0 +1,225 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++// CPU-only admission controller. A decision never edits slots, tokens or a
++// configured batch size: it either admits the original prompt round or defers
++// that whole round while already-generating sequences take one ordinary step.
++class server_prefill_budget {
++public:
++    struct counters {
++        uint64_t decisions = 0;
++        uint64_t deferred = 0;
++        uint64_t forced_admissions = 0;
++        uint64_t pure_samples = 0;
++        uint64_t mixed_samples = 0;
++        uint64_t invalid_samples = 0;
++        uint64_t reserve_admissions = 0;
++    };
++
++    static bool enabled(const char * value) {
++        return value && std::strcmp(value, "1") == 0;
++    }
++
++    static uint64_t parse_target(const char * value) {
++        if (!value || !*value) { return 0; }
++        uint64_t result = 0;
++        for (const char * p = value; *p; ++p) {
++            if (*p < '0' || *p > '9' || result > 60000000) { return 0; }
++            result = result * 10 + uint64_t(*p - '0');
++        }
++        return result >= 100 && result <= 60000000 ? result : 0;
++    }
++
++    void reset(uint64_t target_us = 0) { *this = {}; target_override_us = target_us; }
++
++    void clear_learning() {
++        rows = 0;
++        pure_us = 0;
++        mixed_us = 0;
++        warm_pure = 0;
++        slow_mixed = 0;
++        fast_mixed = 0;
++        pressure = false;
++        last_deferred = false;
++    }
++
++    void reservation_changed() {
++        slow_mixed = fast_mixed = 0;
++        pressure = last_deferred = false;
++    }
++
++    bool defer(uint32_t configured_batch, uint32_t generating_rows,
++               uint32_t pending_prompts, bool eligible, bool transient_reservation = false) {
++        ++counts.decisions;
++        if (!eligible || !generating_rows || !pending_prompts || configured_batch <= generating_rows) {
++            // Attaching another slot's backend sampler requires an ordinary
++            // scheduler reservation. It invalidates pressure, not the pure
++            // baseline of unchanged already-generating rows. Unsupported
++            // layouts/tasks still discard every learned sample.
++            if (!generating_rows || (!eligible && (!transient_reservation || rows != generating_rows))) {
++                clear_learning();
++            }
++            if (!eligible && transient_reservation) { ++counts.reserve_admissions; }
++            last_deferred = false;
++            slow_mixed = 0;
++            fast_mixed = 0;
++            pressure = false;
++            return false;
++        }
++        if (rows != generating_rows) { clear_learning(); rows = generating_rows; }
++        // Every deferred round is followed by an ordinary admission round,
++        // even while pressure remains. Prompt progress cannot be starved.
++        if (last_deferred) {
++            last_deferred = false;
++            ++counts.forced_admissions;
++            return false;
++        }
++        if (warm_pure < 2 || !pressure) { return false; }
++        last_deferred = true;
++        ++counts.deferred;
++        return true;
++    }
++
++    // Only completed, synchronized logical decode calls are observations.
++    // No synchronization is performed by this class or added for telemetry.
++    void observe(int64_t elapsed_us, uint32_t generating_rows,
++                 uint32_t prompt_rows, bool completed) {
++        if (!completed || !generating_rows) { return; }
++        if (elapsed_us <= 0 || elapsed_us > 60000000) {
++            ++counts.invalid_samples;
++            clear_learning();
++            return;
++        }
++        if (rows != generating_rows) { clear_learning(); rows = generating_rows; }
++        const uint64_t sample = uint64_t(elapsed_us);
++        if (!prompt_rows) {
++            pure_us = smooth(pure_us, sample);
++            warm_pure = std::min<uint32_t>(warm_pure + 1, 2);
++            ++counts.pure_samples;
++            return;
++        }
++        mixed_us = smooth(mixed_us, sample);
++        ++counts.mixed_samples;
++        if (warm_pure < 2) { return; }
++        // Two baseline steps is a relative latency objective, not a model
++        // speed claim. The 1 ms floor avoids reacting to tiny timing noise.
++        const uint64_t target = target_latency_us();
++        if (sample > target + target / 10) {
++            slow_mixed = std::min<uint32_t>(slow_mixed + 1, 2);
++            fast_mixed = 0;
++            if (slow_mixed == 2) { pressure = true; }
++        } else if (sample < target - target / 4) {
++            slow_mixed = 0;
++            fast_mixed = std::min<uint32_t>(fast_mixed + 1, 4);
++            if (fast_mixed == 4) { pressure = false; }
++        } else {
++            slow_mixed = fast_mixed = 0;
++        }
++    }
++
++    counters stats() const { return counts; }
++    uint64_t pure_latency_us() const { return pure_us; }
++    uint64_t mixed_latency_us() const { return mixed_us; }
++    uint64_t target_latency_us() const { return target_override_us ? target_override_us : std::max<uint64_t>(1000, 2 * pure_us); }
++    bool under_pressure() const { return pressure; }
++
++private:
++    static uint64_t smooth(uint64_t previous, uint64_t sample) {
++        return previous ? uint64_t(int64_t(previous) + (int64_t(sample) - int64_t(previous)) / 8) : sample;
++    }
++
++    counters counts;
++    uint64_t pure_us = 0;
++    uint64_t mixed_us = 0;
++    uint64_t target_override_us = 0;
++    uint32_t rows = 0;
++    uint32_t warm_pure = 0;
++    uint32_t slow_mixed = 0;
++    uint32_t fast_mixed = 0;
++    bool pressure = false;
++    bool last_deferred = false;
++};
++
++static_assert(sizeof(server_prefill_budget) <= 128, "prefill admission must remain bounded CPU metadata");
++
++// Causal accounting of the EXISTING compute reservations. Ordinary rounds can
++// establish a new baseline before this episode has made any scheduling change.
++// After its first real deferral, even forced ordinary followups remain protected.
++// All secondary growth during a protected episode is unexpected, at every stage.
++class server_prefill_memory {
++public:
++    struct statistics {
++        size_t ordinary_primary_growth_bytes = 0, ordinary_primary_gpu_growth_bytes = 0;
++        size_t primary_growth_bytes = 0, primary_gpu_growth_bytes = 0, secondary_growth_bytes = 0;
++        size_t primary_peak_bytes = 0, primary_gpu_peak_bytes = 0, secondary_peak_bytes = 0;
++        size_t ordinary_primary_before_bytes = 0, ordinary_primary_after_bytes = 0;
++        size_t ordinary_primary_gpu_before_bytes = 0, ordinary_primary_gpu_after_bytes = 0;
++        uint64_t calls = 0;
++    };
++    struct result {
++        bool unexpected = false;
++        bool baseline_changed = false;
++        size_t primary_delta = 0, primary_gpu_delta = 0, secondary_delta = 0;
++    };
++
++    void reset() { *this = {}; }
++    void begin_episode() { adapted = false; }
++    void mark_deferred() { adapted = true; }
++    result observe(size_t primary_before, size_t primary_after, size_t gpu_before, size_t gpu_after,
++                   size_t secondary_before, size_t secondary_after, bool protected_round) {
++        ++counts.calls;
++        counts.primary_peak_bytes = std::max({counts.primary_peak_bytes, primary_before, primary_after});
++        counts.primary_gpu_peak_bytes = std::max({counts.primary_gpu_peak_bytes, gpu_before, gpu_after});
++        counts.secondary_peak_bytes = std::max({counts.secondary_peak_bytes, secondary_before, secondary_after});
++        result value;
++        if (!protected_round) { return value; }
++        value.primary_delta = primary_after > primary_before ? primary_after - primary_before : 0;
++        value.primary_gpu_delta = gpu_after > gpu_before ? gpu_after - gpu_before : 0;
++        value.secondary_delta = secondary_after > secondary_before ? secondary_after - secondary_before : 0;
++        counts.secondary_growth_bytes = std::max(counts.secondary_growth_bytes, value.secondary_delta);
++        if (adapted) {
++            counts.primary_growth_bytes = std::max(counts.primary_growth_bytes, value.primary_delta);
++            counts.primary_gpu_growth_bytes = std::max(counts.primary_gpu_growth_bytes, value.primary_gpu_delta);
++        } else if (value.primary_delta || value.primary_gpu_delta) {
++            counts.ordinary_primary_growth_bytes = std::max(counts.ordinary_primary_growth_bytes, value.primary_delta);
++            counts.ordinary_primary_gpu_growth_bytes = std::max(counts.ordinary_primary_gpu_growth_bytes, value.primary_gpu_delta);
++            counts.ordinary_primary_before_bytes = primary_before;
++            counts.ordinary_primary_after_bytes = primary_after;
++            counts.ordinary_primary_gpu_before_bytes = gpu_before;
++            counts.ordinary_primary_gpu_after_bytes = gpu_after;
++            value.baseline_changed = true;
++        }
++        value.unexpected = value.secondary_delta || (adapted && (value.primary_delta || value.primary_gpu_delta));
++        return value;
++    }
++    statistics stats() const { return counts; }
++
++private:
++    statistics counts;
++    bool adapted = false;
++};
++static_assert(sizeof(server_prefill_memory) <= 128, "memory proof must remain bounded CPU metadata");
++
++// The context keeps normal cache lookup behavior but must not retain a new
++// secondary arena merely because this optional scheduling decision changed
++// the batch composition. Nesting and exceptions restore the previous mode.
++template<typename Context>
++class server_prefill_reuse_scope {
++public:
++    server_prefill_reuse_scope(Context * value, bool active) : ctx(active ? value : nullptr) {
++        if (ctx) { previous = ctx->set_graph_variant_reuse_only(true); }
++    }
++    ~server_prefill_reuse_scope() {
++        if (ctx) { ctx->set_graph_variant_reuse_only(previous); }
++    }
++    server_prefill_reuse_scope(const server_prefill_reuse_scope &) = delete;
++    server_prefill_reuse_scope & operator=(const server_prefill_reuse_scope &) = delete;
++
++private:
++    Context * ctx = nullptr;
++    bool previous = false;
++};
+diff --git a/tests/test-adaptive-prefill.cpp b/tests/test-adaptive-prefill.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-adaptive-prefill.cpp
+@@ -0,0 +1,521 @@
++#include "llama.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++#include "../src/llama-context.h"
++#include "../tools/server/server-prefill-budget.h"
++
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void policy() {
++    require(!server_prefill_budget::enabled(nullptr), "unset enabled experimental policy");
++    for (const char * value : {"", "0", "true", "yes", "01", "1 ", " 1"}) {
++        require(!server_prefill_budget::enabled(value), "unknown value enabled experimental policy");
++    }
++    require(server_prefill_budget::enabled("1"), "exact opt-in rejected");
++    for (const char * value : {"", "0", "1", "99", "-100", "+100", "100us", "60000001", "99999999999999999999"}) {
++        require(server_prefill_budget::parse_target(value) == 0, "invalid target accepted");
++    }
++    require(server_prefill_budget::parse_target(nullptr) == 0 && server_prefill_budget::parse_target("100") == 100 &&
++            server_prefill_budget::parse_target("60000000") == 60000000, "target limits");
++    server_prefill_budget value;
++    require(!value.defer(512, 1, 1, true), "cold admission deferred");
++    value.observe(1000, 1, 0, true);
++    require(!value.defer(512, 1, 1, true), "one pure sample admitted deferral");
++    value.observe(1000, 1, 0, true);
++    value.observe(10000, 1, 511, true);
++    require(!value.defer(512, 1, 1, true), "one slow sample admitted deferral");
++    value.observe(10000, 1, 511, true);
++    require(value.under_pressure() && value.defer(512, 1, 1, true), "sustained pressure not admitted");
++    for (int i = 0; i < 128; ++i) {
++        require(!value.defer(512, 1, 1, true), "pending prompts starved by consecutive deferrals");
++        value.observe(10000, 1, 511, true);
++        require(value.defer(512, 1, 1, true), "pressure unexpectedly dropped");
++        value.observe(1000, 1, 0, true);
++    }
++    require(value.stats().forced_admissions == 128 && value.stats().deferred == 129, "fairness counters");
++    require(!value.defer(512, 1, 0, true), "isolated generation deferred");
++    require(!value.under_pressure(), "finished contention retained pressure");
++    for (int i = 0; i < 4; ++i) { value.observe(10000, 1, 511, false); }
++    require(!value.defer(512, 1, 1, true), "asynchronous samples used as elapsed GPU time");
++    value.observe(10000, 1, 511, true); value.observe(10000, 1, 511, true);
++    require(value.defer(512, 1, 1, true), "warm pressure not restored");
++    require(!value.defer(512, 2, 1, true) && !value.under_pressure(), "changed generation rows reused old baseline");
++    value.observe(1000, 2, 0, true); value.observe(1000, 2, 0, true);
++    value.observe(10000, 2, 510, true); value.observe(10000, 2, 510, true);
++    require(value.defer(512, 2, 1, true), "two-row pressure not admitted");
++    require(!value.defer(512, 2, 1, false) && !value.under_pressure(), "unsupported request changed admission");
++    value.reset(100);
++    require(value.target_latency_us() == 100, "explicit target did not replace relative objective");
++    value.observe(200, 1, 0, true); value.observe(200, 1, 0, true);
++    value.observe(500, 1, 64, true); value.observe(500, 1, 64, true);
++    require(value.defer(512, 1, 1, true), "actual-time diagnostic target not applied");
++    value.observe(-1, 1, 0, true);
++    require(!value.under_pressure() && !value.defer(512, 1, 1, true), "invalid time retained pressure");
++    value.observe(60000001, 1, 0, true);
++    require(value.stats().invalid_samples == 2, "invalid samples not accounted");
++    require(!value.defer(1, 1, 1, true) && !value.defer(512, 0, 1, true), "invalid/no-generation admission");
++    value.reset();
++    require(value.stats().decisions == 0 && value.stats().deferred == 0 && value.pure_latency_us() == 0,
++            "model reload retained previous controller state");
++    value.observe(1000, 1, 0, true); value.observe(1000, 1, 0, true);
++    value.observe(10000, 1, 511, true); value.observe(10000, 1, 511, true);
++    require(value.under_pressure(), "reservation fixture did not establish pressure");
++    require(!value.defer(512, 1, 1, false, true) && !value.under_pressure() && value.pure_latency_us() == 1000,
++            "transient reservation deferred work or discarded unchanged pure baseline");
++    value.observe(10000, 1, 511, true);
++    require(!value.defer(512, 1, 1, true), "reservation retained old pressure streak");
++    value.observe(10000, 1, 511, true);
++    require(value.defer(512, 1, 1, true) && value.stats().reserve_admissions == 1,
++            "ordinary reservation prevented later adaptive admission");
++    value.reservation_changed();
++    require(!value.under_pressure() && value.pure_latency_us() == 1000 && !value.defer(512, 1, 1, true),
++            "ordinary allocation change did not reset pressure while retaining pure baseline");
++    require(!value.defer(512, 2, 1, false, true) && value.pure_latency_us() == 0,
++            "reservation preserved a baseline for different generation rows");
++    std::puts("ADAPTIVE_PREFILL_POLICY exact_opt_in=1 real_time_target_only=1 warm_pure=2 pressure_samples=2 max_consecutive_deferrals=1 prompt_progress=1 isolated_unchanged=1 row_change_reset=1 async_samples_ignored=1 invalid_time_reset=1 transient_reservation_ordinary=1 unchanged_baseline_retained=1 pressure_relearned=1 PASS");
++}
++
++static void memory_policy() {
++    server_prefill_memory memory;
++    memory.begin_episode();
++    auto value = memory.observe(100, 120, 80, 96, 16, 16, true);
++    require(value.baseline_changed && !value.unexpected && memory.stats().ordinary_primary_growth_bytes == 20 &&
++            memory.stats().ordinary_primary_gpu_growth_bytes == 16 && memory.stats().primary_growth_bytes == 0,
++            "ordinary pre-deferral reservation was misclassified as adaptive growth");
++    value = memory.observe(120, 120, 96, 96, 16, 16, true);
++    require(!value.baseline_changed && !value.unexpected, "stable original reservation was rejected");
++    memory.mark_deferred();
++    value = memory.observe(120, 120, 96, 96, 16, 16, true);
++    require(!value.unexpected, "ordinary pure decode changed memory classification");
++    value = memory.observe(120, 124, 96, 100, 16, 16, true);
++    require(value.unexpected && !value.baseline_changed && memory.stats().primary_growth_bytes == 4 &&
++            memory.stats().primary_gpu_growth_bytes == 4, "post-deferral normal followup escaped the memory guard");
++    memory.begin_episode();
++    value = memory.observe(124, 124, 100, 100, 16, 20, true);
++    require(value.unexpected && memory.stats().secondary_growth_bytes == 4,
++            "secondary growth before the first deferral escaped protection");
++    value = memory.observe(124, 128, 100, 104, 20, 24, false);
++    require(!value.unexpected && memory.stats().primary_peak_bytes == 128 && memory.stats().primary_gpu_peak_bytes == 104 &&
++            memory.stats().secondary_peak_bytes == 24, "disabled-control memory trace changed admission or hid its peaks");
++    memory.reset();
++    require(memory.stats().calls == 0 && memory.stats().primary_peak_bytes == 0, "model reload retained old memory proof");
++    std::puts("ADAPTIVE_PREFILL_MEMORY_POLICY original_reserve_recorded=1 pressure_reset_until_stable=1 after_first_deferral_protected=1 forced_followups_protected=1 secondary_always_protected=1 disabled_control_observable=1 peaks_not_hidden=1 PASS");
++}
++
++static void scopes() {
++    struct fake_context {
++        bool reuse_only = false;
++        int transitions = 0;
++        bool set_graph_variant_reuse_only(bool value) {
++            const bool before = reuse_only;
++            reuse_only = value;
++            ++transitions;
++            return before;
++        }
++    } ctx;
++    {
++        server_prefill_reuse_scope<fake_context> inactive(&ctx, false);
++        require(!ctx.reuse_only && ctx.transitions == 0, "inactive scope changed normal admission");
++        try {
++            server_prefill_reuse_scope<fake_context> outer(&ctx, true);
++            require(ctx.reuse_only, "scope failed to enable reuse-only");
++            {
++                server_prefill_reuse_scope<fake_context> nested(&ctx, true);
++                require(ctx.reuse_only, "nested scope cleared outer admission mode");
++            }
++            require(ctx.reuse_only, "nested restore lost prior mode");
++            throw std::runtime_error("scope unwind fixture");
++        } catch (const std::runtime_error &) {}
++        require(!ctx.reuse_only, "exception left admission mode enabled");
++    }
++    ctx.reuse_only = true;
++    { server_prefill_reuse_scope<fake_context> previous(&ctx, true); }
++    require(ctx.reuse_only, "preexisting admission mode not restored");
++    std::puts("ADAPTIVE_PREFILL_SCOPE nested_restore=1 exception_restore=1 inactive_noop=1 previous_mode_preserved=1 extra_gpu_fences=0 PASS");
++}
++
++struct budget_environment {
++    bool had;
++    std::string before;
++    static void set(const char * value) {
++#ifdef _WIN32
++        require(_putenv_s("WILDLLAMA_GRAPH_VARIANTS_MIB", value ? value : "") == 0, "cannot change test graph budget");
++#else
++        require((value ? setenv("WILDLLAMA_GRAPH_VARIANTS_MIB", value, 1) : unsetenv("WILDLLAMA_GRAPH_VARIANTS_MIB")) == 0,
++                "cannot change test graph budget");
++#endif
++    }
++    budget_environment() {
++        const char * value = std::getenv("WILDLLAMA_GRAPH_VARIANTS_MIB");
++        had = value != nullptr;
++        if (value) { before = value; }
++        set("128");
++    }
++    ~budget_environment() { set(had ? before.c_str() : nullptr); }
++};
++
++static void make_fixture(const std::string & path) {
++    constexpr int dim = 64, ff = 128, layers = 2, vocab = 259;
++    gguf_context_ptr meta(gguf_init_empty());
++    gguf_set_val_str(meta.get(), "general.architecture", "llama");
++    gguf_set_val_str(meta.get(), "general.name", "adaptive-prefill-synthetic-fixture");
++    gguf_set_val_u32(meta.get(), "llama.context_length", 4096);
++    gguf_set_val_u32(meta.get(), "llama.embedding_length", dim);
++    gguf_set_val_u32(meta.get(), "llama.block_count", layers);
++    gguf_set_val_u32(meta.get(), "llama.feed_forward_length", ff);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count", 4);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count_kv", 2);
++    gguf_set_val_u32(meta.get(), "llama.rope.dimension_count", 16);
++    gguf_set_val_f32(meta.get(), "llama.attention.layer_norm_rms_epsilon", 1e-6f);
++    gguf_set_val_str(meta.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) { char name[16]; std::snprintf(name, sizeof(name), "<0x%02X>", i); tokens.emplace_back(name); }
++    std::vector<const char *> strings;
++    for (const auto & token : tokens) { strings.push_back(token.c_str()); }
++    std::vector<float> scores(vocab, 0);
++    std::vector<int32_t> types(vocab, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(meta.get(), "tokenizer.ggml.tokens", strings.data(), strings.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.eos_token_id", 2);
++    gguf_set_val_bool(meta.get(), "tokenizer.ggml.add_bos_token", true);
++    ggml_context_ptr tensors(ggml_init({4 * 1024 * 1024, nullptr, false}));
++    require(bool(tensors), "cannot allocate tiny fixture metadata");
++    auto tensor = [&](const std::string & name, int x, int y = 1) {
++        auto * t = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, x, y);
++        ggml_set_name(t, name.c_str());
++        uint32_t salt = 2166136261u;
++        for (unsigned char c : name) { salt = (salt ^ c) * 16777619u; }
++        auto * data = static_cast<float *>(t->data);
++        for (int64_t i = 0; i < ggml_nelements(t); ++i) {
++            salt = salt * 1664525u + 1013904223u;
++            data[i] = float(int(salt >> 16) - 32768) * (0.02f / 32768);
++            if (name.find("norm.weight") != std::string::npos) { data[i] += 1.0f; }
++        }
++        gguf_add_tensor(meta.get(), t);
++    };
++    tensor("token_embd.weight", dim, vocab); tensor("output_norm.weight", dim); tensor("output.weight", dim, vocab);
++    for (int i = 0; i < layers; ++i) {
++        const auto prefix = "blk." + std::to_string(i) + ".";
++        tensor(prefix + "attn_norm.weight", dim); tensor(prefix + "attn_q.weight", dim, dim);
++        tensor(prefix + "attn_k.weight", dim, dim / 2); tensor(prefix + "attn_v.weight", dim, dim / 2);
++        tensor(prefix + "attn_output.weight", dim, dim); tensor(prefix + "ffn_norm.weight", dim);
++        tensor(prefix + "ffn_gate.weight", dim, ff); tensor(prefix + "ffn_up.weight", dim, ff); tensor(prefix + "ffn_down.weight", ff, dim);
++    }
++    require(gguf_write_to_file(meta.get(), path.c_str(), false), "cannot write tiny synthetic fixture");
++}
++
++using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
++static context_ptr context(llama_model * model, bool gpu, bool unified = true) {
++    auto params = llama_context_default_params();
++    params.n_ctx = 4096; params.n_batch = 512; params.n_ubatch = 128;
++    params.n_seq_max = 2; params.kv_unified = unified;
++    params.n_threads = 2; params.n_threads_batch = 2;
++    params.n_outputs_max = 2; params.n_outputs_max_per_seq = 1;
++    params.op_offload = gpu;
++    params.type_k = params.type_v = GGML_TYPE_F32;
++    context_ptr value(llama_init_from_model(model, params), llama_free);
++    require(bool(value), "cannot create tiny inference context");
++    return value;
++}
++
++struct input_row { int sequence; int position; llama_token token; bool output; };
++
++static std::vector<float> process(llama_context * ctx, const std::vector<input_row> & rows, bool reuse_only, int vocab) {
++    auto batch = llama_batch_init(int(rows.size()), 0, 1);
++    try {
++        batch.n_tokens = int(rows.size());
++        for (size_t i = 0; i < rows.size(); ++i) {
++            batch.token[i] = rows[i].token; batch.pos[i] = rows[i].position;
++            batch.n_seq_id[i] = 1; batch.seq_id[i][0] = rows[i].sequence; batch.logits[i] = rows[i].output;
++        }
++        {
++            server_prefill_reuse_scope<llama_context> scope(ctx, reuse_only);
++            require(llama_decode(ctx, batch) == 0, "synthetic decode failed");
++        }
++        llama_synchronize(ctx);
++        require(!ctx->get_graph_variant_admission_stats().reuse_only, "decode leaked reuse-only mode");
++        const float * logits = llama_get_logits_ith(ctx, -1);
++        require(logits != nullptr, "missing synthetic logits");
++        std::vector<float> result(logits, logits + vocab);
++        for (float value : result) { require(std::isfinite(value), "nonfinite synthetic logits"); }
++        llama_batch_free(batch);
++        return result;
++    } catch (...) { llama_batch_free(batch); throw; }
++}
++
++static void runtime(const std::filesystem::path & directory, bool gpu) {
++    std::filesystem::create_directories(directory);
++    const auto path = directory / "adaptive-prefill-tiny.gguf";
++    if (!std::filesystem::exists(path)) { make_fixture(path.string()); }
++    require(std::filesystem::file_size(path) > 0 && std::filesystem::file_size(path) < 4 * 1024 * 1024,
++            "adaptive fixture must remain below 4 MiB");
++    budget_environment budget;
++    auto params = llama_model_default_params(); params.n_gpu_layers = gpu ? 99 : 0; params.load_mode = LLAMA_LOAD_MODE_NONE;
++    // Heavy-op submission counters are intentionally enabled by the existing
++    // exclusive-execution guard. A CUDA reservation alone is not execution proof.
++    params.gpu_exclusive = gpu;
++    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(path.string().c_str(), params), llama_model_free);
++    require(bool(model), "cannot load synthetic model");
++    auto reference = context(model.get(), gpu), scoped = context(model.get(), gpu);
++    require(scoped->adaptive_prefill_supported(), "ordinary unified KV context unexpectedly unsupported");
++    auto split = context(model.get(), gpu, false);
++    require(!split->adaptive_prefill_supported(), "split-stream memory admitted adaptive scheduling");
++    split.reset();
++    constexpr int vocab = 259;
++    std::array<int, 2> next = {0, 0};
++    auto rows = [&](int generation, int prompt) {
++        std::vector<input_row> result;
++        for (int i = 0; i < generation; ++i) {
++            const int position = next[0]++;
++            result.push_back({0, position, 3 + (position * 13) % 256, i + 1 == generation});
++        }
++        for (int i = 0; i < prompt; ++i) {
++            const int position = next[1]++;
++            result.push_back({1, position, 3 + (position * 17 + 7) % 256, false});
++        }
++        return result;
++    };
++    int comparisons = 0;
++    auto compare = [&](const std::vector<input_row> & input, bool restricted) {
++        const auto before = process(reference.get(), input, false, vocab);
++        const auto after = process(scoped.get(), input, restricted, vocab);
++        require(before.size() == after.size() && std::memcmp(before.data(), after.data(), before.size() * sizeof(float)) == 0,
++                "reuse-only policy changed model logits");
++        ++comparisons;
++    };
++    compare(rows(16, 0), false);
++    const auto initial = scoped->get_graph_variant_admission_stats();
++    const auto initial_secondary = scoped->get_graph_variant_stats();
++    size_t primary_peak = initial.primary_compute_bytes;
++    size_t gpu_peak = initial.primary_gpu_bytes;
++    size_t baseline_peak = reference->get_graph_variant_admission_stats().primary_compute_bytes;
++    size_t baseline_gpu_peak = reference->get_graph_variant_admission_stats().primary_gpu_bytes;
++    for (int prompt : {0, 511, 0, 511}) {
++        compare(rows(1, prompt), true);
++        const auto current = scoped->get_graph_variant_admission_stats();
++        const auto cache = scoped->get_graph_variant_stats();
++        primary_peak = std::max(primary_peak, current.primary_compute_bytes);
++        gpu_peak = std::max(gpu_peak, current.primary_gpu_bytes);
++        baseline_peak = std::max(baseline_peak, reference->get_graph_variant_admission_stats().primary_compute_bytes);
++        baseline_gpu_peak = std::max(baseline_gpu_peak, reference->get_graph_variant_admission_stats().primary_gpu_bytes);
++        require(cache.arenas == initial_secondary.arenas && cache.compute_bytes == initial_secondary.compute_bytes,
++                "contention episode allocated another secondary arena");
++    }
++    require(primary_peak <= baseline_peak, "adaptive episode exceeded the baseline primary reservation");
++    require(gpu_peak <= baseline_gpu_peak, "adaptive episode exceeded baseline primary GPU storage");
++    // A normal short shape is still allowed to create a cache entry after the
++    // episode. The configured 128 MiB cache has not been disabled globally.
++    compare(rows(8, 0), false);
++    const auto ordinary_cache = scoped->get_graph_variant_stats();
++    require(ordinary_cache.arenas > initial_secondary.arenas, "normal cache admission was globally disabled");
++    const auto before_hit = scoped->get_graph_variant_admission_stats().reuse_hits;
++    compare(rows(8, 0), true);
++    require(scoped->get_graph_variant_admission_stats().reuse_hits > before_hit,
++            "existing graph reuse was disabled by the scoped policy");
++    // Two restricted visits must not prime the normal two-hit history. All
++    // positions remain in the same 256-token history bucket in this fixture.
++    compare(rows(16, 0), true); compare(rows(16, 0), true);
++    compare(rows(32, 0), false);
++    const auto before_cold = scoped->get_graph_variant_stats();
++    compare(rows(16, 0), false);
++    const auto after_cold = scoped->get_graph_variant_stats();
++    require(after_cold.arenas == before_cold.arenas && after_cold.compute_bytes == before_cold.compute_bytes,
++            "restricted visits primed later normal admission history");
++    compare(rows(32, 0), false); compare(rows(16, 0), false);
++    require(scoped->get_graph_variant_stats().arenas > after_cold.arenas, "ordinary two-hit cache admission stopped working");
++    auto empty = llama_batch_init(1, 0, 1);
++    empty.n_tokens = 0;
++    {
++        server_prefill_reuse_scope<llama_context> failure_scope(scoped.get(), true);
++        const int status = llama_decode(scoped.get(), empty);
++        llama_batch_free(empty);
++        require(status == -1, "invalid batch unexpectedly accepted");
++    }
++    require(!scoped->get_graph_variant_admission_stats().reuse_only, "decode error leaked scoped admission policy");
++    llama_gpu_execution_stats execution{};
++    require(llama_gpu_execution_stats_get(scoped.get(), &execution), "execution counters unavailable");
++    require(gpu ? execution.gpu_heavy_ops_submitted > 0 && execution.cpu_heavy_ops_submitted == 0 :
++            execution.gpu_heavy_ops_submitted == 0,
++            "requested backend did not execute the fixture");
++    const auto observed = scoped->get_graph_variant_admission_stats();
++    std::printf("ADAPTIVE_PREFILL_GRAPH device=%s configured_cache_mib=128 comparisons=%d exact_logits=1 episode_1_512_1_512=1 new_secondary_bytes=0 primary_initial=%zu primary_peak=%zu baseline_primary_peak=%zu primary_gpu_initial=%zu primary_gpu_peak=%zu baseline_primary_gpu_peak=%zu history_unprimed=1 existing_reuse_preserved=1 normal_admission_preserved=1 error_return_restored=1 reuse_scopes=%llu reuse_hits=%llu reuse_misses=%llu scope_restored=%d cpu_heavy_ops=%llu gpu_heavy_ops=%llu actual_backend_execution=1 PASS\n",
++        gpu ? "CUDA" : "CPU", comparisons, initial.primary_compute_bytes, primary_peak, baseline_peak,
++        initial.primary_gpu_bytes, gpu_peak, baseline_gpu_peak, static_cast<unsigned long long>(observed.reuse_scopes),
++        static_cast<unsigned long long>(observed.reuse_hits), static_cast<unsigned long long>(observed.reuse_misses), int(!observed.reuse_only),
++        static_cast<unsigned long long>(execution.cpu_heavy_ops_submitted), static_cast<unsigned long long>(execution.gpu_heavy_ops_submitted));
++}
++
++// Explicit CPU diagnostic, outside the default tests. Feed the SAME logical
++// histories under different physical interleavings; never sample a divergent
++// continuation. Raw logits permit independent error/margin analysis.
++static void interleaving(const std::filesystem::path & model_path, const std::filesystem::path & history_path,
++                         const std::filesystem::path & directory, ggml_type kv_type = GGML_TYPE_F16, bool flash_attention = true) {
++    require(kv_type == GGML_TYPE_F16 || kv_type == GGML_TYPE_F32, "unsupported diagnostic KV precision");
++    require(std::filesystem::is_regular_file(model_path) && std::filesystem::file_size(model_path) > 0 &&
++            std::filesystem::file_size(model_path) <= 64 * 1024 * 1024, "interleaving requires an existing model at most 64 MiB");
++    std::ifstream input(history_path);
++    std::string version; input >> version;
++    require(version == "ADAPTIVE_PREFILL_HISTORY_V1", "invalid teacher-forcing history version");
++    auto read = [&]() {
++        size_t count = 0; input >> count;
++        require(bool(input) && count > 0 && count <= 8192, "invalid teacher-forcing history length");
++        std::vector<llama_token> tokens(count);
++        for (auto & token : tokens) { input >> token; require(bool(input), "incomplete teacher-forcing history"); }
++        return tokens;
++    };
++    const auto prompt_a = read(), generated_a = read(), prompt_b = read(), generated_b = read(), allowed = read();
++    std::string trailing; require(!(input >> trailing), "unexpected trailing teacher-forcing data");
++    require(generated_a.size() == 512 && prompt_b.size() == 3000 && generated_b.size() == 64 && allowed.size() >= 32,
++            "interleaving diagnostic requires the exact bounded concurrent history contract");
++    auto params = llama_model_default_params(); params.n_gpu_layers = 0; params.load_mode = LLAMA_LOAD_MODE_NONE;
++    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
++        llama_model_load_from_file(model_path.string().c_str(), params), llama_model_free);
++    require(bool(model), "cannot load the existing teacher-forcing fixture");
++    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++    require(vocab == 259, "teacher-forcing diagnostic requires the pinned 259-token fixture");
++    for (const auto * tokens : {&prompt_a, &generated_a, &prompt_b, &generated_b, &allowed}) {
++        for (const auto token : *tokens) { require(token >= 0 && token < vocab, "teacher-forcing token is outside the fixture vocabulary"); }
++    }
++    require(!std::filesystem::exists(directory) || std::filesystem::is_empty(directory), "use a fresh interleaving output directory");
++    std::filesystem::create_directories(directory);
++    std::ofstream shape(directory / "shape.txt");
++    shape << vocab << ' ' << generated_a.size() << ' ' << generated_b.size() << '\n';
++    shape.close(); require(bool(shape), "cannot write diagnostic shape");
++    std::ofstream statistics(directory / "controls.tsv");
++    statistics << "control\tdecode_calls\tdeferrals\tprimary_peak_bytes\tprimary_gpu_peak_bytes\tsecondary_peak_bytes\n";
++    budget_environment budget;
++    for (const auto & name : {"ordinary-normal", "ordinary-reuse", "adaptive-reuse", "adaptive-repeat"}) {
++        const bool altered = std::strncmp(name, "adaptive-", 9) == 0;
++        const bool restrict_episode = std::strcmp(name, "ordinary-normal") != 0;
++        auto cp = llama_context_default_params();
++        cp.n_ctx = 8192; cp.n_batch = 512; cp.n_ubatch = 128; cp.n_seq_max = 2; cp.kv_unified = true;
++        cp.n_threads = cp.n_threads_batch = 1; cp.n_outputs_max = 2; cp.n_outputs_max_per_seq = 1;
++        cp.op_offload = false; cp.type_k = cp.type_v = kv_type;
++        cp.flash_attn_type = flash_attention ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
++        context_ptr ctx(llama_init_from_model(model.get(), cp), llama_free);
++        require(bool(ctx) && ctx->adaptive_prefill_supported(), "teacher-forcing context is not eligible plain unified KV");
++        std::vector<float> logits_a, logits_b;
++        logits_a.reserve(generated_a.size() * size_t(vocab)); logits_b.reserve(generated_b.size() * size_t(vocab));
++        size_t calls = 0, deferrals = 0, primary_peak = 0, gpu_peak = 0, secondary_peak = 0;
++        auto append_logits = [&](std::vector<float> & result, int index) {
++            const auto * values = llama_get_logits_ith(ctx.get(), index);
++            require(values != nullptr, "teacher-forcing output logits are missing");
++            for (int i = 0; i < vocab; ++i) { require(std::isfinite(values[i]), "nonfinite teacher-forcing logits"); }
++            result.insert(result.end(), values, values + vocab);
++        };
++        auto decode = [&](const std::vector<input_row> & rows, bool episode, int a_index, int b_index) {
++            auto batch = llama_batch_init(int(rows.size()), 0, 1);
++            try {
++                batch.n_tokens = int(rows.size());
++                for (size_t i = 0; i < rows.size(); ++i) {
++                    batch.token[i] = rows[i].token; batch.pos[i] = rows[i].position;
++                    batch.n_seq_id[i] = 1; batch.seq_id[i][0] = rows[i].sequence; batch.logits[i] = rows[i].output;
++                }
++                {
++                    server_prefill_reuse_scope<llama_context> scope(ctx.get(), restrict_episode && episode);
++                    require(llama_decode(ctx.get(), batch) == 0, "teacher-forcing decode failed");
++                }
++                llama_synchronize(ctx.get());
++                require(!ctx->get_graph_variant_admission_stats().reuse_only, "teacher-forcing scope was not restored");
++                if (a_index >= 0) { append_logits(logits_a, a_index); }
++                if (b_index >= 0) { append_logits(logits_b, b_index); }
++                const auto memory = ctx->get_graph_variant_admission_stats();
++                primary_peak = std::max(primary_peak, memory.primary_compute_bytes);
++                gpu_peak = std::max(gpu_peak, memory.primary_gpu_bytes);
++                secondary_peak = std::max(secondary_peak, ctx->get_graph_variant_stats().compute_bytes);
++                ++calls;
++                llama_batch_free(batch);
++            } catch (...) { llama_batch_free(batch); throw; }
++        };
++        std::vector<input_row> initial;
++        for (size_t i = 0; i < prompt_a.size(); ++i) {
++            initial.push_back({0, int(i), prompt_a[i], i + 1 == prompt_a.size()});
++        }
++        decode(initial, false, int(initial.size()) - 1, -1);
++        size_t b_prompt_done = 0, b_generated = 0, chunks = 0;
++        bool previous_deferred = false;
++        for (size_t sample = 1; sample < generated_a.size(); ++sample) {
++            std::vector<input_row> rows = {{0, int(prompt_a.size() + sample - 1), generated_a[sample - 1], true}};
++            int b_index = -1;
++            const bool episode = sample >= 16 && b_prompt_done < prompt_b.size();
++            const bool defer = altered && episode && chunks >= 3 && !previous_deferred;
++            if (defer) { ++deferrals; previous_deferred = true; }
++            else if (episode) {
++                const size_t count = std::min<size_t>(511, prompt_b.size() - b_prompt_done);
++                for (size_t i = 0; i < count; ++i) {
++                    const size_t position = b_prompt_done + i;
++                    rows.push_back({1, int(position), prompt_b[position], position + 1 == prompt_b.size()});
++                }
++                b_prompt_done += count; ++chunks; previous_deferred = false;
++                if (b_prompt_done == prompt_b.size()) { b_generated = 1; b_index = int(rows.size()) - 1; }
++            } else if (b_prompt_done == prompt_b.size() && b_generated < generated_b.size()) {
++                rows.push_back({1, int(prompt_b.size() + b_generated - 1), generated_b[b_generated - 1], true});
++                ++b_generated; b_index = 1;
++            }
++            decode(rows, episode, 0, b_index);
++        }
++        require(logits_a.size() == generated_a.size() * size_t(vocab) && logits_b.size() == generated_b.size() * size_t(vocab),
++                "teacher-forcing output conservation failed");
++        require(deferrals == (altered ? 3u : 0u), "teacher-forcing schedule did not match the observed policy");
++        auto write = [&](const char * suffix, const std::vector<float> & values) {
++            std::ofstream file(directory / (std::string(name) + suffix), std::ios::binary);
++            file.write(reinterpret_cast<const char *>(values.data()), std::streamsize(values.size() * sizeof(float)));
++            file.close(); require(bool(file), "cannot write teacher-forcing raw logits");
++        };
++        write(".a.f32", logits_a); write(".b.f32", logits_b);
++        statistics << name << '\t' << calls << '\t' << deferrals << '\t' << primary_peak << '\t' << gpu_peak << '\t' << secondary_peak << '\n';
++        std::printf("ADAPTIVE_PREFILL_INTERLEAVING control=%s kv_type=%s flash_attention_requested=%s actual_cpu_decode_calls=%zu deferrals=%zu a_logits=%zu b_logits=%zu primary_peak_bytes=%zu primary_gpu_peak_bytes=%zu secondary_peak_bytes=%zu scope_restored=1\n",
++            name, ggml_type_name(kv_type), flash_attention ? "auto" : "off", calls, deferrals, logits_a.size(), logits_b.size(), primary_peak, gpu_peak, secondary_peak);
++    }
++    statistics.close(); require(bool(statistics), "cannot write teacher-forcing memory statistics");
++}
++
++int main(int argc, char ** argv) {
++    try {
++        if (argc == 5 && (std::strcmp(argv[1], "--interleaving") == 0 || std::strcmp(argv[1], "--interleaving-f32") == 0 ||
++                std::strcmp(argv[1], "--interleaving-f32-no-fa") == 0)) {
++            require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++            llama_backend_init();
++            interleaving(argv[2], argv[3], argv[4], std::strcmp(argv[1], "--interleaving") == 0 ? GGML_TYPE_F16 : GGML_TYPE_F32,
++                std::strcmp(argv[1], "--interleaving-f32-no-fa") != 0);
++            llama_backend_free();
++            return 0;
++        }
++        bool gpu = false;
++        std::filesystem::path directory;
++        for (int i = 1; i < argc; ++i) {
++            if (std::strcmp(argv[i], "--cuda") == 0) { gpu = true; }
++            else { require(directory.empty(), "use [--cuda] [fixture-directory]"); directory = argv[i]; }
++        }
++        policy(); scopes(); memory_policy();
++        if (!directory.empty()) {
++            require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++            if (gpu) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++                require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++#else
++                std::puts("SKIP: CUDA backend not built"); return 77;
++#endif
++            }
++            llama_backend_init(); runtime(directory, gpu); llama_backend_free();
++        }
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

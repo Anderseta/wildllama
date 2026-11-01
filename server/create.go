@@ -148,6 +148,8 @@ func (s *Server) CreateHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	ch := make(chan any)
 	go func() {
+		downloadCleanupGate.RLock()
+		defer downloadCleanupGate.RUnlock()
 		send := func(resp any) bool {
 			select {
 			case ch <- resp:

@@ -114,6 +114,8 @@ type Server struct {
 	defaultNumCtx int
 	requestLogger *inferenceRequestLogger
 	modelCaches   *modelCaches
+	admissionOnce sync.Once
+	admission     *inferenceAdmission
 }
 
 func init() {
@@ -313,11 +315,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		*api.GenerateRequest
 		Think json.RawMessage `json:"think"`
 	}{GenerateRequest: &req}
-	if err := c.ShouldBindJSON(&body); errors.Is(err, io.EOF) {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
-		return
-	} else if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if !bindInferenceJSON(c, &body) {
 		return
 	}
 
@@ -1095,13 +1093,13 @@ func (s *Server) SystemOneHandler(c *gin.Context) {
 func (s *Server) EmbedHandler(c *gin.Context) {
 	checkpointStart := time.Now()
 	var req api.EmbedRequest
-	err := c.ShouldBindJSON(&req)
-	switch {
-	case errors.Is(err, io.EOF):
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+	if !bindInferenceJSON(c, &req) {
 		return
-	case err != nil:
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	}
+	limits := s.requestAdmission().limits
+	items, err := validateEmbeddingInput(req.Input, limits)
+	if err != nil {
+		inferenceError(c, 413, "embedding_input_limit", err.Error())
 		return
 	}
 
@@ -1211,6 +1209,12 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
+	outputBytes, err := embeddingOutputBytes(items, m, limits)
+	if err != nil {
+		inferenceError(c, 413, "embedding_output_limit", err.Error())
+		return
+	}
+	shrinkEmbeddingReservation(c, outputBytes)
 	r, m, opts, err := s.scheduleRunnerForModel(c.Request.Context(), m, []model.Capability{}, req.Options, req.KeepAlive, nil)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
@@ -1496,11 +1500,7 @@ func normalize(vec []float32) ([]float32, error) {
 
 func (s *Server) EmbeddingsHandler(c *gin.Context) {
 	var req api.EmbeddingRequest
-	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
-		return
-	} else if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if !bindInferenceJSON(c, &req) {
 		return
 	}
 
@@ -2303,6 +2303,8 @@ func (s *Server) HeadBlobHandler(c *gin.Context) {
 }
 
 func (s *Server) CreateBlobHandler(c *gin.Context) {
+	downloadCleanupGate.RLock()
+	defer downloadCleanupGate.RUnlock()
 	path, err := manifest.BlobsPath(c.Param("digest"))
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -2436,6 +2438,8 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 		"User-Agent",
 		"Accept",
 		"X-Requested-With",
+		"X-Request-ID",
+		"X-Wildgoose-Priority",
 
 		// OpenAI compatibility headers
 		"OpenAI-Beta",
@@ -2453,12 +2457,14 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 		"x-stainless-timeout",
 	}
 	corsConfig.AllowOrigins = envconfig.AllowedOrigins()
+	corsConfig.ExposeHeaders = append(corsConfig.ExposeHeaders, "X-Request-ID", "X-Wildllama-Queue-Ms", "Retry-After")
 
 	r := gin.Default()
 	r.HandleMethodNotAllowed = true
 	r.Use(
 		cors.New(corsConfig),
 		allowedHostsMiddleware(s.addr),
+		s.inferenceGuard(),
 	)
 
 	// General
@@ -2466,7 +2472,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/version", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog"}})
+		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog", "download_cleanup"}, "wildllama": s.protocolCapabilities()})
 	})
 	r.GET("/api/activity", s.RuntimeActivityHandler)
 	r.GET("/api/huggingface/search", s.HuggingFaceSearchHandler)
@@ -2478,6 +2484,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 
 	// Local model cache management (new implementation is at end of function)
 	r.POST("/api/pull", s.PullHandler)
+	r.DELETE("/api/download", s.DiscardDownloadHandler)
 	r.POST("/api/push", s.PushHandler)
 	r.HEAD("/api/tags", s.ListHandler)
 	r.GET("/api/tags", s.ListHandler)
@@ -3123,11 +3130,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		*api.ChatRequest
 		Think json.RawMessage `json:"think"`
 	}{ChatRequest: &req}
-	if err := c.ShouldBindJSON(&body); errors.Is(err, io.EOF) {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
-		return
-	} else if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if !bindInferenceJSON(c, &body) {
 		return
 	}
 
@@ -3706,11 +3709,14 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 			}
 			ctxLen = previousTokenCount
 		}
-		if m != nil && m.ProjectorPaths != nil {
-			for _, msg := range renderReq.Messages {
-				ctxLen += 768 * len(msg.Images)
-			}
+		mediaTokens, err := nativeMediaTokens(ctx, m, r, renderReq)
+		if err != nil {
+			return 0, err
 		}
+		if mediaTokens > math.MaxInt-ctxLen {
+			return math.MaxInt, nil
+		}
+		ctxLen += mediaTokens
 
 		return ctxLen, nil
 	})

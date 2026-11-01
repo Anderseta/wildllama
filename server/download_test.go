@@ -11,13 +11,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/transfer"
+	"github.com/ollama/ollama/types/model"
 )
 
 func TestDownloadChunkRedirects(t *testing.T) {
@@ -90,6 +95,231 @@ func TestDownloadChunkRedirects(t *testing.T) {
 				t.Errorf("requests = %d, want %d", got, tc.wantHits)
 			}
 		})
+	}
+}
+
+func TestSharedBlobPreparationFailureReachesEveryWaiter(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	started, release := make(chan struct{}), make(chan struct{})
+	var heads atomic.Int32
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("unexpected request: %s", r.Method)
+			return
+		}
+		if heads.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusNotFound)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(registry.Close)
+	opts := sharedDownloadOptions(registry.URL)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	results := make(chan error, 2)
+	go func() { _, err := downloadBlob(ctx, opts); results <- err }()
+	<-started
+	go func() { _, err := downloadBlob(ctx, opts); results <- err }()
+	waitForDownloadReferences(t, opts.digest, 2)
+	close(release)
+	for range 2 {
+		if err := <-results; !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("prepare error = %v", err)
+		}
+	}
+	if heads.Load() != 1 {
+		t.Fatalf("HEAD requests = %d, want 1", heads.Load())
+	}
+}
+
+func TestSharedBlobCancellationKeepsRemainingConsumer(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	started, release, headCancelled := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var gets atomic.Int32
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets.Add(1)
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("x"))
+	}))
+	t.Cleanup(cdn.Close)
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			close(started)
+			select {
+			case <-release:
+				w.Header().Set("Content-Length", "1")
+			case <-r.Context().Done():
+				close(headCancelled)
+			}
+			return
+		}
+		gets.Add(1)
+		http.Redirect(w, r, cdn.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(registry.Close)
+	opts := sharedDownloadOptions(registry.URL)
+	first, cancel := context.WithCancel(t.Context())
+	second, stop := context.WithTimeout(t.Context(), 3*time.Second)
+	defer stop()
+	firstResult, secondResult := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := downloadBlob(first, opts); firstResult <- err }()
+	<-started
+	go func() { _, err := downloadBlob(second, opts); secondResult <- err }()
+	waitForDownloadReferences(t, opts.digest, 2)
+	cancel()
+	if err := <-firstResult; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	select {
+	case <-headCancelled:
+		t.Fatal("remaining consumer lost its preparation")
+	default:
+	}
+	close(release)
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+	if gets.Load() != 2 {
+		t.Fatalf("GET requests = %d, want discovery and one part", gets.Load())
+	}
+}
+
+func TestSharedBlobAllConsumersCancelPreparationWithoutOrphanTransfer(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	started, headCancelled := make(chan struct{}), make(chan struct{})
+	var gets atomic.Int32
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			gets.Add(1)
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+		close(headCancelled)
+	}))
+	t.Cleanup(registry.Close)
+	opts := sharedDownloadOptions(registry.URL)
+	ctx, cancel := context.WithCancel(t.Context())
+	results := make(chan error, 2)
+	go func() { _, err := downloadBlob(ctx, opts); results <- err }()
+	<-started
+	go func() { _, err := downloadBlob(ctx, opts); results <- err }()
+	waitForDownloadReferences(t, opts.digest, 2)
+	cancel()
+	for range 2 {
+		if err := <-results; !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-headCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("orphan HEAD request")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, ok := blobDownloadManager.Load(opts.digest); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("orphan download entry")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if gets.Load() != 0 {
+		t.Fatal("GET started after all consumers cancelled")
+	}
+}
+
+func sharedDownloadOptions(registry string) downloadOpts {
+	u, _ := url.Parse(registry)
+	return downloadOpts{n: model.Name{Host: u.Host, ProtocolScheme: "http", Namespace: "library", Model: "shared"},
+		digest:  "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		regOpts: &registryOptions{Insecure: true}, fn: func(api.ProgressResponse) {}}
+}
+
+func waitForDownloadReferences(t *testing.T, digest string, count int32) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if value, ok := blobDownloadManager.Load(digest); ok && value.(*blobDownload).references.Load() == count {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("download consumers did not join")
+}
+
+type observedCancelledContext struct {
+	context.Context
+	checked chan struct{}
+	once    sync.Once
+}
+
+func (c *observedCancelledContext) Err() error {
+	c.once.Do(func() { close(c.checked) })
+	return c.Context.Err()
+}
+
+func TestSharedBlobFinishingTransferIsNotDownloadedAgain(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	var requests atomic.Int32
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
+	t.Cleanup(registry.Close)
+	opts := sharedDownloadOptions(registry.URL)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	closing := &observedCancelledContext{Context: ctx, checked: make(chan struct{})}
+	previous := &blobDownload{context: closing, CancelFunc: func() {}, done: make(chan struct{})}
+	blobDownloadManager.Store(opts.digest, previous)
+	t.Cleanup(func() { blobDownloadManager.CompareAndDelete(opts.digest, previous) })
+	result := make(chan error, 1)
+	go func() { _, err := downloadBlob(t.Context(), opts); result <- err }()
+	<-closing.checked
+	filename, err := manifest.BlobsPath(opts.digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, []byte("finished"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	blobDownloadManager.CompareAndDelete(opts.digest, previous)
+	close(previous.done)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 0 {
+		t.Fatal("completed blob unnecessarily downloaded again")
+	}
+}
+
+func TestSharedBlobCannotJoinWhileLastConsumerCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	started, proceed := make(chan struct{}), make(chan struct{})
+	download := &blobDownload{context: ctx, CancelFunc: func() { close(started); <-proceed; cancel() }}
+	if !download.acquire() {
+		t.Fatal("initial consumer rejected")
+	}
+	released := make(chan struct{})
+	go func() { download.release(); close(released) }()
+	<-started
+	joined := make(chan bool, 1)
+	go func() { joined <- download.acquire() }()
+	select {
+	case accepted := <-joined:
+		close(proceed)
+		t.Fatalf("joined cancelling transfer: %v", accepted)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(proceed)
+	<-released
+	if <-joined {
+		t.Fatal("cancelled transfer accepted a new consumer")
 	}
 }
 

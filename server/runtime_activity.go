@@ -62,5 +62,5 @@ func (s *Server) RuntimeActivityHandler(c *gin.Context) {
 		runners = append(runners, runnerActivityResponse{Model: entry.model, PID: entry.pid, ContextLength: entry.context, GPUExclusive: entry.exclusive, Activity: entry.reporter.RuntimeActivity()})
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{"version": 1, "observed_at": time.Now().UnixMilli(), "scope": "shared_runner", "scheduler_busy": busy, "queue_length": queueLength, "runners": runners})
+	c.JSON(http.StatusOK, gin.H{"version": 1, "observed_at": time.Now().UnixMilli(), "scope": "shared_runner", "scheduler_busy": busy, "queue_length": queueLength, "admission": s.requestAdmission().snapshot(), "runners": runners})
 }

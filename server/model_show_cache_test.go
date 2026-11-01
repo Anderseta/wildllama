@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,49 @@ import (
 	"github.com/ollama/ollama/manifest"
 	modelpkg "github.com/ollama/ollama/types/model"
 )
+
+func TestModelShowCacheSharesConcurrentLocalMissWithoutSharingMutableResponses(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	createShowCacheModel(t, "show-cache-concurrent", map[string]any{"test.context_length": uint32(1024)})
+	cache := newModelShowCache()
+	var calls atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	cache.getModelInfo = func(req api.ShowRequest) (*api.ShowResponse, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return showCacheTestResponse(1, req.Verbose), nil
+	}
+	var group sync.WaitGroup
+	responses := make([]*api.ShowResponse, 16)
+	errors := make([]error, 16)
+	for i := range responses {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			responses[i], errors[i] = cache.GetLocal(api.ShowRequest{Model: "show-cache-concurrent"})
+		}()
+	}
+	<-started
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	group.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("metadata parses = %d, want one", calls.Load())
+	}
+	for i, err := range errors {
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	responses[0].ModelInfo["call"] = 99
+	for _, response := range responses[1:] {
+		if response.ModelInfo["call"] != 1 {
+			t.Fatal("responses share mutable metadata")
+		}
+	}
+}
 
 func TestModelShowCacheLocalHitUsesManifestDigest(t *testing.T) {
 	gin.SetMode(gin.TestMode)

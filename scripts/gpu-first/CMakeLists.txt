@@ -308,6 +308,19 @@ add_test(NAME top-p-mask-fusion COMMAND test-top-p-mask-fusion)
 add_executable(test-server-slot-iteration "${WILDLLAMA_NATIVE}/tests/test-server-slot-iteration.cpp")
 target_compile_features(test-server-slot-iteration PRIVATE cxx_std_17)
 add_test(NAME server-slot-iteration COMMAND test-server-slot-iteration)
+
+foreach(sampling_prefill_target test-dist-tail-fusion test-moe-prepare test-adaptive-prefill)
+    validation_target(${sampling_prefill_target} llama)
+    target_include_directories(${sampling_prefill_target} PRIVATE
+        "${WILDLLAMA_NATIVE}/src" "${WILDLLAMA_NATIVE}/ggml/src")
+    add_dependencies(${sampling_prefill_target} ggml-cpu)
+    target_compile_definitions(${sampling_prefill_target} PRIVATE
+        GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+endforeach()
+add_test(NAME dist-tail-fusion COMMAND test-dist-tail-fusion)
+add_test(NAME moe-prepare COMMAND test-moe-prepare)
+add_test(NAME adaptive-prefill COMMAND test-adaptive-prefill
+    "${CMAKE_BINARY_DIR}/adaptive-prefill-fixtures")
 if(TARGET ggml-cuda)
     add_dependencies(test-sampler-backend-extensions ggml-cuda)
     target_compile_definitions(test-sampler-backend-extensions PRIVATE GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
@@ -318,6 +331,17 @@ if(TARGET ggml-cuda)
         GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
     add_test(NAME top-p-mask-fusion-cuda COMMAND test-top-p-mask-fusion --cuda)
     set_tests_properties(top-p-mask-fusion-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+    foreach(sampling_prefill_target test-dist-tail-fusion test-moe-prepare test-adaptive-prefill)
+        add_dependencies(${sampling_prefill_target} ggml-cuda)
+        target_compile_definitions(${sampling_prefill_target} PRIVATE
+            GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
+    endforeach()
+    add_test(NAME dist-tail-fusion-cuda COMMAND test-dist-tail-fusion --cuda)
+    add_test(NAME moe-prepare-cuda COMMAND test-moe-prepare --cuda)
+    add_test(NAME adaptive-prefill-cuda COMMAND test-adaptive-prefill --cuda
+        "${CMAKE_BINARY_DIR}/adaptive-prefill-fixtures-cuda")
+    set_tests_properties(dist-tail-fusion-cuda moe-prepare-cuda adaptive-prefill-cuda
+        PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endif()
 add_executable(test-sampling-probability "${WILDLLAMA_NATIVE}/tests/test-sampling-probability.cpp")
 target_compile_features(test-sampling-probability PRIVATE cxx_std_17)

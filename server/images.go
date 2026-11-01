@@ -1177,6 +1177,8 @@ func pushLayersForManifestList(parent manifest.Manifest) ([]manifest.Layer, erro
 }
 
 func PullModel(ctx context.Context, name string, runner string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
+	downloadCleanupGate.RLock()
+	defer downloadCleanupGate.RUnlock()
 	n := model.ParseName(name)
 	if regOpts.HuggingFace.explicit() {
 		if !isHuggingFaceName(n) {

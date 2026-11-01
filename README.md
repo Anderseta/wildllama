@@ -39,6 +39,8 @@ Further [bounded pipeline extensions](docs/sglang-pipeline-followups.md) add ind
 
 The [memory-neutral follow-ups](docs/memory-neutral-runtime.md) remove server callback type erasure and fuse eligible top-p mask work without adding persistent GPU workspace. Candidate sets remain unchanged, and larger CUDA candidate sets retain the original mask graph under the automatic policy.
 
+The [sampling and prefill controls](docs/sampling-prefill-runtime.md) extend exact sampling-graph fusion, reuse bounded CPU preparation for dynamic MoE prefill, and add optional latency-based prompt admission. Their activation rules, memory boundaries, and small-fixture validation are documented separately.
+
 ## Large MoE models on smaller machines
 
 A MoE model uses only its router-selected experts for each token, but the full set of expert weights can still be much larger than VRAM or available RAM. WildLlama's selective-weight path keeps bounded working sets in memory and reads missing weights from the original GGUF files on SSD.

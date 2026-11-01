@@ -49,10 +49,13 @@ type blobDownload struct {
 	Parts []*blobDownloadPart
 
 	context.CancelFunc
+	context context.Context
 
-	done       chan struct{}
-	err        error
-	references atomic.Int32
+	done        chan struct{}
+	ready       chan struct{}
+	err         error
+	references  atomic.Int32
+	referenceMu sync.Mutex
 }
 
 type blobDownloadPart struct {
@@ -134,8 +137,6 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 		return err
 	}
 
-	b.done = make(chan struct{})
-
 	for _, partFilePath := range partFilePaths {
 		part, err := b.readPart(partFilePath)
 		if err != nil {
@@ -185,11 +186,6 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 	return nil
 }
 
-func (b *blobDownload) Run(ctx context.Context, requestURL *url.URL, opts *registryOptions) {
-	defer close(b.done)
-	b.err = b.run(ctx, requestURL, opts)
-}
-
 func newBackoff(maxBackoff time.Duration) func(ctx context.Context) error {
 	var n int
 	return func(ctx context.Context) error {
@@ -217,9 +213,6 @@ func newBackoff(maxBackoff time.Duration) func(ctx context.Context) error {
 }
 
 func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *registryOptions) error {
-	defer blobDownloadManager.Delete(b.Digest)
-	ctx, b.CancelFunc = context.WithCancel(ctx)
-
 	file, err := os.OpenFile(b.Name+"-partial", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
@@ -297,7 +290,13 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 				case err != nil:
 					sleep := time.Second * time.Duration(math.Pow(2, float64(try)))
 					slog.Info(fmt.Sprintf("%s part %d attempt %d failed: %v, retrying in %s", b.Digest[7:19], part.N, try, err, sleep))
-					time.Sleep(sleep)
+					timer := time.NewTimer(sleep)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return ctx.Err()
+					case <-timer.C:
+					}
 					continue
 				default:
 					return nil
@@ -467,21 +466,37 @@ func (b *blobDownload) writePart(partName string, part *blobDownloadPart) error 
 	return json.NewEncoder(partFile).Encode(part)
 }
 
-func (b *blobDownload) acquire() {
+func (b *blobDownload) acquire() bool {
+	b.referenceMu.Lock()
+	defer b.referenceMu.Unlock()
+	if b.context != nil && b.context.Err() != nil {
+		return false
+	}
 	b.references.Add(1)
+	return true
 }
 
 func (b *blobDownload) release() {
+	b.referenceMu.Lock()
+	defer b.referenceMu.Unlock()
 	if b.references.Add(-1) == 0 && b.CancelFunc != nil {
 		b.CancelFunc()
 	}
 }
 
 func (b *blobDownload) Wait(ctx context.Context, fn func(api.ProgressResponse)) error {
-	b.acquire()
-	defer b.release()
+	// Prepare mutates Total and Parts. Do not read progress until it has
+	// published its result; preparation errors complete done for every waiter.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.done:
+		return b.err
+	case <-b.ready:
+	}
 
 	ticker := time.NewTicker(60 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-b.done:
@@ -520,43 +535,64 @@ func downloadBlob(ctx context.Context, opts downloadOpts) (cacheHit bool, _ erro
 		return false, err
 	}
 
-	fi, err := os.Stat(fp)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return false, err
-	default:
-		pending, err := blobVerificationPending(opts.digest)
-		if err != nil {
+	for {
+		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		opts.fn(api.ProgressResponse{
-			Status:    fmt.Sprintf("pulling %s", opts.digest[7:19]),
-			Digest:    opts.digest,
-			Total:     fi.Size(),
-			Completed: fi.Size(),
-		})
-
-		return !pending, nil
+		// A transfer we waited for may have completed while its context was
+		// closing. Recheck the published blob before starting another download.
+		fi, err := os.Stat(fp)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return false, err
+		default:
+			pending, err := blobVerificationPending(opts.digest)
+			if err != nil {
+				return false, err
+			}
+			opts.fn(api.ProgressResponse{Status: fmt.Sprintf("pulling %s", opts.digest[7:19]),
+				Digest: opts.digest, Total: fi.Size(), Completed: fi.Size()})
+			return !pending, nil
+		}
+		shared, cancel := context.WithCancel(context.Background())
+		candidate := &blobDownload{Name: fp, Digest: opts.digest, context: shared,
+			CancelFunc: cancel, done: make(chan struct{}), ready: make(chan struct{})}
+		// Own the first reference before publishing, so cancellation cannot
+		// race startup and leave a background transfer without any consumers.
+		candidate.acquire()
+		data, loaded := blobDownloadManager.LoadOrStore(opts.digest, candidate)
+		download := data.(*blobDownload)
+		if loaded {
+			cancel()
+			if !download.acquire() {
+				select {
+				case <-ctx.Done():
+					return false, ctx.Err()
+				case <-download.done:
+					continue
+				}
+			}
+		} else {
+			if ctx.Err() != nil {
+				cancel()
+			}
+			go func() {
+				defer close(download.done)
+				defer blobDownloadManager.CompareAndDelete(opts.digest, download)
+				defer download.CancelFunc()
+				if download.err = markBlobVerificationPending(opts.digest); download.err != nil {
+					return
+				}
+				requestURL := opts.n.BaseURL().JoinPath("v2", opts.n.DisplayNamespaceModel(), "blobs", opts.digest)
+				if download.err = download.Prepare(shared, requestURL, opts.regOpts); download.err != nil {
+					return
+				}
+				close(download.ready)
+				download.err = download.run(shared, requestURL, opts.regOpts)
+			}()
+		}
+		defer download.release()
+		return false, download.Wait(ctx, opts.fn)
 	}
-
-	data, ok := blobDownloadManager.LoadOrStore(opts.digest, &blobDownload{Name: fp, Digest: opts.digest})
-	download := data.(*blobDownload)
-	if !ok {
-		if err := markBlobVerificationPending(opts.digest); err != nil {
-			blobDownloadManager.Delete(opts.digest)
-			return false, err
-		}
-		requestURL := opts.n.BaseURL()
-		requestURL = requestURL.JoinPath("v2", opts.n.DisplayNamespaceModel(), "blobs", opts.digest)
-		if err := download.Prepare(ctx, requestURL, opts.regOpts); err != nil {
-			blobDownloadManager.Delete(opts.digest)
-			return false, err
-		}
-
-		//nolint:contextcheck
-		go download.Run(context.Background(), requestURL, opts.regOpts)
-	}
-
-	return false, download.Wait(ctx, opts.fn)
 }

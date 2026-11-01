@@ -1,0 +1,839 @@
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -7,6 +7,7 @@
+ #include "ggml-threading.h"
+ #include "ggml-cpu.h"
+ #include "ggml.h"
++#include "ggml-sampling.h"
+ 
+ // FIXME: required here for quantization functions
+ #include "ggml-quants.h"
+@@ -4217,6 +4218,23 @@
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_dist_select(
++        struct ggml_context * ctx, struct ggml_tensor * diff,
++        struct ggml_tensor * candidates) {
++    GGML_ASSERT(diff && diff->type == GGML_TYPE_F32 && ggml_is_vector(diff) && ggml_is_contiguous(diff));
++    GGML_ASSERT(diff->ne[0] > 0 && diff->ne[0] <= 1024);
++    GGML_ASSERT(!candidates || (candidates->type == GGML_TYPE_I32 && ggml_is_vector(candidates) &&
++        ggml_is_contiguous(candidates) && ggml_are_same_shape(diff, candidates)));
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++    result->op = GGML_OP_TOKEN_MASK;
++    // GET_ROWS visited candidates before the selection/CDF branch. Keep that
++    // natural dependency order without expanding an inactive caller graph.
++    result->src[0] = candidates ? candidates : diff;
++    result->src[1] = candidates ? diff : NULL;
++    ggml_set_op_params_i32(result, 1, 3);
++    return result;
++}
++
+ struct ggml_tensor * ggml_top_p_mask(
+         struct ggml_context * ctx, struct ggml_tensor * logits,
+         struct ggml_tensor * cdf, float p) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1738,6 +1738,20 @@
+ /////////////////////////////////
+ 
+ static void ggml_compute_forward_token_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 1) == 3) {
++        if (params->ith != 0) { return; }
++        const struct ggml_tensor * values = dst->src[1] ? dst->src[1] : dst->src[0];
++        const float * diff = (const float *) values->data;
++        const int32_t * candidates = dst->src[1] ? (const int32_t *) dst->src[0]->data : NULL;
++        const int32_t n = (int32_t) ggml_nelements(values);
++        int32_t count = 0;
++        for (int32_t i = 0; i < n; ++i) { count += diff[i] > 0.0f; }
++        // STEP gives exact zero/one values. For n<=1024 its F32 sum,
++        // clamp and n-count conversion are exactly the same integers.
++        const int32_t index = n - MAX(count, 1);
++        *(int32_t *) dst->data = candidates ? candidates[index] : index;
++        return;
++    }
+     if (ggml_get_op_params_i32(dst, 1) == 2) {
+         if (params->ith != 0) { return; }
+         const float * logits = (const float *) dst->src[0]->data;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -442,6 +442,16 @@
+ 
+     switch (op->op) {
+         case GGML_OP_TOKEN_MASK:
++            if (ggml_get_op_params_i32(op, 1) == 3) {
++                for (int i = 2; i < GGML_MAX_SRC; ++i) { if (op->src[i]) { return false; } }
++                const auto * diff = op->src[1] ? op->src[1] : op->src[0];
++                const auto * candidates = op->src[1] ? op->src[0] : nullptr;
++                return op->src[0] && diff && op->type == GGML_TYPE_I32 && ggml_is_scalar(op) && ggml_is_contiguous(op) &&
++                    diff->type == GGML_TYPE_F32 && ggml_is_vector(diff) && ggml_is_contiguous(diff) &&
++                    diff->ne[0] > 0 && diff->ne[0] <= 1024 && !op->src[2] &&
++                    (!candidates || (candidates->type == GGML_TYPE_I32 && ggml_is_vector(candidates) &&
++                        ggml_is_contiguous(candidates) && ggml_are_same_shape(diff, candidates)));
++            }
+             if (ggml_get_op_params_i32(op, 1) == 2) {
+                 const float p = ggml_get_op_params_f32(op, 0);
+                 return src0 && src1 && op->type == GGML_TYPE_F32 &&
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6925,6 +6925,16 @@
+         case GGML_OP_CLAMP:
+             return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_TOKEN_MASK:
++            if (ggml_get_op_params_i32(op, 1) == 3) {
++                for (int i = 2; i < GGML_MAX_SRC; ++i) { if (op->src[i]) { return false; } }
++                const auto * diff = op->src[1] ? op->src[1] : op->src[0];
++                const auto * candidates = op->src[1] ? op->src[0] : nullptr;
++                return op->src[0] && diff && op->type == GGML_TYPE_I32 && ggml_is_scalar(op) && ggml_is_contiguous(op) &&
++                    diff->type == GGML_TYPE_F32 && ggml_is_vector(diff) && ggml_is_contiguous(diff) &&
++                    diff->ne[0] > 0 && diff->ne[0] <= 1024 && !op->src[2] &&
++                    (!candidates || (candidates->type == GGML_TYPE_I32 && ggml_is_vector(candidates) &&
++                        ggml_is_contiguous(candidates) && ggml_are_same_shape(diff, candidates)));
++            }
+             if (ggml_get_op_params_i32(op, 1) == 2) {
+                 const auto * logits = op->src[0];
+                 const auto * cdf = op->src[1];
+diff --git a/ggml/src/ggml-cuda/token-mask.cu b/ggml/src/ggml-cuda/token-mask.cu
+--- a/ggml/src/ggml-cuda/token-mask.cu
++++ b/ggml/src/ggml-cuda/token-mask.cu
+@@ -93,7 +93,75 @@
+ }
+ #endif
+ 
++// Complete the draw only after the ordinary rounded CDF-uniform subtraction.
++// No floating-point reduction, probability approximation or random draw is added.
++template<int threads>
++static __global__ void dist_select_kernel(const float * diff, const int32_t * candidates,
++        int32_t * output, int n) {
++    __shared__ int counts[threads];
++    int count = 0;
++    for (int i = threadIdx.x; i < n; i += threads) { count += diff[i] > 0.0f; }
++    counts[threadIdx.x] = count;
++    __syncthreads();
++    for (int stride = threads/2; stride > 0; stride /= 2) {
++        if (threadIdx.x < stride) { counts[threadIdx.x] += counts[threadIdx.x + stride]; }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        const int index = n - (counts[0] > 0 ? counts[0] : 1);
++        *output = candidates ? candidates[index] : index;
++    }
++}
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static __global__ void dist_select_warp_kernel(const float * diff, const int32_t * candidates,
++        int32_t * output, int n) {
++    int count = 0;
++    for (int i = threadIdx.x; i < n; i += 32) { count += diff[i] > 0.0f; }
++    count = warp_reduce_sum<32>(count);
++    if (threadIdx.x == 0) {
++        const int index = n - (count > 0 ? count : 1);
++        *output = candidates ? candidates[index] : index;
++    }
++}
++
++static __global__ void dist_select_warps_kernel(const float * diff, const int32_t * candidates,
++        int32_t * output, int n) {
++    __shared__ int warp_counts[8];
++    const int lane = threadIdx.x % 32;
++    const int warp = threadIdx.x / 32;
++    int count = 0;
++    for (int i = threadIdx.x; i < n; i += 256) { count += diff[i] > 0.0f; }
++    count = warp_reduce_sum<32>(count);
++    if (lane == 0) { warp_counts[warp] = count; }
++    __syncthreads();
++    if (warp == 0) {
++        count = warp_reduce_sum<32>(lane < 8 ? warp_counts[lane] : 0);
++        if (lane == 0) {
++            const int index = n - (count > 0 ? count : 1);
++            *output = candidates ? candidates[index] : index;
++        }
++    }
++}
++#endif
++
+ void ggml_cuda_op_token_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 1) == 3) {
++        const auto * values = dst->src[1] ? dst->src[1] : dst->src[0];
++        const int n = int(ggml_nelements(values));
++        const float * diff = (const float *) values->data;
++        const int32_t * candidates = dst->src[1] ? (const int32_t *) dst->src[0]->data : nullptr;
++        int32_t * output = (int32_t *) dst->data;
++        GGML_ASSERT(n > 0 && n <= 1024);
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        if (n <= 128) { dist_select_warp_kernel<<<1,32,0,ctx.stream()>>>(diff,candidates,output,n); }
++        else { dist_select_warps_kernel<<<1,256,0,ctx.stream()>>>(diff,candidates,output,n); }
++#else
++        if (n <= 32) { dist_select_kernel<32><<<1,32,0,ctx.stream()>>>(diff,candidates,output,n); }
++        else { dist_select_kernel<256><<<1,256,0,ctx.stream()>>>(diff,candidates,output,n); }
++#endif
++        return;
++    }
+     if (ggml_get_op_params_i32(dst, 1) == 2) {
+         const int n = int(ggml_nelements(dst));
+         const float p = ggml_get_op_params_f32(dst, 0);
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -6,6 +6,7 @@
+ #include "llama-grammar.h"
+ 
+ #include "ggml-cpp.h"
++#include "ggml-sampling.h"
+ #include "ggml-cuda.h"
+ 
+ #include <array>
+@@ -1202,6 +1203,7 @@
+ 
+ struct llama_sampler_dist : public llama_sampler_backend {
+     const uint32_t seed;
++    int64_t fused_tail_limit;
+           uint32_t seed_cur;
+ 
+     std::mt19937 rng;
+@@ -1351,6 +1353,24 @@
+         uint32_t                     n_outputs_max_per_seq) {
+     auto * sctx = (llama_sampler_dist *) smpl->ctx;
+ 
++    const char * requested = std::getenv("WILDLLAMA_DIST_TAIL_FUSION");
++    const bool explicit_fusion = requested && std::strcmp(requested, "1") == 0;
++    const bool standard_cpu = buft == ggml_backend_cpu_buffer_type();
++    sctx->fused_tail_limit = 0;
++    if ((!requested && standard_cpu) || explicit_fusion) {
++        // Metadata-only capability check; the result reuses ordinary graph storage.
++        // Only the standard CPU buffer has a measured automatic policy. GPU
++        // buffers retain the original graph unless explicitly opted in.
++        ggml_context_ptr probe(ggml_init({3*ggml_tensor_overhead(), nullptr, true}));
++        auto * diff = ggml_new_tensor_1d(probe.get(), GGML_TYPE_F32, 32);
++        auto * candidates = ggml_new_tensor_1d(probe.get(), GGML_TYPE_I32, 32);
++        auto * selected = ggml_dist_select(probe.get(), diff, candidates);
++        auto * device = ggml_backend_buft_get_device(buft);
++        if (!device && standard_cpu) {
++            device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        }
++        if (device && ggml_backend_dev_supports_op(device, selected)) { sctx->fused_tail_limit = 1024; }
++    }
+     const bool res = llama_sampler_backend_support(smpl, buft);
+ 
+     sctx->init(res);
+@@ -1392,6 +1412,15 @@
+     // random value, and become zero/positive once the threshold is crossed.
+     struct ggml_tensor * diff = ggml_sub(ctx, cumsum, inp_uniform);
+     ggml_set_name(diff, "dist_cumsum");
++
++    if (sctx->fused_tail_limit > 0 && diff->ne[0] > 0 && diff->ne[0] <= sctx->fused_tail_limit) {
++        struct ggml_tensor * candidates = data->candidates ?
++            ggml_reshape_1d(ctx, data->candidates, ggml_nelements(data->candidates)) : nullptr;
++        data->sampled = ggml_dist_select(ctx, diff, candidates);
++        ggml_set_name(data->sampled, "dist_sampled_token");
++        data->probs = probs;
++        return;
++    }
+ 
+     // The ggml_step function produces a tensor where entries are 1 if the
+     // corresponding entry in diff is > 0, and 0 otherwise. So all values up to
+@@ -1494,6 +1523,7 @@
+         /* .ctx   = */ new llama_sampler_dist {
+             ("dist"),
+             /* .seed                      = */ seed,
++            /* .fused_tail_limit          = */ 0,
+             /* .seed_cur                  = */ seed_cur,
+             /* .rng                       = */ std::mt19937(seed_cur),
+             /* .backend_transactional     = */ false,
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -54,7 +54,7 @@
+ LLAMA_API bool llama_sampler_backend_set_selected_only(llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only(const llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only_ready(const llama_sampler * sampler);
+-void llama_sampler_backend_begin(llama_sampler * sampler);
++LLAMA_API void llama_sampler_backend_begin(llama_sampler * sampler);
+ 
+ // A graph owns tensor bindings, while the original sampler remains the only
+ // owner of RNG/history. Swapping is allocation-free and must be undone before
+diff --git a/ggml/include/ggml-sampling.h b/ggml/include/ggml-sampling.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/include/ggml-sampling.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include "ggml.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Internal inference primitive. diff is the existing rounded CDF-uniform
++// F32 vector, with 1..1024 entries. Optional I32 candidates have the same
++// shape. The scalar result exactly composes STEP/SUM/CLAMP/index/gather.
++// It adds no random draw, floating reduction, device workspace or in-place use.
++// Mapped nodes store candidates before diff to preserve the old dependency order;
++// construction never expands the caller's graph or makes unused outputs live.
++GGML_API struct ggml_tensor * ggml_dist_select(
++        struct ggml_context * ctx,
++        struct ggml_tensor * diff,
++        struct ggml_tensor * candidates);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/tests/test-dist-tail-fusion.cpp b/tests/test-dist-tail-fusion.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-dist-tail-fusion.cpp
+@@ -0,0 +1,549 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "ggml-sampling.h"
++#include "../src/llama-sampler.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void same(float a, float b) {
++    if (std::isnan(a) && std::isnan(b)) { return; }
++    require(std::memcmp(&a, &b, sizeof(a)) == 0, "sampler probability bits differ");
++}
++
++struct fusion_switch {
++    bool had;
++    std::string old;
++    static int set(const char * value) {
++#ifdef _WIN32
++        return _putenv_s("WILDLLAMA_DIST_TAIL_FUSION", value ? value : "");
++#else
++        return value ? setenv("WILDLLAMA_DIST_TAIL_FUSION", value, 1) : unsetenv("WILDLLAMA_DIST_TAIL_FUSION");
++#endif
++    }
++    explicit fusion_switch(const char * value) {
++        const char * before = std::getenv("WILDLLAMA_DIST_TAIL_FUSION");
++        had = before != nullptr;
++        if (before) { old = before; }
++        require(set(value) == 0, "could not set isolated draw-tail control");
++    }
++    ~fusion_switch() { set(had ? old.c_str() : nullptr); }
++};
++
++// The literal pre-057 composition. Keep the actual rounded subtraction outside
++// this function: fusion only replaces this integer-equivalent selection tail.
++static ggml_tensor * legacy_tail(ggml_context * ctx, ggml_tensor * diff, ggml_tensor * candidates) {
++    auto * mask = ggml_step(ctx, diff);
++    auto * count = ggml_clamp(ctx, ggml_sum(ctx, mask), 1.0f, float(diff->ne[0]));
++    auto * index = ggml_cast(ctx, ggml_scale_bias(ctx, count, -1.0f, float(diff->ne[0])), GGML_TYPE_I32);
++    return candidates ? ggml_get_rows(ctx, ggml_reshape_2d(ctx, candidates, 1, candidates->ne[0]), index) : index;
++}
++
++struct draw_graph {
++    ggml_context_ptr ctx{ggml_init({2*1024*1024, nullptr, true})};
++    ggml_gallocr_ptr alloc;
++    ggml_cgraph * graph;
++    ggml_tensor * input;
++    ggml_tensor * uniform = nullptr;
++    ggml_tensor * candidates = nullptr;
++    ggml_tensor * probs = nullptr;
++    ggml_tensor * output;
++    size_t bytes;
++
++    draw_graph(ggml_backend_t backend, int n, bool mapped, bool full, bool fused)
++        : alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))) {
++        require(bool(ctx), "draw metadata allocation failed");
++        graph = ggml_new_graph_custom(ctx.get(), 128, false);
++        input = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
++        ggml_set_input(input); ggml_set_output(input);
++        auto * diff = input;
++        if (full) {
++            uniform = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
++            ggml_set_input(uniform); ggml_set_output(uniform);
++            probs = ggml_soft_max(ctx.get(), input);
++            ggml_set_output(probs);
++            diff = ggml_sub(ctx.get(), ggml_cumsum(ctx.get(), probs), uniform);
++        }
++        if (mapped) {
++            candidates = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n);
++            ggml_set_input(candidates); ggml_set_output(candidates);
++        }
++        output = fused ? ggml_dist_select(ctx.get(), diff, candidates) : legacy_tail(ctx.get(), diff, candidates);
++        ggml_set_output(output);
++        ggml_build_forward_expand(graph, output);
++        if (probs) { ggml_build_forward_expand(graph, probs); }
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            require(ggml_backend_supports_op(backend, ggml_graph_node(graph, i)), "draw-tail fixture op unsupported");
++        }
++        require(ggml_gallocr_alloc_graph(alloc.get(), graph), "draw-tail allocation failed");
++        bytes = ggml_gallocr_get_buffer_size(alloc.get(), 0);
++        require(bytes < 1024*1024, "draw-tail fixture escaped bounded memory");
++        require(output->data != input->data && (!candidates || output->data != candidates->data), "selection overwrote a live input");
++    }
++
++    void set(const std::vector<float> & values, const std::vector<int32_t> & ids, float rnd) {
++        ggml_backend_tensor_set(input, values.data(), 0, values.size()*sizeof(float));
++        if (uniform) { ggml_backend_tensor_set(uniform, &rnd, 0, sizeof(rnd)); }
++        if (candidates) { ggml_backend_tensor_set(candidates, ids.data(), 0, ids.size()*sizeof(int32_t)); }
++    }
++
++    int32_t run(ggml_backend_t backend) {
++        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "draw-tail compute failed");
++        int32_t value; ggml_backend_tensor_get(output, &value, 0, sizeof(value));
++        return value;
++    }
++};
++
++static void capability(ggml_backend_t backend) {
++    ggml_context_ptr ctx(ggml_init({16*ggml_tensor_overhead(), nullptr, true}));
++    auto * diff = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 20);
++    auto * candidates = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 20);
++    auto * selected = ggml_dist_select(ctx.get(), diff, candidates);
++    require(selected->src[0] == candidates && selected->src[1] == diff,"mapped selection dependency order changed");
++    require(!selected->data && !diff->data && !candidates->data, "capability probe allocated tensor storage");
++    require(ggml_backend_supports_op(backend, selected), "valid draw-tail capability rejected");
++    selected->src[0] = nullptr;
++    require(!ggml_backend_supports_op(backend,selected),"mapped draw with missing candidates admitted");
++    selected->src[0] = diff; selected->src[1] = candidates;
++    require(!ggml_backend_supports_op(backend,selected),"wrongly ordered mapped inputs admitted");
++    selected->src[0] = candidates; selected->src[1] = diff;
++    auto * unmapped = ggml_dist_select(ctx.get(),diff,nullptr);
++    require(unmapped->src[0] == diff && !unmapped->src[1] && ggml_backend_supports_op(backend,unmapped),
++            "unmapped selection dependency contract changed");
++    selected->type = GGML_TYPE_F32; selected->ne[0] = 20;
++    require(!ggml_backend_supports_op(backend, selected), "malformed pre-057 unknown-mode probe admitted");
++    selected->type = GGML_TYPE_I32; selected->ne[0] = 1;
++    selected->src[2] = diff;
++    require(!ggml_backend_supports_op(backend, selected), "extraneous draw input admitted");
++    selected->src[2] = nullptr;
++    candidates->ne[0] = 19;
++    require(!ggml_backend_supports_op(backend, selected), "mismatched candidate support admitted");
++    candidates->ne[0] = 20;
++    candidates->type = GGML_TYPE_F32;
++    require(!ggml_backend_supports_op(backend, selected), "noninteger candidate map admitted");
++    candidates->type = GGML_TYPE_I32;
++    const size_t old_stride = diff->nb[0]; diff->nb[0] *= 2;
++    require(!ggml_backend_supports_op(backend, selected), "strided diff admitted");
++    diff->nb[0] = old_stride;
++    diff->ne[1] = 2;
++    require(!ggml_backend_supports_op(backend, selected), "matrix diff admitted");
++    diff->ne[1] = 1;
++    diff->ne[0] = candidates->ne[0] = 1025;
++    require(!ggml_backend_supports_op(backend, selected), "oversized draw admitted");
++    diff->ne[0] = candidates->ne[0] = 0;
++    require(!ggml_backend_supports_op(backend, selected), "empty draw admitted");
++    diff->ne[0] = candidates->ne[0] = 20;
++    int32_t mode = 4; std::memcpy(selected->op_params + 1, &mode, sizeof(mode));
++    require(!ggml_backend_supports_op(backend, selected), "unknown mode admitted");
++    mode = 2; std::memcpy(selected->op_params + 1, &mode, sizeof(mode));
++    require(!ggml_backend_supports_op(backend, selected), "draw scalar admitted as top-p F32 mask");
++    std::puts("DIST_TAIL_CAPABILITY metadata_only=1 scalar_type=1 shape_guard=1 mode2_unchanged=1 unknown_mode=1 PASS");
++}
++
++static void liveness(ggml_backend_t backend) {
++    int controls = 0;
++    for (bool probabilities : {false,true}) {
++        std::vector<float> reference;
++        for (const char * control : {"0","1"}) {
++            fusion_switch mode(control);
++            llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++            llama_sampler_chain_add(sampler.get(),llama_sampler_init_top_k(10));
++            llama_sampler_chain_add(sampler.get(),llama_sampler_init_temp(0.8f));
++            llama_sampler_chain_add(sampler.get(),llama_sampler_init_dist(1234567));
++            require(sampler->iface->backend_init(sampler.get(),ggml_backend_get_default_buffer_type(backend),1),"liveness sampler unsupported");
++            ggml_context_ptr context(ggml_init({2*1024*1024,nullptr,true}));
++            auto * graph = ggml_new_graph_custom(context.get(),256,false);
++            auto * scores = ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,32);
++            auto * candidate_rows = ggml_new_tensor_2d(context.get(),GGML_TYPE_I32,1,32);
++            auto * poisoned_indices = ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,32);
++            auto * poisoned_gather = ggml_get_rows(context.get(),candidate_rows,poisoned_indices);
++            auto * candidates = ggml_reshape_1d(context.get(),poisoned_gather,32);
++            llama_sampler_data output{scores,nullptr,nullptr,candidates};
++            sampler->iface->backend_reset(sampler.get());
++            sampler->iface->backend_apply(sampler.get(),context.get(),graph,&output);
++            require(output.sampled && output.probs && ggml_graph_n_nodes(graph) == 0,
++                    "sampler expanded a discarded or inactive candidate branch");
++            auto * visible = probabilities ? output.probs : output.logits;
++            ggml_build_forward_expand(graph,visible);
++            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++                const auto * node = ggml_graph_node(graph,i);
++                require(node != poisoned_gather && !(node->op == GGML_OP_GET_ROWS && node->type == GGML_TYPE_I32) &&
++                        node != output.sampled,"an unrequested sampled/candidate branch became live");
++            }
++            // Materialize even the unused tensors so a leaked gather would
++            // execute the deliberately invalid indices, rather than merely
++            // failing because an input happened to be unallocated.
++            ggml_backend_buffer_ptr storage(ggml_backend_alloc_ctx_tensors(context.get(),backend));
++            require(bool(storage) && ggml_backend_buffer_get_size(storage.get()) < 1024*1024,"liveness fixture escaped its small allocation");
++            std::vector<float> values(32); std::vector<int32_t> ids(32),poison(32,INT32_MAX);
++            for (int i = 0; i < 32; ++i) { values[i] = float(i-16)/8.0f; ids[i] = i; }
++            ggml_backend_tensor_set(scores,values.data(),0,values.size()*sizeof(float));
++            ggml_backend_tensor_set(candidate_rows,ids.data(),0,ids.size()*sizeof(int32_t));
++            ggml_backend_tensor_set(poisoned_indices,poison.data(),0,poison.size()*sizeof(int32_t));
++            require(ggml_backend_graph_compute(backend,graph) == GGML_STATUS_SUCCESS,"visible-only graph compute failed");
++            std::vector<float> actual(ggml_nelements(visible));
++            ggml_backend_tensor_get(visible,actual.data(),0,actual.size()*sizeof(float));
++            if (reference.empty()) { reference = actual; }
++            else {
++                require(reference.size() == actual.size(),"visible output shape changed");
++                for (size_t i = 0; i < actual.size(); ++i) { same(reference[i],actual[i]); }
++            }
++            ++controls;
++        }
++    }
++    std::printf("DIST_TAIL_LIVENESS controls=%d inactive_graph_empty=1 poisoned_candidate_branch_pruned=1 logits_only=1 probabilities_only=1 outputs_bits_exact=1 PASS\n",controls);
++}
++
++static void primitives(ggml_backend_t backend) {
++    int cases = 0;
++    size_t old_peak = 0, new_peak = 0;
++    const float small = std::numeric_limits<float>::denorm_min();
++    for (int n : {1,2,10,20,31,32,33,127,128,129,255,256,257,512,1023,1024}) {
++        for (bool full : {false,true}) for (bool mapped : {false,true}) {
++            draw_graph before(backend,n,mapped,full,false), after(backend,n,mapped,full,true);
++            require(after.bytes <= before.bytes, "draw-tail compute storage increased");
++            require(ggml_graph_n_nodes(after.graph) < ggml_graph_n_nodes(before.graph), "draw-tail graph not fused");
++            old_peak = std::max(old_peak,before.bytes); new_peak = std::max(new_peak,after.bytes);
++            for (int pattern = 0; pattern < 12; ++pattern) {
++                std::vector<float> values(n); std::vector<int32_t> ids(n);
++                const float special[] = {NAN,INFINITY,-INFINITY,-0.0f,0.0f,small,-small,std::numeric_limits<float>::min()};
++                for (int i = 0; i < n; ++i) {
++                    values[i] = full ? float((i*17+pattern*3)%37-18)/8.0f : float((i*13+pattern)%11-5)/4.0f;
++                    if (!full && pattern < 3) { values[i] = pattern == 0 ? 0.0f : pattern == 1 ? 1.0f : -1.0f; }
++                    if (!full && pattern >= 3 && pattern <= 6) { values[i] = special[(i+pattern)%8]; }
++                    ids[i] = pattern%3 == 0 ? 10000+i : pattern%3 == 1 ? (i%5)-2 : (i%2 ? INT32_MIN : INT32_MAX);
++                }
++                const float uniforms[] = {0.0f,1.0f,0.5f,std::nextafter(0.5f,0.0f),std::nextafter(0.5f,1.0f),small,-small,
++                                          NAN,INFINITY,-INFINITY,-0.0f,std::nextafter(1.0f,0.0f)};
++                before.set(values,ids,uniforms[pattern]); after.set(values,ids,uniforms[pattern]);
++                require(before.run(backend) == after.run(backend), "legacy/fused draw result differs");
++                if (full) {
++                    std::vector<float> a(n), b(n);
++                    ggml_backend_tensor_get(before.probs,a.data(),0,n*sizeof(float));
++                    ggml_backend_tensor_get(after.probs,b.data(),0,n*sizeof(float));
++                    for (int i = 0; i < n; ++i) { same(a[i],b[i]); }
++                }
++                std::vector<float> preserved(n);
++                ggml_backend_tensor_get(after.input,preserved.data(),0,n*sizeof(float));
++                require(std::memcmp(preserved.data(),values.data(),n*sizeof(float)) == 0, "draw-tail input was overwritten");
++                ++cases;
++            }
++        }
++    }
++    std::printf("DIST_TAIL_REFERENCE cases=%d rounded_subtraction_preserved=1 nonmonotonic=1 nonfinite=1 signed_zero=1 integer_maps=1 input_preserved=1 legacy_peak=%zu fused_peak=%zu PASS\n",cases,old_peak,new_peak);
++}
++
++struct sample_result {
++    std::vector<int32_t> selected;
++    std::vector<std::vector<float>> probs;
++    std::vector<std::vector<int32_t>> ids;
++};
++
++static void equal(const sample_result & a, const sample_result & b) {
++    require(a.selected == b.selected && a.ids == b.ids && a.probs.size() == b.probs.size(), "seeded token/candidate order changed");
++    for (size_t row = 0; row < a.probs.size(); ++row) {
++        require(a.probs[row].size() == b.probs[row].size(), "probability support changed");
++        for (size_t i = 0; i < a.probs[row].size(); ++i) { same(a.probs[row][i],b.probs[row][i]); }
++    }
++}
++
++struct chain_graph {
++    ggml_context_ptr ctx{ggml_init({4*1024*1024,nullptr,true})};
++    llama_sampler_ptr sampler;
++    ggml_gallocr_ptr alloc;
++    ggml_cgraph * graph;
++    std::vector<ggml_tensor *> scores;
++    std::vector<llama_sampler_data> outputs;
++    std::unique_ptr<llama_sampler_graph_binding> binding;
++    int fused_nodes = 0;
++    size_t bytes;
++    bool selected_only;
++
++    chain_graph(ggml_backend_t backend, const char * control, int n, int k, float p,
++                bool constrained, int rows = 1, llama_sampler * clone = nullptr, bool only_selected = false)
++        : sampler(clone ? clone : llama_sampler_chain_init(llama_sampler_chain_default_params())),
++          alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))), selected_only(only_selected) {
++        fusion_switch mode(control);
++        if (!clone) {
++            if (constrained) {
++                auto * mask = llama_sampler_init_token_mask(n);
++                std::vector<uint32_t> words((n+31)/32,0);
++                for (int i = 0; i < n; ++i) { if (i%3 != 1) { words[i/32] |= uint32_t(1) << (i%32); } }
++                require(llama_sampler_set_token_mask(mask,words.data(),words.size()), "constraint setup failed");
++                llama_sampler_chain_add(sampler.get(),mask);
++            }
++            if (k) { llama_sampler_chain_add(sampler.get(),llama_sampler_init_top_k(k)); }
++            llama_sampler_chain_add(sampler.get(),llama_sampler_init_top_p(p,1));
++            llama_sampler_chain_add(sampler.get(),llama_sampler_init_temp(0.8f));
++            llama_sampler_chain_add(sampler.get(),llama_sampler_init_dist(1234567));
++        }
++        if (selected_only) { require(llama_sampler_backend_set_selected_only(sampler.get()), "selected-only admission failed"); }
++        require(sampler->iface->backend_init(sampler.get(),ggml_backend_get_default_buffer_type(backend),rows), "complete sampler unavailable");
++        if (selected_only) { require(llama_sampler_backend_selected_only_ready(sampler.get()), "selected-only complete backend not ready"); }
++        graph = ggml_new_graph_custom(ctx.get(),1024,false);
++        sampler->iface->backend_reset(sampler.get());
++        for (int row = 0; row < rows; ++row) {
++            auto * input = ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,n); ggml_set_input(input);
++            scores.push_back(input);
++            llama_sampler_data output{input,nullptr,nullptr,nullptr};
++            sampler->iface->backend_apply(sampler.get(),ctx.get(),graph,&output);
++            require(output.sampled && output.probs, "sampling output contract changed");
++            ggml_set_output(output.sampled); ggml_build_forward_expand(graph,output.sampled);
++            // Mirror the context's selected-only graph output contract: retain
++            // the token root, not public probability/candidate output views.
++            if (!selected_only) {
++                ggml_set_output(output.probs); ggml_build_forward_expand(graph,output.probs);
++                if (output.candidates) { ggml_set_output(output.candidates); ggml_build_forward_expand(graph,output.candidates); }
++            } else {
++                require(!(output.probs->flags & GGML_TENSOR_FLAG_OUTPUT) &&
++                    (!output.candidates || !(output.candidates->flags & GGML_TENSOR_FLAG_OUTPUT)), "selected-only output visibility changed");
++            }
++            outputs.push_back(output);
++        }
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            auto * node = ggml_graph_node(graph,i);
++            int32_t kind; std::memcpy(&kind,node->op_params+1,sizeof(kind));
++            fused_nodes += node->op == GGML_OP_TOKEN_MASK && kind == 3;
++        }
++        require(ggml_gallocr_alloc_graph(alloc.get(),graph), "sampling graph allocation failed");
++        bytes = ggml_gallocr_get_buffer_size(alloc.get(),0);
++        require(bytes < 1024*1024, "sampling fixture escaped bounded allocation");
++        binding = llama_sampler_backend_capture_bindings(sampler.get());
++        require(binding && binding->matches(sampler.get()), "sampling graph binding unavailable");
++    }
++
++    sample_result run(ggml_backend_t backend, int step, int accepts) {
++        require(accepts >= 0 && accepts <= int(outputs.size()), "bad test accept prefix");
++        for (size_t row = 0; row < scores.size(); ++row) {
++            std::vector<float> values(ggml_nelements(scores[row]));
++            for (size_t i = 0; i < values.size(); ++i) { values[i] = float(int((i*17+step*19+row*11)%43)-21)/8.0f; }
++            ggml_backend_tensor_set(scores[row],values.data(),0,values.size()*sizeof(float));
++        }
++        llama_sampler_backend_begin(sampler.get());
++        if (!binding->matches(sampler.get())) {
++            std::fprintf(stderr,"DIST_TAIL_BINDING step=%d rows=%zu selected_only=%d graph_identity_changed=1\n",
++                step,outputs.size(),int(selected_only));
++            require(false,"sampling graph binding invalidated; rebuild before executing");
++        }
++        binding->swap_bindings(sampler.get());
++        sampler->iface->backend_set_input(sampler.get());
++        require(ggml_backend_graph_compute(backend,graph) == GGML_STATUS_SUCCESS, "sampling graph compute failed");
++        binding->swap_bindings(sampler.get());
++        sample_result result;
++        for (const auto & output : outputs) {
++            int32_t selected; ggml_backend_tensor_get(output.sampled,&selected,0,sizeof(selected));
++            result.selected.push_back(selected);
++            std::vector<float> probabilities(selected_only ? 0 : ggml_nelements(output.probs));
++            if (!probabilities.empty()) { ggml_backend_tensor_get(output.probs,probabilities.data(),0,probabilities.size()*sizeof(float)); }
++            result.probs.push_back(std::move(probabilities));
++            std::vector<int32_t> ids(!selected_only && output.candidates ? ggml_nelements(output.candidates) : 0);
++            if (!ids.empty()) { ggml_backend_tensor_get(output.candidates,ids.data(),0,ids.size()*sizeof(int32_t)); }
++            result.ids.push_back(std::move(ids));
++        }
++        for (int row = 0; row < accepts; ++row) { llama_sampler_accept(sampler.get(),result.selected[row]); }
++        return result;
++    }
++};
++
++static void memory_not_increased(const chain_graph & before, const chain_graph & after,
++        int n, int k, float p, bool constrained, int rows, bool selected_only) {
++    if (after.bytes > before.bytes) {
++        std::fprintf(stderr,"DIST_TAIL_ALLOCATION n=%d k=%d p=%.9g constrained=%d rows=%d selected_only=%d legacy_bytes=%zu fused_bytes=%zu\n",
++            n,k,double(p),int(constrained),rows,int(selected_only),before.bytes,after.bytes);
++        for (const auto * fixture : {&before,&after}) {
++            const char * label = fixture == &before ? "legacy" : "fused";
++            for (int i = 0; i < ggml_graph_n_nodes(fixture->graph); ++i) {
++                const auto * node = ggml_graph_node(fixture->graph,i);
++                std::fprintf(stderr,"DIST_TAIL_ALLOCATION_NODE side=%s index=%d name=%s op=%s type=%s ne0=%lld bytes=%zu flags=%d address=%p src0=%p src1=%p\n",
++                    label,i,node->name,ggml_op_name(node->op),ggml_type_name(node->type),
++                    (long long)node->ne[0],ggml_nbytes(node),node->flags,node->data,
++                    node->src[0] ? node->src[0]->data : nullptr,node->src[1] ? node->src[1]->data : nullptr);
++            }
++        }
++    }
++    require(after.bytes <= before.bytes,"complete chain increased compute allocation");
++}
++
++static void chains(ggml_backend_t backend, bool bench) {
++    int draws = 0, transactional = 0;
++    for (int k : {0,10,20,40,128}) for (float p : {1.0f,0.9f}) for (bool constrained : {false,true}) {
++        chain_graph before(backend,"0",256,k,p,constrained), after(backend,"1",256,k,p,constrained);
++        require(before.fused_nodes == 0 && after.fused_nodes == 1, "tail control did not select actual graph");
++        memory_not_increased(before,after,256,k,p,constrained,1,false);
++        if (bench) { std::printf("DIST_TAIL_CHAIN_MEMORY n=256 k=%d p=%.1f constrained=%d rows=1 legacy_bytes=%zu fused_bytes=%zu\n",k,p,int(constrained),before.bytes,after.bytes); }
++        for (int step = 0; step < 24; ++step) {
++            if (step == 12) { llama_sampler_reset(before.sampler.get()); llama_sampler_reset(after.sampler.get()); }
++            equal(before.run(backend,step,1),after.run(backend,step,1));
++            ++draws;
++        }
++    }
++    for (int k : {0,20}) for (float p : {1.0f,0.9f}) {
++        chain_graph before(backend,"0",256,k,p,false,4), after(backend,"1",256,k,p,false,4);
++        require(before.fused_nodes == 0 && after.fused_nodes == 4, "transactional graph not actually fused");
++        memory_not_increased(before,after,256,k,p,false,4,false);
++        for (int step = 0; step < 24; ++step) {
++            if (step == 12) { llama_sampler_reset(before.sampler.get()); llama_sampler_reset(after.sampler.get()); }
++            const int counts[] = {0,1,2,4};
++            equal(before.run(backend,step,counts[step%4]),after.run(backend,step,counts[step%4]));
++            transactional += 4;
++            if (step == 7) {
++                chain_graph a(backend,"0",256,k,p,false,4,llama_sampler_clone(before.sampler.get()));
++                chain_graph b(backend,"1",256,k,p,false,4,llama_sampler_clone(after.sampler.get()));
++                const auto source_a = before.run(backend,71,1), source_b = after.run(backend,71,1);
++                const auto clone_a = a.run(backend,71,1), clone_b = b.run(backend,71,1);
++                equal(source_a,source_b); equal(source_a,clone_a); equal(clone_a,clone_b);
++                llama_sampler_copy(before.sampler.get(),a.sampler.get());
++                llama_sampler_copy(after.sampler.get(),b.sampler.get());
++                const bool valid_a = a.binding->matches(a.sampler.get()), valid_b = b.binding->matches(b.sampler.get());
++                // p=1 installs an empty top-p sampler. Its generic copy path
++                // replaces that child's metadata identity, so the old graph
++                // binding correctly refuses it even though it has no tensors.
++                // Rebuild from the copied logical state instead of bypassing
++                // the production guard or recapturing stale graph inputs.
++                require(valid_a == valid_b && valid_a == (p != 1.0f),"copy-state graph invalidation contract changed");
++                std::unique_ptr<chain_graph> rebuilt_a, rebuilt_b;
++                if (!valid_a) {
++                    rebuilt_a.reset(new chain_graph(backend,"0",256,k,p,false,4,llama_sampler_clone(a.sampler.get())));
++                    rebuilt_b.reset(new chain_graph(backend,"1",256,k,p,false,4,llama_sampler_clone(b.sampler.get())));
++                    memory_not_increased(*rebuilt_a,*rebuilt_b,256,k,p,false,4,false);
++                }
++                auto & copied_graph_a = valid_a ? a : *rebuilt_a;
++                auto & copied_graph_b = valid_b ? b : *rebuilt_b;
++                const auto copied_a = copied_graph_a.run(backend,72,2), copied_b = copied_graph_b.run(backend,72,2);
++                const auto again_a = before.run(backend,72,2), again_b = after.run(backend,72,2);
++                equal(copied_a,copied_b); equal(copied_a,again_a); equal(again_a,again_b);
++            }
++        }
++    }
++    for (const char * value : {"0","true","yes","2","01","-1"}) {
++        chain_graph fallback(backend,value,256,20,0.9f,false);
++        require(fallback.fused_nodes == 0, "unknown control enabled draw fusion");
++    }
++    chain_graph large(backend,"1",2048,0,1.0f,false);
++    require(large.fused_nodes == 0, "oversized draw did not retain legacy composition");
++    std::printf("DIST_TAIL_SAMPLER seeded_draws=%d transactional_rows=%d topK_and_unfiltered=1 probabilities=1 candidate_order=1 constraints=1 reset=1 clone=1 state_copy=1 accepted_prefix_and_discard=1 graph_bindings=1 legacy_fallback=1 PASS\n",draws,transactional);
++    int selected_draws = 0;
++    for (int k : {0,20,128}) for (float p : {1.0f,0.9f}) {
++        chain_graph before(backend,"0",256,k,p,false,1,nullptr,true), after(backend,"1",256,k,p,false,1,nullptr,true);
++        require(before.fused_nodes == 0 && after.fused_nodes == 1, "selected-only draw was not actually fused");
++        memory_not_increased(before,after,256,k,p,false,1,true);
++        for (int step = 0; step < 32; ++step) {
++            if (step == 16) { llama_sampler_reset(before.sampler.get()); llama_sampler_reset(after.sampler.get()); }
++            const auto a = before.run(backend,step,1), b = after.run(backend,step,1);
++            equal(a,b);
++            require(a.probs.size() == 1 && a.probs[0].empty() && a.ids[0].empty(), "selected-only public views were materialized");
++            ++selected_draws;
++        }
++    }
++    std::printf("DIST_TAIL_SELECTED_ONLY seeded_draws=%d probability_views_omitted=1 candidate_views_omitted=1 selected_tokens_exact=1 allocation_not_increased=1 reset=1 PASS\n",selected_draws);
++}
++
++static void defaults(ggml_backend_t backend, bool cuda) {
++    const int limit = cuda ? 0 : 1024;
++    int draws = 0;
++    for (int n : {20,256,1024,1025}) for (int k : {0,10}) for (float p : {1.0f,0.9f}) for (bool selected_only : {false,true}) {
++        chain_graph before(backend,"0",n,k,p,false,1,nullptr,selected_only);
++        chain_graph automatic(backend,nullptr,n,k,p,false,1,nullptr,selected_only);
++        const int candidates = k ? std::min(n,k) : n;
++        require(before.fused_nodes == 0 && automatic.fused_nodes == int(candidates <= limit),"automatic CPU-only candidate boundary changed");
++        memory_not_increased(before,automatic,n,k,p,false,1,selected_only);
++        for (int step = 0; step < 16; ++step) {
++            if (step == 8) { llama_sampler_reset(before.sampler.get()); llama_sampler_reset(automatic.sampler.get()); }
++            equal(before.run(backend,step,1),automatic.run(backend,step,1));
++            ++draws;
++            if (step == 5) {
++                chain_graph clone_before(backend,"0",n,k,p,false,1,llama_sampler_clone(before.sampler.get()),selected_only);
++                chain_graph clone_auto(backend,nullptr,n,k,p,false,1,llama_sampler_clone(automatic.sampler.get()),selected_only);
++                memory_not_increased(clone_before,clone_auto,n,k,p,false,1,selected_only);
++                require(clone_before.fused_nodes == 0 && clone_auto.fused_nodes == int(candidates <= limit),"clone lost its destination default policy");
++                const auto a = before.run(backend,51,1), b = automatic.run(backend,51,1);
++                const auto copied_a = clone_before.run(backend,51,1), copied_b = clone_auto.run(backend,51,1);
++                equal(a,b); equal(a,copied_a); equal(copied_a,copied_b);
++            }
++        }
++    }
++    {
++        fusion_switch empty("");
++        const char * observed = std::getenv("WILDLLAMA_DIST_TAIL_FUSION");
++        const bool deleted = observed == nullptr;
++#ifdef _WIN32
++        require(deleted,"Windows empty environment control did not delete the variable");
++#else
++        require(observed && observed[0] == '\0',"POSIX empty environment control was not retained");
++#endif
++        chain_graph actual(backend,"",20,10,0.9f,false);
++        require(actual.fused_nodes == int(deleted && !cuda),"empty control did not follow observed platform/CPU-only policy");
++        std::printf("DIST_TAIL_EMPTY_ENV deleted=%d retained_empty=%d fused_nodes=%d PASS\n",int(deleted),int(!deleted),actual.fused_nodes);
++    }
++    std::printf("DIST_TAIL_DEFAULT candidate_limit=%d boundaries_20_256_1024_1025=1 seeded_draws=%d probabilities=1 candidate_order=1 reset=1 clone=1 selected_only=1 allocation_not_increased=1 explicit_0_and_unknown_legacy=1 cuda_opt_in_only=1 PASS\n",limit,draws);
++}
++
++static double median(std::vector<double> values) {
++    std::sort(values.begin(),values.end());
++    return (values[values.size()/2-1]+values[values.size()/2])/2;
++}
++
++static void benchmark(ggml_backend_t backend) {
++    for (int n : {10,20,40,64,128,256,512,1024}) for (bool full : {false,true}) {
++        draw_graph before(backend,n,true,full,false), after(backend,n,true,full,true);
++        std::vector<float> values(n); std::vector<int32_t> ids(n);
++        for (int i = 0; i < n; ++i) { values[i] = full ? float((i*17)%37-18)/8.0f : float(i%7-3)/4.0f; ids[i] = 10000+i; }
++        before.set(values,ids,0.5f); after.set(values,ids,0.5f);
++        for (int warm = 0; warm < 10; ++warm) { before.run(backend); after.run(backend); }
++        std::vector<double> old_samples, new_samples;
++        constexpr int rounds = 16, iterations = 400;
++        for (int round = 0; round < rounds; ++round) for (int side = 0; side < 2; ++side) {
++            const bool fused = round%2 == 0 ? side == 1 : side == 0;
++            auto & fixture = fused ? after : before;
++            ggml_backend_synchronize(backend);
++            const auto begin = std::chrono::steady_clock::now();
++            for (int step = 0; step < iterations; ++step) { require(ggml_backend_graph_compute(backend,fixture.graph) == GGML_STATUS_SUCCESS, "benchmark compute failed"); }
++            ggml_backend_synchronize(backend);
++            const double us = std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count()/iterations;
++            (fused ? new_samples : old_samples).push_back(us);
++        }
++        const double old_us = median(old_samples), new_us = median(new_samples);
++        std::printf("DIST_TAIL_BENCH n=%d full=%d legacy_us=%.6f fused_us=%.6f ratio=%.6f legacy_nodes=%d fused_nodes=%d legacy_bytes=%zu fused_bytes=%zu\n",n,int(full),old_us,new_us,new_us/old_us,ggml_graph_n_nodes(before.graph),ggml_graph_n_nodes(after.graph),before.bytes,after.bytes);
++        std::printf("DIST_TAIL_BENCH_JSON {\"n\":%d,\"full\":%d,\"paired_rounds\":16,\"abba_cycles\":8,\"iterations\":400,\"samples_per_control\":16,\"legacy_us\":%.6f,\"fused_us\":%.6f,\"legacy_nodes\":%d,\"fused_nodes\":%d,\"legacy_bytes\":%zu,\"fused_bytes\":%zu,\"legacy_samples_us\":[",n,int(full),old_us,new_us,ggml_graph_n_nodes(before.graph),ggml_graph_n_nodes(after.graph),before.bytes,after.bytes);
++        for (size_t i = 0; i < old_samples.size(); ++i) { std::printf("%s%.6f",i ? "," : "",old_samples[i]); }
++        std::printf("],\"fused_samples_us\":[");
++        for (size_t i = 0; i < new_samples.size(); ++i) { std::printf("%s%.6f",i ? "," : "",new_samples[i]); }
++        std::printf("]}\n");
++    }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        bool cuda = false, bench = false;
++        for (int i = 1; i < argc; ++i) { const std::string arg(argv[i]); require(arg == "--cuda" || arg == "--bench","use --cuda and/or --bench"); cuda |= arg == "--cuda"; bench |= arg == "--bench"; }
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        if (cuda) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++#else
++            std::puts("SKIP: CUDA backend not built"); return 77;
++#endif
++        }
++        auto * device = ggml_backend_dev_by_type(cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU);
++        require(device && (!cuda || std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device))) == "CUDA"), "requested backend unavailable");
++        ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr)); require(bool(backend), "backend initialization failed");
++        capability(backend.get()); liveness(backend.get()); primitives(backend.get()); chains(backend.get(),bench); defaults(backend.get(),cuda);
++        if (bench) { benchmark(backend.get()); }
++        std::printf("DIST_TAIL_FUSION device=%s zero_model_weights=1 no_extra_workspace=1 PASS\n",cuda ? "CUDA" : "CPU");
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}

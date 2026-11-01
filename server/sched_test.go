@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,12 +25,25 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "wildllama-server-tests-")
+	if err != nil {
+		panic(err)
+	}
+	for _, key := range []string{"HOME", "USERPROFILE"} {
+		if err := os.Setenv(key, root); err != nil {
+			panic(err)
+		}
+	}
+	if err := os.Setenv("OLLAMA_MODELS", filepath.Join(root, "models")); err != nil {
+		panic(err)
+	}
 	os.Setenv("OLLAMA_DEBUG", "1")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 	restoreMigrators := compatmigrate.SetMigratorsForTesting(nil)
 	code := m.Run()
 	restoreMigrators()
+	os.RemoveAll(root)
 	os.Exit(code)
 }
 
@@ -278,7 +292,10 @@ func newScenarioRequestWithContext(t *testing.T, ctx context.Context, modelName 
 		successCh:       make(chan *runnerRef, 1),
 		errCh:           make(chan error, 1),
 	}
-	b.srv = &mockLlm{vramSize: vramSize, vramByGPU: vramByGPU}
+	// Match the real runner's context clamp instead of retaining a developer's
+	// environment default above this tiny fixture model's training context.
+	b.srv = &mockLlm{vramSize: vramSize, vramByGPU: vramByGPU,
+		contextLength: effectiveContext(b.req.opts.NumCtx, int(trainCtx))}
 	return b
 }
 
@@ -409,6 +426,8 @@ func TestSchedRequestsSimpleReloadSameModel(t *testing.T) {
 }
 
 func TestSchedRequestsMultipleLoadedModels(t *testing.T) {
+	// The pending loop captures this setting once when it starts.
+	t.Setenv("OLLAMA_MAX_LOADED_MODELS", "0")
 	slog.Info("TestRequestsMultipleLoadedModels")
 	ctx, done := context.WithTimeout(t.Context(), 1000*time.Millisecond)
 	defer done()
@@ -454,7 +473,6 @@ func TestSchedRequestsMultipleLoadedModels(t *testing.T) {
 	require.Len(t, s.loaded, 1)
 	s.loadedMu.Unlock()
 
-	t.Setenv("OLLAMA_MAX_LOADED_MODELS", "0")
 	s.newServerFn = b.newServer
 	slog.Info("Loading B")
 	s.pendingReqCh <- b.req
