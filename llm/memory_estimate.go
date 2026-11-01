@@ -2,6 +2,7 @@ package llm
 
 import (
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/ollama/ollama/api"
@@ -74,6 +75,10 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 		return e
 	}
 	kindK, kindV := resolvedKVCacheTypes(opts)
+	swaPattern, swaContext, ok := estimatedSwaContext(kv, layers, context, parallel, opts)
+	if !ok {
+		return e
+	}
 	var recurrent uint64
 	for layer := uint64(0); layer < trunkLayers+mtpLayers; layer++ {
 		isMTP := layer >= trunkLayers
@@ -132,7 +137,11 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 			committedContext = context
 		}
 		row := vramAdd(kvRowBytes(vramMul(kvHeads, keyDim), strings.ToLower(layerK)), kvRowBytes(vramMul(kvHeads, valueDim), strings.ToLower(layerV)))
-		e.WorstCaseKV = vramAdd(e.WorstCaseKV, vramMul(row, context))
+		layerContext := context
+		if swaPattern != nil && swaPattern[layer] {
+			layerContext, committedContext = swaContext, swaContext
+		}
+		e.WorstCaseKV = vramAdd(e.WorstCaseKV, vramMul(row, layerContext))
 		e.InitialKV = vramAdd(e.InitialKV, vramMul(row, committedContext))
 	}
 	if recurrent > 0 {
@@ -152,6 +161,71 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 	e.Auxiliary = max(uint64(256<<20), e.Weights/20)
 	e.Valid = vramAdd(e.Weights, e.KV, e.Recurrent, e.Auxiliary) != math.MaxUint64
 	return e
+}
+
+// Matches llama_kv_cache_iswa: only the full-attention layers retain the entire
+// context. Window caches include a physical batch and 256-cell padding per stream.
+func estimatedSwaContext(kv *gguf.Metadata, layers, context uint64, parallel int, opts api.Options) ([]bool, uint64, bool) {
+	if kv.Architecture() != "spark2_5" {
+		return nil, context, true
+	}
+	window, ok := kv.UintOK("attention.sliding_window")
+	pattern := kv.KeyValue("attention.sliding_window_pattern").Bools()
+	if !ok || window == 0 || uint64(len(pattern)) != layers {
+		return nil, 0, false
+	}
+	flag := func(key string) (bool, bool) {
+		switch strings.ToLower(gpuNativeEnvironment(opts, key)) {
+		case "", "0", "false", "off":
+			return false, true
+		case "1", "true", "on":
+			return true, true
+		default:
+			return false, false
+		}
+	}
+	full, ok := flag("LLAMA_ARG_SWA_FULL")
+	if !ok {
+		return nil, 0, false
+	}
+	if full {
+		return pattern, context, true
+	}
+	unified, ok := flag("LLAMA_ARG_KV_UNIFIED")
+	if !ok {
+		return nil, 0, false
+	}
+	envSize := func(key string, fallback uint64) uint64 {
+		if raw := gpuNativeEnvironment(opts, key); raw != "" {
+			value, err := strconv.ParseUint(raw, 10, 64)
+			if err != nil || value == 0 {
+				return math.MaxUint64
+			}
+			return value
+		}
+		return fallback
+	}
+	batch := envSize("LLAMA_ARG_BATCH", 2048)
+	if opts.NumBatch > 0 {
+		batch = uint64(opts.NumBatch)
+	}
+	physical := envSize("LLAMA_ARG_UBATCH", 512)
+	if opts.NumBatch > 0 {
+		physical = batch
+	}
+	if opts.NumUbatch > 0 {
+		physical = uint64(opts.NumUbatch)
+	}
+	if batch == math.MaxUint64 || physical == math.MaxUint64 {
+		return nil, 0, false
+	}
+	physical = min(context, batch, physical)
+	streams, sequences := uint64(parallel), uint64(1)
+	if unified {
+		streams, sequences = 1, uint64(parallel)
+	}
+	cells := vramMul(vramRoundUp(min(context/streams, vramAdd(vramMul(window, sequences), physical)), 256), streams)
+	return pattern, cells, cells != math.MaxUint64
 }
 
 func estimateMemoryLayers(kv *gguf.Metadata, layers uint64, opts api.Options) (uint64, uint64, bool) {

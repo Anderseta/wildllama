@@ -22,8 +22,53 @@ func qwen35MemoryMetadata() gguftest.KV {
 
 func clearEstimateCacheEnvironment(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"OLLAMA_KV_CACHE_TYPE", "LLAMA_ARG_CACHE_TYPE_K", "LLAMA_ARG_CACHE_TYPE_V", "OLLAMA_KV_CACHE_INITIAL_TOKENS"} {
+	for _, key := range []string{"OLLAMA_KV_CACHE_TYPE", "LLAMA_ARG_CACHE_TYPE_K", "LLAMA_ARG_CACHE_TYPE_V", "OLLAMA_KV_CACHE_INITIAL_TOKENS", "LLAMA_ARG_SWA_FULL", "LLAMA_ARG_KV_UNIFIED", "LLAMA_ARG_BATCH", "LLAMA_ARG_UBATCH"} {
 		t.Setenv(key, "")
+	}
+}
+
+func TestEstimateServerVRAMSparkHybrid(t *testing.T) {
+	clearEstimateCacheEnvironment(t)
+	pattern := make([]bool, 36)
+	for i := range pattern {
+		pattern[i] = (i+1)%4 != 0
+	}
+	metadata := gguftest.KV{
+		"general.architecture": "spark2_5", "spark2_5.block_count": uint32(36),
+		"spark2_5.context_length": uint32(1048576), "spark2_5.embedding_length": uint32(2560),
+		"spark2_5.attention.head_count": uint32(16), "spark2_5.attention.head_count_kv": uint32(4),
+		"spark2_5.attention.key_length": uint32(256), "spark2_5.attention.value_length": uint32(256),
+		"spark2_5.attention.sliding_window": uint32(512), "spark2_5.attention.sliding_window_pattern": pattern,
+	}
+	opts := api.DefaultOptions()
+	opts.NumCtx, opts.NumBatch = 256000, 512
+	initial := 8192
+	opts.KVCacheInitialTokens = &initial
+	opts.RunnerEnv = map[string]string{"OLLAMA_KV_CACHE_TYPE": "q8_0"}
+	f := loadTestGGUF(t, metadata)
+	value := EstimateServerVRAM("", f, opts, 1)
+	if !value.Valid || value.KV != 5073666048 || value.InitialKV != (9*8192+27*1024)*2176 {
+		t.Fatalf("hybrid KV not sized by layer type: %+v", value)
+	}
+	if value := EstimateServerVRAM("", f, opts, 2); !value.Valid || value.KV != (9*512000+27*2048)*2176 {
+		t.Fatalf("split streams: %+v", value)
+	}
+	opts.RunnerEnv["LLAMA_ARG_KV_UNIFIED"] = "1"
+	if value := EstimateServerVRAM("", f, opts, 2); !value.Valid || value.KV != (9*512000+27*1536)*2176 {
+		t.Fatalf("unified streams: %+v", value)
+	}
+	opts.RunnerEnv["LLAMA_ARG_SWA_FULL"] = "1"
+	if value := EstimateServerVRAM("", f, opts, 1); !value.Valid || value.KV != 36*256000*2176 {
+		t.Fatalf("explicit full SWA: %+v", value)
+	}
+	delete(opts.RunnerEnv, "LLAMA_ARG_SWA_FULL")
+	opts.NumBatch, opts.NumUbatch = 2048, 128
+	if value := EstimateServerVRAM("", f, opts, 1); !value.Valid || value.KV != (9*256000+27*768)*2176 {
+		t.Fatalf("physical batch and padding: %+v", value)
+	}
+	metadata["spark2_5.attention.sliding_window_pattern"] = []bool{true}
+	if value := EstimateServerVRAM("", loadTestGGUF(t, metadata), opts, 1); value.Valid {
+		t.Fatal("accepted incomplete hybrid layer metadata")
 	}
 }
 
