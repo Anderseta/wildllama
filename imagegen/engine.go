@@ -664,6 +664,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 }
 
 var stepPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,3})/([0-9]{1,3})(?:[^0-9]|$)`)
+var byteRatePattern = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:[kmgt]i?)?b/s\b`)
 
 type progressLog struct {
 	mu          sync.Mutex
@@ -728,7 +729,18 @@ func (p *progressLog) line(line string) {
 		current, _ := strconv.Atoi(match[1])
 		total, _ := strconv.Atoi(match[2])
 		if total > 1 && current <= total {
-			update = Progress{Phase: "sampling", Message: "Generating image", Current: current, Total: total}
+			// Native tensor transfers and denoising both print unlabelled N/M
+			// bars. Byte rates identify transfers; explicit phase labels win.
+			if update.Phase == "" {
+				if byteRatePattern.MatchString(line) {
+					update.Phase = "loading"
+					update.Message = "Loading image model components"
+				} else {
+					update.Phase = "sampling"
+					update.Message = "Generating image"
+				}
+			}
+			update.Current, update.Total = current, total
 		}
 	}
 	if update.Phase != "" {

@@ -43,6 +43,7 @@ type imageTestRunner struct {
 	request imagegen.Request
 	entered chan struct{}
 	wait    bool
+	release <-chan struct{}
 }
 
 func (e *imageTestRunner) Status() imagegen.RunnerStatus {
@@ -58,6 +59,13 @@ func (e *imageTestRunner) Run(ctx context.Context, _ imagegen.Profile, request i
 	if e.wait {
 		<-ctx.Done()
 		return imagegen.Result{}, ctx.Err()
+	}
+	if e.release != nil {
+		select {
+		case <-e.release:
+		case <-ctx.Done():
+			return imagegen.Result{}, ctx.Err()
+		}
 	}
 	progress(imagegen.Progress{Phase: "generation", Message: "Denoising", Current: 1, Total: 8})
 	if err := os.MkdirAll(filepath.Dir(request.OutputPath), 0700); err != nil {
@@ -152,6 +160,50 @@ func TestImageExclusiveRestoresExactProfileAfterChildClose(t *testing.T) {
 	require.Equal(t, 200, response.Code)
 	_, err := png.Decode(response.Body)
 	require.NoError(t, err)
+}
+
+func TestImageWorkerStartTimestampRemainsStableAfterCompletion(t *testing.T) {
+	_, service, router, _, runner := newImageTestService(t)
+	runner.entered = make(chan struct{})
+	release := make(chan struct{})
+	runner.release = release
+	job, err := service.enqueue(&imageJob{Kind: "generate", Config: cloneImageConfig(service.config), Profile: service.config.Profiles[0], Request: imageJobRequest{Prompt: "timestamp fixture"}})
+	require.NoError(t, err)
+	select {
+	case <-runner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("async worker did not enter the blocked image runner")
+	}
+	response := imageTestHTTP(router, "GET", "/api/images/jobs/"+job.ID, nil, "")
+	require.Equal(t, 200, response.Code)
+	var running struct {
+		Job imageJob `json:"job"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &running))
+	require.Equal(t, "running", running.Job.Status)
+	require.NotNil(t, running.Job.StartedAt)
+	require.Nil(t, running.Job.FinishedAt)
+	observedStart := *running.Job.StartedAt
+	// Completion is impossible until this external handoff, after the running
+	// timestamp has already been observed through the public API.
+	handoff := time.Now().UTC()
+	close(release)
+	require.Eventually(t, func() bool {
+		service.mu.Lock()
+		defer service.mu.Unlock()
+		return imageTerminal(job.Status)
+	}, 2*time.Second, time.Millisecond)
+	response = imageTestHTTP(router, "GET", "/api/images/jobs/"+job.ID, nil, "")
+	var completed struct {
+		Job imageJob `json:"job"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &completed))
+	require.Equal(t, "completed", completed.Job.Status, completed.Job.Error)
+	require.NotNil(t, completed.Job.StartedAt)
+	require.NotNil(t, completed.Job.FinishedAt)
+	require.True(t, completed.Job.StartedAt.Equal(observedStart), "completion must preserve the previously observed start")
+	require.True(t, completed.Job.FinishedAt.After(observedStart))
+	require.False(t, completed.Job.FinishedAt.Before(handoff), "finish must follow the external release")
 }
 
 func mustImageRouter(t *testing.T, server *Server) *gin.Engine {

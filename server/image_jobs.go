@@ -107,8 +107,8 @@ func (v *imageService) work() {
 			v.mu.Unlock()
 			continue
 		}
-		now := time.Now().UTC()
-		job.StartedAt = &now
+		started := time.Now().UTC()
+		job.StartedAt = &started
 		job.Status = "running"
 		_ = v.persistJobsLocked()
 		v.mu.Unlock()
@@ -123,8 +123,8 @@ func (v *imageService) work() {
 			err = v.generate(job)
 		}
 		v.mu.Lock()
-		now = time.Now().UTC()
-		job.FinishedAt = &now
+		finished := time.Now().UTC()
+		job.FinishedAt = &finished
 		switch {
 		case job.ctx.Err() != nil:
 			job.Status = "cancelled"

@@ -43,6 +43,38 @@ func TestMain(m *testing.M) {
 	os.RemoveAll(dir)
 	os.Exit(code)
 }
+
+func TestProgressNativeCounterPhases(t *testing.T) {
+	tests := []struct {
+		name, line, phase string
+		current, total    int
+	}{
+		{"tensor count", "loading 42/756 tensors from denoiser.safetensors", "loading", 42, 756},
+		{"bytes", "|###       | 42/756 - 512.00B/s\x1b[K", "loading", 42, 756},
+		{"megabytes", "|###       | 42/756 - 512.00MB/s\x1b[K", "loading", 42, 756},
+		{"gigabytes", "|###       | 42/756 - 1.20GB/s\x1b[K", "loading", 42, 756},
+		{"gibibytes", "|###       | 42/756 - 1.20GiB/s\x1b[K", "loading", 42, 756},
+		{"mebibytes", "|###       | 42/756 - 512.00MiB/s\x1b[K", "loading", 42, 756},
+		{"encoding", "encoding reference image 1/2", "encoding", 1, 2},
+		{"decoding", "decoding VAE tile 1/4", "decoding", 1, 4},
+		{"saving", "2/2 images saved", "saving", 2, 2},
+		{"seconds per iteration", "|====>     | 1/25 - 0.20s/it\x1b[K", "sampling", 1, 25},
+		{"iterations per second", "|====>     | 1/25 - 5.00it/s\x1b[K", "sampling", 1, 25},
+		{"unlabelled count", "1/25", "sampling", 1, 25},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var updates []Progress
+			log := progressLog{start: time.Now(), callback: func(update Progress) { updates = append(updates, update) }}
+			if _, err := log.Write([]byte(test.line + "\r")); err != nil {
+				t.Fatal(err)
+			}
+			if len(updates) != 1 || updates[0].Phase != test.phase || updates[0].Current != test.current || updates[0].Total != test.total {
+				t.Fatalf("native progress %q: %#v", test.line, updates)
+			}
+		})
+	}
+}
 func fakeChild(mode string) {
 	values := map[string]string{}
 	for i := 1; i+1 < len(os.Args); i++ {
