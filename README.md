@@ -51,6 +51,8 @@ Optional [physical KV paging](docs/physical-kv-paging.md) can reclaim compatible
 
 [Batched host outputs](docs/batched-host-outputs.md) reduce compatible CUDA copy submissions using the existing output arrays. Indexed output ordering preserves the original lazy swap sequence without another workspace. Optional [shared cold-prefix chunks](docs/hierarchical-prefix-pages.md) reuse verified unchanged snapshot regions on SSD under explicit CPU metadata, disk and file limits. The [small validation](docs/output-pipeline-efficiency.md) covers exact output/state behavior and component timings; it does not establish parity with SGLang or a trained-model throughput increase.
 
+[Further runtime improvements](docs/runtime-pipeline-efficiency.md) avoid unused prompt echoes and repeated JSON copies, consolidate completed neural-output reads, batch conventional MoE uploads on compatible devices, and recycle bounded RAM-page queue metadata. They preserve existing weights, profiles and memory budgets without adding GPU buffers; their small validation reports component results separately from model throughput.
+
 ## Large MoE models on smaller machines
 
 A MoE model uses only its router-selected experts for each token, but the full set of expert weights can still be much larger than VRAM or available RAM. WildLlama's selective-weight path keeps bounded working sets in memory and reads missing weights from the original GGUF files on SSD.

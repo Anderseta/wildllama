@@ -1,0 +1,117 @@
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -121,6 +121,15 @@
+     // Embeddings
+     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+ 
++    bool needs_prompt() const {
++        if (res_type != TASK_RESPONSE_TYPE_NONE) { return false; }
++        if (response_fields.empty()) { return true; }
++        for (const auto & path : response_fields) {
++            if (path == "prompt" || path.compare(0, 7, "prompt/") == 0) { return true; }
++        }
++        return false;
++    }
++
+     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
+     json to_json(bool only_metrics = false) const;
+ };
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2513,7 +2513,9 @@
+             res->tokens      = std::move(slot.generated_tokens);
+         }
+         res->stats           = slot.stats;
+-        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
++        if (slot.task->params.needs_prompt()) {
++            res->prompt = slot.task->tokens.detokenize(ctx_tgt, true);
++        }
+         res->response_fields = std::move(slot.task->params.response_fields);
+ 
+         res->truncated             = slot.truncated;
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -969,18 +969,18 @@
+     json result = json::object();
+ 
+     for (const std::string & path : paths) {
+-        json current = js;
++        const json * current = &js;
+         const auto keys = string_split<std::string>(path, /*separator*/ '/');
+         bool valid_path = true;
+         for (const std::string & k : keys) {
+-            if (valid_path && current.is_object() && current.contains(k)) {
+-                current = current[k];
+-            } else {
++            if (!current->is_object() || !current->contains(k)) {
+                 valid_path = false;
++                break;
+             }
++            current = &(*current)[k];
+         }
+         if (valid_path) {
+-            result[path] = current;
++            result[path] = *current;
+         }
+     }
+     return result;
+diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
+--- a/tests/test-server-component.cpp
++++ b/tests/test-server-component.cpp
+@@ -247,6 +247,21 @@
+         t.assert_true("missing",  !res.contains("a/missing"));
+         t.assert_true("not obj",  !res.contains("x/y"));
+         t.assert_equal("count", (size_t) 3, res.size());
++
++        json edge = {{"", {{"", 7}}}, {"null", nullptr}, {"array", json::array({1, 2})},
++            {"scalar", "value"}, {"a", {{"b", 9}}}, {"unused_prompt", std::string(512 * 1024, 'p')}};
++        const auto original = edge;
++        res = json_get_nested_values({"", "/", "null", "array", "array/0", "scalar/x", "a/b", "a/b", "missing", "null/x"}, edge);
++        t.assert_true("empty key", res.at("") == json{{"", 7}});
++        t.assert_equal("empty nested keys", 7, res.at("/").get<int>());
++        t.assert_true("null retained", res.contains("null") && res.at("null").is_null());
++        t.assert_true("whole array retained", res.at("array") == json::array({1, 2}));
++        t.assert_true("array indexing stays unsupported", !res.contains("array/0"));
++        t.assert_true("scalar and null child paths omitted", !res.contains("scalar/x") && !res.contains("null/x"));
++        t.assert_equal("duplicate path replaces same key", 9, res.at("a/b").get<int>());
++        t.assert_true("source unchanged", edge == original);
++        res["array"][0] = 99;
++        t.assert_equal("selected output owns its value", 1, edge.at("array").at(0).get<int>());
+     });
+ }
+ 
+@@ -624,6 +639,23 @@
+     t.assert_equal("disabled controller has no accumulated timing", 0.0, control.window_us);
+ }
+ 
++static void test_prompt_response_materialization(testing & t) {
++    task_params params;
++    t.assert_true("native default retains echoed prompt", params.needs_prompt());
++    params.response_fields = {"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress"};
++    t.assert_true("internal completion excludes unused prompt", !params.needs_prompt());
++    params.response_fields.push_back("prompt");
++    t.assert_true("explicit prompt preserved", params.needs_prompt());
++    params.response_fields = {"prompt/unknown"};
++    t.assert_true("nested prompt selector stays conservative", params.needs_prompt());
++    params.response_fields.clear();
++    for (const auto type : {TASK_RESPONSE_TYPE_OAI_CMPL, TASK_RESPONSE_TYPE_OAI_CHAT,
++            TASK_RESPONSE_TYPE_OAI_RESP, TASK_RESPONSE_TYPE_OAI_ASR, TASK_RESPONSE_TYPE_ANTHROPIC}) {
++        params.res_type = type;
++        t.assert_true("compatibility protocols never emit native prompt field", !params.needs_prompt());
++    }
++}
++
+ static void test_grammar_first_request_contract(testing & t) {
+     common_params base;
+     auto evaluate=[&](const json & data) {return server_schema::eval_llama_cmpl_schema(nullptr,base,{},data);};
+@@ -663,6 +695,7 @@
+     t.test("speculation_cost_recovery", test_speculation_cost_recovery);
+     t.test("speculation_reference_and_clock", test_speculation_reference_and_clock);
+     t.test("grammar_first_request", test_grammar_first_request_contract);
++    t.test("prompt_response_materialization", test_prompt_response_materialization);
+ 
+     return t.summary();
+ }

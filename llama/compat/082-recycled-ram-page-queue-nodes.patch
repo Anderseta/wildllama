@@ -1,0 +1,369 @@
+diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
+--- a/src/llama-model-ram.cpp
++++ b/src/llama-model-ram.cpp
+@@ -3,6 +3,7 @@
+ #include "llama-model-ram-pipeline.h"
+ #include "llama-model-ram-read-plan.h"
+ #include "llama-model-ram-admission.h"
++#include "llama-model-ram-queue-nodes.h"
+ #include "llama-impl.h"
+ #include "llama-runtime-activity.h"
+ #include "llama-moe-runtime.h"
+@@ -272,6 +273,7 @@
+     std::vector<std::unique_ptr<region>> regions;
+     std::map<uintptr_t, region *> addresses;
+     std::list<page *> probation, protected_pages;
++    llama_model_ram_queue_nodes<page *> queue_nodes;
+     llama_model_ram_frequency frequency;
+     std::mutex compute_mutex;
+     std::string last_error;
+@@ -308,7 +310,8 @@
+     }
+ 
+     impl(size_t bytes, const llama_files & files, bool streaming) : limit(bytes / page_size * page_size),
+-            pooled(streaming && llama_moe_runtime::option("WILDLLAMA_MOE_RAM_POOL")),frequency(limit/page_size) {
++            pooled(streaming && llama_moe_runtime::option("WILDLLAMA_MOE_RAM_POOL")),
++            queue_nodes(limit / page_size), frequency(limit/page_size) {
+         // Experimental policy: unlike the established runtime components it
+         // requires an explicit opt-in. Cache it once so ordinary SLRU does not
+         // inspect the environment or update frequency history on each demand.
+@@ -504,7 +507,7 @@
+                 elapsed(start, release_us);
+                 evicted_pages += n; ++eviction_calls;
+                 for (auto cur = it; cur != end; ++cur) { (*cur)->resident = false; }
+-                queue->erase(it, end);
++                queue_nodes.recycle(*queue, it, end);
+                 if (!pooled) { resident -= n * page_size; }
+                 return;
+         }
+@@ -608,7 +611,7 @@
+                 // Form the whole request before allocating cache slots or
+                 // submitting I/O. A hot page need not become cold simply to
+                 // coalesce its neighbours; only their source bytes are read.
+-                job.ready.push_back(first);
++                queue_nodes.append(job.ready, first);
+                 while (end < needed.size()) {
+                     page * next = needed[end];
+                     if (next->resident) {
+@@ -622,7 +625,7 @@
+                     auto read = job.read;
+                     if (!read.append(nr.file,checked_add(nr.offset,no),std::min(page_size,nr.size-no),alignment,
+                                      io_chunk+alignment,coalesce ? page_size/4 : 0)) { break; }
+-                    job.ready.push_back(next);
++                    queue_nodes.append(job.ready, next);
+                     job.read = read;
+                     ++n; ++end;
+                 }
+@@ -698,12 +701,14 @@
+             // I/O must finish before its buffers or destination pages can be released.
+             for (auto & request : requests) { request.drain(); }
+             for (auto & job : jobs) {
+-                if (!job.committed) { continue; }
+-                try {
+-                    if (pooled) { for (page * p : job.ready) { if (p->storage) { free_slots.push_back(p->storage); p->storage=nullptr; } } }
+-                    else { decommit(job.dst, job.bytes); resident -= job.bytes; }
++                if (job.committed) {
++                    try {
++                        if (pooled) { for (page * p : job.ready) { if (p->storage) { free_slots.push_back(p->storage); p->storage=nullptr; } } }
++                        else { decommit(job.dst, job.bytes); resident -= job.bytes; }
++                    }
++                    catch (...) { poisoned = true; }
+                 }
+-                catch (...) { poisoned = true; }
++                queue_nodes.recycle(job.ready);
+             }
+             throw;
+         }
+diff --git a/src/llama-model-ram-queue-nodes.h b/src/llama-model-ram-queue-nodes.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-model-ram-queue-nodes.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include <cassert>
++#include <cstddef>
++#include <list>
++#include <memory>
++#include <stdexcept>
++#include <type_traits>
++
++// Queues share an allocator and transfer nodes only by splice/recycle until
++// final destruction. Pointer values in the recycled list are never dereferenced.
++template <typename Pointer, typename Allocator = std::allocator<Pointer>>
++class llama_model_ram_queue_nodes {
++    static_assert(std::is_pointer<Pointer>::value, "RAM queue entries must be pointers");
++public:
++    using queue = std::list<Pointer, Allocator>;
++    using iterator = typename queue::iterator;
++
++    explicit llama_model_ram_queue_nodes(size_t maximum, const Allocator & allocator = Allocator()) :
++        recycled(allocator), maximum(maximum) {}
++
++    llama_model_ram_queue_nodes(const llama_model_ram_queue_nodes &) = delete;
++    llama_model_ram_queue_nodes & operator=(const llama_model_ram_queue_nodes &) = delete;
++
++    iterator append(queue & target, Pointer value) {
++        assert(target.get_allocator() == recycled.get_allocator());
++        if (!recycled.empty()) {
++            auto node = recycled.begin();
++            *node = value;
++            target.splice(target.end(), recycled, node);
++            return node;
++        }
++        if (allocated == maximum) {
++            throw std::length_error("MoE RAM cache: queue node limit exceeded");
++        }
++        target.push_back(value);
++        ++allocated;
++        return --target.end();
++    }
++
++    void recycle(queue & source, iterator first, iterator last) noexcept {
++        assert(source.get_allocator() == recycled.get_allocator());
++        recycled.splice(recycled.end(), source, first, last);
++    }
++
++    void recycle(queue & source) noexcept {
++        assert(source.get_allocator() == recycled.get_allocator());
++        recycled.splice(recycled.end(), source);
++    }
++
++    size_t allocated_nodes() const { return allocated; }
++    size_t recycled_nodes() const { return recycled.size(); }
++
++private:
++    queue recycled;
++    size_t maximum;
++    size_t allocated = 0;
++};
+diff --git a/tests/test-moe-ram-queue-nodes.cpp b/tests/test-moe-ram-queue-nodes.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-moe-ram-queue-nodes.cpp
+@@ -0,0 +1,164 @@
++#include "../src/llama-model-ram-queue-nodes.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <iterator>
++#include <memory>
++#include <new>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++struct allocation_state {
++    size_t allocations = 0, releases = 0, live = 0, peak = 0;
++    bool fail = false;
++};
++
++template <typename T>
++struct counting_allocator {
++    using value_type = T;
++    std::shared_ptr<allocation_state> state;
++    explicit counting_allocator(std::shared_ptr<allocation_state> state) : state(std::move(state)) {}
++    template <typename U> counting_allocator(const counting_allocator<U> & other) noexcept : state(other.state) {}
++    T * allocate(size_t count) {
++        if (state->fail) { throw std::bad_alloc(); }
++        T * result = std::allocator<T>().allocate(count);
++        state->allocations += count;
++        state->live += count;
++        state->peak = std::max(state->peak, state->live);
++        return result;
++    }
++    void deallocate(T * pointer, size_t count) noexcept {
++        state->releases += count;
++        state->live -= count;
++        std::allocator<T>().deallocate(pointer, count);
++    }
++    template <typename U> bool operator==(const counting_allocator<U> & other) const noexcept { return state == other.state; }
++    template <typename U> bool operator!=(const counting_allocator<U> & other) const noexcept { return !(*this == other); }
++};
++
++using pointer = const int *;
++using allocator = counting_allocator<pointer>;
++using pool = llama_model_ram_queue_nodes<pointer, allocator>;
++
++static void order_and_quota() {
++    auto state = std::make_shared<allocation_state>();
++    {
++        allocator allocation(state);
++        pool nodes(4, allocation);
++        pool::queue cold(allocation), hot(allocation), ready(allocation);
++        const size_t empty_queue_nodes = state->live; // Some standard libraries allocate list sentinels.
++        std::array<int, 8> pages{};
++        require(nodes.allocated_nodes() == 0, "queue pool eagerly allocated page nodes");
++        for (size_t i = 0; i < 4; ++i) { nodes.append(cold, &pages[i]); }
++        auto retained = std::next(cold.begin());
++        hot.splice(hot.end(), cold, retained);
++        auto reused = cold.begin();
++        nodes.recycle(cold, cold.begin(), std::next(cold.begin(), 2));
++        require(nodes.recycled_nodes() == 2 && cold.front() == &pages[3], "eviction range or survivor order changed");
++        nodes.append(ready, &pages[4]);
++        nodes.append(ready, &pages[5]);
++        cold.splice(cold.end(), ready);
++        require(*retained == &pages[1] && *reused == &pages[4], "splice changed stable active or recycled node identity");
++        require(std::vector<pointer>(cold.begin(), cold.end()) == std::vector<pointer>({&pages[3], &pages[4], &pages[5]}),
++                "recycling changed probation publication order");
++        const size_t allocated = state->allocations;
++        bool rejected = false;
++        try { nodes.append(ready, &pages[6]); } catch (const std::length_error &) { rejected = true; }
++        require(rejected && ready.empty() && nodes.allocated_nodes() == 4 && state->allocations == allocated,
++                "active plus inflight nodes bypassed the cap or mutated a rejected queue");
++        nodes.recycle(hot);
++        require(nodes.allocated_nodes() == 4 && nodes.recycled_nodes() == 1, "recycled node escaped total accounting");
++        nodes.append(ready, &pages[7]);
++        require(state->allocations == allocated && state->live == empty_queue_nodes + 4,
++                "a full pool allocated a node instead of reusing its reservation");
++    }
++    require(state->live == 0 && state->allocations == state->releases, "queue pool destruction leaked nodes");
++}
++
++static void failure_return() {
++    auto state = std::make_shared<allocation_state>();
++    {
++        allocator allocation(state);
++        pool nodes(8, allocation);
++        pool::queue ready(allocation), cold(allocation);
++        auto pages = std::make_unique<std::array<int, 8>>();
++        state->fail = true;
++        bool rejected = false;
++        try { nodes.append(ready, &(*pages)[0]); } catch (const std::bad_alloc &) { rejected = true; }
++        require(rejected && ready.empty() && nodes.allocated_nodes() == 0,
++                "allocation failure consumed a node reservation or partially appended");
++        state->fail = false;
++        nodes.append(ready, &(*pages)[0]);
++        nodes.append(ready, &(*pages)[1]);
++        state->fail = true;
++        rejected = false;
++        try { nodes.append(ready, &(*pages)[2]); } catch (const std::bad_alloc &) { rejected = true; }
++        require(rejected && ready.size() == 2 && nodes.allocated_nodes() == 2, "partial planning failure lost ready nodes");
++        nodes.recycle(ready); // Exception cleanup must not allocate.
++        const size_t allocated = state->allocations;
++        nodes.append(ready, &(*pages)[3]);
++        nodes.append(ready, &(*pages)[4]);
++        require(state->allocations == allocated && ready.size() == 2, "exception cleanup failed to recover reusable nodes");
++        cold.splice(cold.end(), ready);
++        nodes.recycle(cold);
++        pages.reset(); // Recycled dangling pointer values must never be dereferenced, even on destruction.
++    }
++    require(state->live == 0 && state->allocations == state->releases, "failure cleanup leaked queue nodes");
++}
++
++static void plateau() {
++    constexpr size_t capacity = 128, cycles = 1024;
++    std::array<int, capacity> pages{};
++    auto baseline_state = std::make_shared<allocation_state>();
++    auto pooled_state = std::make_shared<allocation_state>();
++    double baseline_ms = 0, pooled_ms = 0;
++    size_t baseline_new = 0, pooled_new = 0;
++    {
++        allocator baseline_allocation(baseline_state), pooled_allocation(pooled_state);
++        pool::queue baseline(baseline_allocation), cold(pooled_allocation), ready(pooled_allocation);
++        pool nodes(capacity, pooled_allocation);
++        for (const auto & page : pages) { baseline.push_back(&page); nodes.append(cold, &page); }
++        const size_t before_baseline = baseline_state->allocations, before_pool = pooled_state->allocations;
++        const auto begin_baseline = std::chrono::steady_clock::now();
++        for (size_t cycle = 0; cycle < cycles; ++cycle) {
++            baseline.clear();
++            for (const auto & page : pages) { baseline.push_back(&page); }
++        }
++        baseline_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin_baseline).count();
++        const auto begin_pool = std::chrono::steady_clock::now();
++        for (size_t cycle = 0; cycle < cycles; ++cycle) {
++            nodes.recycle(cold);
++            for (const auto & page : pages) { nodes.append(ready, &page); }
++            cold.splice(cold.end(), ready);
++        }
++        pooled_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin_pool).count();
++        baseline_new = baseline_state->allocations - before_baseline;
++        pooled_new = pooled_state->allocations - before_pool;
++        require(pooled_new == 0 && baseline_new == capacity * cycles, "queue allocations did not plateau after warmup");
++        require(nodes.allocated_nodes() == capacity && nodes.recycled_nodes() == 0 && cold.size() == capacity,
++                "cycling exceeded total node cap or lost an active node");
++        require(std::equal(cold.begin(), cold.end(), baseline.begin()), "recycled queue changed the exact page order");
++    }
++    require(baseline_state->live == 0 && pooled_state->live == 0, "plateau fixture leaked queue nodes");
++    std::printf("RAM_QUEUE_NODES capacity=%zu cycles=%zu baseline_new=%zu recycled_new=%zu baseline_ms=%.6f recycled_ms=%.6f persistent_page_nodes=%zu\n",
++        capacity, cycles, baseline_new, pooled_new, baseline_ms, pooled_ms, capacity);
++}
++
++int main() {
++    try {
++        order_and_quota();
++        failure_return();
++        plateau();
++        std::puts("PASS RAM queue nodes: lazy allocation, combined cap, exact order, stable iterators, failure recovery and allocation plateau");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-moe-ram-pool.cpp b/tests/test-moe-ram-pool.cpp
+--- a/tests/test-moe-ram-pool.cpp
++++ b/tests/test-moe-ram-pool.cpp
+@@ -368,20 +368,43 @@
+         one.get(); two.get();
+         {
+             auto guard=cache.acquire();
+-            cache.read(weights,size-budget,result.data(),budget);
+-            std::filesystem::resize_file(file.path,prefix);
+-            bool rejected=false;
+-            try { cache.copy_batch(backend.get(),{{weights,destination,0,0,page}}); }
+-            catch (const std::exception &) { rejected=true; }
+-            require(rejected, "truncated pooled transfer accepted");
+-            check_budget(cache.stats(guard));
+-            write_fixture();
+-            require(cache.copy_batch(backend.get(),{{weights,destination,0,0,page}}),
+-                    "pool or upload queue remained unusable after failed I/O");
+-            ggml_backend_synchronize(backend.get());
+-            ggml_backend_tensor_get(destination,result.data(),0,page);
+-            require(!memcmp(result.data(),raw.data()+prefix,page), "recovered pooled transfer changed bytes");
+-            check_budget(cache.stats(guard));
++            for (size_t attempt = 0; attempt < 8; ++attempt) {
++                cache.read(weights,size-budget,result.data(),budget);
++                std::filesystem::resize_file(file.path,prefix);
++                bool rejected=false;
++                try { cache.copy_batch(backend.get(),{{weights,destination,0,0,budget}}); }
++                catch (const std::exception &) { rejected=true; }
++                require(rejected, "truncated pooled transfer accepted");
++                check_budget(cache.stats(guard));
++                write_fixture();
++                require(cache.copy_batch(backend.get(),{{weights,destination,0,0,budget}}),
++                        "pool or upload queue remained unusable after failed I/O");
++                ggml_backend_synchronize(backend.get());
++                ggml_backend_tensor_get(destination,result.data(),0,budget);
++                require(!memcmp(result.data(),raw.data()+prefix,budget), "recovered pooled transfer changed bytes");
++                check_budget(cache.stats(guard));
++            }
++        }
++        {
++            ggml_context_ptr legacy_source(ggml_init({4 * ggml_tensor_overhead(), nullptr, true}));
++            require(legacy_source != nullptr, "cannot create nonpooled recovery context");
++            auto * legacy_weights = ggml_new_tensor_1d(legacy_source.get(), GGML_TYPE_I8, size);
++            llama_model_ram_cache legacy(budget, files, false);
++            legacy.bind(legacy_weights, 0, prefix);
++            auto guard = legacy.acquire();
++            for (size_t attempt = 0; attempt < 8; ++attempt) {
++                legacy.read(legacy_weights, size - budget, result.data(), budget);
++                std::filesystem::resize_file(file.path, prefix);
++                bool rejected = false;
++                try { legacy.read(legacy_weights, 0, result.data(), budget); }
++                catch (const std::exception &) { rejected = true; }
++                require(rejected, "truncated nonpooled queued read accepted");
++                check_budget(legacy.stats(guard));
++                write_fixture();
++                legacy.read(legacy_weights, 0, result.data(), budget);
++                require(!memcmp(result.data(), raw.data() + prefix, budget), "recovered nonpooled queued read changed bytes");
++                check_budget(legacy.stats(guard));
++            }
+         }
+         const auto final=cache.stats();
+         require(final.commit_us == filled.commit_us, "pool grew commitment after its slots were fully allocated");

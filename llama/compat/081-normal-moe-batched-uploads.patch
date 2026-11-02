@@ -1,0 +1,449 @@
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -5,6 +5,7 @@
+ #include "llama-expert-trace.h"
+ #include "llama-moe-partition.h"
+ #include "llama-moe-copy-plan.h"
++#include "llama-moe-cache-upload.h"
+ #include "llama-moe-work-batch.h"
+ #include "llama-moe-expert-plan.h"
+ #include "llama-moe-expert-graph.h"
+@@ -213,6 +214,7 @@
+         ggml_backend_buffer_type_t buft;
+         size_t host_bytes = 0; // host experts of the layers it caches
+         double split = 0.0;    // share of the budget
++        bool batch_uploads = false;
+ 
+         // banks and their views
+         ggml_context_ptr ctx;
+@@ -322,6 +324,9 @@
+                 auto & d = devices.emplace_back();
+                 d.backend = backends[i];
+                 d.buft    = bufts[i];
++                ggml_backend_dev_props props = {};
++                ggml_backend_dev_get_props(ggml_backend_get_device(d.backend), &props);
++                d.batch_uploads = props.caps.async && props.caps.host_buffer;
+             }
+         }
+         if (devices.empty()) {
+@@ -984,37 +989,11 @@
+             }
+         } guard { g.slru, fills, il };
+ 
+-        if (model.ram_cache && !fills.empty()) {
+-            std::vector<llama_model_ram_range> ranges;
+-            ranges.reserve(l.experts.size()*fills.size());
+-            for (const auto * w : l.experts) {
+-                for (const auto & fill : fills) {
+-                    ranges.push_back({ w, fill.expert*w->nb[2], w->nb[2] });
+-                }
+-            }
+-            model.ram_cache->prefetch(ranges);
+-        }
+-
+-        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+-        size_t bytes = 0;
+-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+-            const ggml_tensor * w    = l.experts[ip];
+-            ggml_tensor       * bank = g.banks[ip];
+-            const size_t expert_size = w->nb[2];
+-            for (size_t i = 0; i < fills.size();) {
+-                size_t n = 1;
+-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+-                    n++;
+-                }
+-                if (model.ram_cache && model.ram_cache->contains(w)) {
+-                    model.ram_cache->copy(backend, w, bank, fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+-                } else {
+-                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+-                }
+-                bytes += n*expert_size;
+-                i += n;
+-            }
+-        }
++        // Keep all selected gate/up/down pages pinned through one admitted
++        // upload batch. Its existing event handoff orders compute after every
++        // bank write; denial retains the quota-bounded per-run fallback.
++        const size_t bytes = llama_moe_upload_normal_cache(
++            backend, model.ram_cache.get(), devices[g.id].batch_uploads, l.experts, g.banks, fills);
+ 
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+diff --git a/src/llama-moe-cache-upload.h b/src/llama-moe-cache-upload.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-moe-cache-upload.h
+@@ -0,0 +1,81 @@
++#pragma once
++
++#include "llama-moe-copy-plan.h"
++
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++// Normal (whole-expert) GPU cache upload path. The caller owns the RAM-cache
++// compute lock and the slot-map rollback guard until every upload is scheduled.
++// A successful batch hands off to the backend compute stream before publishing
++// its slot map. A quota/placement denial performs no uploads and keeps the
++// established prefetch + synchronous managed-copy fallback. Backend capability
++// admission is cached by the owning device, never queried on this hot path.
++template<typename Fill>
++size_t llama_moe_upload_normal_cache(
++        ggml_backend_t backend, llama_model_ram_cache * ram, bool allow_batch,
++        const std::vector<ggml_tensor *> & weights,
++        const std::vector<ggml_tensor *> & banks,
++        const std::vector<Fill> & fills) {
++    if (weights.size() != banks.size()) {
++        throw std::runtime_error("MoE cache: mismatched expert banks");
++    }
++    auto each_copy = [&](const auto & upload) {
++        for (size_t ip = 0; ip < weights.size(); ++ip) {
++            const auto * weight = weights[ip];
++            const size_t expert_size = weight->nb[2];
++            for (size_t i = 0; i < fills.size();) {
++                size_t n = 1;
++                while (i + n < fills.size() &&
++                       fills[i + n].expert == fills[i].expert + (int32_t) n &&
++                       fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                    ++n;
++                }
++                upload(llama_model_ram_copy { weight, banks[ip], fills[i].expert*expert_size,
++                    fills[i].slot*expert_size, n*expert_size });
++                i += n;
++            }
++        }
++    };
++    size_t bytes = 0;
++    if (ram && !fills.empty()) {
++        if (weights.size() > std::numeric_limits<size_t>::max()/fills.size()) {
++            throw std::runtime_error("MoE cache: expert upload plan overflow");
++        }
++        if (allow_batch) {
++            // No additional weight pages, pinned ring or device bank. Backends
++            // without async host staging skip this descriptor vector entirely.
++            std::vector<llama_model_ram_copy> copies;
++            copies.reserve(weights.size()*fills.size());
++            each_copy([&](const llama_model_ram_copy & copy) { llama_moe_append_copy(copies, copy); });
++            if (ram->copy_batch(backend, copies)) {
++                for (const auto & copy : copies) { bytes += copy.size; }
++                return bytes;
++            }
++        }
++
++        // Admission may reject a union larger than the existing RAM budget or
++        // containing an unmanaged source. Preserve the original fallback and
++        // let each managed copy process its own bounded chunks.
++        std::vector<llama_model_ram_range> ranges;
++        ranges.reserve(weights.size()*fills.size());
++        for (const auto * weight : weights) {
++            for (const auto & fill : fills) {
++                ranges.push_back({weight, fill.expert*weight->nb[2], weight->nb[2]});
++            }
++        }
++        ram->prefetch(ranges);
++    }
++    each_copy([&](const llama_model_ram_copy & copy) {
++        if (ram && ram->contains(copy.src)) {
++            ram->copy(backend, copy.src, copy.dst, copy.src_offset, copy.dst_offset, copy.size);
++        } else {
++            ggml_backend_tensor_set_async(backend, copy.dst,
++                static_cast<const uint8_t *>(copy.src->data) + copy.src_offset,
++                copy.dst_offset, copy.size);
++        }
++        bytes += copy.size;
++    });
++    return bytes;
++}
+diff --git a/tests/test-moe-normal-upload.cpp b/tests/test-moe-normal-upload.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-moe-normal-upload.cpp
+@@ -0,0 +1,286 @@
++#include "../src/llama-moe-cache-upload.h"
++#include "llama.h"
++#include "ggml-cpp.h"
++#include "llama-cpp.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++constexpr size_t page = 65536, experts = 8, planes = 3, plane_bytes = experts*page;
++struct fill { int32_t expert, slot; };
++const std::vector<fill> selection {{0,1},{1,2},{4,4},{7,6}};
++void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++struct fixture {
++    std::filesystem::path path;
++    std::vector<uint8_t> bytes;
++    explicit fixture(const std::filesystem::path & directory) :
++        path(directory/("moe-normal-upload-"+std::to_string(std::random_device{}())+".bin")),
++        bytes(31+planes*(plane_bytes+17)) {
++        for (size_t i=0; i<bytes.size(); ++i) { bytes[i]=uint8_t(i*29+i/127); }
++        write();
++    }
++    void write() {
++        std::ofstream output(path,std::ios::binary|std::ios::trunc);
++        output.write(reinterpret_cast<const char *>(bytes.data()),bytes.size());
++        require(output.good(),"cannot write synthetic expert fixture");
++    }
++    ~fixture() { std::error_code ec; std::filesystem::remove(path,ec); }
++};
++struct tensors {
++    llama_files files;
++    ggml_context_ptr source_ctx, target_ctx;
++    ggml_backend_buffer_ptr targets;
++    std::vector<ggml_tensor *> weights, banks;
++    llama_model_ram_cache cache;
++    tensors(ggml_backend_t backend, const fixture & file, size_t quota, bool mixed=false) :
++        files(open(file.path)),
++        source_ctx(ggml_init({planes*ggml_tensor_overhead(),nullptr,true})),
++        target_ctx(ggml_init({planes*ggml_tensor_overhead(),nullptr,true})),
++        cache(quota,files) {
++        require(source_ctx && target_ctx,"test metadata allocation failed");
++        for (size_t i=0; i<planes; ++i) {
++            auto * weight=ggml_new_tensor_3d(source_ctx.get(),GGML_TYPE_I8,256,page/256,experts);
++            auto * bank=ggml_new_tensor_3d(target_ctx.get(),GGML_TYPE_I8,256,page/256,experts+1);
++            weights.push_back(weight); banks.push_back(bank);
++            if (mixed && i+1==planes) {
++                weight->data=const_cast<uint8_t *>(file.bytes.data()+31+i*(plane_bytes+17));
++            } else { cache.bind(weight,0,31+i*(plane_bytes+17)); }
++        }
++        targets.reset(ggml_backend_alloc_ctx_tensors(target_ctx.get(),backend));
++        require(targets!=nullptr,"test GPU/CPU bank allocation failed");
++        ggml_backend_buffer_clear(targets.get(),0xa5);
++        cache.set_diagnostics(true);
++    }
++    static llama_files open(const std::filesystem::path & path) {
++        llama_files files;
++        files.emplace_back(new llama_file(path.string().c_str(),"rb"));
++        return files;
++    }
++    void verify(const fixture & file) const {
++        std::vector<uint8_t> expected((experts+1)*page,0xa5),actual(expected.size());
++        for (size_t ip=0; ip<planes; ++ip) {
++            std::fill(expected.begin(),expected.end(),0xa5);
++            for (const auto & fill:selection) {
++                std::memcpy(expected.data()+fill.slot*page,
++                    file.bytes.data()+31+ip*(plane_bytes+17)+fill.expert*page,page);
++            }
++            ggml_backend_tensor_get(banks[ip],actual.data(),0,actual.size());
++            require(actual==expected,"normal-cache upload changed expert bytes or an unrequested bank slot");
++        }
++    }
++    void untouched() const {
++        std::vector<uint8_t> actual((experts+1)*page);
++        for (auto * bank:banks) {
++            ggml_backend_tensor_get(bank,actual.data(),0,actual.size());
++            require(std::all_of(actual.begin(),actual.end(),[](uint8_t x){return x==0xa5;}),
++                "denied batch uploaded a managed prefix before fallback");
++        }
++    }
++};
++
++// Original normal-cache transfer order, retained only as an independent
++// comparison in this operator test. Production always uses the admitted path.
++size_t legacy(ggml_backend_t backend,tensors & t) {
++    std::vector<llama_model_ram_range> ranges;
++    for (auto * weight:t.weights) {
++        for (const auto & fill:selection) { ranges.push_back({weight,fill.expert*page,page}); }
++    }
++    t.cache.prefetch(ranges);
++    size_t bytes=0;
++    for (size_t ip=0; ip<planes; ++ip) {
++        for (size_t i=0; i<selection.size();) {
++            size_t n=1;
++            while (i+n<selection.size() && selection[i+n].expert==selection[i].expert+int32_t(n) &&
++                   selection[i+n].slot==selection[i].slot+int32_t(n)) { ++n; }
++            t.cache.copy(backend,t.weights[ip],t.banks[ip],selection[i].expert*page,selection[i].slot*page,n*page);
++            bytes+=n*page; i+=n;
++        }
++    }
++    return bytes;
++}
++struct measured { uint64_t syncs=0, reads=0, calls=0; size_t peak=0; double warm_ms=0; };
++measured transfer(ggml_backend_t backend,const fixture & file,bool batched,bool gpu,bool allow_batch=true) {
++    constexpr size_t quota=1024*1024;
++    tensors t(backend,file,quota);
++    auto lock=t.cache.acquire();
++    auto copy=[&] {
++        const size_t bytes=batched ? llama_moe_upload_normal_cache(backend,&t.cache,allow_batch,t.weights,t.banks,selection) : legacy(backend,t);
++        require(bytes==planes*selection.size()*page,"normal-cache byte accounting changed");
++        ggml_backend_synchronize(backend);
++    };
++    copy();
++    t.verify(file);
++    const auto cold=t.cache.stats(lock);
++    const auto start=std::chrono::steady_clock::now();
++    copy();
++    const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
++    const auto warm=t.cache.stats(lock);
++    t.verify(file);
++    require(warm.bytes_read==cold.bytes_read,"admitted warm normal-cache upload reread SSD pages");
++    require(warm.peak<=quota && warm.resident<=quota,"normal-cache upload exceeded its existing weight RAM quota");
++    require(warm.h2d_bytes-cold.h2d_bytes==(gpu ? planes*selection.size()*page : 0),"normal-cache H2D bytes changed");
++    return {warm.h2d_sync_calls-cold.h2d_sync_calls,cold.read_calls,
++        warm.h2d_calls-cold.h2d_calls,warm.peak,elapsed};
++}
++void fallback(ggml_backend_t backend,const fixture & file,bool mixed) {
++    const size_t quota=mixed ? 1024*1024 : 2*page;
++    tensors t(backend,file,quota,mixed);
++    std::vector<llama_model_ram_copy> copies;
++    for (size_t ip=0; ip<planes; ++ip) {
++        for (const auto & fill:selection) { copies.push_back({t.weights[ip],t.banks[ip],fill.expert*page,fill.slot*page,page}); }
++    }
++    auto lock=t.cache.acquire();
++    const auto before=t.cache.stats(lock);
++    require(!t.cache.copy_batch(backend,copies),"ineligible union unexpectedly admitted");
++    ggml_backend_synchronize(backend);
++    t.untouched();
++    const auto denied=t.cache.stats(lock);
++    require(denied.h2d_bytes==before.h2d_bytes && denied.bytes_read==before.bytes_read,
++        "denied batch performed I/O or uploaded a partial prefix");
++    require(llama_moe_upload_normal_cache(backend,&t.cache,true,t.weights,t.banks,selection)==planes*selection.size()*page,
++        "fallback byte accounting changed");
++    ggml_backend_synchronize(backend);
++    t.verify(file);
++    require(t.cache.stats(lock).peak<=quota,"normal-cache fallback exceeded RAM quota");
++}
++void validation_failure(ggml_backend_t backend,const fixture & file) {
++    tensors t(backend,file,1024*1024);
++    auto lock=t.cache.acquire();
++    const auto size=t.banks[1]->ne[2];
++    t.banks[1]->ne[2]=1; // a valid first plane precedes this invalid destination
++    bool failed=false,published=false;
++    try {
++        llama_moe_upload_normal_cache(backend,&t.cache,true,t.weights,t.banks,selection);
++        published=true;
++    } catch (const std::runtime_error &) { failed=true; }
++    t.banks[1]->ne[2]=size;
++    require(failed && !published,"invalid later normal-cache plane reached publication");
++    ggml_backend_synchronize(backend);
++    t.untouched();
++    require(t.cache.stats(lock).bytes_read==0,"invalid later plane caused an earlier read");
++}
++void read_failure(ggml_backend_t backend,fixture & file,bool gpu) {
++    {
++        tensors t(backend,file,1024*1024);
++        std::filesystem::resize_file(file.path,31+page);
++        auto lock=t.cache.acquire();
++        bool failed=false,published=false;
++        try {
++            llama_moe_upload_normal_cache(backend,&t.cache,true,t.weights,t.banks,selection);
++            published=true; // matches the production publish-after-upload order
++        } catch (const std::runtime_error &) { failed=true; }
++        require(failed && !published,"failed normal-cache read reached slot-map publication");
++        // Nonpooled normal-cache staging reads all pages before its first H2D.
++        ggml_backend_synchronize(backend);
++        t.untouched();
++        require(t.cache.stats(lock).peak<=1024*1024,"failed upload exceeded quota");
++    }
++    file.write();
++    // A subsequent independent cache remains usable after the failed reader.
++    transfer(backend,file,true,gpu);
++}
++
++struct model_result { std::vector<float> logits; llama_gpu_execution_stats cache {}; llama_moe_io_stats io {}; };
++model_result evaluate(const char * path,bool bounded) {
++    require(std::filesystem::file_size(path)<=32*1024*1024,"only small synthetic MoE fixtures are allowed");
++    auto mp=llama_model_default_params();
++    mp.n_gpu_layers=99; mp.load_mode=LLAMA_LOAD_MODE_MMAP;
++    mp.no_host=true; mp.use_extra_bufts=false; mp.gpu_exclusive=false;
++    mp.gpu_vram_limit_mib=128;
++    mp.moe_ram_limit=bounded ? 4*1024*1024 : 0;
++    const llama_model_tensor_buft_override overrides[] {
++        {".*ffn_(gate|up|down|gate_up)_exps.*",ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))},
++        {nullptr,nullptr}};
++    mp.tensor_buft_overrides=overrides;
++    llama_model_ptr model(llama_model_load_from_file(path,mp));
++    require(model!=nullptr,"cannot load tiny normal-cache MoE fixture");
++    auto cp=llama_context_default_params();
++    cp.n_ctx=128; cp.n_batch=8; cp.n_ubatch=8; cp.n_seq_max=1;
++    cp.n_threads=2; cp.n_threads_batch=2; cp.moe_cache_size=1024*1024;
++    llama_context_ptr ctx(llama_init_from_model(model.get(),cp));
++    require(ctx!=nullptr,"cannot create tiny normal-cache MoE context");
++    model_result result;
++    const int vocab=llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++    for (int step=0; step<24; ++step) {
++        llama_token token=50+(step*17)%150;
++        auto batch=llama_batch_get_one(&token,1);
++        require(llama_decode(ctx.get(),batch)==0,"tiny normal-cache decode failed");
++        const auto * logits=llama_get_logits_ith(ctx.get(),-1);
++        require(logits!=nullptr,"tiny normal-cache decode has no logits");
++        result.logits.insert(result.logits.end(),logits,logits+vocab);
++    }
++    require(llama_gpu_execution_stats_get(ctx.get(),&result.cache),"normal-cache stats unavailable");
++    require(result.cache.vram_cache_misses>0,"tiny test did not exercise the normal GPU expert-cache route");
++    if (bounded) {
++        require(llama_model_get_moe_io_stats(model.get(),&result.io),"bounded normal-cache I/O stats unavailable");
++        require(result.io.ram_peak_bytes<=4*1024*1024 && result.io.h2d_bytes>0 && result.io.ssd_reads>0,
++            "tiny normal-cache route bypassed bounded reads/uploads or exceeded quota");
++    }
++    return result;
++}
++void model_check(const char * path) {
++    const auto resident=evaluate(path,false),bounded=evaluate(path,true);
++    require(resident.logits.size()==bounded.logits.size(),"normal-cache output count differs");
++    float maximum=0;
++    for (size_t i=0; i<resident.logits.size(); ++i) {
++        const float a=resident.logits[i],b=bounded.logits[i],error=std::abs(a-b);
++        maximum=std::max(maximum,error);
++        require(std::isfinite(a) && std::isfinite(b) && error<=1e-6f*std::max(1.0f,std::abs(a)),
++            "normal-cache bounded upload changed model logits");
++    }
++    std::printf("PASS tiny NORMAL MoE route: %zu logits, max error %.9g, %llu misses, %llu H2D syncs, RAM peak %llu bytes\n",
++        bounded.logits.size(),maximum,(unsigned long long)bounded.cache.vram_cache_misses,
++        (unsigned long long)bounded.io.h2d_sync_calls,(unsigned long long)bounded.io.ram_peak_bytes);
++}
++}
++int main(int argc,char ** argv) {
++    try {
++        require(argc>=2,"usage: test-moe-normal-upload DIRECTORY [--gpu] [--model tiny.gguf]");
++        bool gpu=false; const char * model=nullptr;
++        for (int i=2; i<argc; ++i) {
++            const std::string arg=argv[i];
++            if (arg=="--gpu") { gpu=true; }
++            else if (arg=="--model" && i+1<argc) { model=argv[++i]; }
++            else { throw std::runtime_error("unknown normal-cache test argument"); }
++        }
++        require(!model || gpu,"the actual tiny normal-cache MoE route requires --gpu");
++        std::filesystem::create_directories(argv[1]);
++        ggml_backend_load_all(); llama_backend_init();
++        ggml_backend_ptr backend(ggml_backend_init_by_type(gpu ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU,nullptr));
++        if (gpu && !backend) { std::fprintf(stderr,"SKIP: no GPU backend\n"); return 77; }
++        require(backend!=nullptr,"test backend unavailable");
++        fixture file(argv[1]);
++        const auto old=transfer(backend.get(),file,false,gpu),batch=transfer(backend.get(),file,true,gpu);
++        const auto disabled=transfer(backend.get(),file,true,gpu,false);
++        require(disabled.syncs==old.syncs && disabled.reads==old.reads && disabled.calls==old.calls && disabled.peak==old.peak,
++            "capability-disabled normal upload changed legacy fences, reads, calls or weight RAM");
++        require(batch.peak==old.peak,"batched normal cache changed managed weight residency");
++        require(batch.reads==old.reads,"batched normal cache changed cold SSD read requests");
++        if (gpu) {
++            require(batch.syncs<old.syncs && batch.syncs<=1,"normal-cache batch did not remove per-run device fences");
++            require(batch.calls<=old.calls,"normal-cache batching increased upload calls");
++        }
++        fallback(backend.get(),file,false); fallback(backend.get(),file,true);
++        validation_failure(backend.get(),file);
++        read_failure(backend.get(),file,gpu);
++        if (model) { backend.reset(); model_check(model); }
++        std::printf("PASS %s NORMAL upload: exact bytes/guard slots, warm SSD reuse, quota/mixed-source denial, read failure, "
++            "capability-disabled legacy parity; H2D syncs %llu -> %llu",
++            gpu ? "CUDA" : "CPU",(unsigned long long)old.syncs,(unsigned long long)batch.syncs);
++        if (gpu) { std::printf("; synthetic warm copy %.4f -> %.4f ms (not model TPS)\n",old.warm_ms,batch.warm_ms); }
++        else { std::printf(" (CPU correctness only; production capability gate is disabled)\n"); }
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}

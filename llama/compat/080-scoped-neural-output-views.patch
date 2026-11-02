@@ -1,0 +1,754 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -815,6 +815,16 @@
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+     llama_synchronize(ctx);
+     return common_sampler_sample_synchronized(gsmpl, ctx, idx, grammar_first);
++}
++
++bool common_sampler_draft_host_only(const common_sampler * gsmpl) {
++    return gsmpl && !gsmpl->grmr && !gsmpl->rbudget && !gsmpl->params.reasoning_control &&
++        llama_sampler_draft_host_only(gsmpl->chain);
++}
++
++llama_token common_sampler_sample_draft_synchronized(common_sampler * gsmpl, llama_context * ctx, int idx) {
++    GGML_ASSERT(common_sampler_draft_host_only(gsmpl));
++    return common_sampler_sample_synchronized(gsmpl, ctx, idx, true);
+ }
+ 
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+diff --git a/common/sampling.h b/common/sampling.h
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -84,6 +84,12 @@
+ //
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+ 
++// Internal neural-draft contract: the caller already fenced this output
++// generation and will not submit/mutate the context while consuming it.
++// Custom samplers/controllers must retain common_sampler_sample instead.
++bool common_sampler_draft_host_only(const common_sampler * gsmpl);
++llama_token common_sampler_sample_draft_synchronized(common_sampler * gsmpl, llama_context * ctx, int idx);
++
+ // generalized version of common_sampler_sample
+ //
+ // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
+diff --git a/common/speculative-output.h b/common/speculative-output.h
+new file mode 100644
+--- /dev/null
++++ b/common/speculative-output.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include "sampling.h"
++#include "../src/llama-ext.h"
++
++// One completed neural forward, consumed by builtin host-only draft samplers.
++// Create after the submitted hook and destroy before the next context mutation
++// or submit. It never caches readiness across generations or changes public
++// getter synchronization, and it owns no tensor/staging storage.
++class common_speculative_output {
++    llama_context * context;
++    bool completed = false;
++    bool supported = true;
++
++    void complete() {
++        if (!completed) { llama_synchronize(context); completed = true; }
++    }
++
++public:
++    explicit common_speculative_output(llama_context * context) : context(context) {}
++    common_speculative_output(const common_speculative_output &) = delete;
++    common_speculative_output & operator=(const common_speculative_output &) = delete;
++
++    llama_token sample(common_sampler * sampler, int32_t index) {
++        if (!supported || !common_sampler_draft_host_only(sampler)) {
++            // Custom apply/accept can submit arbitrary work. Never carry its
++            // synchronization assumption into another sampled row or getter.
++            completed = false;
++            supported = false;
++            return common_sampler_sample(sampler, context, index, true);
++        }
++        complete();
++        return common_sampler_sample_draft_synchronized(sampler, context, index);
++    }
++
++    const float * nextn(int32_t index) {
++        if (!supported) { return llama_get_embeddings_nextn_ith(context, index); }
++        complete();
++        return llama_get_embeddings_nextn_ith_synchronized(context, index);
++    }
++
++    const float * nextn() {
++        if (!supported) { return llama_get_embeddings_nextn(context); }
++        complete();
++        return llama_get_embeddings_nextn_synchronized(context);
++    }
++};
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2,6 +2,7 @@
+ #include "mtp-state.h"
+ #include "mtp-device-state.h"
+ #include "speculative-input.h"
++#include "speculative-output.h"
+ #include <cstdlib>
+ 
+ #include "common.h"
+@@ -419,59 +420,62 @@
+         int i = 0;
+ 
+         while (n_drafting > 0) {
+-            int i_batch = 0;
+-
+-            batch.clear();
+-
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                if (!drafting[seq_id]) {
+-                    continue;
+-                }
+-
+-                auto * smpl = smpls[seq_id].get();
+-
+-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_batch, true);
+-                ++i_batch;
+-
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+-
+-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+-                }
+-
+-                // add drafted token for each sequence
+-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+-
+-                // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
+-                    drafting[seq_id] = false;
+-                    n_drafting--;
+-
+-                    continue;
+-                }
+-
+-                common_sampler_accept(smpl, id, true);
+-
+-                auto & dp = dparams.at(seq_id);
+-                auto & result = *dp.result;
+-
+-                result.push_back(id);
+-
+-                if (dp.result_q) {
+-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+-                }
+-
+-                if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
+-                    llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+-                    drafting[seq_id] = false;
+-                    n_drafting--;
+-                    continue;
+-                }
+-
+-                batch.add(id, dp.pos0 + i + 1, seq_id, true);
+-            }
++            {
++                common_speculative_output outputs(ctx_dft);
++                int i_batch = 0;
++
++                batch.clear();
++
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (!drafting[seq_id]) {
++                        continue;
++                    }
++
++                    auto * smpl = smpls[seq_id].get();
++
++                    const llama_token id_sampled = outputs.sample(smpl, i_batch);
++                    ++i_batch;
++
++                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
++
++                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
++                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
++                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
++                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
++                    }
++
++                    // add drafted token for each sequence
++                    const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
++
++                    // only collect very high-confidence draft tokens
++                    if (cur_p->data[0].p < params.p_min) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
++
++                        continue;
++                    }
++
++                    common_sampler_accept(smpl, id, true);
++
++                    auto & dp = dparams.at(seq_id);
++                    auto & result = *dp.result;
++
++                    result.push_back(id);
++
++                    if (dp.result_q) {
++                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
++                    }
++
++                    if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
++                        llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        continue;
++                    }
++
++                    batch.add(id, dp.pos0 + i + 1, seq_id, true);
++                }
++            } // completed output scope ends before the next decode
+ 
+             if (batch.size() == 0) {
+                 break;
+@@ -874,59 +878,62 @@
+         int i = 0;
+ 
+         while (n_drafting > 0) {
+-            int i_batch = 0;
+-
+-            batch.clear();
+-
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                if (!drafting[seq_id]) {
+-                    continue;
+-                }
+-
+-                auto * smpl = smpls[seq_id].get();
+-
+-                common_sampler_sample(smpl, ctx_dft, i_batch, true);
+-                const int32_t sampled_batch = i_batch;
+-                ++i_batch;
+-
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+-
+-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+-                }
+-
+-                const llama_token id = cur_p->data[0].id;
+-
+-                // only collect very high-confidence draft tokens
+-                // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
+-                if (cur_p->data[0].p < params.p_min) {
+-                    drafting[seq_id] = false;
+-                    n_drafting--;
+-
+-                    continue;
+-                }
+-
+-                common_sampler_accept(smpl, id, true);
+-
+-                auto & dp = dparams.at(seq_id);
+-                auto & result = *dp.result;
+-
+-                result.push_back(id);
+-
+-                if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
+-                    llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+-                    drafting[seq_id] = false;
+-                    n_drafting--;
+-                    continue;
+-                }
+-
+-                // Read the next-step state only when another forward pass is actually needed.
+-                const float * prenorm = llama_get_embeddings_nextn_ith(ctx_dft, sampled_batch);
+-                const int32_t idx = batch.add(id, pending_pos_last[seq_id] + (i + 1), seq_id, true);
+-                batch.set_embd(idx, { prenorm, 1, (size_t) n_embd_dec });
+-            }
++            {
++                common_speculative_output outputs(ctx_dft);
++                int i_batch = 0;
++
++                batch.clear();
++
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (!drafting[seq_id]) {
++                        continue;
++                    }
++
++                    auto * smpl = smpls[seq_id].get();
++
++                    outputs.sample(smpl, i_batch);
++                    const int32_t sampled_batch = i_batch;
++                    ++i_batch;
++
++                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
++
++                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
++                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
++                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
++                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
++                    }
++
++                    const llama_token id = cur_p->data[0].id;
++
++                    // only collect very high-confidence draft tokens
++                    // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
++                    if (cur_p->data[0].p < params.p_min) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
++
++                        continue;
++                    }
++
++                    common_sampler_accept(smpl, id, true);
++
++                    auto & dp = dparams.at(seq_id);
++                    auto & result = *dp.result;
++
++                    result.push_back(id);
++
++                    if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
++                        llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        continue;
++                    }
++
++                    // Read the next-step state only when another forward pass is actually needed.
++                    const float * prenorm = outputs.nextn(sampled_batch);
++                    const int32_t idx = batch.add(id, pending_pos_last[seq_id] + (i + 1), seq_id, true);
++                    batch.set_embd(idx, { prenorm, 1, (size_t) n_embd_dec });
++                }
++            } // completed output scope ends before the next decode
+ 
+             if (batch.size() == 0) {
+                 break;
+@@ -1362,6 +1369,7 @@
+             return;
+         }
+         submitted();
++        common_speculative_output outputs(ctx_dft);
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             if (i_block_beg[seq_id] < 0) {
+@@ -1378,7 +1386,7 @@
+ 
+             if (is_dflash2 || is_lilicorr) {
+                 // Both DFlash and LiliCorr greedily walk the candidate lattice.
+-                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
++                const float * lattice = outputs.nextn();
+                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+ 
+                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
+@@ -1457,7 +1465,7 @@
+ 
+             if (is_dspark) {
+                 // DSpark: read from the first draft slot, truncate below the confidence threshold
+-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
++                const float * conf = params.p_min > 0.0f ? outputs.nextn() : nullptr;
+                 // bonus-anchor drafts read the mask positions only, like DFlash
+                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+@@ -1467,7 +1475,7 @@
+                         break;
+                     }
+ 
+-                    common_sampler_sample(smpl, ctx_dft, idx, true);
++                    outputs.sample(smpl, idx);
+ 
+                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
+ 
+@@ -1486,7 +1494,7 @@
+             } else {
+                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+                 for (int32_t i = 1; i < n_block_tokens; ++i) {
+-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
++                    outputs.sample(smpl, beg + i);
+ 
+                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
+ 
+@@ -1987,6 +1995,7 @@
+                 break;
+             }
+             submitted();
++            common_speculative_output outputs(ctx_dft);
+ 
+             // rebuild the batch for the next step: the growing-KV paths re-add only the
+             // new token (the KV already holds the prefix), while chained heads re-add the
+@@ -2001,7 +2010,7 @@
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
+-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                const llama_token id_sampled = outputs.sample(smpl, i_last[seq_id]);
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+ 
+@@ -2042,7 +2051,7 @@
+ 
+                 // Final proposals need no state download: the verifier supplies the accepted state.
+                 auto device_row = device_state_enabled ? llama_get_nextn_device_row(ctx_dft, i_last[seq_id]) : llama_nextn_device_row{};
+-                const float * h_row = device_row ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
++                const float * h_row = device_row ? nullptr : outputs.nextn(i_last[seq_id]);
+                 if (chain_heads) {
+                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
+                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1195,10 +1195,6 @@
+ 
+ const llama_cparams & llama_context::get_cparams() const {
+     return cparams;
+-}
+-
+-ggml_backend_sched_t llama_context::get_sched() const {
+-    return sched.get();
+ }
+ 
+ llama_moe_cache::statistics llama_context::get_moe_cache_stats() const {
+@@ -5706,6 +5702,14 @@
+     return ctx->get_embeddings_nextn_ith(i);
+ }
+ 
++float * llama_get_embeddings_nextn_ith_synchronized(llama_context * ctx, int32_t i) {
++    return ctx->get_embeddings_nextn_ith(i);
++}
++
++float * llama_get_embeddings_nextn_synchronized(llama_context * ctx) {
++    return ctx->get_embeddings_nextn();
++}
++
+ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -116,7 +116,7 @@
+     const llama_model   & get_model()   const;
+     const llama_cparams & get_cparams() const;
+ 
+-    ggml_backend_sched_t get_sched() const;
++    ggml_backend_sched_t get_sched() const { return sched.get(); }
+     ggml_backend_sched_gpu_stats get_gpu_sched_stats() const;
+ 
+     struct graph_variant_stats {
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -35,6 +35,10 @@
+ // It performs no synchronization. General callers must use the safe public
+ // llama_get_sampler_output_ith instead. Borrowed pointer lifetime is unchanged.
+ LLAMA_API llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i);
++// Same completed-generation borrowing contract. Device-backed lazy output
++// materialization still performs its required copy/completion when requested.
++LLAMA_API float * llama_get_embeddings_nextn_ith_synchronized(llama_context * ctx, int32_t i);
++LLAMA_API float * llama_get_embeddings_nextn_synchronized(llama_context * ctx);
+ // Read-only capability query after a completed decode. It permits a server to
+ // overlap CPU response formatting with the next ordinary known-token decode;
+ // it neither queues speculative work nor creates an autonomous token pipeline.
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -4774,6 +4774,19 @@
+     return !accept || accept == llama_sampler_empty_accept || accept == llama_sampler_dist_accept;
+ }
+ 
++bool llama_sampler_draft_host_only(const llama_sampler * sampler) {
++    if (!sampler || !sampler->iface) { return false; }
++    if (sampler->iface == &llama_sampler_chain_i) {
++        const auto & children = static_cast<const llama_sampler_chain *>(sampler->ctx)->samplers;
++        return !children.empty() && std::all_of(children.begin(), children.end(), [](const llama_sampler_chain::info & child) {
++            return llama_sampler_draft_host_only(child.ptr);
++        });
++    }
++    return sampler->iface == &llama_sampler_empty_i || sampler->iface == &llama_sampler_top_k_i ||
++        sampler->iface == &llama_sampler_temp_i || sampler->iface == &llama_sampler_temp_ext_i ||
++        sampler->iface == &llama_sampler_dist_i || sampler->iface == &llama_sampler_greedy_i;
++}
++
+ // Owned dynamic allowed-token bitset. Logical words/versions survive arena
+ // changes; only inp_words belongs to a particular graph.
+ struct llama_sampler_token_mask : llama_sampler_backend {
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -51,6 +51,9 @@
+ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+ // Accept handlers cannot inspect candidate storage or throw in this subset.
+ LLAMA_API bool llama_sampler_can_defer_candidates(const llama_sampler * sampler);
++// Exact builtins whose apply/accept only touch host data. This is deliberately
++// stricter than accept-only observers: a custom apply can submit backend work.
++LLAMA_API bool llama_sampler_draft_host_only(const llama_sampler * sampler);
+ // Set before registering the sampler with a context. This mode is for clients
+ // that will not inspect candidates/probabilities; it never changes sampling.
+ LLAMA_API bool llama_sampler_backend_set_selected_only(llama_sampler * sampler);
+diff --git a/tests/test-neural-output.cpp b/tests/test-neural-output.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-neural-output.cpp
+@@ -0,0 +1,257 @@
++// Nonzero model-free Qwen/MTP fixture; no trained weights or downloads.
++#define main neural_output_unused_mtp_main
++#include "test-mtp-state.cpp"
++#undef main
++#include "speculative-output.h"
++#include "../src/llama-context.h"
++#include "../src/llama-sampler.h"
++#include "../ggml/src/ggml-backend-impl.h"
++#include "ggml-cuda.h"
++#include <array>
++#include <chrono>
++
++// Instrument real scheduler backend synchronization only inside this fixture.
++// Production builds need no counter, dirty flag, callback or extra buffer.
++struct sync_counter {
++    using callback = decltype(((ggml_backend_t) nullptr)->iface.synchronize);
++    struct entry { ggml_backend_t backend; callback original; uint64_t count = 0; };
++    std::vector<entry> entries;
++    static sync_counter * active;
++    static void synchronize(ggml_backend_t backend) {
++        for (auto & entry : active->entries) {
++            if (entry.backend != backend) { continue; }
++            ++entry.count;
++            if (entry.original) { entry.original(backend); }
++            return;
++        }
++        throw std::runtime_error("unknown instrumented backend");
++    }
++    explicit sync_counter(llama_context * context) {
++        require(!active, "nested fixture synchronization observer");
++        auto * scheduler = context->get_sched();
++        const int count = ggml_backend_sched_get_n_backends(scheduler);
++        entries.reserve(count);
++        for (int i = 0; i < count; ++i) {
++            auto * backend = ggml_backend_sched_get_backend(scheduler, i);
++            entries.push_back({backend, backend->iface.synchronize});
++        }
++        active = this;
++        for (auto & entry : entries) { entry.backend->iface.synchronize = synchronize; }
++    }
++    ~sync_counter() {
++        for (auto & entry : entries) { entry.backend->iface.synchronize = entry.original; }
++        active = nullptr;
++    }
++    uint64_t count() const {
++        uint64_t total = 0;
++        for (const auto & entry : entries) { total += entry.count; }
++        return total;
++    }
++};
++sync_counter * sync_counter::active = nullptr;
++
++struct observed_row {
++    llama_token token;
++    std::vector<llama_token_data> candidates;
++    int64_t selected;
++    std::vector<float> hidden;
++};
++
++static std::vector<observed_row> read_rows(llama_context * context, common_sampler * sampler,
++        bool scoped, int rows, int hidden_rows) {
++    common_speculative_output output(context);
++    std::vector<observed_row> result;
++    result.reserve(rows);
++    for (int row = 0; row < rows; ++row) {
++        observed_row saved;
++        saved.token = scoped ? output.sample(sampler, row) : common_sampler_sample(sampler, context, row, true);
++        const auto * candidates = common_sampler_get_candidates(sampler, true);
++        saved.candidates.assign(candidates->data, candidates->data + candidates->size);
++        saved.selected = candidates->selected;
++        common_sampler_accept(sampler, saved.token, true);
++        if (row < hidden_rows) {
++            const auto * hidden = scoped ? output.nextn(row) : llama_get_embeddings_nextn_ith(context, row);
++            require(hidden != nullptr, "fixture hidden row missing");
++            saved.hidden.assign(hidden, hidden + 32);
++        }
++        result.push_back(std::move(saved));
++    }
++    return result;
++}
++
++static void equal(const std::vector<observed_row> & a, const std::vector<observed_row> & b) {
++    require(a.size() == b.size(), "output count changed");
++    for (size_t row = 0; row < a.size(); ++row) {
++        require(a[row].token == b[row].token && a[row].selected == b[row].selected &&
++            a[row].candidates.size() == b[row].candidates.size() && a[row].hidden.size() == b[row].hidden.size(),
++            "sampled token or candidate shape/index changed");
++        for (size_t i = 0; i < a[row].candidates.size(); ++i) {
++            const auto & x = a[row].candidates[i]; const auto & y = b[row].candidates[i];
++            require(x.id == y.id && !std::memcmp(&x.logit, &y.logit, sizeof(float)) &&
++                !std::memcmp(&x.p, &y.p, sizeof(float)), "candidate fields changed");
++        }
++        require(a[row].hidden.empty() || !std::memcmp(a[row].hidden.data(), b[row].hidden.data(), a[row].hidden.size()*sizeof(float)),
++            "NextN hidden values changed");
++    }
++}
++
++static common_sampler_ptr sampler(llama_model * model) {
++    common_params_sampling params;
++    params.samplers = {COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE};
++    params.top_k = 10; params.temp = .8f; params.seed = 12345; params.no_perf = true;
++    common_sampler_ptr result(common_sampler_init(model, params));
++    require(bool(result) && common_sampler_draft_host_only(result.get()), "builtin sampler not eligible");
++    return result;
++}
++
++static void decode_rows(llama_context * context, int salt = 0) {
++    llama_memory_clear(llama_get_memory(context), true);
++    common_batch batch(context);
++    for (int row = 0; row < 16; ++row) { batch.add(3 + (row + salt)%50, row, 0, true); }
++    require(llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "fixture decode failed");
++    llama_synchronize(context);
++}
++
++static void verify(llama_context * context, llama_model * model) {
++    decode_rows(context);
++    auto reference = sampler(model), candidate = sampler(model);
++    uint64_t old_calls = 0, new_calls = 0;
++    {
++        sync_counter counter(context);
++        const auto old = read_rows(context, reference.get(), false, 3, 2);
++        old_calls = counter.count();
++        const auto current = read_rows(context, candidate.get(), true, 3, 2);
++        new_calls = counter.count() - old_calls;
++        equal(old, current);
++        require(old_calls == 5*counter.entries.size() && new_calls == counter.entries.size(),
++            "neural step did not reduce five fences to one");
++        // Public getters keep their original completion boundary.
++        const auto before = counter.count();
++        require(llama_get_embeddings_nextn_ith(context, 0) != nullptr, "public NextN view missing");
++        require(counter.count() - before == counter.entries.size(), "public getter lost synchronization");
++    }
++    // Same subsequent RNG/history after the identical logical sample/accepts.
++    equal(read_rows(context, reference.get(), false, 16, 0), read_rows(context, candidate.get(), true, 16, 0));
++    decode_rows(context, 9);
++    // A new scope must fence the new generation, not retain the previous view.
++    {
++        sync_counter counter(context);
++        common_speculative_output output(context);
++        output.sample(candidate.get(), 0);
++        require(counter.count() == counter.entries.size(), "new generation reused an old completion assumption");
++    }
++
++    struct custom_state { unsigned calls = 0; } state;
++    llama_sampler_i iface{};
++    iface.name = [](const llama_sampler *) { return "top-k"; };
++    iface.apply = [](llama_sampler * s, llama_token_data_array *) { ++static_cast<custom_state *>(s->ctx)->calls; };
++    auto custom = sampler(model);
++    auto * unknown = llama_sampler_init(&iface, &state);
++    require(!llama_sampler_draft_host_only(unknown), "custom name impersonated a builtin");
++    llama_sampler_chain_add(common_sampler_get(custom.get()), unknown);
++    require(!common_sampler_draft_host_only(custom.get()), "custom chain admitted");
++    {
++        sync_counter counter(context);
++        common_speculative_output output(context);
++        output.sample(candidate.get(), 0);
++        output.sample(custom.get(), 1);
++        output.nextn(1);
++        output.sample(candidate.get(), 2);
++        require(counter.count() == 4*counter.entries.size() && state.calls == 1,
++            "custom sampler did not keep conservative public fences");
++    }
++    std::printf("NEURAL_OUTPUT exact=1 old_backend_fences=%llu scoped_backend_fences=%llu public_getter_fences=preserved custom_fallback=1\n",
++        (unsigned long long) old_calls, (unsigned long long) new_calls);
++}
++
++static void benchmark(llama_context * context, llama_model * model) {
++    decode_rows(context);
++    for (const int rows : {1, 3, 16}) {
++        const int hidden = rows == 1 ? 1 : rows == 3 ? 2 : 0;
++        auto reference = sampler(model), candidate = sampler(model);
++        std::array<std::vector<double>, 2> times;
++        for (int cycle = 0; cycle < 4; ++cycle) for (const bool scoped : {false, true, true, false}) {
++            const auto begin = std::chrono::steady_clock::now();
++            for (int repeat = 0; repeat < 16; ++repeat) {
++                read_rows(context, scoped ? candidate.get() : reference.get(), scoped, rows, hidden);
++            }
++            times[scoped].push_back(std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count()/16);
++        }
++        for (auto & control : times) { std::sort(control.begin(), control.end()); }
++        // Both controls consumed the same number of uniforms; check the next stream too.
++        equal(read_rows(context, reference.get(), false, 16, 0), read_rows(context, candidate.get(), true, 16, 0));
++        std::printf("NEURAL_OUTPUT_ABBA rows=%d hidden=%d baseline_fences=%d scoped_fences=1 baseline_us=%.6f scoped_us=%.6f exact_rng=1 inference_measured=0\n",
++            rows, hidden, rows+hidden, (times[0][3]+times[0][4])/2, (times[1][3]+times[1][4])/2);
++    }
++}
++
++static void lazy_device_hidden(llama_context * context, llama_model * model) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_MTP_DEVICE_STATE_MIB", "1") == 0, "cannot set fixture transport bound");
++#else
++    require(setenv("WILDLLAMA_MTP_DEVICE_STATE_MIB", "1", 1) == 0, "cannot set fixture transport bound");
++#endif
++    require(llama_set_nextn_device(context, true), "cannot enable tiny NextN device transport");
++    decode_rows(context, 17);
++    const auto row = llama_get_nextn_device_row(context, 1);
++    require(bool(row), "device transport did not retain its output row");
++    std::array<float, 32> expected{};
++    require(llama_nextn_device_read(row, expected.data()), "cannot read reference hidden row");
++    auto owner = llama_get_nextn_device_owner(context);
++    const auto before = owner->materialized_bytes;
++    auto selected = sampler(model);
++    {
++        common_speculative_output output(context);
++        output.sample(selected.get(), 1);
++        require(owner->materialized_bytes == before, "sampling eagerly downloaded device hidden state");
++        const auto * actual = output.nextn(1);
++        require(actual && !std::memcmp(actual, expected.data(), sizeof(expected)) && owner->materialized_bytes > before,
++            "synchronized view skipped required device materialization or changed hidden values");
++        const auto after = owner->materialized_bytes;
++        output.nextn(1);
++        require(owner->materialized_bytes == after, "warm hidden getter recopied device state");
++    }
++    require(llama_set_nextn_device(context, false), "cannot disable fixture device transport");
++    std::puts("PASS: lazy NextN transport remains lazy and performs required exact host materialization");
++}
++
++int main(int argc, char ** argv) {
++    try {
++        const bool gpu = argc > 1 && std::strcmp(argv[1], "--cuda") == 0;
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++        if (!gpu) { require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH) != nullptr, "cannot load CPU fixture backend"); }
++        else { ggml_backend_load_all(); }
++#else
++        ggml_backend_load_all();
++#endif
++        llama_backend_init();
++        if (gpu && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
++            std::puts("SKIP: CUDA required"); return 77;
++        }
++        {
++            auto model = tiny_model(gpu, 32, gpu ? 96 : 0);
++            auto params = llama_context_default_params();
++            params.n_ctx = 128; params.n_batch = params.n_ubatch = 64; params.n_rs_seq = 2;
++            params.n_outputs_max = params.n_outputs_max_per_seq = 16;
++            params.n_threads = params.n_threads_batch = 1;
++            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++            llama_context_ptr context(llama_init_from_model(model.get(), params));
++            require(bool(context), "cannot initialize neural output context");
++            llama_set_embeddings_nextn(context.get(), true, true);
++            verify(context.get(), model.get());
++            if (argc > 2 && std::strcmp(argv[2], "--bench") == 0) { benchmark(context.get(), model.get()); }
++            if (gpu) {
++                lazy_device_hidden(context.get(), model.get());
++                llama_gpu_memory_stats memory{};
++                require(llama_model_get_gpu_memory_stats(model.get(), &memory) && memory.enabled &&
++                    memory.limit_bytes == 96*1024*1024 && memory.managed_peak_bytes <= memory.limit_bytes,
++                    "small CUDA fixture exceeded managed96 MiB quota");
++                std::printf("NEURAL_OUTPUT_CUDA peak=%llu limit=%llu\n",
++                    (unsigned long long) memory.managed_peak_bytes, (unsigned long long) memory.limit_bytes);
++            }
++        }
++        llama_backend_free();
++        std::puts("PASS: scoped neural output fences, exact tokens/candidates/hidden/RNG and custom/public contracts");
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

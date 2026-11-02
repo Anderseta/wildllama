@@ -1612,6 +1612,7 @@ type llamaServerCompletionRequest struct {
 	Stream              bool            `json:"stream"`
 	CachePrompt         bool            `json:"cache_prompt"`
 	ReturnProgress      bool            `json:"return_progress,omitempty"`
+	ResponseFields      []string        `json:"response_fields,omitempty"`
 	NPredict            int             `json:"n_predict,omitempty"`
 	NKeep               int             `json:"n_keep,omitempty"`
 	Temperature         float32         `json:"temperature"`
@@ -1882,6 +1883,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		Stream:              true,
 		CachePrompt:         true,
 		ReturnProgress:      true,
+		ResponseFields:      []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress"},
 		NPredict:            req.Options.NumPredict,
 		NKeep:               req.Options.NumKeep,
 		Temperature:         req.Options.Temperature,

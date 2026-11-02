@@ -1,0 +1,290 @@
+{
+  "schema": 1,
+  "date": "2026-11-02",
+  "source_base": "76a63bf05f89963efc101363b48b9f8a4cc6f23b",
+  "native_base": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "platform": "Windows, RTX 5060 Ti; shared GPU",
+  "trained_models_tested": false,
+  "patches": [
+    {
+      "file": "079-demand-driven-response-fields.patch",
+      "sha256": "f2ebed1988016ee1ae376123ca3061e87b3a53a37172f2a0799f0a482abc1fb3"
+    },
+    {
+      "file": "080-scoped-neural-output-views.patch",
+      "sha256": "74c7cb0d00516dcea26d107c3fdeb442ff7c57b26120cdef8ee9dffeb046f9c3"
+    },
+    {
+      "file": "081-normal-moe-batched-uploads.patch",
+      "sha256": "d7919f4a94149aa0580711ec26fb2a3b374ea8416fc62a75535bdc114169121c"
+    },
+    {
+      "file": "082-recycled-ram-page-queue-nodes.patch",
+      "sha256": "adb9b8c82c52a7ee33769be19eb3bbafb35b6e003594c882de5e0c9572c58de1"
+    }
+  ],
+  "cpu": {
+    "device": "CPU only",
+    "cases": [
+      {
+        "case": "queue-nodes",
+        "target": "test-moe-ram-queue-nodes",
+        "args": [],
+        "exit": 0,
+        "seconds": 0.063
+      },
+      {
+        "case": "neural-cpu",
+        "target": "test-neural-output",
+        "args": [],
+        "exit": 0,
+        "seconds": 0.125
+      },
+      {
+        "case": "ram-pool",
+        "target": "test-moe-ram-pool",
+        "args": [
+          "$TASK\\fixtures\\ram-pool"
+        ],
+        "exit": 0,
+        "seconds": 1.329
+      },
+      {
+        "case": "ram-metrics",
+        "target": "test-moe-ram-metrics",
+        "args": [
+          "$TASK\\fixtures\\ram-metrics"
+        ],
+        "exit": 0,
+        "seconds": 0.484
+      },
+      {
+        "case": "read-plan",
+        "target": "test-moe-read-plan",
+        "args": [
+          "$TASK\\fixtures\\read-plan"
+        ],
+        "exit": 0,
+        "seconds": 0.203
+      },
+      {
+        "case": "copy-plan",
+        "target": "test-moe-copy-plan",
+        "args": [
+          "$TASK\\fixtures\\copy-plan"
+        ],
+        "exit": 0,
+        "seconds": 0.672
+      },
+      {
+        "case": "speculative-depth",
+        "target": "test-speculative-depth",
+        "args": [],
+        "exit": 0,
+        "seconds": 0.484
+      },
+      {
+        "case": "mtp-state",
+        "target": "test-mtp-state",
+        "args": [],
+        "exit": 0,
+        "seconds": 0.219
+      },
+      {
+        "case": "mtp-device-state",
+        "target": "test-mtp-device-state",
+        "args": [],
+        "exit": 0,
+        "seconds": 0.219
+      },
+      {
+        "case": "mtp-carry-state",
+        "target": "test-mtp-carry-state",
+        "args": [],
+        "exit": 0,
+        "seconds": 0.047
+      },
+      {
+        "case": "server-component",
+        "target": "test-server-component",
+        "args": [],
+        "exit": 0,
+        "seconds": 0.078
+      },
+      {
+        "case": "normal-moe-cpu",
+        "target": "test-moe-normal-upload",
+        "args": [
+          "$TASK\\fixtures\\normal-cpu"
+        ],
+        "exit": 0,
+        "seconds": 0.562
+      }
+    ]
+  },
+  "cuda": {
+    "device": "CUDA shared GPU",
+    "managed_model_test_caps_mib": [
+      96,
+      128
+    ],
+    "gpu_before": {
+      "used_mib": 12503,
+      "free_mib": 3550,
+      "utilization_percent": 11
+    },
+    "cases": [
+      {
+        "case": "neural-cuda",
+        "target": "test-neural-output",
+        "args": [
+          "--cuda",
+          "--bench"
+        ],
+        "exit": 0,
+        "seconds": 16.375
+      },
+      {
+        "case": "normal-moe-cuda",
+        "target": "test-moe-normal-upload",
+        "args": [
+          "$TASK\\fixtures\\normal-cuda",
+          "--gpu",
+          "--model",
+          "$FIXTURES/qwen3moe-q4.gguf"
+        ],
+        "exit": 0,
+        "seconds": 1.125
+      }
+    ]
+  },
+  "http_fields": {
+    "status": "passed",
+    "device": "CPU only",
+    "fixture_bytes": 7241024,
+    "synthetic_context_override": "llama.context_length=int:2048",
+    "equivalent_consumed_fields": true,
+    "default_and_explicit_prompt_preserved": true,
+    "cases": [
+      {
+        "stream": false,
+        "prompt_tokens": 1536,
+        "full_bytes": 11876,
+        "selected_bytes": 1243,
+        "saved_bytes": 10633
+      },
+      {
+        "stream": true,
+        "prompt_tokens": 1536,
+        "full_bytes": 12430,
+        "selected_bytes": 1785,
+        "saved_bytes": 10645
+      }
+    ]
+  },
+  "http_before_after": {
+    "status": "passed",
+    "cases_per_payload": 6,
+    "device": "CPU only",
+    "fixture_bytes": 28628288,
+    "trained_weights": false,
+    "gpu_overlap_activated": false,
+    "responses_equal": true
+  },
+  "go_tests": [
+    "TestCompletionResponseFieldsPreserveEveryConsumer",
+    "TestCompletionRequestsOnlyConsumedNativeFields"
+  ],
+  "go_status": "passed",
+  "neural_component_abba": [
+    {
+      "rows": 1,
+      "hidden": 1,
+      "baseline_fences": 2,
+      "scoped_fences": 1,
+      "baseline_us": 2.44375,
+      "scoped_us": 1.890625,
+      "exact_rng": 1,
+      "inference_measured": 0
+    },
+    {
+      "rows": 3,
+      "hidden": 2,
+      "baseline_fences": 5,
+      "scoped_fences": 1,
+      "baseline_us": 6.453125,
+      "scoped_us": 4.059375,
+      "exact_rng": 1,
+      "inference_measured": 0
+    },
+    {
+      "rows": 16,
+      "hidden": 0,
+      "baseline_fences": 16,
+      "scoped_fences": 1,
+      "baseline_us": 27.303125,
+      "scoped_us": 16.94375,
+      "exact_rng": 1,
+      "inference_measured": 0
+    }
+  ],
+  "neural_memory": {
+    "peak": 36759680,
+    "limit": 100663296
+  },
+  "queue_nodes_component": {
+    "capacity": 128,
+    "cycles": 1024,
+    "baseline_new": 131072,
+    "recycled_new": 0,
+    "baseline_ms": 7.7279,
+    "recycled_ms": 0.6019,
+    "persistent_page_nodes": 128
+  },
+  "normal_cache_public_model": {
+    "logits": 6216,
+    "maximum_absolute_error": 0.0,
+    "vram_cache_misses": 57,
+    "h2d_syncs": 46,
+    "weight_ram_peak_bytes": 1769472
+  },
+  "normal_copy_component": {
+    "legacy_syncs": 9,
+    "batched_syncs": 1,
+    "legacy_warm_ms": 1.2916,
+    "batched_warm_ms": 0.3175,
+    "bytes_and_untouched_slots_exact": true,
+    "cold_read_count_and_weight_peak_equal": true,
+    "capability_disabled_matches_legacy": true
+  },
+  "fixtures": [
+    {
+      "name": "llama-tied.gguf",
+      "bytes": 7241024,
+      "sha256": "54c98dcfc1377d106c91e202f738dbe4bd85228c505a8b9566b0177634dbb711"
+    },
+    {
+      "name": "llama-tied-wide.gguf",
+      "bytes": 28628288,
+      "sha256": "efd68eddb2424f2fc0c21a55024f6a3b1aa58b7758c9ff8b6cfeb9720cd3fea4"
+    },
+    {
+      "name": "qwen3moe-q4.gguf",
+      "bytes": 1433632,
+      "sha256": "90eb3c2b4777a18373486fe27751788f3aea394e7306fa9a46c85a44fb78a8b3"
+    }
+  ],
+  "patch_replay": {
+    "status": "passed",
+    "patches": 79,
+    "files": 218
+  },
+  "limits": [
+    "Component timings are not trained-model tokens per second or a comparison with SGLang.",
+    "Normal-cache batching requires async and host-buffer capabilities; other backends retain the original path.",
+    "The forced CPU transfer helper is correctness coverage, not a production CPU-inference speed claim.",
+    "No model weights, context, sampling settings, user profiles or memory budgets were changed.",
+    "No new device bank, pinned ring or KV allocation is introduced; recycled CPU metadata is bounded.",
+    "Windows/CUDA was tested; Linux, HIP and Metal were not runtime-tested."
+  ]
+}
