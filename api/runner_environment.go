@@ -39,7 +39,7 @@ func ParseRunnerEnvironment(value any) (map[string]string, error) {
 			choices = "|0|1"
 		case "WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP", "WILDLLAMA_MTP_DEVICE_STATE", "WILDLLAMA_KV_CACHE_PAGING":
 			choices = "|0|1"
-		case "WILDLLAMA_VERIFY_DEVICE_MIB":
+		case "WILDLLAMA_VERIFY_DEVICE_MIB", "WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB":
 			if value != "" {
 				if strings.Trim(value, "0123456789") != "" {
 					return nil, fmt.Errorf("runner_env %s must be an integer between 0 and 64", key)

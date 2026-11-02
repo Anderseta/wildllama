@@ -1,0 +1,709 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3007,6 +3007,7 @@
+ // initialization of the speculative decoding system
+ //
+ common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
++    llama_link_device_verification_resources(params.draft.ctx_tgt, params.draft.ctx_dft);
+     // Compute the implementations to use based on the config and their order of preference
+     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
+     {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -15,6 +15,8 @@
+ #include "llama-state-transfer.h"
+ #include "llama-memory.h"
+ #include "llama-kv-cache.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-recurrent.h"
+ #include <typeinfo>
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+@@ -36,6 +38,11 @@
+ //
+ // llama_context
+ //
++
++struct llama_device_verification_owner {
++    llama_context * context = nullptr;
++    std::weak_ptr<llama_device_verification_owner> child;
++};
+ 
+ // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
+ // without this check, an arch that skips the transform helpers loads and computes wrong results
+@@ -677,6 +684,14 @@
+ }
+ 
+ llama_context::~llama_context() {
++    if (device_verify_owner) { device_verify_owner->context = nullptr; }
++    if (auto parent = device_verify_parent.lock()) {
++        if (parent->context && parent->child.lock() == device_verify_owner) {
++            parent->context->release_device_verifier_local();
++            parent->context->device_verify_cooperative = false;
++            parent->child.reset();
++        }
++    }
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+     deferred_sampler_rows.clear();
+@@ -1437,7 +1452,9 @@
+ }
+ 
+ bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint32_t row_offset, uint32_t total_rows) {
+-    if (!device_verify_allowance || !device_verify_conventional_kv || row_offset || !total_rows || total_rows > llama_device_verification_policy::max_rows ||
++    if (!device_verify_allowance || device_verify_draft_child || !device_verify_preflight_known ||
++            (!device_verify_conventional_kv && !device_verify_cooperative) ||
++            row_offset || !total_rows || total_rows > llama_device_verification_policy::max_rows ||
+             result->t_sampled.size() != total_rows || result->t_sampled_logits.size() != total_rows ||
+             result->t_sampled_probs.size() != total_rows || result->t_candidates.size() != total_rows ||
+             !sampling.sampled.has_data() || !sampling.logits.has_data() || !sampling.probs.has_data() ||
+@@ -1474,6 +1491,7 @@
+             for (size_t i = 0; i < eog.size(); ++i) { eog[i] = model.vocab.is_eog(llama_token(i)); }
+             device_verify_state = device_verify_api->create(backend, device_verify_allowance, model.vocab.n_tokens(), eog.data());
+             device_verify_backend = backend;
++            if (device_verify_state) { ++device_verify_stats.allocations; }
+         }
+         if (!device_verify_state) { device_verify_admission.deny(); return false; }
+         if (backend != device_verify_backend) { return false; }
+@@ -1519,6 +1537,74 @@
+     if (copied) { synchronize(); }
+ }
+ 
++void llama_context::release_device_verifier_local(bool preflight) {
++    materialize_sampler_outputs(); deferred_sampler_rows.clear(); device_verify_ordered = false;
++    if (device_verify_state) {
++        device_verify_api->destroy(device_verify_state); device_verify_state = nullptr;
++        device_verify_backend = nullptr;
++        if (preflight) { ++device_verify_stats.preflight_releases; }
++        else { ++device_verify_stats.mandatory_releases; }
++    }
++}
++
++void llama_context::release_device_verifier_resources(bool preflight) {
++    release_device_verifier_local(preflight);
++    if (auto parent = device_verify_parent.lock()) {
++        if (parent->context) { parent->context->release_device_verifier_local(preflight); }
++    }
++}
++
++void llama_context::preflight_device_verifier(const llama_memory_context_i * memory_context) {
++    if (!device_verify_allowance && device_verify_parent.expired()) { return; }
++    const auto requirement = memory_context ? memory_context->allocation_requirement() : llama_memory_allocation::unknown;
++    device_verify_preflight_known = requirement != llama_memory_allocation::unknown;
++    if (requirement != llama_memory_allocation::stable) { release_device_verifier_resources(true); }
++}
++
++bool llama_context::link_device_verification_resources(llama_context * draft) {
++    if (draft == this || device_verify_draft_child) { return false; }
++    if (!device_verify_allowance) { return false; }
++    auto known = [](const llama_context * context) {
++        return context && context->memory && (typeid(*context->memory) == typeid(llama_kv_cache) ||
++            typeid(*context->memory) == typeid(llama_memory_hybrid) ||
++            typeid(*context->memory) == typeid(llama_memory_recurrent));
++    };
++    if (!known(this) || (draft && !known(draft))) {
++        release_device_verifier_local(); device_verify_cooperative = false; return false;
++    }
++    if (draft && draft->device_verify_draft_child) {
++        const auto parent = draft->device_verify_parent.lock();
++        if (parent && parent->context == this) { device_verify_cooperative = true; return true; }
++        if (parent && parent->context) { return false; }
++    }
++    if (device_verify_owner) {
++        const auto child = device_verify_owner->child.lock();
++        if (child && child->context && (!draft || child != draft->device_verify_owner)) { return false; }
++    }
++    if (draft && draft->device_verify_owner) {
++        const auto nested = draft->device_verify_owner->child.lock();
++        if (nested && nested->context) { return false; }
++    }
++    try {
++        if (!device_verify_owner) { device_verify_owner = std::make_shared<llama_device_verification_owner>(); }
++        // Allocate both lifetime tokens before changing either context's linkage.
++        if (draft && !draft->device_verify_owner) {
++            draft->device_verify_owner = std::make_shared<llama_device_verification_owner>();
++        }
++        release_device_verifier_local();
++        device_verify_owner->context = this;
++        if (draft) {
++            draft->release_device_verifier_local();
++            draft->device_verify_owner->context = draft;
++            draft->device_verify_parent = device_verify_owner;
++            draft->device_verify_draft_child = true;
++            device_verify_owner->child = draft->device_verify_owner;
++        }
++        device_verify_cooperative = true;
++        return true;
++    } catch (const std::bad_alloc &) { return false; }
++}
++
+ bool llama_context::verify_draft_device(const std::vector<int> & indexes, const std::vector<llama_token> & draft,
+         std::vector<llama_token> & accepted) {
+     if (!device_verify_state || !device_verify_ordered || draft.empty() || indexes.size() != draft.size() + 1 ||
+@@ -2031,11 +2117,7 @@
+ }
+ 
+ void llama_context::graph_variants_clear() {
+-    materialize_sampler_outputs(); deferred_sampler_rows.clear(); device_verify_ordered = false;
+-    if (device_verify_state) {
+-        device_verify_api->destroy(device_verify_state); device_verify_state = nullptr;
+-        device_verify_backend = nullptr;
+-    }
++    release_device_verifier_resources();
+     output_overlap_checked = nullptr;
+     draft_overlap_checked = nullptr;
+     graph_prefill_admission.clear();
+@@ -2295,6 +2377,7 @@
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    preflight_device_verifier(mctx);
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -4638,6 +4721,7 @@
+         // A missing/truncated/incompatible header must preserve the live state.
+         llama_state_read_model_info(io, model);
+         try {
++            release_device_verifier_resources();
+             if (memory) { memory->state_read(io); }
+             if (io.n_bytes() != n_state_size_cur) {
+                 throw std::runtime_error("did not read all of the session file data");
+@@ -4799,6 +4883,7 @@
+     }
+ 
+     if (memory) {
++        release_device_verifier_resources();
+         LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
+ 
+         memory->state_read(io);
+@@ -4816,6 +4901,7 @@
+ }
+ 
+ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++    release_device_verifier_resources();
+     if (memory) {
+         memory->state_read(io, seq_id, flags);
+     }
+@@ -6095,3 +6181,8 @@
+ llama_device_verification_stats llama_get_device_verification_stats(llama_context * ctx) {
+     return ctx ? ctx->get_device_verification_stats() : llama_device_verification_stats{};
+ }
++
++
++bool llama_link_device_verification_resources(llama_context * target, llama_context * draft) {
++    return target && target->link_device_verification_resources(draft);
++}
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -25,6 +25,7 @@
+ class llama_batch_allocr;
+ class llama_moe_cache;
+ struct llama_gpu_layer_diagnostics;
++struct llama_device_verification_owner;
+ 
+ class llama_io_read_i;
+ class llama_io_write_i;
+@@ -191,6 +192,7 @@
+     bool verify_draft_device(const std::vector<int> & indexes, const std::vector<llama_token> & draft,
+             std::vector<llama_token> & accepted);
+     llama_device_verification_stats get_device_verification_stats() const;
++    bool link_device_verification_resources(llama_context * draft);
+     llama_token   get_sampled_token_ith(int32_t idx);
+ 
+     float * get_sampled_logits_ith(int32_t idx);
+@@ -479,6 +481,11 @@
+     ggml_backend_t device_verify_backend = nullptr;
+     std::vector<deferred_sampler_row> deferred_sampler_rows;
+     bool device_verify_ordered = false;
++    bool device_verify_preflight_known = false;
++    bool device_verify_cooperative = false;
++    bool device_verify_draft_child = false;
++    std::shared_ptr<llama_device_verification_owner> device_verify_owner;
++    std::weak_ptr<llama_device_verification_owner> device_verify_parent;
+     llama_device_verification_stats device_verify_stats;
+     llama_device_verification_admission device_verify_admission;
+     const size_t device_verify_allowance = llama_device_verification_policy::budget(std::getenv("WILDLLAMA_VERIFY_DEVICE_MIB"));
+@@ -487,6 +494,9 @@
+     bool defer_sampler_outputs(const llm_graph_result * result, uint32_t row_offset, uint32_t total_rows);
+     void materialize_sampler_row(size_t row, bool fence = true);
+     void materialize_sampler_outputs();
++    void release_device_verifier_local(bool preflight = false);
++    void release_device_verifier_resources(bool preflight = false);
++    void preflight_device_verifier(const llama_memory_context_i * memory_context);
+ 
+     // sequence embeddings output (map of [n_embd] vectors)
+     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -220,7 +220,11 @@
+ struct llama_device_verification_stats {
+     size_t allowance_bytes = 0, scratch_bytes = 0;
+     uint64_t verified_batches = 0, deferred_bytes = 0, materialized_bytes = 0, fallbacks = 0;
++    uint64_t allocations = 0, preflight_releases = 0, mandatory_releases = 0;
+ };
+ LLAMA_API bool llama_verify_draft_device(struct llama_context * ctx, const std::vector<int> & indexes,
+         const std::vector<llama_token> & draft, std::vector<llama_token> & accepted);
+ LLAMA_API llama_device_verification_stats llama_get_device_verification_stats(struct llama_context * ctx);
++// Call only for nonconcurrent target/draft operations on the same inference worker.
++// A null draft explicitly declares a standalone cooperative target.
++LLAMA_API bool llama_link_device_verification_resources(struct llama_context * target, struct llama_context * draft);
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1468,15 +1468,23 @@
+     return true;
+ }
+ 
+-bool llama_kv_cache::grow_for(const slot_info & sinfo) {
+-    if (!growth_initial_tokens) { return true; }
++uint32_t llama_kv_cache::growth_tokens_for(const slot_info & sinfo) const {
++    if (!growth_initial_tokens) { return 0; }
+     uint32_t needed=growth_initial_tokens;
+     for (const auto & cells : v_cells) { needed=std::max(needed,cells.used_max_p1()); }
+     for (const auto & indices : sinfo.idxs) {
+         for (const uint32_t index : indices) { needed=std::max(needed,index+1); }
+     }
+     const uint32_t padding=std::max(n_pad,256u);
+-    return grow_to(std::min(get_size(),uint32_t(GGML_PAD(needed,padding))));
++    return std::min(get_size(),uint32_t(GGML_PAD(needed,padding)));
++}
++
++bool llama_kv_cache::growth_needed_for(const slot_info & sinfo) const {
++    return growth_initial_tokens && growth_tokens_for(sinfo) > growth_committed_tokens;
++}
++
++bool llama_kv_cache::grow_for(const slot_info & sinfo) {
++    return !growth_initial_tokens || grow_to(growth_tokens_for(sinfo));
+ }
+ 
+ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+@@ -3316,6 +3324,14 @@
+     return true;
+ }
+ 
++llama_memory_allocation llama_kv_cache_context::allocation_requirement() const {
++    if (typeid(*this) != typeid(llama_kv_cache_context) || llama_memory_status_is_fail(status) ||
++            ubatches.empty() || i_cur >= sinfos.size() || !kv->allocation_preflight_safe()) {
++        return llama_memory_allocation::unknown;
++    }
++    return kv->growth_needed_for(sinfos[i_cur]) ? llama_memory_allocation::grow : llama_memory_allocation::stable;
++}
++
+ bool llama_kv_cache_context::apply() {
+     assert(!llama_memory_status_is_fail(status));
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -225,6 +225,8 @@
+     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
+     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+     bool grow_for(const slot_info & sinfo);
++    bool growth_needed_for(const slot_info & sinfo) const;
++    bool allocation_preflight_safe() const { return !other && v_cells_impl.use_count() == 1; }
+ 
+     //
+     // input API
+@@ -311,6 +313,7 @@
+     uint32_t growth_committed_tokens = 0;
+     bool growth_paging = false;
+     bool grow_to(uint32_t tokens);
++    uint32_t growth_tokens_for(const slot_info & sinfo) const;
+     size_t trim_to(uint32_t tokens, const char * proc);
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+@@ -427,6 +430,7 @@
+ 
+     bool next()  override;
+     bool apply() override;
++    llama_memory_allocation allocation_requirement() const override;
+ 
+     llama_memory_status  get_status() const override;
+     const llama_ubatch & get_ubatch() const override;
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -408,6 +408,11 @@
+     return true;
+ }
+ 
++llama_memory_allocation llama_memory_hybrid_context::allocation_requirement() const {
++    return typeid(*this) == typeid(llama_memory_hybrid_context) && ctx_attn && ctx_recr ? llama_memory_allocation_combine(
++        ctx_attn->allocation_requirement(), ctx_recr->allocation_requirement()) : llama_memory_allocation::unknown;
++}
++
+ bool llama_memory_hybrid_context::apply() {
+     assert(!llama_memory_status_is_fail(status));
+ 
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -124,6 +124,7 @@
+ 
+     bool next()  override;
+     bool apply() override;
++    llama_memory_allocation allocation_requirement() const override;
+ 
+     llama_memory_status  get_status() const override;
+     const llama_ubatch & get_ubatch() const override;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <typeinfo>
+ 
+ #include "llama-batch.h"
+ #include "llama-graph.h"
+@@ -163,6 +164,10 @@
+ 
+     bool next()  override;
+     bool apply() override;
++    llama_memory_allocation allocation_requirement() const override {
++        return typeid(*this) == typeid(llama_memory_recurrent_context) && !ubatches.empty() ?
++            llama_memory_allocation::stable : llama_memory_allocation::unknown;
++    }
+ 
+     llama_memory_status  get_status() const override;
+     const llama_ubatch & get_ubatch() const override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -42,6 +42,15 @@
+ // helper function for checking if a memory status indicates a failure
+ bool llama_memory_status_is_fail(llama_memory_status status);
+ 
++// Optional scratch can be retained only across a proven allocation-free apply.
++enum class llama_memory_allocation { unknown, stable, grow };
++
++inline llama_memory_allocation llama_memory_allocation_combine(llama_memory_allocation a, llama_memory_allocation b) {
++    if (a == llama_memory_allocation::unknown || b == llama_memory_allocation::unknown) { return llama_memory_allocation::unknown; }
++    return a == llama_memory_allocation::grow || b == llama_memory_allocation::grow ?
++        llama_memory_allocation::grow : llama_memory_allocation::stable;
++}
++
+ // the interface for managing the memory context during batch processing
+ // this interface is implemented per memory type. see:
+ //   - llama_kv_cache_context
+@@ -59,6 +68,10 @@
+     // apply the memory state for the current ubatch to the memory object
+     // return false on failure
+     virtual bool apply() = 0;
++
++    // Read-only preflight before apply() can allocate physical storage. Unknown
++    // memories cannot retain optional device scratch across this boundary.
++    virtual llama_memory_allocation allocation_requirement() const { return llama_memory_allocation::unknown; }
+ 
+     // get the current ubatch
+     virtual const llama_ubatch & get_ubatch() const = 0;
+diff --git a/tests/test-device-verification.cpp b/tests/test-device-verification.cpp
+--- a/tests/test-device-verification.cpp
++++ b/tests/test-device-verification.cpp
+@@ -6,6 +6,8 @@
+ #include "../src/llama-context.h"
+ #include "../src/llama-sampler.h"
+ #include "../src/llama-device-verification.h"
++#include "../src/llama-memory-hybrid.h"
++#include "../src/llama-model.h"
+ #include "ggml-cuda.h"
+ #include "ggml-cuda-verify.h"
+ #include <chrono>
+@@ -28,6 +30,14 @@
+ 
+ static void policy() {
+     using policy = llama_device_verification_policy;
++    using allocation = llama_memory_allocation;
++    for (const auto a : {allocation::unknown, allocation::stable, allocation::grow}) {
++        for (const auto b : {allocation::unknown, allocation::stable, allocation::grow}) {
++            const auto expected = a == allocation::unknown || b == allocation::unknown ? allocation::unknown :
++                a == allocation::grow || b == allocation::grow ? allocation::grow : allocation::stable;
++            require(llama_memory_allocation_combine(a,b) == expected, "composite preflight admitted an unproven allocation");
++        }
++    }
+     require(policy::budget(nullptr) == 0 && policy::budget("0") == 0, "zero/unset verifier enabled");
+     for (const char * value : {"", "-1", "65", "1 ", " 1", "1MiB", "+1", "99999999999999"}) {
+         require(policy::budget(value) == 0, "invalid verifier budget admitted");
+@@ -197,7 +207,8 @@
+     common_sampler_ptr sampler;
+     llama_context_ptr target, draft;
+     common_speculative_ptr speculative;
+-    explicit verify_session(llama_model * model, bool device) {
++    llama_tokens last_proposals;
++    explicit verify_session(llama_model * model, bool device, bool physical = false, bool cooperative = true) {
+         budget(device ? "1" : "0");
+         common_params_sampling parameters;
+         parameters.samplers = {COMMON_SAMPLER_TYPE_TEMPERATURE};
+@@ -208,6 +219,11 @@
+         p.n_ctx = 128; p.n_batch = p.n_ubatch = 64; p.n_seq_max = 1; p.n_rs_seq = 2;
+         p.n_threads = p.n_threads_batch = 1; p.n_outputs_max = p.n_outputs_max_per_seq = 16;
+         p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++        if (physical) {
++            p.n_ctx = 8192; p.n_batch = p.n_ubatch = 64;
++            p.kv_unified = true; p.type_k = p.type_v = GGML_TYPE_F32;
++            p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++        }
+         target.reset(llama_init_from_model(model, p)); require(bool(target), "fixture target missing");
+         require(llama_set_sampler(target.get(), 0, common_sampler_get_backend_speculative(sampler.get())), "fixture sampler attachment failed");
+         p.ctx_other = target.get(); p.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+@@ -216,25 +232,31 @@
+         config.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+         config.draft.ctx_tgt = target.get(); config.draft.ctx_dft = draft.get();
+         config.draft.n_max = 2; config.draft.n_min = 0; config.draft.p_min = 0;
+-        speculative.reset(common_speculative_init(config, 1)); require(bool(speculative), "fixture MTP implementation missing");
+-    }
+-    llama_tokens run() {
++        if (cooperative) {
++            speculative.reset(common_speculative_init(config, 1)); require(bool(speculative), "fixture MTP implementation missing");
++        }
++    }
++    llama_tokens run(const llama_tokens * replay = nullptr) {
+         common_batch prefix(target.get());
+         for (int i = 0; i < 4; ++i) { prefix.add(3+i, i, 0, i==3); }
+         require(llama_process(target.get(), LLAMA_PROCESS_TYPE_DECODE, prefix.get()) == 0 &&
+-            common_speculative_process(speculative.get(), prefix), "MTP prefix failed");
++            (!speculative || common_speculative_process(speculative.get(), prefix)), "MTP prefix failed");
+         llama_tokens proposals;
+-        auto & params = common_speculative_get_draft_params(speculative.get(), 0);
+-        params.drafting = true; params.n_max = 2; params.pos0 = 4; params.id_last = 7;
+-        params.prompt = nullptr; params.result = &proposals; params.result_q = nullptr;
+-        common_speculative_draft(speculative.get()); require(proposals.size() == 2, "MTP draft depth changed");
+-        require(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 4, -1), "MTP draft trim failed");
++        if (replay) { proposals = *replay; }
++        else {
++            auto & params = common_speculative_get_draft_params(speculative.get(), 0);
++            params.drafting = true; params.n_max = 2; params.pos0 = 4; params.id_last = 7;
++            params.prompt = nullptr; params.result = &proposals; params.result_q = nullptr;
++            common_speculative_draft(speculative.get()); require(proposals.size() == 2, "MTP draft depth changed");
++            require(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 4, -1), "MTP draft trim failed");
++        }
++        last_proposals = proposals;
+         common_batch verify(target.get()); verify.add(7, 4, 0, true);
+         for (size_t i = 0; i < proposals.size(); ++i) { verify.add(proposals[i], 5+i, 0, true); }
+         require(llama_process(target.get(), LLAMA_PROCESS_TYPE_DECODE, verify.get()) == 0 &&
+-            common_speculative_process(speculative.get(), verify), "MTP verification decode failed");
++            (!speculative || common_speculative_process(speculative.get(), verify)), "MTP verification decode failed");
+         auto accepted = common_sampler_sample_and_accept_n(sampler.get(), target.get(), proposals);
+-        common_speculative_accept(speculative.get(), 0, uint16_t(accepted.size()-1));
++        if (speculative) { common_speculative_accept(speculative.get(), 0, uint16_t(accepted.size()-1)); }
+         return accepted;
+     }
+ };
+@@ -249,11 +271,13 @@
+     };
+     std::array<row_data, 3> expected_rows;
+     llama_tokens expected;
++    llama_tokens proposals;
+     std::vector<llama_token_data> expected_candidates;
+     int64_t expected_selected = -1;
+     {
+         verify_session reference(model.get(), false);
+         expected = reference.run();
++        proposals = reference.last_proposals;
+         const auto * view = common_sampler_get_candidates(reference.sampler.get(), false);
+         expected_candidates.assign(view->data, view->data + view->size);
+         expected_selected = view->selected;
+@@ -300,43 +324,170 @@
+     }
+     initial_kv("256");
+     {
+-        verify_session fallback(model.get(), true);
+-        require(fallback.run() == expected, "physical-KV fallback changed accepted tokens");
++        verify_session fallback(model.get(), true, false, false);
++        require(fallback.run(&proposals) == expected, "unlinked physical-KV fallback changed accepted tokens");
+         const auto stats = llama_get_device_verification_stats(fallback.target.get());
+         require(stats.allowance_bytes == 1024*1024 && stats.scratch_bytes == 0 &&
+             stats.verified_batches == 0 && stats.deferred_bytes == 0,
+             "positive initial-KV configuration retained optional verifier memory");
+         require(std::strcmp(std::getenv("WILDLLAMA_KV_CACHE_INITIAL_TOKENS"), "256") == 0,
+             "verifier changed the configured initial KV");
+-        std::puts("PASS: positive initial KV retains original verifier, exact MTP tokens, zero scratch and unchanged configuration");
++        std::puts("PASS: unlinked positive initial KV retains original verifier, exact MTP tokens and zero scratch");
++    }
++    {
++        verify_session linked(model.get(), true);
++        require(linked.run() == expected, "linked positive-KV verification changed MTP tokens");
++        require(llama_get_device_verification_stats(linked.target.get()).verified_batches == 1,
++            "known cooperative positive-KV pipeline was rejected");
+     }
+     initial_kv("0");
++}
++
++static size_t context_bytes(llama_context * context) {
++    size_t bytes = 0;
++    for (const auto & entry : llama_get_memory_breakdown(context)) { bytes += entry.second.context; }
++    return bytes;
++}
++
++static std::vector<uint8_t> sequence_bytes(llama_context * context) {
++    std::vector<uint8_t> state(llama_state_seq_get_size(context, 0));
++    require(llama_state_seq_get_data(context, state.data(), state.size(), 0) == state.size(), "sequence snapshot failed");
++    return state;
++}
++
++static void growth_pipeline() {
++    initial_kv("256");
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_KV_CACHE_PAGING", "1") == 0, "cannot enable fixture paging");
++#else
++    require(setenv("WILDLLAMA_KV_CACHE_PAGING", "1", 1) == 0, "cannot enable fixture paging");
++#endif
++    auto model = tiny_model(true, 512, 128);
++    llama_tokens expected_accepted, expected_tokens;
++    std::vector<uint8_t> expected_target_state, expected_draft_state;
++    size_t expected_physical = 0;
++    for (const bool device : {false, true}) {
++        verify_session session(model.get(), device, true);
++        auto accepted = session.run();
++        if (device) { require(accepted == expected_accepted, "growing MTP accepted tokens changed"); }
++        else { expected_accepted = accepted; }
++        // The accepted speculative prefix was already checked. Start a fresh
++        // prompt so rejected verification rows cannot enter this continuation.
++        llama_memory_clear(llama_get_memory(session.target.get()), true);
++        llama_memory_clear(llama_get_memory(session.draft.get()), true);
++        std::vector<llama_token> tokens;
++        uint64_t target_growths = 0, child_reclaims = 0;
++        auto feed = [&](int position, int count) {
++            common_batch batch(session.target.get());
++            for (int i = 0; i < count; ++i) { batch.add(3 + (position+i)*13%60, position+i, 0, i+1 == count); }
++            const auto before = llama_get_device_verification_stats(session.target.get());
++            const size_t physical = context_bytes(session.target.get());
++            require(llama_process(session.target.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
++                "growing target decode failed");
++            const auto after = llama_get_device_verification_stats(session.target.get());
++            if (context_bytes(session.target.get()) > physical) {
++                ++target_growths;
++                if (device && before.scratch_bytes) {
++                    require(after.preflight_releases > before.preflight_releases,
++                        "mandatory physical KV growth retained optional verifier scratch");
++                }
++            }
++            tokens.push_back(llama_get_sampler_output_ith(session.target.get(), count-1).sampled_token);
++            require(common_speculative_process(session.speculative.get(), batch), "growing MTP child catch-up failed");
++            const auto caught_up = llama_get_device_verification_stats(session.target.get());
++            if (device && after.scratch_bytes && caught_up.preflight_releases > after.preflight_releases) { ++child_reclaims; }
++        };
++        for (int position = 0; position < 2304; position += 64) { feed(position, std::min(64, 2304-position)); }
++        // Warm the one-token graph once, then prove ordinary tokens retain the bank.
++        feed(2304, 1); feed(2305, 1);
++        const auto warm = llama_get_device_verification_stats(session.target.get());
++        feed(2306, 1);
++        const auto stable = llama_get_device_verification_stats(session.target.get());
++        if (device) {
++            require(stable.scratch_bytes && stable.allocations == warm.allocations &&
++                stable.preflight_releases == warm.preflight_releases && stable.mandatory_releases == warm.mandatory_releases,
++                "stable token needlessly recreated verifier scratch");
++            require(target_growths && child_reclaims, "fixture did not exercise target and child physical-growth reclamation");
++            require(tokens == expected_tokens && context_bytes(session.target.get()) == expected_physical &&
++                sequence_bytes(session.target.get()) == expected_target_state && sequence_bytes(session.draft.get()) == expected_draft_state,
++                "cooperative physical KV changed tokens, context bytes or target/draft state");
++            const auto child_state = sequence_bytes(session.draft.get());
++            require(llama_state_seq_set_data(session.draft.get(), child_state.data(), child_state.size(), 0) == child_state.size(),
++                "child state restore failed");
++            const auto restored = llama_get_device_verification_stats(session.target.get());
++            require(restored.scratch_bytes == 0 && restored.mandatory_releases > stable.mandatory_releases &&
++                sequence_bytes(session.draft.get()) == child_state, "child restore retained parent scratch or changed state");
++            feed(2307, 1);
++            require(llama_get_device_verification_stats(session.target.get()).scratch_bytes > 0,
++                "verifier did not resume after mandatory child restore");
++            std::printf("DEVICE_VERIFY_GROWTH target_growths=%llu child_reclaims=%llu allocations=%llu preflight_releases=%llu context_bytes=%zu exact=1\n",
++                (unsigned long long) target_growths, (unsigned long long) child_reclaims,
++                (unsigned long long) stable.allocations, (unsigned long long) stable.preflight_releases, context_bytes(session.target.get()));
++        } else {
++            expected_tokens = tokens; expected_physical = context_bytes(session.target.get());
++            expected_target_state = sequence_bytes(session.target.get()); expected_draft_state = sequence_bytes(session.draft.get());
++        }
++    }
++    // A shared attention owner cannot prove exclusive ordered allocation.
++    {
++        verify_session shared(model.get(), true, true, false);
++        require(llama_link_device_verification_resources(shared.target.get(), nullptr), "standalone cooperative link failed");
++        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(shared.target.get()));
++        require(hybrid != nullptr, "shared fixture is not hybrid");
++        auto filter = [](int32_t layer) { return layer == 1; };
++        auto share = [](int32_t layer) { return layer; };
++        llama_kv_cache view(*model, model->hparams, GGML_TYPE_F32, GGML_TYPE_F32, false, true, true,
++            8192, 1, 256, 0, LLAMA_SWA_TYPE_NONE, hybrid->get_mem_attn(), filter, nullptr, share, "verification-view");
++        common_batch batch(shared.target.get()); batch.add(7, 0, 0, true);
++        require(llama_process(shared.target.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
++            "shared fallback decode failed");
++        const auto stats = llama_get_device_verification_stats(shared.target.get());
++        require(stats.scratch_bytes == 0 && stats.deferred_bytes == 0, "shared owner retained optional verifier memory");
++        require(!llama_link_device_verification_resources(shared.target.get(), shared.draft.get()) ||
++            !llama_link_device_verification_resources(shared.target.get(), nullptr), "active child was silently replaced");
++    }
++    // The child token must remain safe after its parent dies. Detach common's raw
++    // inference pointers first; they are unrelated to the weak resource link.
++    {
++        verify_session lifetime(model.get(), true, true);
++        lifetime.speculative.reset(); lifetime.target.reset();
++        const auto state = sequence_bytes(lifetime.draft.get());
++        require(llama_state_seq_set_data(lifetime.draft.get(), state.data(), state.size(), 0) == state.size(),
++            "expired parent link broke child restore");
++    }
++    require(std::strcmp(std::getenv("WILDLLAMA_KV_CACHE_INITIAL_TOKENS"), "256") == 0,
++        "cooperation changed initial KV configuration");
++    initial_kv("0");
++    std::puts("PASS: cooperative growth, stable bank reuse, child restore, shared-owner fallback and weak lifetime");
+ }
+ 
+ int main(int argc, char ** argv) {
+     try {
+         policy();
+         const bool benchmark=argc>1 && std::strcmp(argv[1],"--bench")==0;
+-        if (!benchmark && (argc == 1 || std::strcmp(argv[1], "--cuda") != 0)) { return 0; }
++        const bool growth=argc>1 && std::strcmp(argv[1],"--growth")==0;
++        if (!benchmark && !growth && (argc == 1 || std::strcmp(argv[1], "--cuda") != 0)) { return 0; }
+         ggml_backend_load_all(); llama_backend_init();
+         auto * registry = ggml_backend_reg_by_name("CUDA");
+         if (!registry || !ggml_backend_reg_dev_count(registry)) { std::puts("SKIP: CUDA required"); return 77; }
+         auto * device = ggml_backend_reg_dev_get(registry,0);
+         auto set_limit = reinterpret_cast<decltype(&ggml_backend_cuda_set_memory_limit)>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_set_memory_limit"));
+         auto get_stats = reinterpret_cast<decltype(&ggml_backend_cuda_get_memory_stats)>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_get_memory_stats"));
+-        require(set_limit && get_stats && set_limit(device, 96*1024*1024, true), "96 MiB test CUDA quota unavailable");
++        require(set_limit && get_stats && set_limit(device, (growth ? 128 : 96)*1024*1024, true), "small test CUDA quota unavailable");
+         const auto * api = static_cast<const ggml_backend_cuda_verify_api *>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_verify_api"));
+         require(api && api->version == 1, "device verification API unavailable");
+         {
+             ggml_backend_ptr gpu(ggml_backend_dev_init(device,nullptr)); require(bool(gpu),"CUDA backend missing");
+             if (benchmark) { driver_benchmark(gpu.get(),api); }
+-            else { operators(gpu.get(),api); }
+-        }
+-        if (!benchmark) { pipeline(); }
++            else if (!growth) { operators(gpu.get(),api); }
++        }
++        if (growth) { growth_pipeline(); }
++        else if (!benchmark) { pipeline(); }
+         ggml_backend_cuda_memory_stats memory{};
+         require(get_stats(device,&memory) && memory.managed_peak_bytes <= memory.limit_bytes,"test exceeded managed quota");
+         std::printf(benchmark ? "PASS: model-free CUDA driver-call ABBA comparisons; peak=%zu limit=%zu\n"
+-                              : "PASS: actual tiny MTP/CUDA verification and public getters; peak=%zu limit=%zu\n",
++                              : growth ? "PASS: tiny MTP/CUDA verification with physical KV growth; peak=%zu limit=%zu\n"
++                                       : "PASS: actual tiny MTP/CUDA verification and public getters; peak=%zu limit=%zu\n",
+             memory.managed_peak_bytes,memory.limit_bytes);
+         set_limit(device,0,false); llama_backend_free();
+         return 0;
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -13,7 +13,7 @@
+ 
+ static void require(bool condition, const char * message) { if (!condition) { throw std::runtime_error(message); } }
+ static void step(const char * message) { std::fprintf(stderr, "mtp-state STEP %s\n", message); std::fflush(stderr); }
+-static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32) {
++static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, uint64_t gpu_vram_limit_mib = 0) {
+     const int dim=embedding_width, vocab=64;
+     gguf_context_ptr metadata(gguf_init_empty());
+     gguf_set_val_str(metadata.get(), "general.architecture", "qwen35");
+@@ -57,6 +57,7 @@
+     ggml_backend_dev_t devices[]={gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
+     params.devices=devices; params.n_gpu_layers=gpu ? 99 : 0; params.load_mode=LLAMA_LOAD_MODE_NONE;
+     params.use_extra_bufts=false; params.no_host=true; params.load_mtp=true;
++    params.gpu_vram_limit_mib=gpu_vram_limit_mib;
+     llama_model_ptr model(llama_model_init_from_user(metadata.get(),initialize,nullptr,params));
+     require(bool(model),"cannot initialize nonzero tiny recurrent fixture");
+     return model;

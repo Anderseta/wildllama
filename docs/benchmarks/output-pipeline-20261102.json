@@ -1,0 +1,241 @@
+{
+  "schema": 1,
+  "date": "2026-11-02",
+  "source_base": "e1830fd3e339afcfb94ebda50868d973cf931d83",
+  "native_base": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "platform": "Windows, RTX 5060 Ti; shared GPU",
+  "trained_models_tested": false,
+  "patches": [
+    {
+      "file": "075-cooperative-verifier-kv-growth.patch",
+      "sha256": "24d21ad277fa1c386ca29f35d625cd7927c8bfff6c3db8c6185deea3a1b9e858"
+    },
+    {
+      "file": "076-hierarchical-prefix-pages.patch",
+      "sha256": "2d89188d53f2a83b622cd3c643fd0619a37344ce901d9c5ea22d569587ff06e3"
+    },
+    {
+      "file": "077-batched-host-outputs.patch",
+      "sha256": "8cdf1a0ee48f795f9830c5b0b661370812b03e13646787f3da17e6fe3fac6700"
+    },
+    {
+      "file": "078-output-pipeline-integration.patch",
+      "sha256": "ce21ecaeff7ad1d89c3565ff53dcd84d4cd646ea5286c56fe61b674608e55a9c"
+    }
+  ],
+  "cpu": {
+    "device": "CPU only",
+    "cases": [
+      {
+        "case": "output-permutation",
+        "binary": "test-output-permutation",
+        "arguments": [],
+        "exit": 0,
+        "seconds": 2.328
+      },
+      {
+        "case": "host-output-policy",
+        "binary": "test-host-output-copy",
+        "arguments": [],
+        "exit": 0,
+        "seconds": 0.047
+      },
+      {
+        "case": "verifier-policy",
+        "binary": "test-device-verification",
+        "arguments": [],
+        "exit": 0,
+        "seconds": 0.047
+      },
+      {
+        "case": "pager-original",
+        "binary": "test-state-pager",
+        "arguments": [
+          "G:\\Goose\\work\\wildllama\\.build\\pipeline-followups-20261102\\fixtures\\pager-original"
+        ],
+        "exit": 0,
+        "seconds": 0.125
+      },
+      {
+        "case": "pager-shared",
+        "binary": "test-state-pager",
+        "arguments": [
+          "G:\\Goose\\work\\wildllama\\.build\\pipeline-followups-20261102\\fixtures\\pager-shared",
+          "--pages"
+        ],
+        "exit": 0,
+        "seconds": 0.328
+      },
+      {
+        "case": "writeback-original",
+        "binary": "test-state-writeback",
+        "arguments": [
+          "G:\\Goose\\work\\wildllama\\.build\\pipeline-followups-20261102\\fixtures\\writeback-original"
+        ],
+        "exit": 0,
+        "seconds": 0.172
+      },
+      {
+        "case": "writeback-shared",
+        "binary": "test-state-writeback",
+        "arguments": [
+          "G:\\Goose\\work\\wildllama\\.build\\pipeline-followups-20261102\\fixtures\\writeback-shared",
+          "--pages"
+        ],
+        "exit": 0,
+        "seconds": 0.047
+      },
+      {
+        "case": "prefix-original",
+        "binary": "test-server-prefix-cache",
+        "arguments": [],
+        "exit": 0,
+        "seconds": 0.062
+      },
+      {
+        "case": "prefix-shared",
+        "binary": "test-server-prefix-cache",
+        "arguments": [
+          "--page-state-dir",
+          "G:\\Goose\\work\\wildllama\\.build\\pipeline-followups-20261102\\fixtures\\prefix-shared"
+        ],
+        "exit": 0,
+        "seconds": 0.078
+      },
+      {
+        "case": "server-writeback",
+        "binary": "test-server-writeback",
+        "arguments": [
+          "G:\\Goose\\work\\wildllama\\.build\\pipeline-followups-20261102\\fixtures\\server-writeback"
+        ],
+        "exit": 0,
+        "seconds": 0.079
+      },
+      {
+        "case": "kv-indexed-copy",
+        "binary": "test-kv-indexed-copy",
+        "arguments": [],
+        "exit": 0,
+        "seconds": 0.188
+      },
+      {
+        "case": "hybrid-prefix",
+        "binary": "test-hybrid-prefix",
+        "arguments": [],
+        "exit": 0,
+        "seconds": 0.641
+      }
+    ]
+  },
+  "cuda": {
+    "device": "CUDA shared GPU",
+    "managed_test_caps_mib": [
+      16,
+      96,
+      128
+    ],
+    "gpu_before": {
+      "used_mib": 11392,
+      "free_mib": 4661,
+      "utilization_percent": 10
+    },
+    "model_throughput_claim": false,
+    "cases": [
+      {
+        "case": "host-output-cuda",
+        "binary": "test-host-output-copy",
+        "arguments": [
+          "--cuda"
+        ],
+        "exit": 0,
+        "seconds": 10.281
+      },
+      {
+        "case": "verifier-cuda",
+        "binary": "test-device-verification",
+        "arguments": [
+          "--cuda"
+        ],
+        "exit": 0,
+        "seconds": 16.625
+      },
+      {
+        "case": "verifier-growth",
+        "binary": "test-device-verification",
+        "arguments": [
+          "--growth"
+        ],
+        "exit": 0,
+        "seconds": 1.625
+      }
+    ]
+  },
+  "http_before_after": {
+    "status": "passed",
+    "cases_per_payload": 6,
+    "device": "CPU only",
+    "fixture_bytes": 28628288,
+    "trained_weights": false,
+    "gpu_overlap_activated": false,
+    "responses_equal": true
+  },
+  "ui": {
+    "source": "2c9343612ad0af70d1fae0c32d9f5579d3c537c1",
+    "focused_test_cases": 79,
+    "test_files": 7,
+    "typescript": "passed",
+    "package_guard": "75 artifacts, canonical main revision matched"
+  },
+  "output_order_component": {
+    "outputs": 512,
+    "repeats": 256,
+    "abba_cycles": 4,
+    "selection_median_ms": 72.1366,
+    "indexed_median_ms": 0.74835,
+    "old_comparisons": 130816,
+    "max_index_visits": 1024,
+    "extra_workspace_bytes": 0,
+    "checksum": 3141632
+  },
+  "host_output_component": {
+    "rows": 512,
+    "width": 4,
+    "repeats": 128,
+    "legacy_median_ms": 2385.6071,
+    "batched_median_ms": 9.4613,
+    "old_calls": 512,
+    "new_calls": 1,
+    "payload_unchanged": 1,
+    "shared_gpu_timings": 1
+  },
+  "host_output_memory": {
+    "managed_peak": 4194304,
+    "quota": 16777216,
+    "additional_gpu_bytes": 0
+  },
+  "physical_growth_correctness": {
+    "target_growths": 1,
+    "child_reclaims": 9,
+    "allocations": 20,
+    "preflight_releases": 18,
+    "context_bytes": 8599040,
+    "exact": 1
+  },
+  "shared_prefix_cache": {
+    "spilled": 1,
+    "cold": 1,
+    "reused_bytes": 1769490,
+    "reused_chunks": 11,
+    "metadata": 530040,
+    "limit": 4194304
+  },
+  "actual_context_copy_runs": 6,
+  "limits": [
+    "Component ABBA timings do not measure trained-model tokens per second or SGLang parity.",
+    "Optional verifier and SSD sharing remain disabled unless explicitly configured.",
+    "SSD sharing still restores complete components through host memory; no general paged attention.",
+    "Only retained source snapshots can provide shared blocks; obsolete-prefix pruning is unchanged.",
+    "Managed CUDA limits exclude other processes and implicit driver/library allocations.",
+    "CPU metadata allowance is additional snapshot metadata, not total process RAM or MoE weight RAM."
+  ]
+}

@@ -1,0 +1,431 @@
+diff --git a/ggml/include/ggml-output-copy-plan.h b/ggml/include/ggml-output-copy-plan.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/include/ggml-output-copy-plan.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++
++struct ggml_output_copy_row {
++    uintptr_t address = 0;
++    uintptr_t owner = 0;
++    uintptr_t buffer_begin = 0;
++    size_t buffer_bytes = 0;
++    size_t bytes = 0;
++    bool eligible = false;
++};
++
++struct ggml_output_copy_plan {
++    static constexpr size_t max_rows = 1024;
++    static constexpr size_t max_row_bytes = 64 * 1024;
++    size_t rows = 0;
++    size_t row_bytes = 0;
++    size_t source_stride = 0;
++};
++
++inline bool ggml_output_copy_row_valid(const ggml_output_copy_row & row) {
++    const auto maximum = std::numeric_limits<uintptr_t>::max();
++    return row.eligible && row.owner && row.buffer_begin && row.address && row.bytes &&
++        row.bytes <= ggml_output_copy_plan::max_row_bytes && row.bytes % 4 == 0 && row.address % 4 == 0 &&
++        row.buffer_bytes <= maximum - row.buffer_begin && row.address >= row.buffer_begin &&
++        row.address - row.buffer_begin <= row.buffer_bytes &&
++        row.bytes <= row.buffer_bytes - (row.address - row.buffer_begin);
++}
++
++// Inspect original rows. No envelope tensor or extra staging allocation is created.
++template <typename RowAt>
++ggml_output_copy_plan ggml_output_copy_rows(size_t available, uintptr_t destination,
++        size_t destination_stride, size_t destination_bytes, RowAt row_at) {
++    const auto maximum = std::numeric_limits<uintptr_t>::max();
++    if (available < 2 || !destination || destination % 4 || !destination_stride ||
++            destination_stride % 4 || destination_bytes > maximum - destination) { return {}; }
++    const auto first = row_at(0);
++    if (!ggml_output_copy_row_valid(first) || first.bytes > destination_stride ||
++            first.bytes > destination_bytes) { return {}; }
++    const size_t rows_fit = 1 + (destination_bytes - first.bytes) / destination_stride;
++    const size_t limit = std::min({available, rows_fit, ggml_output_copy_plan::max_rows});
++    if (limit < 2) { return {}; }
++    const uintptr_t destination_end = destination + (limit - 1) * destination_stride + first.bytes;
++    if (destination < first.buffer_begin + first.buffer_bytes && first.buffer_begin < destination_end) { return {}; }
++    const auto second = row_at(1);
++    if (!ggml_output_copy_row_valid(second) || second.owner != first.owner ||
++            second.buffer_begin != first.buffer_begin || second.buffer_bytes != first.buffer_bytes ||
++            second.bytes != first.bytes || second.address <= first.address) { return {}; }
++    const size_t pitch = second.address - first.address;
++    if (pitch < first.bytes || pitch % 4) { return {}; }
++    size_t count = 2;
++    for (; count < limit; ++count) {
++        const auto row = row_at(count);
++        if (!ggml_output_copy_row_valid(row) || row.owner != first.owner ||
++                row.buffer_begin != first.buffer_begin || row.buffer_bytes != first.buffer_bytes ||
++                row.bytes != first.bytes || count > (maximum - first.address) / pitch ||
++                row.address != first.address + count * pitch) { break; }
++    }
++    return {count, first.bytes, pitch};
++}
+diff --git a/ggml/include/ggml-cuda-output.h b/ggml/include/ggml-cuda-output.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/include/ggml-cuda-output.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Optional registry extension "ggml_backend_cuda_output_api". A return value
++// of zero enqueues nothing; the caller retains its original per-row path.
++struct ggml_backend_cuda_output_api {
++    uint32_t version;
++    size_t (*copy_rows)(ggml_backend_t backend, ggml_backend_sched_t scheduler,
++        const struct ggml_tensor * const * tensors, size_t rows, void * destination,
++        size_t destination_stride_bytes, size_t destination_capacity_bytes);
++};
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-cuda/host-output.cuh b/ggml/src/ggml-cuda/host-output.cuh
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/host-output.cuh
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include "ggml-cuda-output.h"
++#include "ggml-output-copy-plan.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace wildllama_cuda_output {
++inline size_t copy_rows(ggml_backend_t backend, ggml_backend_sched_t scheduler,
++        const ggml_tensor * const * tensors, size_t rows, void * destination,
++        size_t destination_stride, size_t destination_capacity) {
++    if (!backend || !scheduler || !tensors || !destination || rows < 2 || !ggml_backend_is_cuda(backend)) { return 0; }
++    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
++    const auto buffer_type = ggml_backend_cuda_buffer_type(context->device);
++    const auto type = tensors[0] ? tensors[0]->type : GGML_TYPE_COUNT;
++    auto inspect = [&](size_t index) -> ggml_output_copy_row {
++        const auto * tensor = tensors[index];
++        if (!tensor || tensor->type != type || (type != GGML_TYPE_F32 && type != GGML_TYPE_I32) ||
++                tensor->ne[0] <= 0 || tensor->ne[0] > int64_t(ggml_output_copy_plan::max_row_bytes / 4) ||
++                !ggml_is_vector(tensor) || !ggml_is_contiguous(tensor) || !tensor->data ||
++                ggml_backend_sched_get_tensor_backend(scheduler, const_cast<ggml_tensor *>(tensor)) != backend) { return {}; }
++        auto * buffer = tensor->buffer;
++        if (!buffer || buffer->buft != buffer_type ||
++                (tensor->view_src && tensor->view_src->buffer != buffer) ||
++                buffer->iface.get_base != ggml_backend_cuda_buffer_interface.get_base ||
++                buffer->iface.free_buffer != ggml_backend_cuda_buffer_interface.free_buffer) { return {}; }
++        const auto * storage = static_cast<const ggml_backend_cuda_buffer_context *>(buffer->context);
++        if (storage->kv_vmm) { return {}; }
++        return {reinterpret_cast<uintptr_t>(tensor->data), reinterpret_cast<uintptr_t>(buffer),
++            reinterpret_cast<uintptr_t>(storage->dev_ptr), buffer->size, size_t(tensor->ne[0]) * 4, true};
++    };
++    const auto plan = ggml_output_copy_rows(rows, reinterpret_cast<uintptr_t>(destination),
++        destination_stride, destination_capacity, inspect);
++    if (plan.rows < 2) { return 0; }
++    ggml_cuda_set_device(context->device);
++    if (plan.source_stride == plan.row_bytes && destination_stride == plan.row_bytes) {
++        CUDA_CHECK(cudaMemcpyAsync(destination, tensors[0]->data, plan.rows * plan.row_bytes,
++            cudaMemcpyDeviceToHost, context->stream()));
++    } else {
++        // Cache this immutable device limit on the calling inference thread.
++        static thread_local int last_device = -1;
++        static thread_local size_t maximum_pitch = 0;
++        const int physical = ggml_cuda_get_physical_device(context->device);
++        if (last_device != physical) {
++            int value = 0;
++            if (cudaDeviceGetAttribute(&value, cudaDevAttrMaxPitch, physical) != cudaSuccess || value <= 0) { return 0; }
++            maximum_pitch = size_t(value);
++            last_device = physical;
++        }
++        if (plan.source_stride > maximum_pitch || destination_stride > maximum_pitch) { return 0; }
++        CUDA_CHECK(cudaMemcpy2DAsync(destination, destination_stride, tensors[0]->data,
++            plan.source_stride, plan.row_bytes, plan.rows, cudaMemcpyDeviceToHost, context->stream()));
++    }
++    static const bool trace = [] {
++        const char * value = std::getenv("GGML_CUDA_OUTPUT_TRACE");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    if (trace) {
++        std::fprintf(stderr, "cuda_output: rows=%zu row_bytes=%zu source_pitch=%zu host_pitch=%zu\n",
++            plan.rows, plan.row_bytes, plan.source_stride, destination_stride);
++    }
++    return plan.rows;
++}
++
++inline const ggml_backend_cuda_output_api api = {1, copy_rows};
++}
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3407,6 +3407,10 @@
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#include "ggml-cuda/host-output.cuh"
++#endif
++
+ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+@@ -7303,6 +7307,9 @@
+     if (strcmp(name, "ggml_backend_cuda_tuning_api") == 0) {
+         return const_cast<ggml_backend_cuda_tuning_api *>(&ggml_cuda_resident_tuning_api);
+     }
++    if (strcmp(name, "ggml_backend_cuda_output_api") == 0) {
++        return const_cast<ggml_backend_cuda_output_api *>(&wildllama_cuda_output::api);
++    }
+ #endif
+     if (strcmp(name,"ggml_backend_cuda_moe_api")==0) {
+         return const_cast<ggml_backend_cuda_moe_api *>(&ggml_cuda_moe_api);
+diff --git a/tests/test-host-output-copy.cpp b/tests/test-host-output-copy.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-host-output-copy.cpp
+@@ -0,0 +1,235 @@
++#include "ggml-cpp.h"
++#include "ggml-cuda.h"
++#include "ggml-cuda-output.h"
++#include "ggml-output-copy-plan.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void policy() {
++    constexpr uintptr_t source = 0x10000000, destination = 0x50000000;
++    std::vector<ggml_output_copy_row> rows(1050);
++    for (size_t i = 0; i < rows.size(); ++i) {
++        rows[i] = {source + i * 128, 1, source, rows.size() * 128, 4, true};
++    }
++    auto plan = [&](size_t count = 512, uintptr_t target = 0x50000000, size_t stride = 4, size_t capacity = 8192) {
++        return ggml_output_copy_rows(count, target, stride, capacity, [&](size_t index) { return rows[index]; });
++    };
++    require(plan().rows == 512 && plan().source_stride == 128 && plan().row_bytes == 4, "regular rows were not batched");
++    require(plan(1050).rows == 1024, "copy planner exceeded bounded lookahead");
++    require(plan(1).rows == 0 && plan(0).rows == 0, "one-row path gained planning work");
++    require(plan(512, destination, 4, 3).rows == 0, "destination overflow was admitted");
++    require(plan(512, destination, 3).rows == 0 && plan(512, destination + 1).rows == 0, "unaligned host layout admitted");
++    require(plan(512, source).rows == 0, "source/destination alias admitted");
++    const auto original = rows;
++    rows[1].eligible = false;
++    require(plan().rows == 0, "unsupported row admitted");
++    rows = original; rows[4].eligible = false;
++    require(plan().rows == 4, "null/unsupported row did not end a run");
++    rows = original; rows[1].owner = 2;
++    require(plan().rows == 0, "different owner was merged");
++    rows = original; rows[2].bytes = 8;
++    require(plan().rows == 2, "different widths were merged");
++    rows = original; rows[1].address = source;
++    require(plan().rows == 0, "duplicate source row was merged");
++    rows = original; std::swap(rows[0], rows[1]);
++    require(plan().rows == 0, "reverse source order admitted");
++    rows = original; rows[2].address += 4;
++    require(plan().rows == 2, "nonuniform pitch was merged");
++    rows = original; rows[0].address = source + rows[0].buffer_bytes - 2;
++    require(plan().rows == 0, "source row outside its owner was admitted");
++    rows = original; rows[0].buffer_begin = std::numeric_limits<uintptr_t>::max() - 1;
++    require(plan().rows == 0, "overflowed buffer range admitted");
++    rows = original; rows[0].bytes = ggml_output_copy_plan::max_row_bytes + 4;
++    require(plan().rows == 0, "unmeasured large row admitted");
++    rows = original;
++    require(plan(512, destination, 4, 4 * 7).rows == 7, "host capacity did not bound the run");
++    std::puts("HOST_OUTPUT_PLAN rows=512 old_submissions=512 planned_submissions=1 payload_bytes=2048 lookahead=1024 boundaries=exact PASS");
++}
++
++struct cuda_fixture {
++    ggml_backend_t backend;
++    ggml_backend_t cpu;
++    const ggml_backend_cuda_output_api * api;
++    size_t count, width, device_pitch, host_pitch, host_bytes;
++    ggml_context_ptr context;
++    ggml_backend_buffer_ptr source;
++    ggml_backend_buffer_ptr host;
++    ggml_backend_sched_ptr scheduler;
++    std::vector<ggml_tensor *> rows;
++    std::vector<const ggml_tensor *> read_rows;
++    uint8_t * expected;
++    uint8_t * actual;
++
++    cuda_fixture(ggml_backend_t backend, ggml_backend_t cpu, const ggml_backend_cuda_output_api * api,
++            size_t count, size_t elements, size_t device_pitch, size_t host_pitch, ggml_type type) :
++        backend(backend), cpu(cpu), api(api), count(count), width(elements * 4), device_pitch(device_pitch), host_pitch(host_pitch),
++        host_bytes((count - 1) * host_pitch + width + 64),
++        context(ggml_init({(count + 16) * ggml_tensor_overhead(), nullptr, true})),
++        source(ggml_backend_alloc_buffer(backend, 4 * 1024 * 1024)),
++        host(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend)), 2 * host_bytes)) {
++        require(context && source && host, "tiny output fixture allocation failed");
++        ggml_backend_t backends[] = {backend, cpu};
++        scheduler.reset(ggml_backend_sched_new(backends, nullptr, 2, count + 64, false, true));
++        require(bool(scheduler), "tiny scheduler allocation failed");
++        auto * data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(source.get()));
++        auto * whole = ggml_new_tensor_1d(context.get(), GGML_TYPE_I8, ggml_backend_buffer_get_size(source.get()));
++        require(ggml_backend_tensor_alloc(source.get(), whole, data) == GGML_STATUS_SUCCESS, "whole source attachment failed");
++        std::vector<uint8_t> payload(ggml_nbytes(whole));
++        for (size_t i = 0; i < payload.size(); ++i) { payload[i] = uint8_t((i * 97 + (i >> 8)) & 255); }
++        ggml_backend_tensor_set(whole, payload.data(), 0, payload.size());
++        for (size_t i = 0; i < count; ++i) {
++            auto * row = ggml_new_tensor_1d(context.get(), type, elements);
++            require(ggml_backend_tensor_alloc(source.get(), row, data + i * device_pitch) == GGML_STATUS_SUCCESS, "row source attachment failed");
++            ggml_backend_sched_set_tensor_backend(scheduler.get(), row, backend);
++            rows.push_back(row); read_rows.push_back(row);
++        }
++        expected = static_cast<uint8_t *>(ggml_backend_buffer_get_base(host.get()));
++        actual = expected + host_bytes;
++    }
++
++    void baseline() {
++        for (size_t row = 0; row < count; ++row) {
++            const auto producer = ggml_backend_sched_get_tensor_backend(scheduler.get(), rows[row]);
++            ggml_backend_tensor_get_async(producer, rows[row], expected + row * host_pitch, 0, width);
++        }
++    }
++    size_t batched() {
++        return api->copy_rows(backend, scheduler.get(), read_rows.data(), read_rows.size(), actual, host_pitch, host_bytes);
++    }
++    void equal() {
++        std::memset(expected, 0xa7, host_bytes); std::memset(actual, 0xa7, host_bytes);
++        baseline(); require(batched() == count, "eligible rows were not batched");
++        ggml_backend_synchronize(backend);
++        require(std::memcmp(expected, actual, host_bytes) == 0, "batched output bytes or host padding changed");
++    }
++};
++
++static void fallback(cuda_fixture & fixture) {
++    auto unchanged = [&] {
++        std::memset(fixture.actual, 0xa7, fixture.host_bytes);
++        require(fixture.batched() == 0, "unsafe rows were queued");
++        ggml_backend_synchronize(fixture.backend);
++        for (size_t i = 0; i < fixture.host_bytes; ++i) { require(fixture.actual[i] == 0xa7, "failed admission changed host output"); }
++    };
++    const auto * second = fixture.read_rows[1];
++    fixture.read_rows[1] = nullptr; unchanged(); fixture.read_rows[1] = second;
++    std::swap(fixture.read_rows[0], fixture.read_rows[1]); unchanged();
++    std::swap(fixture.read_rows[0], fixture.read_rows[1]);
++    auto * row = fixture.rows[1];
++    const auto data = row->data;
++    row->data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(fixture.source.get())) + ggml_backend_buffer_get_size(fixture.source.get()) - 2;
++    unchanged(); row->data = data;
++    ggml_backend_sched_set_tensor_backend(fixture.scheduler.get(), row, fixture.cpu);
++    unchanged(); ggml_backend_sched_set_tensor_backend(fixture.scheduler.get(), row, fixture.backend);
++    const auto type = row->type;
++    row->type = type == GGML_TYPE_F32 ? GGML_TYPE_I32 : GGML_TYPE_F32;
++    unchanged(); row->type = type;
++    require(fixture.api->copy_rows(fixture.backend, fixture.scheduler.get(), fixture.read_rows.data(), fixture.count,
++        fixture.actual, fixture.host_pitch, fixture.width - 1) == 0, "host capacity was ignored");
++    require(fixture.api->copy_rows(fixture.backend, fixture.scheduler.get(), fixture.read_rows.data(), fixture.count,
++        fixture.actual + 1, fixture.host_pitch, fixture.host_bytes - 1) == 0, "unaligned destination was admitted");
++    require(fixture.api->copy_rows(fixture.backend, fixture.scheduler.get(), fixture.read_rows.data(), fixture.count,
++        ggml_backend_buffer_get_base(fixture.source.get()), fixture.host_pitch, fixture.host_bytes) == 0, "device alias destination admitted");
++    fixture.equal();
++    std::puts("HOST_OUTPUT_FALLBACK null_reverse_bounds_backend_type_host_alias all_before_enqueue PASS");
++}
++
++static void pageable(cuda_fixture & fixture) {
++    const size_t stride = fixture.width + 16;
++    const size_t bytes = (fixture.count - 1) * stride + fixture.width + 64;
++    std::vector<uint8_t> expected(bytes, 0xa7), actual(bytes, 0xa7);
++    for (size_t row = 0; row < fixture.count; ++row) {
++        ggml_backend_tensor_get_async(fixture.backend, fixture.rows[row],
++            expected.data() + row * stride, 0, fixture.width);
++    }
++    require(fixture.api->copy_rows(fixture.backend, fixture.scheduler.get(),
++        fixture.read_rows.data(), fixture.count, actual.data(), stride, bytes) == fixture.count,
++        "ordinary pageable host output was not batched");
++    ggml_backend_synchronize(fixture.backend);
++    require(expected == actual, "pageable output payload or host padding changed");
++    std::puts("HOST_OUTPUT_PAGEABLE rows=32 width=4 host_pitch=20 payload_padding=exact PASS");
++}
++
++static void benchmark(cuda_fixture & fixture) {
++    constexpr int rounds = 2, repeats = 128;
++    for (int i = 0; i < 4; ++i) { fixture.baseline(); fixture.batched(); ggml_backend_synchronize(fixture.backend); }
++    std::vector<double> legacy, batched;
++    for (int round = 0; round < rounds; ++round) {
++        for (int leg = 0; leg < 4; ++leg) {
++            const bool fast = leg == 1 || leg == 2;
++            const auto begin = std::chrono::steady_clock::now();
++            for (int repeat = 0; repeat < repeats; ++repeat) {
++                if (fast) { require(fixture.batched() == fixture.count, "benchmark did not batch rows"); }
++                else { fixture.baseline(); }
++                ggml_backend_synchronize(fixture.backend);
++            }
++            const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
++            (fast ? batched : legacy).push_back(elapsed);
++            std::printf("HOST_OUTPUT_ABBA round=%d leg=%d batched=%d rows=%zu width=%zu repeats=%d wall_ms=%.6f\n",
++                round, leg, int(fast), fixture.count, fixture.width, repeats, elapsed);
++        }
++    }
++    std::sort(legacy.begin(), legacy.end()); std::sort(batched.begin(), batched.end());
++    std::printf("HOST_OUTPUT_BENCH rows=%zu width=%zu repeats=%d legacy_median_ms=%.6f batched_median_ms=%.6f old_calls=%zu new_calls=%d payload_unchanged=1 shared_gpu_timings=1\n",
++        fixture.count, fixture.width, repeats, (legacy[1] + legacy[2]) / 2, (batched[1] + batched[2]) / 2, fixture.count, 1);
++}
++
++static void cuda_cases() {
++    ggml_backend_load_all();
++    auto * registry = ggml_backend_reg_by_name("CUDA");
++    require(registry && ggml_backend_reg_dev_count(registry), "CUDA backend unavailable");
++    auto * device = ggml_backend_reg_dev_get(registry, 0);
++    const auto * api = static_cast<const ggml_backend_cuda_output_api *>(ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_output_api"));
++    auto set_limit = reinterpret_cast<decltype(&ggml_backend_cuda_set_memory_limit)>(ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_set_memory_limit"));
++    auto get_stats = reinterpret_cast<decltype(&ggml_backend_cuda_get_memory_stats)>(ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_get_memory_stats"));
++    require(api && api->version == 1 && set_limit && get_stats, "CUDA output API/quota unavailable");
++    require(set_limit(device, 16 * 1024 * 1024, true), "tiny test quota failed");
++    struct quota_owner {
++        decltype(set_limit) release; ggml_backend_dev_t device;
++        ~quota_owner() { release(device, 0, false); }
++    } quota {set_limit, device};
++    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
++    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++    require(backend && cpu, "tiny test backends failed");
++    require(api->copy_rows(nullptr, nullptr, nullptr, 0, nullptr, 0, 0) == 0, "invalid API arguments were admitted");
++    for (const auto type : {GGML_TYPE_F32, GGML_TYPE_I32}) {
++        for (const auto & shape : {std::array<size_t, 4>{32, 1, 128, 4}, {64, 32, 256, 4096}, {256, 1, 4, 4}}) {
++            cuda_fixture fixture(backend.get(), cpu.get(), api, shape[0], shape[1], shape[2], shape[3], type);
++            fixture.equal(); fallback(fixture);
++            if (type == GGML_TYPE_I32 && shape[0] == 32) { pageable(fixture); }
++        }
++    }
++    {
++        cuda_fixture fixture(backend.get(), cpu.get(), api, 512, 1, 128, 4, GGML_TYPE_I32);
++        fixture.equal();
++        ggml_backend_cuda_memory_stats before{}, after{};
++        require(get_stats(device, &before), "cannot read baseline memory");
++        benchmark(fixture);
++        require(get_stats(device, &after) && before.managed_used_bytes == after.managed_used_bytes &&
++            before.managed_peak_bytes == after.managed_peak_bytes && after.managed_peak_bytes <= after.limit_bytes,
++            "batched output copy allocated extra managed CUDA memory");
++        fixture.equal();
++        std::printf("HOST_OUTPUT_MEMORY managed_peak=%zu quota=%zu additional_gpu_bytes=0 PASS\n", after.managed_peak_bytes, after.limit_bytes);
++    }
++    std::puts("PASS: model-free CUDA output copies, exact payload and padding, guarded fallback, ABBA and unchanged managed memory");
++}
++
++int main(int argc, char ** argv) {
++    try {
++        policy();
++        if (argc > 1 && std::string(argv[1]) == "--cuda") { cuda_cases(); }
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

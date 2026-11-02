@@ -1,0 +1,294 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include "ggml.h"
+ #include "ggml-cuda.h"
++#include "ggml-cuda-output.h"
++#include "llama-output-permutation.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-graph-variant-policy.h"
+@@ -2716,6 +2718,8 @@
+         return;
+     }
+ 
++    ggml_backend_reg_t copy_registry = nullptr;
++    const ggml_backend_cuda_output_api * copy_api = nullptr;
+     for (size_t i = 0; i < tensors.size(); ++i) {
+         auto * tensor = tensors[i];
+         if (tensor == nullptr) {
+@@ -2730,6 +2734,31 @@
+ 
+         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+         T * row_ptr = dst.data + (size_t) row * stride;
++        if constexpr (sizeof(T) == 4) {
++            if (tensors.size() - i >= 2 && n_elements > 0 && n_elements <= 16 * 1024 &&
++                    stride <= SIZE_MAX / sizeof(T) && dst.size - size_t(row) * stride <= SIZE_MAX / sizeof(T)) {
++                auto * device = ggml_backend_get_device(backend);
++                auto * registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++                if (registry != copy_registry) {
++                    copy_registry = registry;
++                    copy_api = registry && std::strcmp(ggml_backend_reg_name(registry), "CUDA") == 0 ?
++                        static_cast<const ggml_backend_cuda_output_api *>(ggml_backend_reg_get_proc_address(
++                            registry, "ggml_backend_cuda_output_api")) : nullptr;
++                }
++                const size_t copied = copy_api && copy_api->version == 1 ? copy_api->copy_rows(
++                    backend, sched, tensors.data() + i, tensors.size() - i, row_ptr,
++                    stride * sizeof(T), (dst.size - size_t(row) * stride) * sizeof(T)) : 0;
++                if (copied >= 2) {
++                    GGML_ASSERT(copied <= tensors.size() - i);
++                    if (counts) {
++                        GGML_ASSERT(size_t(row) + copied <= counts->size());
++                        for (size_t j = 0; j < copied; ++j) { (*counts)[size_t(row) + j] = n_elements; }
++                    }
++                    i += copied - 1;
++                    continue;
++                }
++            }
++        }
+         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
+ 
+         if (counts) {
+@@ -3153,28 +3182,30 @@
+             device_verify_ordered = false;
+             GGML_ASSERT((size_t) n_outputs == out_ids.size());
+ 
+-            // TODO: is there something more efficient which also minimizes swaps?
+-            // selection sort, to minimize swaps (from https://en.wikipedia.org/wiki/Selection_sort)
+-            for (uint32_t i = 0; i < n_outputs - 1; ++i) {
+-                uint32_t j_min = i;
+-                for (uint32_t j = i + 1; j < n_outputs; ++j) {
+-                    if (out_ids[j] < out_ids[j_min]) {
+-                        j_min = j;
++            // The inverse map preserves the exact lazy selection-sort swaps.
++            // Small/sparse or unproven maps retain the original implementation.
++            if (!llama_output_permutation_indexed(out_ids, output_ids, output_swaps)) {
++                for (uint32_t i = 0; i < n_outputs - 1; ++i) {
++                    uint32_t j_min = i;
++                    for (uint32_t j = i + 1; j < n_outputs; ++j) {
++                        if (out_ids[j] < out_ids[j_min]) {
++                            j_min = j;
++                        }
+                     }
++                    if (j_min == i) {
++                        continue;
++                    }
++                    std::swap(out_ids[i], out_ids[j_min]);
++
++                    // remember the swaps and apply them lazily upon logits/embeddings access
++                    output_swaps.push_back({ i, j_min });
+                 }
+-                if (j_min == i) {
+-                    continue;
++
++                std::fill(output_ids.begin(), output_ids.end(), -1);
++
++                for (uint32_t i = 0; i < n_outputs; ++i) {
++                    output_ids[out_ids[i]] = i;
+                 }
+-                std::swap(out_ids[i], out_ids[j_min]);
+-
+-                // remember the swaps and apply them lazily upon logits/embeddings access
+-                output_swaps.push_back({ i, j_min });
+-            }
+-
+-            std::fill(output_ids.begin(), output_ids.end(), -1);
+-
+-            for (uint32_t i = 0; i < n_outputs; ++i) {
+-                output_ids[out_ids[i]] = i;
+             }
+         }
+     }
+diff --git a/src/llama-output-permutation.h b/src/llama-output-permutation.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-output-permutation.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <vector>
++#include <utility>
++
++// Reuse the already populated token-to-output map. The swap order is identical
++// to selection sort, so the existing lazy output views keep their contract.
++template <typename Swaps>
++bool llama_output_permutation_indexed(std::vector<int32_t> & outputs,
++        std::vector<int32_t> & inverse, Swaps & swaps, size_t * visited = nullptr) {
++    const size_t count = outputs.size();
++    if (count < 32 || count > size_t(std::numeric_limits<int32_t>::max()) ||
++            inverse.size() > size_t(std::numeric_limits<int32_t>::max()) ||
++            inverse.size() > uint64_t(count) * (count - 1) / 16) { return false; }
++
++    size_t valid = 0;
++    for (size_t token = 0; token < inverse.size(); ++token) {
++        if (visited) { ++*visited; }
++        const int32_t position = inverse[token];
++        if (position < 0) { if (position != -1) { return false; } continue; }
++        if (size_t(position) >= count || outputs[position] != int32_t(token)) { return false; }
++        ++valid;
++    }
++    if (valid != count) { return false; }
++
++    uint32_t position = 0;
++    for (size_t token = 0; token < inverse.size() && position + 1 < count; ++token) {
++        if (visited) { ++*visited; }
++        const int32_t selected = inverse[token];
++        if (selected < 0) { continue; }
++        if (uint32_t(selected) != position) {
++            const auto previous = outputs[position];
++            std::swap(outputs[position], outputs[selected]);
++            inverse[token] = int32_t(position);
++            inverse[previous] = selected;
++            swaps.push_back({position, uint32_t(selected)});
++        }
++        ++position;
++    }
++    return true;
++}
+diff --git a/tests/test-output-permutation.cpp b/tests/test-output-permutation.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-output-permutation.cpp
+@@ -0,0 +1,107 @@
++#include "../src/llama-output-permutation.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++
++struct swap_pair {
++    uint32_t i0, i1;
++    bool operator==(const swap_pair & other) const { return i0 == other.i0 && i1 == other.i1; }
++};
++using swaps_t = std::vector<swap_pair>;
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++static void original(std::vector<int32_t> & out, std::vector<int32_t> & inverse, swaps_t & swaps) {
++    for (uint32_t i = 0; i + 1 < out.size(); ++i) {
++        uint32_t selected = i;
++        for (uint32_t j = i + 1; j < out.size(); ++j) {
++            if (out[j] < out[selected]) { selected = j; }
++        }
++        if (selected != i) { std::swap(out[i], out[selected]); swaps.push_back({i, selected}); }
++    }
++    std::fill(inverse.begin(), inverse.end(), -1);
++    for (uint32_t i = 0; i < out.size(); ++i) { inverse[out[i]] = int32_t(i); }
++}
++static std::vector<int32_t> map(const std::vector<int32_t> & out, size_t capacity) {
++    std::vector<int32_t> inverse(capacity, -1);
++    for (size_t i = 0; i < out.size(); ++i) { inverse[out[i]] = int32_t(i); }
++    return inverse;
++}
++static void contracts() {
++    std::mt19937 random(73031);
++    int admitted = 0, fallback = 0;
++    for (const int capacity : {32, 64, 256, 512, 4096}) {
++        std::vector<int32_t> all(capacity); std::iota(all.begin(), all.end(), 0);
++        for (int trial = 0; trial < 96; ++trial) {
++            std::shuffle(all.begin(), all.end(), random);
++            const auto count = trial % 4 ? size_t(capacity) : size_t(1 + random() % capacity);
++            std::vector<int32_t> out(all.begin(), all.begin() + count), reference = out;
++            auto inverse = map(out, capacity), expected_inverse = inverse;
++            const auto before = out, before_inverse = inverse;
++            swaps_t expected, actual;
++            original(reference, expected_inverse, expected);
++            size_t visited = 0;
++            const bool used = llama_output_permutation_indexed(out, inverse, actual, &visited);
++            if (!used) {
++                ++fallback;
++                require(out == before && inverse == before_inverse && actual.empty(), "fallback mutated output metadata");
++                original(out, inverse, actual);
++            } else { ++admitted; require(visited <= 2 * size_t(capacity), "indexed output order exceeded its linear bound"); }
++            require(out == reference && inverse == expected_inverse && actual == expected,
++                "output ordering changed the lazy selection-sort swap sequence");
++            // Exercise the same deferred swaps on independent token/probability rows.
++            auto rows = before;
++            for (const auto & change : actual) { std::swap(rows[change.i0], rows[change.i1]); }
++            require(rows == reference, "lazy row permutation changed");
++        }
++    }
++    std::vector<int32_t> out(64); std::iota(out.rbegin(), out.rend(), 0);
++    const auto original_out = out;
++    for (int invalid : {0, 1, 2, 3}) {
++        auto inverse = map(out, 128);
++        if (invalid == 0) { inverse[13] = 64; }
++        else if (invalid == 1) { inverse[13] = -1; }
++        else if (invalid == 2) { inverse[13] = inverse[14]; }
++        else { inverse[113] = -2; }
++        const auto before = inverse;
++        swaps_t swaps;
++        require(!llama_output_permutation_indexed(out, inverse, swaps) && out == original_out && inverse == before && swaps.empty(),
++            "invalid inverse mapping partially changed outputs");
++    }
++    std::printf("PASS: 480 output permutations; %d indexed, %d conservative fallback; exact lazy swaps and invalid-map transaction\n", admitted, fallback);
++}
++static void benchmark() {
++    constexpr size_t count = 512, repeats = 256;
++    std::vector<int32_t> input(count); std::iota(input.rbegin(), input.rend(), 0);
++    const auto initial = map(input, count);
++    swaps_t swaps; swaps.reserve(count);
++    std::vector<int32_t> out(count), inverse(count);
++    volatile uint64_t checksum = 0;
++    auto run = [&](bool indexed) {
++        const auto start = std::chrono::steady_clock::now();
++        for (size_t repeat = 0; repeat < repeats; ++repeat) {
++            out = input; inverse = initial; swaps.clear();
++            if (indexed) { require(llama_output_permutation_indexed(out, inverse, swaps), "benchmark was not admitted"); }
++            else { original(out, inverse, swaps); }
++            checksum += swaps.size() + out.back();
++        }
++        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++    };
++    std::vector<double> baseline, indexed;
++    for (int cycle = 0; cycle < 4; ++cycle) {
++        baseline.push_back(run(false)); indexed.push_back(run(true));
++        indexed.push_back(run(true)); baseline.push_back(run(false));
++    }
++    std::sort(baseline.begin(), baseline.end()); std::sort(indexed.begin(), indexed.end());
++    const auto median = [](const std::vector<double> & values) { return (values[3] + values[4]) / 2; };
++    std::printf("OUTPUT_ORDER_BENCH outputs=%zu repeats=%zu abba_cycles=4 selection_median_ms=%.6f indexed_median_ms=%.6f old_comparisons=%zu max_index_visits=%zu extra_workspace_bytes=0 checksum=%llu\n",
++        count, repeats, median(baseline), median(indexed), count * (count - 1) / 2, 2 * count, (unsigned long long) checksum);
++}
++int main() {
++    try { contracts(); benchmark(); return 0; }
++    catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}
+diff --git a/tests/test-server-writeback.cpp b/tests/test-server-writeback.cpp
+--- a/tests/test-server-writeback.cpp
++++ b/tests/test-server-writeback.cpp
+@@ -141,11 +141,12 @@
+             cache.writer.set_enabled(true);
+             auto * first=cache.alloc(prompt(1),data(41));
+             require(first && cache.alloc(prompt(2),data(51)),"hot cache allocation failed");
++            const auto * original_data = first->data.main.data();
+             cache.update();
+             require(first->writeback && cache.materialize(cache.states.begin()),"pending hot prefix unavailable");
+             check_bytes(*first,41);
+-            require(!first->writeback && !first->backing && cache.size()<=cache.limit_size,
+-                    "pending hot prefix used disk instead of original vectors");
++            require(!first->writeback && first->backing && first->data.main.data() == original_data && cache.size()<=cache.limit_size,
++                    "pending hot prefix lost original vectors or its reusable disk backing");
+             server_prompt_cache moved=std::move(cache);
+             require(moved.size()<=moved.limit_size,"cache move lost RAM accounting");
+             moved.limit_size=0; moved.limit_tokens=1; moved.update();

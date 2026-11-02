@@ -1,0 +1,704 @@
+diff --git a/tools/server/server-state-pager.h b/tools/server/server-state-pager.h
+--- a/tools/server/server-state-pager.h
++++ b/tools/server/server-state-pager.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+@@ -23,14 +24,51 @@
+ // unchanged if optional storage fails. All files are owned by this cache session.
+ class server_state_pager {
+     static constexpr size_t page_bytes = 256 * 1024;
++    static constexpr size_t minimum_chunk = 192 * 1024;
++    static constexpr size_t index_charge = 512 * 1024;
++    static constexpr size_t work_charge = page_bytes + 32 * 1024;
+     static constexpr uint64_t magic = 0x31524750534c5755ull;
++    static constexpr uint64_t shared_magic = 0x32524750534c5755ull;
++    struct file_storage;
++    struct indexed_page {
++        std::weak_ptr<file_storage> source;
++        uint64_t offset = 0, hash = 0;
++        uint32_t size = 0;
++    };
++    struct page_index { std::array<indexed_page, 8192> slots; };
+     struct pool {
+         mutable std::mutex mutex;
+         std::filesystem::path directory;
+         uint64_t limit = 0, used = 0;
+         size_t entries = 0;
+         uint64_t serial = 0;
++        size_t metadata_limit = 0, metadata_used = 0;
++        uint64_t shared_bytes = 0, written_bytes = 0, reused_chunks = 0;
++        std::unique_ptr<page_index> index;
+         ~pool() { std::error_code ec; std::filesystem::remove(directory, ec); }
++    };
++    struct file_storage {
++        std::shared_ptr<pool> owner;
++        std::filesystem::path path;
++        uint64_t bytes = 0, serial = 0;
++        size_t metadata_charge = 0;
++        ~file_storage() {
++            if (!owner) { return; }
++            std::error_code ec;
++            std::filesystem::remove(path, ec);
++            {
++                std::lock_guard<std::mutex> lock(owner->mutex);
++                owner->metadata_used -= metadata_charge;
++                if (ec) { return; }
++                owner->used -= bytes; --owner->entries;
++            }
++        }
++    };
++    struct shared_page {
++        std::shared_ptr<file_storage> source;
++        uint64_t offset = 0, hash = 0;
++        uint32_t size = 0, part = 0;
++        size_t input_offset = 0;
+     };
+     std::shared_ptr<pool> owner;
+     static uint64_t checksum(const uint8_t * data, size_t n) {
+@@ -44,11 +82,53 @@
+         for (; i < n; ++i) { h = (h ^ data[i]) * 1099511628211ull; }
+         return h;
+     }
++    static size_t index_slot(uint64_t hash) {
++        // Repeated words can give different-sized chunks identical low bits.
++        hash ^= hash >> 30; hash *= 0xbf58476d1ce4e5b9ull;
++        hash ^= hash >> 27; hash *= 0x94d049bb133111ebull;
++        hash ^= hash >> 31;
++        return size_t(hash % 8192);
++    }
+     template<class T> static void write(std::ostream & out, const T & value) {
+         out.write(reinterpret_cast<const char *>(&value), sizeof(value));
+     }
+     template<class T> static bool read(std::istream & in, T & value) {
+         return bool(in.read(reinterpret_cast<char *>(&value), sizeof(value)));
++    }
++    static size_t metadata_budget(const char * value) {
++        if (!value || !*value) { return 0; }
++        uint32_t mib = 0;
++        for (; *value; ++value) {
++            if (*value < '0' || *value > '9' || mib > 64) { return 0; }
++            mib = mib * 10 + uint32_t(*value - '0');
++        }
++        return mib <= 64 ? size_t(mib) * 1024 * 1024 : 0;
++    }
++    template<class Parts> static size_t descriptor_charge(const Parts & parts) {
++        size_t pages = 0;
++        for (const auto * part : parts) {
++            if (!part || part->size() > SIZE_MAX - minimum_chunk + 1) { return SIZE_MAX; }
++            const size_t count = (part->size() + minimum_chunk - 1) / minimum_chunk;
++            if (count > (SIZE_MAX - page_bytes) / sizeof(shared_page) - pages) { return SIZE_MAX; }
++            pages += count;
++        }
++        return pages * sizeof(shared_page);
++    }
++    static size_t chunk_size(const std::vector<uint8_t> & part, size_t start) {
++        const size_t remaining = part.size() - start;
++        if (remaining <= page_bytes) { return remaining; }
++        constexpr size_t window = 64;
++        uint64_t power = 1;
++        for (size_t i = 1; i < window; ++i) { power *= 257; }
++        size_t boundary = start + minimum_chunk, best = boundary;
++        uint64_t hash = 0;
++        for (size_t i = boundary - window; i < boundary; ++i) { hash = hash * 257 + uint64_t(part[i]) + 1; }
++        uint64_t minimum = hash;
++        for (++boundary; boundary <= start + page_bytes; ++boundary) {
++            hash = (hash - (uint64_t(part[boundary - window - 1]) + 1) * power) * 257 + uint64_t(part[boundary - 1]) + 1;
++            if (hash < minimum) { minimum = hash; best = boundary; }
++        }
++        return best - start;
+     }
+ public:
+     struct entry {
+@@ -56,7 +136,16 @@
+         std::filesystem::path path;
+         std::vector<uint64_t> lengths;
+         uint64_t payload_bytes = 0, file_bytes = 0;
++        std::shared_ptr<file_storage> storage;
++        std::vector<shared_page> pages;
++        size_t metadata_charge = 0;
++        size_t resident_metadata_bytes() const { return metadata_charge + (storage ? storage->metadata_charge : 0); }
+         ~entry() {
++            if (metadata_charge && owner) {
++                std::lock_guard<std::mutex> lock(owner->mutex);
++                owner->metadata_used -= metadata_charge;
++            }
++            if (storage) { return; }
+             std::error_code ec;
+             std::filesystem::remove(path, ec);
+             if (owner) {
+@@ -100,6 +189,13 @@
+                 auto pending = std::make_shared<pool>();
+                 if (!std::filesystem::create_directory(path)) { continue; }
+                 pending->directory = std::move(path); pending->limit = bytes;
++                pending->metadata_limit = metadata_budget(std::getenv("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB"));
++                if (pending->metadata_limit >= index_charge + work_charge) {
++                    try {
++                        pending->index = std::make_unique<page_index>();
++                        pending->metadata_used = index_charge;
++                    } catch (...) { pending->metadata_limit = 0; }
++                }
+                 owner = std::move(pending); return true;
+             }
+         } catch (...) {}
+@@ -111,11 +207,221 @@
+         std::lock_guard<std::mutex> lock(owner->mutex);
+         return owner->used;
+     }
++    struct page_statistics {
++        size_t metadata_used = 0, metadata_limit = 0, files = 0;
++        uint64_t shared_bytes = 0, written_bytes = 0, reused_chunks = 0;
++    };
++    page_statistics page_stats() const {
++        if (!owner) { return {}; }
++        std::lock_guard<std::mutex> lock(owner->mutex);
++        return {owner->metadata_used, owner->metadata_limit, owner->entries,
++            owner->shared_bytes, owner->written_bytes, owner->reused_chunks};
++    }
++    static bool backing_available(const handle & saved) noexcept {
++        if (!saved) { return false; }
++        std::error_code ec;
++        if (std::filesystem::file_size(saved->path, ec) != saved->file_bytes || ec) { return false; }
++        std::array<uint64_t, 64> checked{};
++        size_t count = 0;
++        for (const auto & page : saved->pages) {
++            if (!page.source) { return false; }
++            bool known = false;
++            for (size_t i = 0; i < count; ++i) { known |= checked[i] == page.source->serial; }
++            if (known) { continue; }
++            if (count == checked.size()) { return false; }
++            checked[count++] = page.source->serial;
++            ec.clear();
++            if (std::filesystem::file_size(page.source->path, ec) != page.source->bytes || ec) { return false; }
++        }
++        return true;
++    }
++    template<class Parts> size_t page_metadata_charge(const Parts & parts) const {
++        if (!owner || !owner->index) { return 0; }
++        const size_t descriptors = descriptor_charge(parts);
++        const size_t retained = retained_charge(*owner, parts.size()), resource = resource_charge(*owner);
++        if (retained == SIZE_MAX || resource > SIZE_MAX - retained || descriptors > SIZE_MAX - retained - resource) { return SIZE_MAX; }
++        return descriptors + retained + resource;
++    }
+ 
+     handle store(const std::vector<const std::vector<uint8_t> *> & parts) noexcept {
++        if (owner && owner->index) {
++            if (auto saved = store_shared(owner, parts)) { return saved; }
++        }
+         return store_owned(owner, parts);
+     }
+ private:
++    static size_t path_charge(const pool & storage) {
++        const size_t characters = storage.directory.native().size();
++        if (characters > (SIZE_MAX / (4 * sizeof(std::filesystem::path::value_type))) - 64) { return SIZE_MAX; }
++        return (characters + 64) * 4 * sizeof(std::filesystem::path::value_type);
++    }
++    static size_t resource_charge(const pool & storage) {
++        const size_t path = path_charge(storage);
++        return path > SIZE_MAX - sizeof(file_storage) - 64 ? SIZE_MAX : path + sizeof(file_storage) + 64;
++    }
++    static size_t retained_charge(const pool & storage, size_t parts) {
++        const size_t path = path_charge(storage), fixed = sizeof(entry) + 128 + parts * sizeof(uint64_t);
++        return path > SIZE_MAX - fixed ? SIZE_MAX : path + fixed;
++    }
++    struct metadata_ticket {
++        std::shared_ptr<pool> owner;
++        size_t bytes = 0;
++        metadata_ticket(const std::shared_ptr<pool> & storage, size_t charge) {
++            std::lock_guard<std::mutex> lock(storage->mutex);
++            for (auto & slot : storage->index->slots) { if (slot.source.expired()) { slot = {}; } }
++            if (storage->metadata_used <= storage->metadata_limit && charge <= storage->metadata_limit - storage->metadata_used) {
++                owner = storage; bytes = charge; storage->metadata_used += charge;
++            }
++        }
++        ~metadata_ticket() {
++            if (owner) { std::lock_guard<std::mutex> lock(owner->mutex); owner->metadata_used -= bytes; }
++        }
++        void publish(entry & pending) {
++            pending.owner = owner; pending.metadata_charge = bytes; owner.reset(); bytes = 0;
++        }
++    };
++    struct page_reader {
++        std::shared_ptr<file_storage> source;
++        std::ifstream stream;
++        bool get(const shared_page & page, uint8_t * destination) {
++            if (!page.source || page.offset > page.source->bytes || page.size > page.source->bytes - page.offset) { return false; }
++            if (source != page.source) {
++                stream.close(); stream.clear(); source.reset();
++                source = page.source;
++                std::error_code ec;
++                if (std::filesystem::file_size(source->path, ec) != source->bytes || ec) { return false; }
++                stream.open(source->path, std::ios::binary);
++            }
++            stream.clear(); stream.seekg(std::streamoff(page.offset));
++            return bool(stream.read(reinterpret_cast<char *>(destination), page.size));
++        }
++    };
++    static handle store_shared(const std::shared_ptr<pool> & storage,
++            const std::vector<const std::vector<uint8_t> *> & parts) noexcept {
++        if (!storage || !storage->index || parts.empty() || parts.size() > 4096) { return {}; }
++        try {
++            const size_t descriptors = descriptor_charge(parts);
++            const size_t retained = retained_charge(*storage, parts.size()), resource = resource_charge(*storage);
++            if (descriptors == SIZE_MAX || retained == SIZE_MAX || resource > SIZE_MAX - retained ||
++                    descriptors > SIZE_MAX - retained - resource || work_charge > SIZE_MAX - descriptors - retained - resource) { return {}; }
++            metadata_ticket reservation(storage, descriptors + retained + resource + work_charge);
++            if (!reservation.owner) { return {}; }
++            auto pending = std::make_shared<entry>();
++            pending->storage = std::make_shared<file_storage>();
++            reservation.publish(*pending);
++            pending->pages.reserve(descriptors / sizeof(shared_page));
++            if (pending->pages.capacity() * sizeof(shared_page) > descriptors) { return {}; }
++            pending->lengths.reserve(parts.size());
++            if (pending->lengths.capacity() > parts.size()) { return {}; }
++            std::vector<uint8_t> scratch(page_bytes);
++            page_reader reader;
++            uint64_t shared = 0, hits = 0, total = 2 * sizeof(uint64_t);
++            for (size_t part = 0; part < parts.size(); ++part) {
++                const auto & input = *parts[part];
++                if (input.size() > UINT64_MAX - pending->payload_bytes || total > UINT64_MAX - sizeof(uint64_t)) { return {}; }
++                pending->payload_bytes += input.size();
++                pending->lengths.push_back(input.size()); total += sizeof(uint64_t);
++                for (size_t offset = 0; offset < input.size();) {
++                    const size_t size = chunk_size(input, offset);
++                    shared_page page;
++                    page.size = uint32_t(size); page.part = uint32_t(part); page.input_offset = offset;
++                    page.hash = checksum(input.data() + offset, size);
++                    {
++                        std::lock_guard<std::mutex> lock(storage->mutex);
++                        const auto & slot = storage->index->slots[index_slot(page.hash)];
++                        if (slot.hash == page.hash && slot.size == size) {
++                            page.source = slot.source.lock(); page.offset = slot.offset;
++                        }
++                    }
++                    if (!page.source || !reader.get(page, scratch.data()) ||
++                            std::memcmp(scratch.data(), input.data() + offset, size) != 0) {
++                        page.source = pending->storage;
++                        if (size > UINT64_MAX - total) { return {}; }
++                        total += size;
++                    } else { shared += size; ++hits; }
++                    if (total > UINT64_MAX - 4 * sizeof(uint64_t)) { return {}; }
++                    total += 4 * sizeof(uint64_t);
++                    pending->pages.push_back(std::move(page));
++                    offset += size;
++                }
++            }
++            if (!pending->payload_bytes || total > storage->limit) { return {}; }
++            {
++                std::lock_guard<std::mutex> lock(storage->mutex);
++                if (storage->entries >= 64 || storage->used > storage->limit || total > storage->limit - storage->used) { return {}; }
++                auto & file = *pending->storage;
++                file.serial = ++storage->serial;
++                file.path = storage->directory / (std::to_string(file.serial) + ".state");
++                const size_t actual = sizeof(file_storage) + 64 + file.path.native().capacity() * sizeof(std::filesystem::path::value_type);
++                if (actual > resource) { return {}; }
++                file.metadata_charge = actual; pending->metadata_charge -= actual;
++                file.bytes = total; file.owner = storage;
++                storage->used += total; ++storage->entries;
++                pending->path = file.path; pending->file_bytes = total;
++            }
++            std::ofstream output(pending->path, std::ios::binary | std::ios::trunc);
++            output.exceptions(std::ios::failbit | std::ios::badbit);
++            write(output, shared_magic); write(output, uint64_t(parts.size()));
++            size_t page_index = 0;
++            for (size_t part = 0; part < parts.size(); ++part) {
++                write(output, uint64_t(parts[part]->size()));
++                while (page_index < pending->pages.size() && pending->pages[page_index].part == part) {
++                    auto & page = pending->pages[page_index++];
++                    if (page.source == pending->storage) { page.offset = uint64_t(output.tellp()) + 4 * sizeof(uint64_t); }
++                    write(output, uint64_t(page.size)); write(output, page.hash);
++                    write(output, page.source->serial); write(output, page.offset);
++                    if (page.source == pending->storage) {
++                        output.write(reinterpret_cast<const char *>(parts[part]->data() + page.input_offset), page.size);
++                    }
++                }
++            }
++            output.close();
++            std::vector<uint8_t>().swap(scratch);
++            {
++                std::lock_guard<std::mutex> lock(storage->mutex);
++                const size_t release = work_charge + resource - pending->storage->metadata_charge;
++                pending->metadata_charge -= release; storage->metadata_used -= release;
++                storage->shared_bytes += shared; storage->reused_chunks += hits; storage->written_bytes += total;
++                for (const auto & page : pending->pages) {
++                    auto & slot = storage->index->slots[index_slot(page.hash)];
++                    slot.source = page.source; slot.offset = page.offset; slot.hash = page.hash; slot.size = page.size;
++                }
++            }
++            return pending;
++        } catch (...) { return {}; }
++    }
++    static bool load_shared(const handle & saved, const std::vector<std::vector<uint8_t> *> & parts,
++            std::ifstream & file) {
++        if (!saved->storage || saved->pages.empty()) { return false; }
++        uint64_t count = 0;
++        if (!read(file, count) || count != parts.size()) { return false; }
++        std::vector<std::vector<uint8_t>> pending(parts.size());
++        page_reader reader;
++        size_t page_index = 0;
++        for (size_t part = 0; part < parts.size(); ++part) {
++            uint64_t length = 0;
++            if (!read(file, length) || length != saved->lengths[part] || length > SIZE_MAX) { return false; }
++            pending[part].resize(size_t(length));
++            for (size_t offset = 0; offset < length;) {
++                if (page_index >= saved->pages.size()) { return false; }
++                const auto & page = saved->pages[page_index++];
++                uint64_t size = 0, hash = 0, serial = 0, source_offset = 0;
++                if (!read(file, size) || !read(file, hash) || !read(file, serial) || !read(file, source_offset) ||
++                        !size || size > page_bytes || size > length - offset || page.part != part ||
++                        size != page.size || hash != page.hash || !page.source ||
++                        serial != page.source->serial || source_offset != page.offset) { return false; }
++                auto * destination = pending[part].data() + offset;
++                if (page.source == saved->storage) {
++                    if (uint64_t(file.tellg()) != page.offset || !file.read(reinterpret_cast<char *>(destination), page.size)) { return false; }
++                } else if (!reader.get(page, destination)) { return false; }
++                if (checksum(destination, page.size) != hash) { return false; }
++                offset += page.size;
++            }
++        }
++        if (page_index != saved->pages.size() || file.peek() != std::char_traits<char>::eof()) { return false; }
++        for (size_t part = 0; part < parts.size(); ++part) { parts[part]->swap(pending[part]); }
++        return true;
++    }
+     static handle store_owned(const std::shared_ptr<pool> & storage,
+             const std::vector<const std::vector<uint8_t> *> & parts) noexcept {
+         if (!storage || parts.empty() || parts.size() > 4096) { return {}; }
+@@ -178,7 +484,9 @@
+             if (std::filesystem::file_size(saved->path, ec) != saved->file_bytes || ec) { return false; }
+             std::ifstream file(saved->path, std::ios::binary);
+             uint64_t marker = 0, count = 0;
+-            if (!read(file, marker) || marker != magic || !read(file, count) || count != parts.size()) { return false; }
++            if (!read(file, marker)) { return false; }
++            if (marker == shared_magic) { return load_shared(saved, parts, file); }
++            if (marker != magic || !read(file, count) || count != parts.size()) { return false; }
+             std::vector<std::vector<uint8_t>> pending(parts.size());
+             for (size_t i = 0; i < parts.size(); ++i) {
+                 uint64_t n = 0;
+diff --git a/tools/server/server-state-writeback.h b/tools/server/server-state-writeback.h
+--- a/tools/server/server-state-writeback.h
++++ b/tools/server/server-state-writeback.h
+@@ -192,6 +192,9 @@
+         if (!can_submit() || !pager.enabled()) { return {}; }
+         auto bytes = charge(parts);
+         if (bytes > allowed_bytes || bytes > maximum_bytes) { return {}; }
++        const size_t descriptors = pager.page_metadata_charge(parts);
++        if (descriptors > maximum_bytes - bytes || descriptors > allowed_bytes - bytes) { return {}; }
++        bytes += descriptors;
+         try {
+             auto job = std::make_shared<work>(pager);
+             job->data.resize(parts.size());
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1792,8 +1792,7 @@
+     try {
+         auto buffers = state.buffers();
+         if (state.backing) {
+-            std::error_code error;
+-            if (std::filesystem::file_size(state.backing->path, error) == state.backing->file_bytes && !error) {
++            if (server_state_pager::backing_available(state.backing)) {
+                 for (auto * buffer : buffers) { std::vector<uint8_t>().swap(*buffer); }
+                 return true;
+             }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -713,7 +713,7 @@
+     size_t size() const {
+         size_t res = data.size() + (resident ? resident->size() : 0);
+         // Cold entries keep their token keys and checkpoint descriptors in RAM.
+-        if (backing) { res += cold_metadata_size() + backing->lengths.size()*sizeof(uint64_t); }
++        if (backing) { res += cold_metadata_size() + backing->lengths.size()*sizeof(uint64_t) + backing->resident_metadata_bytes(); }
+         if (writeback) { res += cold_metadata_size() + writeback->resident_bytes(); }
+ 
+         for (const auto & ckpt : prompt.checkpoints) {
+diff --git a/tests/test-state-pager.cpp b/tests/test-state-pager.cpp
+--- a/tests/test-state-pager.cpp
++++ b/tests/test-state-pager.cpp
+@@ -1,5 +1,6 @@
+ #include "../tools/server/server-state-pager.h"
+ #include <cstdio>
++#include <future>
+ #include <stdexcept>
+ #ifdef _WIN32
+ #ifndef NOMINMAX
+@@ -9,8 +10,150 @@
+ #endif
+ 
+ static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++static void page_budget(const char * value) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB", value) == 0, "cannot set page-cache metadata budget");
++#else
++    require(setenv("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB", value, 1) == 0, "cannot set page-cache metadata budget");
++#endif
++}
++static std::vector<uint8_t> patterned(size_t size, uint32_t seed) {
++    std::vector<uint8_t> result(size);
++    for (auto & value : result) {
++        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
++        value = uint8_t(seed);
++    }
++    return result;
++}
++static void shared_pages(const std::filesystem::path & directory) {
++    constexpr size_t mib = 1024 * 1024;
++    page_budget("4");
++    server_state_pager pager;
++    require(pager.configure(directory, 8 * mib), "shared page pool configure failed");
++    auto base = patterned(2 * mib + 17, 9181), grown = base;
++    auto auxiliary = patterned(31, 219), empty = std::vector<uint8_t>{};
++    grown.insert(grown.begin() + 23, 37, 0x7e);
++    const auto suffix = patterned(384 * 1024, 9871);
++    grown.insert(grown.end(), suffix.begin(), suffix.end());
++    auto original = pager.store({&base, &auxiliary, &empty});
++    require(original && original->storage && original->resident_metadata_bytes(), "first content-defined snapshot missing");
++    const auto original_path = original->path;
++    const auto original_size = original->file_bytes;
++    auto child = pager.store({&grown, &auxiliary, &empty});
++    require(child && child->storage && child->file_bytes + 256 * 1024 < child->payload_bytes,
++            "shifted header/grown prefix did not reuse immutable chunks");
++    const auto child_path = child->path;
++    const auto child_size = child->file_bytes;
++    const auto stats = pager.page_stats();
++    require(stats.reused_chunks > 1 && stats.shared_bytes > 256 * 1024 &&
++            stats.metadata_used <= stats.metadata_limit && stats.metadata_limit == 4 * mib,
++            "shared chunk accounting escaped its explicit metadata allowance");
++    std::vector<uint8_t> a, b, c;
++    require(server_state_pager::load(child, {&a, &b, &c}) && a == grown && b == auxiliary && c.empty(),
++            "shared page restore changed complete component bytes");
++    original.reset();
++    require(std::filesystem::exists(original_path) && pager.used() == original_size + child_size,
++            "a small child bypassed the retained origin's complete file charge");
++    std::vector<server_state_pager::handle> retained;
++    for (size_t i = 0; i < 62; ++i) {
++        auto value = patterned(1024, uint32_t(i + 1));
++        auto saved = pager.store({&value}); require(bool(saved), "bounded origin pool filled before 64 files");
++        retained.push_back(std::move(saved));
++    }
++    require(pager.page_stats().files == 64 && !pager.store({&auxiliary}),
++            "retained origins did not count toward the existing 64-file limit");
++    retained.clear();
++    uint64_t corrupt_offset = 0;
++    for (const auto & page : child->pages) {
++        if (page.source->path == original_path && page.size > 256) { corrupt_offset = page.offset + 9; break; }
++    }
++    require(corrupt_offset > 0, "test did not retain an origin page");
++    char previous = 0;
++    {
++        std::fstream file(original_path, std::ios::binary | std::ios::in | std::ios::out);
++        file.seekg(std::streamoff(corrupt_offset)); file.read(&previous, 1);
++        file.seekp(std::streamoff(corrupt_offset)); const char bad = char(previous ^ 0x53); file.write(&bad, 1);
++    }
++    a.assign(5, 91); b.assign(7, 92); c.assign(3, 93);
++    const auto olda = a, oldb = b, oldc = c;
++    require(!server_state_pager::load(child, {&a, &b, &c}) && a == olda && b == oldb && c == oldc,
++            "corrupt retained origin published a partial component transaction");
++    child.reset();
++    require(pager.used() == 0 && !std::filesystem::exists(original_path) && !std::filesystem::exists(child_path),
++            "shared file ownership leaked its quota or paths");
++    require(pager.page_stats().metadata_used < mib, "entry descriptors remained after their last handle");
++
++    // Delta snapshots refer directly to source files, not to prior snapshot descriptors.
++    auto repeated = patterned(4096, 777);
++    auto first = pager.store({&repeated}); require(first && first->storage, "flat ancestry base missing");
++    const auto first_path = first->path;
++    auto latest = first;
++    for (size_t i = 0; i < 96; ++i) {
++        auto next = pager.store({&repeated}); require(next && next->storage, "flat ancestry snapshot missing");
++        latest = std::move(next); first.reset();
++        require(pager.page_stats().files <= 2 && latest->pages.front().source->path == first_path,
++                "snapshot metadata or file lookup formed an ancestor chain");
++    }
++    require(server_state_pager::load(latest, {&a}) && a == repeated, "flat ancestry restore changed bytes");
++    latest.reset(); require(pager.used() == 0, "flat ancestry origin leaked");
++
++    require(pager.configure(directory, 32 * mib), "concurrent page pool missing");
++    auto anchor = pager.store({&base}); require(bool(anchor), "concurrent anchor missing");
++    std::vector<std::future<bool>> concurrent;
++    for (uint32_t worker = 0; worker < 4; ++worker) {
++        concurrent.push_back(std::async(std::launch::async, [&, worker, copy = pager] () mutable {
++            auto value = base; value.insert(value.begin() + 19, 41 + worker, uint8_t(worker));
++            auto saved = copy.store({&value});
++            std::vector<uint8_t> restored;
++            return saved && server_state_pager::load(saved, {&restored}) && restored == value;
++        }));
++    }
++    for (auto & result : concurrent) { require(result.get(), "concurrent weak index/shared file transaction failed"); }
++    require(pager.page_stats().files == 1 && pager.page_stats().metadata_used <= pager.page_stats().metadata_limit,
++            "concurrent shared pages lost file/metadata charges");
++    anchor.reset(); require(pager.used() == 0, "concurrent origin leaked");
++
++#ifdef _WIN32
++    require(pager.configure(directory, 8 * mib), "partial-write pool missing");
++    auto short_value = patterned(32768, 37);
++    anchor = pager.store({&short_value}); require(bool(anchor), "partial-write anchor missing");
++    const auto blocked = anchor->path.parent_path() / "2.state";
++    const auto lock = CreateFileW(blocked.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++    require(lock != INVALID_HANDLE_VALUE, "cannot lock optional delta output");
++    auto full_fallback = pager.store({&short_value});
++    const auto blocked_charge = pager.used();
++    CloseHandle(lock); DeleteFileW(blocked.c_str());
++    require(full_fallback && !full_fallback->storage && server_state_pager::load(full_fallback, {&a}) && a == short_value,
++            "failed optional delta write lost the original snapshot fallback");
++    require(blocked_charge > anchor->file_bytes + full_fallback->file_bytes && pager.page_stats().files == 3,
++            "undeletable delta output bypassed physical quota/entry reservations");
++    anchor.reset(); full_fallback.reset();
++#endif
++
++    page_budget("1");
++    server_state_pager limited;
++    require(limited.configure(directory, 8 * mib), "limited metadata pool missing");
++    std::vector<const std::vector<uint8_t> *> many(3000, &auxiliary);
++    auto wide = limited.store(many);
++    require(wide && wide->storage, "first bounded descriptor table was not admitted");
++    auto fallback = limited.store(many);
++    require(fallback && !fallback->storage && limited.page_stats().metadata_used <= mib,
++            "metadata denial failed to retain the original full-snapshot path");
++    std::vector<std::vector<uint8_t>> restored(many.size());
++    std::vector<std::vector<uint8_t> *> outputs;
++    for (auto & value : restored) { outputs.push_back(&value); }
++    require(server_state_pager::load(fallback, outputs) && restored.front() == auxiliary && restored.back() == auxiliary,
++            "metadata fallback changed serialized components");
++    wide.reset(); fallback.reset(); require(limited.used() == 0, "metadata fallback leaked physical quota");
++    page_budget("0");
++    std::printf("SHARED_STATE_PAGES shifted_header=37 grown_prefix=393216 reused_bytes=%llu full_origin_charge=1 max_files=64 flat_generations=96 metadata_fallback=exact corruption_transaction=1 PASS\n",
++        (unsigned long long)stats.shared_bytes);
++}
+ int main(int argc, char ** argv) {
+     try {
++        if (argc == 3 && std::strcmp(argv[2], "--pages") == 0) {
++            shared_pages(std::filesystem::absolute(argv[1])); return 0;
++        }
+         require(argc == 2, "test directory required");
+         server_state_pager pager;
+         require(!pager.configure("relative", 1024), "relative directory accepted");
+diff --git a/tests/test-state-writeback.cpp b/tests/test-state-writeback.cpp
+--- a/tests/test-state-writeback.cpp
++++ b/tests/test-state-writeback.cpp
+@@ -34,6 +34,35 @@
+     std::vector<uint8_t> result(size);
+     for (size_t i = 0; i < size; ++i) { result[i] = uint8_t(seed + 29*i); }
+     return result;
++}
++static void shared_page_admission(const std::filesystem::path & directory) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB", "4") == 0, "cannot set metadata allowance");
++#else
++    require(setenv("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB", "4", 1) == 0, "cannot set metadata allowance");
++#endif
++    server_state_pager pager;
++    require(pager.configure(directory, 8 * 1024 * 1024), "shared async pager configure failed");
++    server_state_writeback writer; writer.set_enabled(true);
++    auto value = bytes(1024 * 1024 + 17, 93);
++    const auto original = value;
++    std::vector<std::vector<uint8_t> *> parts {&value};
++    const auto baseline = server_state_writeback::charge(parts), descriptors = pager.page_metadata_charge(parts);
++    require(descriptors > 0 && !writer.submit(pager, parts, baseline) && value == original,
++            "async shared-page descriptors bypassed the existing RAM admission");
++    auto pending = writer.submit(pager, parts, baseline + descriptors + 1024);
++    require(bool(pending) && value.empty() && pending->resident_bytes() >= baseline + descriptors,
++            "async shared metadata was not reserved before moving vectors");
++    server_state_pager::handle saved;
++    require(pending->finish(parts, saved, true) && value == original && saved && saved->storage,
++            "async shared write changed hot component bytes");
++    pending.reset();
++    std::vector<uint8_t> restored;
++    require(server_state_pager::load(saved, {&restored}) && restored == original &&
++            pager.page_stats().metadata_used <= pager.page_stats().metadata_limit,
++            "async shared restore or metadata charge changed");
++    saved.reset(); require(pager.used() == 0, "async shared descriptor lifetime leaked files");
++    std::puts("PASS: async shared-page descriptor admission, original-vector ownership, exact restore and metadata/file budgets");
+ }
+ static void exact_and_bounded(const std::filesystem::path & directory) {
+     server_state_pager pager;
+@@ -153,6 +182,9 @@
+ }
+ int main(int argc,char ** argv) {
+     try {
++        if (argc == 3 && std::strcmp(argv[2], "--pages") == 0) {
++            shared_page_admission(std::filesystem::absolute(argv[1])); return 0;
++        }
+         require(argc==2,"absolute test directory required");
+         const std::filesystem::path directory(argv[1]);
+         require(directory.is_absolute(),"test directory must be explicit absolute path");
+diff --git a/tests/test-server-prefix-cache.cpp b/tests/test-server-prefix-cache.cpp
+--- a/tests/test-server-prefix-cache.cpp
++++ b/tests/test-server-prefix-cache.cpp
+@@ -141,6 +141,61 @@
+     const size_t before = cache.states.size();
+     require(!cache.alloc(make_prompt({99}), {}), "empty capture published");
+     require(cache.states.size() == before, "failed capture evicted snapshots");
++}
++
++static void shared_page_cache(const std::filesystem::path & directory) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB", "4") == 0, "cannot set page metadata allowance");
++#else
++    require(setenv("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB", "4", 1) == 0, "cannot set page metadata allowance");
++#endif
++    server_prompt_cache cache(4, 0);
++    require(cache.pager.configure(directory, 16 * 1024 * 1024), "shared state cache configure failed");
++    cache.writer.set_enabled(false);
++    auto data = make_data(2 * 1024 * 1024, 71);
++    auto expected = data;
++    require(cache.alloc(make_prompt({1,2,3}), std::move(data)), "base shared state insertion failed");
++    auto base = cache.states.begin();
++    require(cache.spill(*base) && base->is_cold() && base->backing->resident_metadata_bytes() > 0,
++            "base shared state metadata missing");
++    const auto origin_path = base->backing->path;
++    expected.main.insert(expected.main.begin() + 17, 37, 95);
++    expected.main.insert(expected.main.end(), 384 * 1024, 83);
++    auto next = expected;
++    require(cache.alloc(make_prompt({1,2,4,5}), std::move(next)), "branched shared state insertion failed");
++    auto child = std::prev(cache.states.end());
++    const bool spilled = cache.spill(*child);
++    const auto shared_stats = cache.pager.page_stats();
++    std::printf("SHARED_CACHE spilled=%d cold=%d reused_bytes=%llu reused_chunks=%llu metadata=%zu limit=%zu\n",
++        int(spilled), int(child->is_cold()), (unsigned long long)shared_stats.shared_bytes,
++        (unsigned long long)shared_stats.reused_chunks, shared_stats.metadata_used, shared_stats.metadata_limit);
++    require(spilled && child->is_cold() && shared_stats.shared_bytes > 256 * 1024,
++            "cache did not publish shared component backing");
++    require(child->size() >= child->backing->resident_metadata_bytes() && cache.size() <= cache.limit_size,
++            "cold shared descriptors escaped cache RAM accounting");
++    require(cache.materialize(child) && child->data.main == expected.main && child->data.drft == expected.drft &&
++            child->data.spec == expected.spec && cache.size() <= cache.limit_size,
++            "shared cache materialization changed complete components or RAM budget");
++    const auto previous = child->backing->path;
++    const auto ram_limit = cache.limit_size;
++    cache.limit_size = 0;
++    cache.limit_tokens = child->prompt.n_tokens();
++    cache.update();
++    cache.limit_size = ram_limit;
++    cache.limit_tokens = 0;
++    require(cache.states.size() == 1 && &cache.states.front() == &*child, "public token-budget eviction did not retain the child");
++    require(std::filesystem::exists(origin_path), "child lost its owned origin file");
++    std::filesystem::resize_file(origin_path, 8);
++    require(!server_state_pager::backing_available(child->backing), "missing/truncated shared origin looked available");
++    require(cache.spill(*child) && child->is_cold() && child->backing->path != previous,
++            "valid hot components were discarded into an invalid shared backing");
++    require(cache.materialize(child) && child->data.main == expected.main && child->data.drft == expected.drft &&
++            child->data.spec == expected.spec && cache.size() <= cache.limit_size,
++            "rewritten shared backing changed bytes or RAM allowance");
++    cache.states.clear();
++    require(cache.pager.used() == 0 && cache.pager.page_stats().metadata_used <= cache.pager.page_stats().metadata_limit,
++            "shared cache resources outlived their entry owners");
++    std::puts("PASS: shared cold descriptors charged to RAM, byte-exact component restore, retained origins and warm rewrite after truncated origin");
+ }
+ 
+ static void warm_disk_backing(const std::filesystem::path & directory) {
+@@ -256,6 +311,9 @@
+ 
+ int main(int argc, char ** argv) {
+     try {
++        if (argc == 3 && std::string(argv[1]) == "--page-state-dir") {
++            shared_page_cache(std::filesystem::absolute(argv[2])); return 0;
++        }
+         selection_and_mutation();
+         fallback_paths();
+         if (argc == 3 && std::string(argv[1]) == "--state-dir") { warm_disk_backing(argv[2]); }

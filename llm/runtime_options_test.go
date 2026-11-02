@@ -56,12 +56,14 @@ func TestMTPTransportEnvironmentPreservesMemoryPolicies(t *testing.T) {
 
 func TestBoundedDeviceFeaturesPreserveRunnerPolicies(t *testing.T) {
 	t.Setenv("WILDLLAMA_VERIFY_DEVICE_MIB", "32")
+	t.Setenv("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB", "4")
 	for _, budget := range []string{"", "0", "64"} {
 		t.Run("budget="+budget, func(t *testing.T) {
 			cmd := &exec.Cmd{}
 			SetupLlamaServerCommandEnv(cmd, "llama-server", nil, map[string]string{
 				"WILDLLAMA_VERIFY_DEVICE_MIB": budget, "WILDLLAMA_KV_CACHE_PAGING": "1",
-				"LLAMA_ARG_GPU_VRAM_LIMIT_MIB": "12288", "LLAMA_ARG_MOE_RAM_LIMIT_MIB": "10240",
+				"WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB": budget,
+				"LLAMA_ARG_GPU_VRAM_LIMIT_MIB":         "12288", "LLAMA_ARG_MOE_RAM_LIMIT_MIB": "10240",
 				"WILDLLAMA_KV_CACHE_INITIAL_TOKENS": "8192", "LLAMA_ARG_CTX_SIZE": "131072",
 			})
 			policies := map[string]string{}
@@ -71,6 +73,9 @@ func TestBoundedDeviceFeaturesPreserveRunnerPolicies(t *testing.T) {
 			}
 			if value, present := policies["WILDLLAMA_VERIFY_DEVICE_MIB"]; present != (budget != "") || value != budget {
 				t.Fatalf("explicit off/default budget changed: %q present=%v", value, present)
+			}
+			if value, present := policies["WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB"]; present != (budget != "") || value != budget {
+				t.Fatalf("explicit SSD metadata off/default budget changed: %q present=%v", value, present)
 			}
 			for key, value := range map[string]string{
 				"WILDLLAMA_KV_CACHE_PAGING": "1", "LLAMA_ARG_GPU_VRAM_LIMIT_MIB": "12288",
@@ -84,6 +89,9 @@ func TestBoundedDeviceFeaturesPreserveRunnerPolicies(t *testing.T) {
 	}
 	if os.Getenv("WILDLLAMA_VERIFY_DEVICE_MIB") != "32" {
 		t.Fatal("profile changed the parent process")
+	}
+	if os.Getenv("WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB") != "4" {
+		t.Fatal("profile changed the parent SSD metadata budget")
 	}
 }
 

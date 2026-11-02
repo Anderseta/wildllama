@@ -51,14 +51,16 @@ func TestRuntimeFeatureRunnerEnvironment(t *testing.T) {
 			t.Fatalf("profile runtime controls admitted unrelated or diagnostic key %q", key)
 		}
 	}
-	for _, value := range []string{"", "0", "1", "64"} {
-		if _, err := ParseRunnerEnvironment(map[string]string{"WILDLLAMA_VERIFY_DEVICE_MIB": value}); err != nil {
-			t.Fatalf("device verification budget %q: %v", value, err)
+	for _, key := range []string{"WILDLLAMA_VERIFY_DEVICE_MIB", "WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB"} {
+		for _, value := range []string{"", "0", "1", "64"} {
+			if _, err := ParseRunnerEnvironment(map[string]string{key: value}); err != nil {
+				t.Fatalf("%s budget %q: %v", key, value, err)
+			}
 		}
-	}
-	for _, value := range []string{"-1", "+1", "-0", "65", "1.5", "64\n", "99999999999999999999"} {
-		if _, err := ParseRunnerEnvironment(map[string]string{"WILDLLAMA_VERIFY_DEVICE_MIB": value}); err == nil {
-			t.Fatalf("accepted invalid device verification budget %q", value)
+		for _, value := range []string{"-1", "+1", "-0", "65", "1.5", "64\n", "99999999999999999999"} {
+			if _, err := ParseRunnerEnvironment(map[string]string{key: value}); err == nil {
+				t.Fatalf("accepted invalid %s budget %q", key, value)
+			}
 		}
 	}
 }
