@@ -107,7 +107,16 @@ func fakeChild(mode string) {
 		os.Exit(5)
 	}
 	f.Close()
+	if mode == "truncated-output" {
+		_ = os.Truncate(values["--output"], 33)
+	}
 	fmt.Fprintln(os.Stderr, "1/1 images saved")
+	if mode == "late-failure" {
+		os.Exit(7)
+	}
+	if mode == "saved-wait" {
+		time.Sleep(30 * time.Second)
+	}
 }
 func modelBytes() []byte {
 	data := make([]byte, 4096)

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -115,6 +116,51 @@ func TestImageGateCancelsRequestBeforeItsReaderLeaseIsReleased(t *testing.T) {
 	service.gate.mu.Lock()
 	require.Zero(t, service.gate.readers)
 	service.gate.mu.Unlock()
+}
+
+func TestImageHTTPGateRejectsFullQueueWithoutCallingInference(t *testing.T) {
+	server, service, _, _, _ := newImageTestService(t)
+	writer, err := service.gate.exclusive(t.Context(), "image")
+	require.NoError(t, err)
+	defer writer()
+	service.gate.maxWaiting = 0
+	called := false
+	router := gin.New()
+	router.Use(server.imageInferenceGate())
+	router.POST("/api/generate", func(c *gin.Context) { called = true; c.String(200, "must not run") })
+	response := imageTestHTTP(router, "POST", "/api/generate", nil, "")
+	require.Equal(t, 503, response.Code)
+	require.Equal(t, "1", response.Header().Get("Retry-After"))
+	require.Contains(t, response.Body.String(), "image_gpu_queue_full")
+	require.False(t, called)
+}
+
+func TestImageHTTPGateAbortsCancelledOrClosedAdmission(t *testing.T) {
+	for _, closed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "cancelled", true: "closed"}[closed], func(t *testing.T) {
+			server, service, _, _, _ := newImageTestService(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if closed {
+				service.gate.shutdown()
+			} else {
+				cancel()
+			}
+			called := false
+			router := gin.New()
+			router.Use(server.imageInferenceGate())
+			router.POST("/api/generate", func(c *gin.Context) { called = true; c.String(200, "must not run") })
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest("POST", "/api/generate", nil).WithContext(ctx))
+			require.False(t, called)
+			if closed {
+				require.Equal(t, 503, response.Code)
+				require.Contains(t, response.Body.String(), "image_gpu_unavailable")
+			} else {
+				require.Equal(t, 499, response.Code)
+			}
+		})
+	}
 }
 
 func TestImageSimultaneousSchedulerAllowsOnlyUnchangedResidentModel(t *testing.T) {

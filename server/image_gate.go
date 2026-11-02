@@ -188,10 +188,17 @@ func (s *Server) imageInferenceGate() gin.HandlerFunc {
 		c.Request = c.Request.WithContext(requestCtx)
 		release, err := s.imageService().gate.reader(requestCtx)
 		if err != nil {
+			requestErr := requestCtx.Err()
 			cancel()
-			if c.Request.Context().Err() == nil {
+			if requestErr != nil {
+				c.AbortWithStatus(499)
+			} else {
+				code := "image_gpu_unavailable"
+				if errors.Is(err, errImageGPUQueueFull) {
+					code = "image_gpu_queue_full"
+				}
 				c.Header("Retry-After", "1")
-				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "code": "image_gpu_queue_full", "retryable": true})
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "code": code, "retryable": true})
 			}
 			return
 		}

@@ -39,14 +39,20 @@ func (e *imageTestEvents) snapshot() []string {
 }
 
 type imageTestRunner struct {
-	events  *imageTestEvents
-	request imagegen.Request
-	entered chan struct{}
-	wait    bool
-	release <-chan struct{}
+	events    *imageTestEvents
+	request   imagegen.Request
+	entered   chan struct{}
+	wait      bool
+	release   <-chan struct{}
+	status    *imagegen.RunnerStatus
+	resultErr error
+	afterSave func()
 }
 
 func (e *imageTestRunner) Status() imagegen.RunnerStatus {
+	if e.status != nil {
+		return *e.status
+	}
 	return imagegen.RunnerStatus{Ready: true, Revision: "test"}
 }
 func (e *imageTestRunner) Close() error { e.events.add("close_image"); return nil }
@@ -83,7 +89,10 @@ func (e *imageTestRunner) Run(ctx context.Context, _ imagegen.Profile, request i
 	if closeErr != nil {
 		return imagegen.Result{}, closeErr
 	}
-	return imagegen.Result{Path: request.OutputPath, MIMEType: "image/png", Width: 64, Height: 64, Seed: request.Seed}, nil
+	if e.afterSave != nil {
+		e.afterSave()
+	}
+	return imagegen.Result{Path: request.OutputPath, MIMEType: "image/png", Width: 64, Height: 64, Seed: request.Seed}, e.resultErr
 }
 
 type imageTestText struct {
@@ -152,7 +161,7 @@ func TestImageExclusiveRestoresExactProfileAfterChildClose(t *testing.T) {
 	profile.Seed = &seed
 	job := &imageJob{ID: "fixture", Config: cloneImageConfig(service.config), Profile: profile, Request: imageJobRequest{Prompt: "Portuguese prompt: uma paisagem"}, ctx: service.ctx}
 	require.NoError(t, service.generate(job))
-	require.Equal(t, []string{"suspend_text", "free_memory", "run_image", "close_image", "restore_text"}, events.snapshot())
+	require.Equal(t, []string{"suspend_text", "free_memory", "run_image", "close_image", "free_memory", "restore_text"}, events.snapshot())
 	require.Empty(t, job.RestoreErrors)
 	require.Equal(t, int64(0), runner.request.Seed)
 	require.NotNil(t, job.Result)
@@ -231,7 +240,7 @@ func TestImageCancelRestoresWithUncancelledCleanupContext(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 	require.NoError(t, <-restored)
-	require.Equal(t, []string{"suspend_text", "free_memory", "run_image", "close_image", "restore_text"}, events.snapshot())
+	require.Equal(t, []string{"suspend_text", "free_memory", "run_image", "close_image", "free_memory", "restore_text"}, events.snapshot())
 }
 
 func TestImageShutdownCancelsCleanupRestore(t *testing.T) {

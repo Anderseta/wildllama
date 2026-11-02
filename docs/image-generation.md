@@ -72,6 +72,18 @@ models and their effective profiles. Restore failures are reported separately an
 do not delete a successful image. Conversation messages are unaffected, although
 an unloaded model's KV cache must be rebuilt on its next turn.
 
+The queued job rechecks runner availability before unloading text. Restoration
+briefly observes released GPU memory to allow delayed CUDA accounting to catch up,
+then lets the normal text scheduler restore the saved profiles. Other programs
+cannot extend that observation into an indefinite wait. Models requested with
+`keep_alive=0` remain on demand instead of receiving an unnecessary warm reload.
+
+Outputs receive a full PNG integrity check, including compressed pixels and
+checksums, after checking the requested dimension bounds. Validation buffers are
+not retained between jobs. If the runner finishes saving before a late
+failure or cancellation, the validated image remains available alongside the
+operation's error and any restoration warnings.
+
 **Auto** uses the safe exclusive policy unless coexistence can be established.
 Explicit **simultaneous** mode checks available GPU memory and permits matching
 resident text runners. Loading or reconfiguring another text runner is refused
@@ -164,6 +176,13 @@ safe checkpoints; WildLlama enforces actual inference admission. It returns a
 reusable asset ID, original path, seed and a bounded user-only thumbnail. A
 text-only conversation model receives the descriptor rather than image pixels.
 Generated originals are registered as deliverables and survive temporary cleanup.
+
+Transient submit and progress failures use bounded retries with the same request
+ID and payload, so losing an acknowledgement does not start a second generation.
+A saved image, its terminal operation status and text-restoration warnings are
+reported separately. The chat's image tool has a one-hour minimum deadline for
+the complete unload/generate/restore cycle; ordinary MCP calls keep their configured
+deadlines, and explicit cancellation remains available throughout.
 
 Small tests cover configuration, admission, cancellation, restore failures,
 idempotency, downloads and asset handling without loading a large image model.

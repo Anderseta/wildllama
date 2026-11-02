@@ -1,7 +1,6 @@
 package imagegen
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -486,25 +485,26 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	defer func() { guardMu.Lock(); _ = guard.Close(); guardMu.Unlock() }()
 	err = cmd.Wait()
 	log.flush()
+	var runErr error
 	if ctx.Err() != nil {
+		runErr = ctx.Err()
+	} else if err != nil {
+		runErr = fmt.Errorf("image runner failed: %w: %s", err, log.tail())
+	}
+	if err := validateOutputPNG(output, p.Width, p.Height); err != nil {
 		_ = os.Remove(output)
-		return Result{}, ctx.Err()
+		if runErr != nil {
+			return Result{}, runErr
+		}
+		return Result{}, fmt.Errorf("runner did not produce a complete PNG with the requested dimensions: %w", err)
 	}
-	if err != nil {
-		_ = os.Remove(output)
-		return Result{}, fmt.Errorf("image runner failed: %w: %s", err, log.tail())
+	result := Result{Path: output, MIMEType: "image/png", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}
+	// A process can fail, or cancellation can arrive, immediately after it saves
+	// the complete image. Return both facts so the caller can preserve the asset
+	// while still reporting cancellation/failure and restoring the chat model.
+	if runErr != nil {
+		return result, runErr
 	}
-	f, err := os.Open(output)
-	if err != nil {
-		return Result{}, fmt.Errorf("runner did not produce an image: %w", err)
-	}
-	cfg, format, err := image.DecodeConfig(bufio.NewReader(f))
-	f.Close()
-	if err != nil || format != "png" || cfg.Width != p.Width || cfg.Height != p.Height {
-		_ = os.Remove(output)
-		return Result{}, errors.New("runner output is not a valid PNG with the requested dimensions")
-	}
-	result := Result{Path: output, MIMEType: "image/png", Width: cfg.Width, Height: cfg.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}
 	log.emit(Progress{Phase: "completed", Message: "Image saved", Current: p.Steps, Total: p.Steps}, true)
 	return result, nil
 }

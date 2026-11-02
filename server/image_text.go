@@ -138,6 +138,11 @@ func (b *schedulerImageText) Restore(ctx context.Context, states []imageTextStat
 	}
 	var failures []string
 	for _, state := range states {
+		// An explicit keep_alive=0 means the original caller wanted no idle
+		// residency. The next normal text request still loads it on demand.
+		if state.duration == 0 {
+			continue
+		}
 		loadCtx, cancel := context.WithCancel(ctx)
 		keep := &api.Duration{Duration: state.duration}
 		shift := state.shift

@@ -251,36 +251,57 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	if mode == "auto" {
 		mode = "exclusive"
 	}
-	v.mu.Lock()
-	job.EffectiveMode = mode
-	v.mu.Unlock()
-	v.update(job, "waiting_for_text", "Waiting for active text and RAG requests to finish", 0, 0)
-	transition, stopWait := context.WithTimeout(job.ctx, 10*time.Minute)
-	release, err := v.gate.exclusive(transition, job.ID)
-	stopWait()
+	if !validImageMode(mode, false) {
+		return errors.New("invalid image execution mode")
+	}
+	if mode == "simultaneous" && profile.MaxVRAMMiB <= 0 {
+		return errors.New("simultaneous mode requires a positive image VRAM fitting target")
+	}
+	// Recheck the runtime after queueing, before disrupting resident text. This
+	// performs no subprocess launch or tensor load, and closes on every path.
+	engine, err := v.newEngine(job.Config.Config)
 	if err != nil {
 		return err
 	}
-	defer release()
+	var release func()
 	var saved []imageTextState
+	var beforeImageFree uint64
+	imageStarted, activeOwned := false, false
 	// Cleanup owns its own deadline: cancelling image generation must still
 	// release its process and restore unchanged prior text profiles when chosen.
 	defer func() {
-		v.mu.Lock()
-		engine := v.active
-		shuttingDown := v.closed
-		v.mu.Unlock()
-		if engine != nil {
-			if closeErr := engine.Close(); closeErr != nil && runErr == nil {
-				runErr = closeErr
-			}
+		if release != nil {
+			defer release()
 		}
 		v.mu.Lock()
-		v.active = nil
+		shuttingDown := v.closed
 		v.mu.Unlock()
-		if job.Config.RestoreTextModels && len(saved) > 0 && !shuttingDown {
+		if closeErr := engine.Close(); closeErr != nil && runErr == nil {
+			runErr = closeErr
+		}
+		if activeOwned {
+			v.mu.Lock()
+			v.active = nil
+			v.mu.Unlock()
+		}
+		needsRestore := false
+		for _, state := range saved {
+			if state.duration != 0 {
+				needsRestore = true
+				break
+			}
+		}
+		if job.Config.RestoreTextModels && needsRestore && !shuttingDown {
 			v.update(job, "restoring_text", "Restoring previously resident text models and profiles", 0, 0)
 			cleanup, cancel := context.WithTimeout(v.ctx, 10*time.Minute)
+			if imageStarted && beforeImageFree > 0 {
+				v.update(job, "restoring_text", "Waiting briefly for released image memory before restoring text", 0, 0)
+				// Driver accounting can lag behind process exit. This is a short
+				// best-effort wait, not a new quota: other programs may consume
+				// memory, and the normal scheduler still gets to attempt restore.
+				_ = v.waitForImageMemoryRecovery(cleanup, beforeImageFree)
+			}
+			v.update(job, "restoring_text", "Restoring previously resident text models and profiles", 0, 0)
 			failures := v.text.Restore(cleanup, saved)
 			cancel()
 			v.mu.Lock()
@@ -288,6 +309,19 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			v.mu.Unlock()
 		}
 	}()
+	if status := engine.Status(); !status.Ready {
+		return fmt.Errorf("image runtime is not ready: %s", status.Error)
+	}
+	v.mu.Lock()
+	job.EffectiveMode = mode
+	v.mu.Unlock()
+	v.update(job, "waiting_for_text", "Waiting for active text and RAG requests to finish", 0, 0)
+	transition, stopWait := context.WithTimeout(job.ctx, 10*time.Minute)
+	release, err = v.gate.exclusive(transition, job.ID)
+	stopWait()
+	if err != nil {
+		return err
+	}
 	if mode == "exclusive" {
 		v.update(job, "unloading_text", "Releasing text weights, context and draft memory", 0, 0)
 		drain, cancel := context.WithTimeout(job.ctx, 2*time.Minute)
@@ -296,11 +330,9 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		if err != nil {
 			return err
 		}
-	} else if profile.MaxVRAMMiB <= 0 {
-		return errors.New("simultaneous mode requires a positive image VRAM fitting target")
 	}
 	v.update(job, "checking_memory", "Checking actual free CUDA memory; the fitting target is not a hard process limit", 0, 0)
-	if err = v.waitForMemory(job.ctx, profile.MaxVRAMMiB, job.Config.ReserveVRAMMiB); err != nil {
+	if beforeImageFree, err = v.waitForMemory(job.ctx, profile.MaxVRAMMiB, job.Config.ReserveVRAMMiB); err != nil {
 		return err
 	}
 	if mode == "simultaneous" {
@@ -308,19 +340,17 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			return err
 		}
 	}
-	engine, err := v.newEngine(job.Config.Config)
-	if err != nil {
-		return err
-	}
 	v.mu.Lock()
 	v.active = engine
+	activeOwned = true
 	v.mu.Unlock()
 	v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
-	result, err := engine.Run(job.ctx, profile, input, func(progress imagegen.Progress) {
+	imageStarted = true
+	result, generationErr := engine.Run(job.ctx, profile, input, func(progress imagegen.Progress) {
 		v.update(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total))
 	})
-	if err != nil {
-		return err
+	if result.Path == "" && generationErr != nil {
+		return generationErr
 	}
 	if filepath.Clean(result.Path) != filepath.Clean(outputPath) {
 		return errors.New("image runner returned an unexpected output path")
@@ -340,25 +370,53 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		return err
 	}
 	job.Result = &asset.imageAsset
-	return nil
+	return generationErr
 }
 
-func (v *imageService) waitForMemory(ctx context.Context, target, reserve int) error {
+func (v *imageService) waitForMemory(ctx context.Context, target, reserve int) (uint64, error) {
 	needed := uint64(target+reserve) * 1024 * 1024
 	check, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
 		free, err := v.text.FreeVRAM(check)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if free >= needed {
+			return free, nil
+		}
+		select {
+		case <-check.Done():
+			return 0, fmt.Errorf("insufficient free CUDA memory: fitting target plus headroom requires %d MiB: %w", target+reserve, check.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (v *imageService) waitForImageMemoryRecovery(ctx context.Context, before uint64) error {
+	// Small display/driver fluctuations must not turn a normal restore into a
+	// fixed three-second delay. Preserve the observed baseline, allowing 64 MiB.
+	const tolerance = uint64(64 << 20)
+	target := uint64(0)
+	if before > tolerance {
+		target = before - tolerance
+	}
+	check, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		free, err := v.text.FreeVRAM(check)
+		if err != nil {
+			return err
+		}
+		if free >= target {
 			return nil
 		}
 		select {
 		case <-check.Done():
-			return fmt.Errorf("insufficient free CUDA memory: fitting target plus headroom requires %d MiB: %w", target+reserve, check.Err())
-		case <-time.After(500 * time.Millisecond):
+			return check.Err()
+		case <-ticker.C:
 		}
 	}
 }
