@@ -1,0 +1,312 @@
+diff --git a/tools/server/server-prefill-budget.h b/tools/server/server-prefill-budget.h
+--- a/tools/server/server-prefill-budget.h
++++ b/tools/server/server-prefill-budget.h
+@@ -5,9 +5,9 @@
+ #include <cstdint>
+ #include <cstring>
+ 
+-// CPU-only admission controller. A decision never edits slots, tokens or a
+-// configured batch size: it either admits the original prompt round or defers
+-// that whole round while already-generating sequences take one ordinary step.
++// CPU-only admission controller. Configured batch/context limits stay intact.
++// A bounded prompt slice can run beside generation when completed observations
++// establish its cost. Unsupported or unlearned layouts use ordinary admission.
+ class server_prefill_budget {
+ public:
+     struct counters {
+@@ -18,6 +18,13 @@
+         uint64_t mixed_samples = 0;
+         uint64_t invalid_samples = 0;
+         uint64_t reserve_admissions = 0;
++        uint64_t chunked_admissions = 0;
++    };
++
++    struct admission {
++        uint32_t prompt_rows = 0;
++        bool deferred = false;
++        bool chunked = false;
+     };
+ 
+     static bool enabled(const char * value) {
+@@ -40,6 +47,7 @@
+         rows = 0;
+         pure_us = 0;
+         mixed_us = 0;
++        prompt_row_us_q16 = 0;
+         warm_pure = 0;
+         slow_mixed = 0;
+         fast_mixed = 0;
+@@ -50,10 +58,12 @@
+     void reservation_changed() {
+         slow_mixed = fast_mixed = 0;
+         pressure = last_deferred = false;
++        prompt_row_us_q16 = 0;
+     }
+ 
+     bool defer(uint32_t configured_batch, uint32_t generating_rows,
+-               uint32_t pending_prompts, bool eligible, bool transient_reservation = false) {
++               uint32_t pending_prompts, bool eligible, bool transient_reservation = false,
++               bool chunk_within_target = false) {
+         ++counts.decisions;
+         if (!eligible || !generating_rows || !pending_prompts || configured_batch <= generating_rows) {
+             // Attaching another slot's backend sampler requires an ordinary
+@@ -71,6 +81,9 @@
+             return false;
+         }
+         if (rows != generating_rows) { clear_learning(); rows = generating_rows; }
++        // A measured slice that fits the objective can make prompt progress on
++        // every step instead of alternating a pure step and a full prompt round.
++        if (chunk_within_target) { last_deferred = false; return false; }
+         // Every deferred round is followed by an ordinary admission round,
+         // even while pressure remains. Prompt progress cannot be starved.
+         if (last_deferred) {
+@@ -82,6 +95,36 @@
+         last_deferred = true;
+         ++counts.deferred;
+         return true;
++    }
++
++    admission plan(uint32_t configured_batch, uint32_t generating_rows,
++                   uint32_t pending_prompts, bool eligible, bool transient_reservation = false) {
++        const uint32_t capacity = configured_batch > generating_rows ? configured_batch - generating_rows : 0;
++        admission value {capacity, false, false};
++        bool fits_target = false;
++        if (eligible && pending_prompts && generating_rows && rows == generating_rows &&
++                warm_pure >= 2 && pressure && prompt_row_us_q16 && capacity) {
++            const uint64_t target = target_latency_us();
++            const uint64_t available = target > pure_us ? target - pure_us : 0;
++            const uint64_t affordable = (available << 16) / prompt_row_us_q16;
++            // Keep useful matrix work per submission. Power-of-two slices avoid
++            // a different graph shape for each small latency fluctuation; no
++            // padding or extra tokens are computed. The tail may be shorter.
++            const uint32_t floor = std::min<uint32_t>(32, capacity);
++            const uint32_t ceiling = uint32_t(std::min<uint64_t>(capacity, std::max<uint64_t>(floor, affordable)));
++            uint32_t chunk = floor;
++            while (chunk <= ceiling / 2) { chunk *= 2; }
++            if (affordable >= capacity) { chunk = capacity; }
++            value.prompt_rows = chunk;
++            value.chunked = chunk < capacity;
++            const uint64_t predicted = pure_us + ((prompt_row_us_q16 * chunk + 65535) >> 16);
++            fits_target = value.chunked && predicted <= target + target / 10;
++        }
++        value.deferred = defer(configured_batch, generating_rows, pending_prompts, eligible,
++            transient_reservation, fits_target);
++        if (value.deferred) { value.prompt_rows = 0; }
++        else if (value.chunked) { ++counts.chunked_admissions; }
++        return value;
+     }
+ 
+     // Only completed, synchronized logical decode calls are observations.
+@@ -105,6 +148,13 @@
+         mixed_us = smooth(mixed_us, sample);
+         ++counts.mixed_samples;
+         if (warm_pure < 2) { return; }
++        if (sample > pure_us) {
++            // The subtraction excludes the measured generation baseline. At
++            // most 60M us shifted by 16 fits comfortably in uint64_t. Keep one
++            // scalar estimate, not a history or a workspace proportional to n_batch.
++            const uint64_t cost = std::max<uint64_t>(1, ((sample - pure_us) << 16) / prompt_rows);
++            prompt_row_us_q16 = smooth(prompt_row_us_q16, cost);
++        }
+         // Two baseline steps is a relative latency objective, not a model
+         // speed claim. The 1 ms floor avoids reacting to tiny timing noise.
+         const uint64_t target = target_latency_us();
+@@ -136,6 +186,7 @@
+     uint64_t pure_us = 0;
+     uint64_t mixed_us = 0;
+     uint64_t target_override_us = 0;
++    uint64_t prompt_row_us_q16 = 0;
+     uint32_t rows = 0;
+     uint32_t warm_pure = 0;
+     uint32_t slow_mixed = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4307,6 +4307,7 @@
+         // process in chunks of params.n_batch
+         int32_t n_batch  = llama_n_batch(ctx_tgt);
+         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
++        int32_t prompt_batch_limit = n_batch;
+ 
+         if (prefill_budget_enabled) {
+             bool supported = !prefill_budget_failed && params_base.cont_batching && !mctx && !spec && !ctx_dft &&
+@@ -4338,12 +4339,18 @@
+             // primary graph. Unsupported new work admits normally but cannot
+             // turn this episode's shape alternation into extra cache storage.
+             prefill_round_reuse_only = prefill_episode_active && pending_prompts;
+-            prefill_round_deferred = prefill_budget.defer(uint32_t(n_batch), generation_rows, pending_prompts,
++            const auto prefill_plan = prefill_budget.plan(uint32_t(n_batch), generation_rows, pending_prompts,
+                 prefill_round_eligible, supported && reservation_pending);
+-            if (prefill_round_deferred) { prefill_memory.mark_deferred(); }
+-            if (prefill_round_deferred && prefill_budget.stats().deferred == 1) {
+-                SRV_INF("ADAPTIVE_PREFILL_ACTIVE generation_rows=%u pending_prompts=%u target_us=%" PRIu64 " max_consecutive_deferrals=1\n",
+-                    generation_rows, pending_prompts, prefill_budget.target_latency_us());
++            prefill_round_deferred = prefill_plan.deferred;
++            if (prefill_plan.chunked && !prefill_plan.deferred) {
++                prompt_batch_limit = int32_t(generation_rows + prefill_plan.prompt_rows);
++            }
++            if (prefill_round_deferred || prefill_plan.chunked) { prefill_memory.mark_deferred(); }
++            const auto prefill_stats = prefill_budget.stats();
++            if ((prefill_round_deferred || prefill_plan.chunked) &&
++                    prefill_stats.deferred + prefill_stats.chunked_admissions == 1) {
++                SRV_INF("ADAPTIVE_PREFILL_ACTIVE generation_rows=%u pending_prompts=%u target_us=%" PRIu64 " prompt_rows=%u max_consecutive_deferrals=1\n",
++                    generation_rows, pending_prompts, prefill_budget.target_latency_us(), prefill_plan.prompt_rows);
+             }
+         }
+ 
+@@ -4355,7 +4362,7 @@
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+ 
+             iterate(slots, [&](server_slot & slot) {
+-                if (!add_ok || batch.size() >= n_batch) {
++                if (!add_ok || batch.size() >= prompt_batch_limit) {
+                     return; // batch is full, skip remaining slots
+                 }
+ 
+@@ -4855,7 +4862,7 @@
+                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+ 
+                     // add prompt tokens for processing in the current batch
+-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
++                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < prompt_batch_limit) {
+                         // get next token to process
+                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+                         if (cur_tok == LLAMA_TOKEN_NULL) {
+@@ -5657,24 +5664,24 @@
+         }
+         if (!prefill_budget_enabled) { return; }
+         const auto stats = prefill_budget.stats();
+-        if (stats.deferred != prefill_summary_deferred) {
++        if (stats.deferred + stats.chunked_admissions != prefill_summary_deferred) {
+             const auto cache = ctx_tgt->get_graph_variant_admission_stats();
+             SRV_INF("ADAPTIVE_PREFILL_SUMMARY decisions=%" PRIu64 " deferred=%" PRIu64 " forced_admissions=%" PRIu64
+-                    " pure_samples=%" PRIu64 " mixed_samples=%" PRIu64 " reserve_admissions=%" PRIu64 " reuse_scopes=%" PRIu64
++                    " chunked_admissions=%" PRIu64 " pure_samples=%" PRIu64 " mixed_samples=%" PRIu64 " reserve_admissions=%" PRIu64 " reuse_scopes=%" PRIu64
+                     " reuse_hits=%" PRIu64 " reuse_misses=%" PRIu64
+                     " primary_growth_bytes=%zu primary_gpu_growth_bytes=%zu secondary_growth_bytes=%zu"
+                     " ordinary_primary_growth_bytes=%zu ordinary_primary_gpu_growth_bytes=%zu"
+                     " ordinary_primary_before_bytes=%zu ordinary_primary_after_bytes=%zu"
+                     " ordinary_primary_gpu_before_bytes=%zu ordinary_primary_gpu_after_bytes=%zu"
+                     " primary_peak_bytes=%zu primary_gpu_peak_bytes=%zu secondary_peak_bytes=%zu scope_restored=%d\n",
+-                stats.decisions, stats.deferred, stats.forced_admissions, stats.pure_samples, stats.mixed_samples, stats.reserve_admissions,
++                stats.decisions, stats.deferred, stats.forced_admissions, stats.chunked_admissions, stats.pure_samples, stats.mixed_samples, stats.reserve_admissions,
+                 cache.reuse_scopes, cache.reuse_hits, cache.reuse_misses,
+                 memory.primary_growth_bytes, memory.primary_gpu_growth_bytes, memory.secondary_growth_bytes,
+                 memory.ordinary_primary_growth_bytes, memory.ordinary_primary_gpu_growth_bytes,
+                 memory.ordinary_primary_before_bytes, memory.ordinary_primary_after_bytes,
+                 memory.ordinary_primary_gpu_before_bytes, memory.ordinary_primary_gpu_after_bytes,
+                 memory.primary_peak_bytes, memory.primary_gpu_peak_bytes, memory.secondary_peak_bytes, int(!cache.reuse_only));
+-            prefill_summary_deferred = stats.deferred;
++            prefill_summary_deferred = stats.deferred + stats.chunked_admissions;
+         }
+         prefill_budget.clear_learning();
+         prefill_round_eligible = prefill_round_reuse_only = prefill_round_deferred = false;
+diff --git a/tests/test-adaptive-prefill.cpp b/tests/test-adaptive-prefill.cpp
+--- a/tests/test-adaptive-prefill.cpp
++++ b/tests/test-adaptive-prefill.cpp
+@@ -116,6 +116,71 @@
+     std::puts("ADAPTIVE_PREFILL_MEMORY_POLICY original_reserve_recorded=1 pressure_reset_until_stable=1 after_first_deferral_protected=1 forced_followups_protected=1 secondary_always_protected=1 disabled_control_observable=1 peaks_not_hidden=1 PASS");
+ }
+ 
++static void chunks() {
++    server_prefill_budget value;
++    auto plan = value.plan(512, 1, 1, true);
++    require(!plan.deferred && !plan.chunked && plan.prompt_rows == 511,
++            "cold controller changed prompt batch size");
++    value.observe(1000, 1, 0, true); value.observe(1000, 1, 0, true);
++    value.observe(10000, 1, 511, true); value.observe(10000, 1, 511, true);
++    plan = value.plan(512, 1, 1, true);
++    require(!plan.deferred && plan.chunked && plan.prompt_rows == 32,
++            "learned prompt slice did not replace an avoidable whole-round deferral");
++    uint32_t processed = 0;
++    for (int i = 0; i < 24; ++i) {
++        plan = value.plan(512, 1, 1, true);
++        require(!plan.deferred && plan.chunked && plan.prompt_rows >= 32 && plan.prompt_rows <= 511,
++                "bounded affordable prompt slices did not make progress every round");
++        processed += plan.prompt_rows;
++        value.observe(1000 + int64_t(plan.prompt_rows) * 18, 1, plan.prompt_rows, true);
++    }
++    require(processed == 24 * 32 && value.stats().chunked_admissions == 25,
++            "prompt-row conservation or chunk accounting changed");
++    plan = value.plan(512, 1, 0, true);
++    require(!plan.deferred && !plan.chunked && plan.prompt_rows == 511,
++            "finished contention retained a prompt slice");
++    // A stricter-than-generation objective cannot be met by any prompt size.
++    // Keep the throughput floor and old alternating fairness fallback.
++    value.reset(100);
++    value.observe(200, 1, 0, true); value.observe(200, 1, 0, true);
++    value.observe(500, 1, 64, true); value.observe(500, 1, 64, true);
++    plan = value.plan(512, 1, 1, true);
++    require(plan.deferred && plan.prompt_rows == 0, "unreachable objective was treated as satisfied");
++    plan = value.plan(512, 1, 1, true);
++    require(!plan.deferred && plan.chunked && plan.prompt_rows == 32,
++            "unreachable objective starved prompt progress or dropped throughput floor");
++    plan = value.plan(512, 1, 1, false, true);
++    require(!plan.deferred && !plan.chunked && plan.prompt_rows == 511 && !value.under_pressure(),
++            "transient reservation used a stale prompt-row estimate");
++    value.observe(200, 1, 0, true); value.observe(200, 1, 0, true);
++    value.observe(500, 1, 64, true); value.observe(500, 1, 64, true);
++    value.reservation_changed();
++    plan = value.plan(512, 1, 1, true);
++    require(!plan.deferred && !plan.chunked, "changed reservation retained the old prompt-row model");
++    value.observe(500, 1, 64, true); value.observe(500, 1, 64, true);
++    plan = value.plan(512, 2, 1, true);
++    require(!plan.deferred && !plan.chunked && plan.prompt_rows == 510,
++            "changed generation rows reused the old prompt-row model");
++    plan = value.plan(1, 1, 1, true);
++    require(!plan.deferred && !plan.chunked && plan.prompt_rows == 0, "full generation batch admitted prompt rows");
++    // Exercise extreme legal sizes without overflowing latency arithmetic.
++    value.reset(60000000);
++    value.observe(1, 1, 0, true); value.observe(1, 1, 0, true);
++    value.observe(60000000, 1, 1, true); value.observe(60000000, 1, 1, true);
++    plan = value.plan(UINT32_MAX, 1, 1, true);
++    require(!plan.deferred && !plan.chunked && plan.prompt_rows == UINT32_MAX - 1,
++            "samples inside the maximum target spuriously triggered adaptation");
++    value.reset(1000);
++    value.observe(1, 1, 0, true); value.observe(1, 1, 0, true);
++    value.observe(60000000, 1, 1, true); value.observe(60000000, 1, 1, true);
++    for (int i = 0; i < 3; ++i) {
++        plan = value.plan(UINT32_MAX, 1, 1, true);
++        require(plan.prompt_rows <= UINT32_MAX - 1 && (plan.deferred || plan.prompt_rows == 32),
++                "extreme latency/capacity overflowed bounded prompt admission");
++    }
++    std::puts("ADAPTIVE_PREFILL_CHUNKS measured_row_cost=1 power_of_two_slices=1 throughput_floor=32 bounded_progress=1 configured_batch_unchanged=1 isolated_unchanged=1 unreachable_target_fair=1 reservation_reset=1 row_change_reset=1 arithmetic_bounded=1 PASS");
++}
++
+ static void scopes() {
+     struct fake_context {
+         bool reuse_only = false;
+@@ -340,6 +405,24 @@
+             "restricted visits primed later normal admission history");
+     compare(rows(32, 0), false); compare(rows(16, 0), false);
+     require(scoped->get_graph_variant_stats().arenas > after_cold.arenas, "ordinary two-hit cache admission stopped working");
++    // Exercise sliced mixed batches as a separate contention episode. Appending
++    // them before the warm/hit pair above can cross a padded KV-history boundary
++    // between its two visits, legitimately changing the graph's input layout.
++    // A retained hit must still be proved by that unchanged same-layout pair.
++    const auto before_slices = scoped->get_graph_variant_stats();
++    for (int prompt : {32, 64, 128}) {
++        compare(rows(1, prompt), true);
++        const auto current = scoped->get_graph_variant_admission_stats();
++        const auto cache = scoped->get_graph_variant_stats();
++        primary_peak = std::max(primary_peak, current.primary_compute_bytes);
++        gpu_peak = std::max(gpu_peak, current.primary_gpu_bytes);
++        baseline_peak = std::max(baseline_peak, reference->get_graph_variant_admission_stats().primary_compute_bytes);
++        baseline_gpu_peak = std::max(baseline_gpu_peak, reference->get_graph_variant_admission_stats().primary_gpu_bytes);
++        require(cache.arenas == before_slices.arenas && cache.compute_bytes == before_slices.compute_bytes,
++                "sliced contention retained another secondary arena");
++    }
++    require(primary_peak <= baseline_peak && gpu_peak <= baseline_gpu_peak,
++            "sliced contention exceeded ordinary compute reservations");
+     auto empty = llama_batch_init(1, 0, 1);
+     empty.n_tokens = 0;
+     {
+@@ -504,7 +587,7 @@
+             if (std::strcmp(argv[i], "--cuda") == 0) { gpu = true; }
+             else { require(directory.empty(), "use [--cuda] [fixture-directory]"); directory = argv[i]; }
+         }
+-        policy(); scopes(); memory_policy();
++        policy(); scopes(); memory_policy(); chunks();
+         if (!directory.empty()) {
+             require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
+             if (gpu) {

@@ -1,0 +1,151 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -788,15 +788,7 @@
+             p1 = std::numeric_limits<llama_pos>::max();
+         }
+ 
+-        for (uint32_t i = 0; i < cells.size(); ++i) {
+-            if (!cells.pos_in(i, p0, p1)) {
+-                continue;
+-            }
+-
+-            if (cells.seq_has(i, seq_id_src)) {
+-                cells.seq_add(i, seq_id_dst);
+-            }
+-        }
++        llama_kv_seq_cp_indexed(cells, seq_id_src, seq_id_dst, p0, p1);
+ 
+         return;
+     }
+diff --git a/src/llama-kv-cell-range.h b/src/llama-kv-cell-range.h
+--- a/src/llama-kv-cell-range.h
++++ b/src/llama-kv-cell-range.h
+@@ -25,3 +25,20 @@
+     }
+     return first_free;
+ }
++
++// Adding another sequence does not invalidate the source position index.
++template <typename Cells>
++void llama_kv_seq_cp_indexed(Cells & cells, llama_seq_id source, llama_seq_id destination,
++        llama_pos p0, llama_pos p1, uint32_t * visited = nullptr) {
++    if (source == destination) { return; }
++    if (p0 < 0) { p0 = 0; }
++    if (p1 < 0) { p1 = std::numeric_limits<llama_pos>::max(); }
++    const auto & positions = cells.seq_pos_get(source);
++    for (auto position = positions.lower_bound({p0, 0});
++            position != positions.end() && position->first < p1; ++position) {
++        if (visited) { ++*visited; }
++        if (!cells.seq_has(position->second, destination)) {
++            cells.seq_add(position->second, destination);
++        }
++    }
++}
+diff --git a/tests/test-kv-indexed-copy.cpp b/tests/test-kv-indexed-copy.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-kv-indexed-copy.cpp
+@@ -0,0 +1,102 @@
++#include "../src/llama-kv-cell-range.h"
++#include "../src/llama-kv-cells.h"
++
++#include <chrono>
++#include <cstdio>
++#include <limits>
++#include <stdexcept>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void legacy_copy(llama_kv_cells & cells, llama_seq_id source, llama_seq_id destination,
++        llama_pos p0, llama_pos p1) {
++    if (source == destination) { return; }
++    if (p0 < 0) { p0 = 0; }
++    if (p1 < 0) { p1 = std::numeric_limits<llama_pos>::max(); }
++    for (uint32_t i = 0; i < cells.size(); ++i) {
++        if (cells.pos_in(i, p0, p1) && cells.seq_has(i, source) && !cells.seq_has(i, destination)) {
++            cells.seq_add(i, destination);
++        }
++    }
++}
++
++static void equal(const llama_kv_cells & a, const llama_kv_cells & b) {
++    require(a.size() == b.size() && a.get_used() == b.get_used(), "copy changed physical occupancy");
++    for (int sequence = 0; sequence < 8; ++sequence) {
++        require(a.seq_pos_get(sequence) == b.seq_pos_get(sequence), "copy changed position index");
++    }
++    for (uint32_t i = 0; i < a.size(); ++i) {
++        require(a.is_empty(i) == b.is_empty(i), "copy changed free cells");
++        if (a.is_empty(i)) { continue; }
++        const auto & x = a.ext_get(i);
++        const auto & y = b.ext_get(i);
++        require(a.pos_get(i) == b.pos_get(i) && a.get_shift(i) == b.get_shift(i) &&
++                a.seq_get_all(i) == b.seq_get_all(i) && x.x == y.x && x.y == y.y && x.tok == y.tok,
++                "copy changed cell metadata");
++    }
++}
++
++static void contracts() {
++    llama_kv_cells original;
++    original.resize(4096);
++    uint32_t random = 7711;
++    auto next = [&] { random = random * 1664525u + 1013904223u; return random; };
++    for (uint32_t i = 0; i < original.size(); i += 7) {
++        original.pos_set(i, next() % 512);
++        original.ext_set(i, {llama_pos(next() % 17), llama_pos(next() % 19), llama_token(next() % 259)});
++        original.seq_add(i, next() % 4);
++    }
++    for (int trial = 0; trial < 256; ++trial) {
++        auto reference = original, indexed = original;
++        const auto source = llama_seq_id(next() % 4), destination = llama_seq_id(next() % 8);
++        const llama_pos p0 = trial % 9 == 0 ? -1 : llama_pos(next() % 600);
++        const llama_pos p1 = trial % 7 == 0 ? -1 : llama_pos(next() % 600);
++        legacy_copy(reference, source, destination, p0, p1);
++        uint32_t visited = 0;
++        llama_kv_seq_cp_indexed(indexed, source, destination, p0, p1, &visited);
++        equal(reference, indexed);
++        require(visited <= original.seq_pos_get(source).size(), "copy visited another sequence's cells");
++        llama_kv_seq_cp_indexed(indexed, source, destination, p0, p1);
++        equal(reference, indexed);
++    }
++    auto a = original, b = original;
++    llama_kv_seq_cp_indexed(a, 0, 7, 0, 512);
++    legacy_copy(b, 0, 7, 0, 512);
++    const auto first_a = llama_kv_seq_rm_indexed(a, 0, 37, 200);
++    const auto first_b = llama_kv_seq_rm_indexed(b, 0, 37, 200);
++    require(first_a == first_b, "copy changed subsequent placement hint");
++    equal(a, b);
++    std::puts("PASS: 256 indexed KV copies; boundaries, duplicates, idempotence, spatial metadata and shared removal");
++}
++
++static void benchmark() {
++    constexpr uint32_t capacity = 131072, live = 64, repeats = 256;
++    llama_kv_cells cells;
++    cells.resize(capacity);
++    for (uint32_t i = 0; i < live; ++i) {
++        const uint32_t physical = i * 997;
++        cells.pos_set(physical, i); cells.seq_add(physical, 0);
++    }
++    auto measure = [&](bool indexed) {
++        const auto start = std::chrono::steady_clock::now();
++        for (uint32_t repeat = 0; repeat < repeats; ++repeat) {
++            if (indexed) { llama_kv_seq_cp_indexed(cells, 0, 1, -1, -1); }
++            else { legacy_copy(cells, 0, 1, -1, -1); }
++            llama_kv_seq_rm_indexed(cells, 1, -1, -1);
++        }
++        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++    };
++    const auto scan = measure(false), indexed = measure(true);
++    uint32_t visited = 0;
++    llama_kv_seq_cp_indexed(cells, 0, 1, -1, -1, &visited);
++    require(visited == live && cells.get_used() == live, "sparse branch duplicated physical KV");
++    std::printf("KV_COPY_BENCH capacity=%u live=%u repeats=%u scan_ms=%.6f indexed_ms=%.6f visited=%u no_new_physical_cells=1\n",
++        capacity, live, repeats, scan, indexed, visited);
++}
++
++int main() {
++    try { contracts(); benchmark(); return 0; }
++    catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

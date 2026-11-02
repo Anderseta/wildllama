@@ -1,0 +1,221 @@
+diff --git a/ggml/src/ggml-cuda/dense-reuse.h b/ggml/src/ggml-cuda/dense-reuse.h
+--- a/ggml/src/ggml-cuda/dense-reuse.h
++++ b/ggml/src/ggml-cuda/dense-reuse.h
+@@ -22,15 +22,19 @@
+ 
+ enum class ggml_cuda_dense_event { quantize, reuse, norm_silu };
+ 
++inline std::atomic<unsigned> * ggml_cuda_dense_trace_counts() {
++    static std::atomic<unsigned> counts[3]{};
++    return counts;
++}
++
+ inline void ggml_cuda_dense_trace(ggml_cuda_dense_event event, const ggml_tensor * tensor) {
+     static const bool enabled = [] {
+         const char * value = std::getenv("GGML_CUDA_DENSE_TRACE");
+         return value && std::strcmp(value, "1") == 0;
+     }();
+     if (!enabled) { return; }
+-    static std::atomic<unsigned> counts[3]{};
++    auto * counts = ggml_cuda_dense_trace_counts();
+     const auto index = static_cast<unsigned>(event);
+-    if (counts[index].load(std::memory_order_relaxed) >= 4) { return; }
+     const auto count = counts[index].fetch_add(1, std::memory_order_relaxed) + 1;
+     if (count <= 4) {
+         static const char * names[] = {"shared-input-quantize", "shared-input-reuse", "norm-gamma-silu"};
+@@ -38,6 +42,16 @@
+             names[index], count, tensor->name,
+             (long long) tensor->ne[0], (long long) tensor->ne[1],
+             (long long) tensor->ne[2], (long long) tensor->ne[3]);
++    }
++}
++
++inline bool ggml_cuda_dense_q8_1_input(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: return true;
++        default: return false;
+     }
+ }
+ 
+@@ -77,7 +91,7 @@
+         if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1]) { continue; }
+         const auto * weight = node->src[0];
+         const auto * input = node->src[1];
+-        if (weight->type != GGML_TYPE_Q8_0 || input->type != GGML_TYPE_F32 ||
++        if (!ggml_cuda_dense_q8_1_input(weight->type) || input->type != GGML_TYPE_F32 ||
+             weight->ne[0] != input->ne[0] || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+             input->ne[0] <= 0 || input->ne[1] <= 0 || input->ne[1] > 8 ||
+             input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input)) { continue; }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1650,7 +1650,7 @@
+     const size_t quantized_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+     bool quantize = true;
+-    char * quantized = !ids && src0->type == GGML_TYPE_Q8_0 ?
++    char * quantized = !ids && ggml_cuda_dense_q8_1_input(src0->type) ?
+         mmvq_reuse_input(ctx, src1, quantized_bytes, quantize) : nullptr;
+     if (!quantized) { quantized = src1_q8_1.alloc(quantized_bytes); }
+     if (quantize) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2309,7 +2309,7 @@
+     // Stand-alone matrix timing does not include shared input quantization
+     // savings. Keep the original MMVQ path for every planned consumer,
+     // including the first, before the shared activation is materialized.
+-    if (a->type == GGML_TYPE_Q8_0 && ggml_cuda_mmvq_has_reuse_plan(ctx, b)) { return false; }
++    if (ggml_cuda_dense_q8_1_input(a->type) && ggml_cuda_mmvq_has_reuse_plan(ctx, b)) { return false; }
+     switch (a->type) {
+         case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+@@ -7309,6 +7309,16 @@
+     if (strcmp(name, "ggml_backend_cuda_test_norm_affine_fusions") == 0) {
+         return (void *) ggml_backend_cuda_test_norm_affine_fusions;
+     }
++    if (strcmp(name, "ggml_backend_cuda_test_dense_quantizations") == 0) {
++        return (void *) +[]() -> uint64_t {
++            return ggml_cuda_dense_trace_counts()[0].load(std::memory_order_relaxed);
++        };
++    }
++    if (strcmp(name, "ggml_backend_cuda_test_dense_reuses") == 0) {
++        return (void *) +[]() -> uint64_t {
++            return ggml_cuda_dense_trace_counts()[1].load(std::memory_order_relaxed);
++        };
++    }
+     if (strcmp(name, "ggml_backend_cuda_test_bias_activation_fusions") == 0) {
+         return (void *) ggml_backend_cuda_test_bias_activation_fusions;
+     }
+diff --git a/tests/test-cuda-dense.cpp b/tests/test-cuda-dense.cpp
+--- a/tests/test-cuda-dense.cpp
++++ b/tests/test-cuda-dense.cpp
+@@ -1,4 +1,5 @@
+ #include "ggml-cpp.h"
++#include "../ggml/include/ggml-cuda.h"
+ #include "../ggml/src/ggml-cuda/dense-reuse.h"
+ #include "../ggml/src/ggml-cuda/residual-norm.h"
+ #include "../ggml/src/ggml-cuda/affine-fusion.h"
+@@ -8,6 +9,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <fstream>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -78,8 +80,19 @@
+     input->ne[2] = 2;
+     require(ggml_cuda_dense_plan_inputs(graph).empty(), "broadcast sequences were shared");
+     input->ne[2] = 1;
+-    for (auto * weight : weights) { weight->type = GGML_TYPE_Q4_0; }
++    for (auto * weight : weights) { weight->type = GGML_TYPE_F16; }
+     require(ggml_cuda_dense_plan_inputs(graph).empty(), "incompatible quantization was shared");
++    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
++            GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
++        for (auto * weight : weights) { weight->type = type; }
++        plans = ggml_cuda_dense_plan_inputs(graph);
++        require(plans.size() == 1 && plans[0].consumers == 4, "compatible Q8_1 activation was not shared");
++    }
++    weights[0]->type = GGML_TYPE_Q4_K;
++    weights[1]->type = GGML_TYPE_Q5_K;
++    weights[2]->type = GGML_TYPE_Q6_K;
++    weights[3]->type = GGML_TYPE_Q8_0;
++    require(ggml_cuda_dense_plan_inputs(graph).size() == 1, "mixed compatible weights were not shared");
+     for (auto * weight : weights) { weight->type = GGML_TYPE_Q8_0; }
+ 
+     auto * changed = ggml_scale_inplace(ctx.get(), input, 2.0f);
+@@ -355,13 +368,15 @@
+     }
+ };
+ 
+-static void projections(fixture & f, int tokens, int sequences, bool lora) {
++static void projections(fixture & f, int tokens, int sequences, bool lora,
++        ggml_type type = GGML_TYPE_Q8_0, bool mixed = false) {
+     constexpr int width = 256;
+     f.input = ggml_new_tensor_4d(f.inputs.get(), GGML_TYPE_F32, width, tokens, sequences, 1);
+     ggml_set_input(f.input);
+     std::array<ggml_tensor *, 4> weights;
++    const ggml_type mixed_types[] = {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0};
+     for (size_t i = 0; i < weights.size(); ++i) {
+-        weights[i] = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_Q8_0, width, i < 2 ? 128 : 32);
++        weights[i] = ggml_new_tensor_2d(f.inputs.get(), mixed ? mixed_types[i] : type, width, i < 2 ? 128 : 32);
+         auto * result = ggml_mul_mat(f.compute.get(), weights[i], f.input);
+         if (lora && i == 0) {
+             auto * adapter = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_F32, width, 128);
+@@ -374,7 +389,7 @@
+         std::vector<float> values(ggml_nelements(weights[k]));
+         for (size_t i = 0; i < values.size(); ++i) { values[i] = std::sin(float(i) * 0.021f + k) * 0.03f; }
+         std::vector<uint8_t> quantized(ggml_nbytes(weights[k]));
+-        ggml_quantize_chunk(GGML_TYPE_Q8_0, values.data(), quantized.data(), 0, weights[k]->ne[1], width, nullptr);
++        ggml_quantize_chunk(weights[k]->type, values.data(), quantized.data(), 0, weights[k]->ne[1], width, nullptr);
+         ggml_backend_tensor_set(weights[k], quantized.data(), 0, quantized.size());
+     }
+     if (lora) {
+@@ -510,6 +525,63 @@
+         ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+         ggml_backend_ptr gpu(ggml_backend_dev_init(ggml_backend_reg_dev_get(registry, 0), nullptr));
+         require(cpu && gpu, "cannot create reference/CUDA backends");
++        if (argc > 1 && std::string(argv[1]) == "--projections-only") {
++            auto set_limit = reinterpret_cast<bool (*)(ggml_backend_dev_t, size_t, bool)>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_set_memory_limit"));
++            auto quantizations = reinterpret_cast<uint64_t (*)()>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_dense_quantizations"));
++            auto reuses = reinterpret_cast<uint64_t (*)()>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_dense_reuses"));
++            auto get_stats = reinterpret_cast<decltype(&ggml_backend_cuda_get_memory_stats)>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_get_memory_stats"));
++            require(set_limit && quantizations && reuses && get_stats, "projection quota/counters unavailable");
++            require(set_limit(ggml_backend_get_device(gpu.get()), 64 * 1024 * 1024, true), "projection quota failed");
++            std::ofstream dump;
++            if (argc > 2) { dump.open(argv[2], std::ios::binary); require(bool(dump), "cannot open projection output"); }
++            const bool tracing = std::getenv("GGML_CUDA_DENSE_TRACE") &&
++                std::strcmp(std::getenv("GGML_CUDA_DENSE_TRACE"), "1") == 0;
++            for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
++                    GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
++                    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
++                for (const int tokens : {1, 4}) {
++                    const auto before_q = quantizations(), before_r = reuses();
++                    fixture reference(cpu.get()), candidate(gpu.get());
++                    projections(reference, tokens, 1, false, type);
++                    projections(candidate, tokens, 1, false, type);
++                    for (int iteration = 0; iteration < 3; ++iteration) {
++                        const auto actual = candidate.run(iteration);
++                        compare(reference.run(iteration), actual, 0.01f);
++                        if (dump.is_open()) {
++                            for (const auto & row : actual) {
++                                dump.write(reinterpret_cast<const char *>(row.data()), row.size() * sizeof(float));
++                            }
++                        }
++                    }
++                    if (explicit_dense_opt() && tracing) {
++                        require(quantizations() > before_q && reuses() > before_r, "shared activation path was not executed");
++                    }
++                }
++            }
++            fixture reference(cpu.get()), candidate(gpu.get());
++            projections(reference, 4, 1, false, GGML_TYPE_Q8_0, true);
++            projections(candidate, 4, 1, false, GGML_TYPE_Q8_0, true);
++            for (int iteration = 0; iteration < 3; ++iteration) {
++                const auto actual = candidate.run(iteration);
++                compare(reference.run(iteration), actual, 0.01f);
++                if (dump.is_open()) for (const auto & row : actual) {
++                    dump.write(reinterpret_cast<const char *>(row.data()), row.size() * sizeof(float));
++                }
++            }
++            if (dump.is_open()) { dump.flush(); require(bool(dump), "projection output write failed"); }
++            ggml_backend_cuda_memory_stats memory{};
++            require(get_stats(ggml_backend_get_device(gpu.get()), &memory) && memory.enabled &&
++                memory.managed_peak_bytes <= memory.limit_bytes, "projection exceeded managed CUDA quota");
++            std::printf("PASS: ten quantizations and mixed Q/K projections; 64 MiB managed CUDA quota; quantizations=%llu reuses=%llu\n",
++                (unsigned long long) quantizations(), (unsigned long long) reuses());
++            std::printf("PROJECTION_MEMORY tracked_peak_bytes=%llu limit_bytes=%llu\n",
++                (unsigned long long) memory.managed_peak_bytes, (unsigned long long) memory.limit_bytes);
++            return 0;
++        }
+         for (const auto test : { std::array<int, 3>{127, 3, 0}, {128, 1, 0}, {1024, 1, 0}, {128, 2, 1} }) {
+             const auto before = affine_fusion_count();
+             fixture reference(cpu.get()), candidate(gpu.get());

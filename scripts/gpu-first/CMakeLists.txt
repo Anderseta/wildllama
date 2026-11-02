@@ -268,6 +268,8 @@ if(MSVC)
 endif()
 
 # Header-only cache-safety tests also work in standalone CPU builds.
+validation_target(test-kv-indexed-copy llama)
+add_test(NAME kv-indexed-copy COMMAND test-kv-indexed-copy)
 foreach(test_name IN ITEMS test-kv-trim-ranges test-prompt-state-transaction)
     add_executable(${test_name} "${WILDLLAMA_NATIVE}/tests/${test_name}.cpp")
     target_compile_features(${test_name} PRIVATE cxx_std_17)

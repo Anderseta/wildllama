@@ -1,0 +1,274 @@
+diff --git a/tools/server/server-state-pager.h b/tools/server/server-state-pager.h
+--- a/tools/server/server-state-pager.h
++++ b/tools/server/server-state-pager.h
+@@ -168,7 +168,11 @@
+     // Stage every component before publication. The caller makes room inside
+     // its RAM-cache budget before materializing this one cold entry.
+     static bool load(const handle & saved, const std::vector<std::vector<uint8_t> *> & parts) noexcept {
+-        if (!saved || saved->lengths.size() != parts.size()) { return false; }
++        if (!saved || saved->lengths.size() != parts.size() || parts.size() > 4096) { return false; }
++        for (size_t i = 0; i < parts.size(); ++i) {
++            if (!parts[i]) { return false; }
++            for (size_t j = 0; j < i; ++j) { if (parts[i] == parts[j]) { return false; } }
++        }
+         try {
+             std::error_code ec;
+             if (std::filesystem::file_size(saved->path, ec) != saved->file_bytes || ec) { return false; }
+diff --git a/tools/server/server-state-writeback.h b/tools/server/server-state-writeback.h
+--- a/tools/server/server-state-writeback.h
++++ b/tools/server/server-state-writeback.h
+@@ -130,15 +130,16 @@
+         bool finish(const std::vector<std::vector<uint8_t> *> & parts,
+                 server_state_pager::handle & backing, bool keep_ram) noexcept {
+             if (parts.size() != job->data.size()) { return false; }
+-            for (auto * part : parts) { if (!part || !part->empty()) { return false; } }
++            for (size_t i = 0; i < parts.size(); ++i) {
++                if (!parts[i] || !parts[i]->empty()) { return false; }
++                for (size_t j = 0; j < i; ++j) { if (parts[i] == parts[j]) { return false; } }
++            }
+             wait();
+             const bool success = bool(job->saved);
+             if (keep_ram || !success) {
+                 for (size_t i = 0; i < parts.size(); ++i) { parts[i]->swap(job->data[i]); }
+-                job->saved.reset();
+-            } else {
+-                backing = std::move(job->saved);
+-            }
++            }
++            if (success) { backing = std::move(job->saved); }
+             std::vector<std::vector<uint8_t>>().swap(job->data);
+             return keep_ram || success;
+         }
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1742,10 +1742,10 @@
+ void server_prompt_cache::collect_writebacks() {
+     if (!pager.enabled() || !writer.is_enabled()) { return; }
+     for (auto & state : states) {
+-        // Keep successful prewrites in RAM until pressure actually needs their
+-        // bytes. A hot hit must not become an avoidable SSD read.
+-        if (state.writeback && state.writeback->ready() && !state.writeback->succeeded()) {
+-            finish_writeback(state, false, false);
++        // Release completed writer tickets while retaining hot vectors and their
++        // immutable disk backing. Pressure can drop RAM without writing again.
++        if (state.writeback && state.writeback->ready()) {
++            finish_writeback(state, state.writeback->succeeded(), false);
+         }
+     }
+ }
+@@ -1788,9 +1788,17 @@
+ 
+ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
+     if (state.writeback) { return finish_writeback(state, false, true); }
+-    if (!pager.enabled() || state.backing || state.resident || state.data.main.empty() || state.prompt.tokens.has_mtmd) { return false; }
++    if (!pager.enabled() || state.resident || state.data.main.empty() || state.prompt.tokens.has_mtmd) { return false; }
+     try {
+         auto buffers = state.buffers();
++        if (state.backing) {
++            std::error_code error;
++            if (std::filesystem::file_size(state.backing->path, error) == state.backing->file_bytes && !error) {
++                for (auto * buffer : buffers) { std::vector<uint8_t>().swap(*buffer); }
++                return true;
++            }
++            state.backing.reset();
++        }
+         std::vector<const std::vector<uint8_t> *> sources(buffers.begin(), buffers.end());
+         auto saved = pager.store(sources);
+         if (!saved) { return false; }
+@@ -1807,7 +1815,7 @@
+     while (size() > limit_size - bytes) {
+         auto victim = states.end();
+         for (auto it = states.begin(); it != states.end(); ++it) {
+-            if (&*it != preserve && !it->backing) { victim = it; break; }
++            if (&*it != preserve && !it->is_cold()) { victim = it; break; }
+         }
+         if (victim == states.end()) {
+             victim = std::find_if(states.begin(), states.end(), [&](server_prompt_cache_state & state) { return &state != preserve; });
+@@ -1821,14 +1829,13 @@
+     // A selected pending prefix can reuse its original vectors. Do not read the
+     // just-written disk image back into another temporary allocation.
+     if (state->writeback) { return finish_writeback(*state, true, true); }
+-    if (!state->backing) { return true; }
++    if (!state->is_cold()) { return true; }
+     const auto bytes = state->backing->payload_bytes;
+     if (bytes > SIZE_MAX || (limit_size && bytes > limit_size - std::min(limit_size, state->size()))) { return false; }
+     try {
+         make_room(size_t(bytes), &*state);
+         if (limit_size && size() > limit_size - size_t(bytes)) { return false; }
+         if (!server_state_pager::load(state->backing, state->buffers())) { return false; }
+-        state->backing.reset();
+         return true;
+     } catch (...) { return false; }
+ }
+@@ -2008,7 +2015,7 @@
+             // A cold restore includes checksums and disk I/O. Keep its measured
+             // cost separate from a RAM restore, with a conservative cold start.
+             double rate = restore_us_per_byte;
+-            if (it->backing) {
++            if (it->is_cold()) {
+                 rate = std::max(disk_restore_us_per_byte, 1e6/(128.0*1024*1024));
+             } else if (it->writeback && !it->writeback->ready()) {
+                 // Unfinished writes can delay ownership handoff. Completed
+@@ -2071,7 +2078,7 @@
+             states.erase(it_best); // active sequence now owns the shared cells
+             return true;
+         }
+-        const bool was_cold = bool(it_best->backing);
++        const bool was_cold = it_best->is_cold();
+         const bool waited_writeback = it_best->writeback && !it_best->writeback->ready();
+         const size_t cold_bytes = was_cold ? it_best->storage_size() : 0;
+         const int64_t restore_start = ggml_time_us();
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -702,6 +702,7 @@
+         }
+         return result;
+     }
++    bool is_cold() const { return backing && data.main.empty() && !writeback; }
+     size_t storage_size() const {
+         return backing ? size_t(backing->payload_bytes) : writeback ? writeback->payload_bytes() : size();
+     }
+diff --git a/tests/test-state-pager.cpp b/tests/test-state-pager.cpp
+--- a/tests/test-state-pager.cpp
++++ b/tests/test-state-pager.cpp
+@@ -22,6 +22,11 @@
+         const auto file=saved->path;
+         std::vector<uint8_t> x,y,z;
+         require(server_state_pager::load(saved,{&x,&y,&z}) && x==a && y==b && z==c, "page restore changed bytes");
++        const auto keepx=x, keepy=y, keepz=z;
++        require(!server_state_pager::load(saved,{&x,&x,&z}) && x==keepx && y==keepy && z==keepz,
++                "aliased component destinations published incomplete state");
++        require(!server_state_pager::load(saved,{&x,nullptr,&z}) && x==keepx && y==keepy && z==keepz,
++                "null component destination changed state");
+         auto held=saved;
+         saved.reset();
+         require(std::filesystem::exists(file) && pager.used()>0, "copy handle lost owner");
+diff --git a/tests/test-state-writeback.cpp b/tests/test-state-writeback.cpp
+--- a/tests/test-state-writeback.cpp
++++ b/tests/test-state-writeback.cpp
+@@ -66,17 +66,19 @@
+     open_gate(); pending->wait(); second->wait();
+     require(pending->succeeded() && pending->resident_bytes()==charge, "ready write prematurely freed charged RAM");
+     server_state_pager::handle saved;
++    require(!pending->finish({&a,&a,&c,&d,&e},saved,true) && pending->payload_bytes() > 0 && a.empty(),
++            "aliased handoff discarded original components");
+     require(pending->finish(parts,saved,false) && saved && pending->payload_bytes()==0, "complete disk handle not published");
+     pending.reset();
+     require(server_state_pager::load(saved,parts) && a==oa && b==ob && c==oc && d==od && e==oe,
+             "async target/draft/spec/checkpoint bytes changed");
+     server_state_pager::handle unused;
+-    require(second->finish({&x},unused,true) && x==ox && !unused, "hot RAM hit reread or changed original bytes");
++    require(second->finish({&x},unused,true) && x==ox && unused, "hot RAM hit lost its original bytes or disk backing");
+     second.reset();
+     auto last=writer.submit(pager,{&y},4096);
+     require(bool(last), "completed request reservation leaked");
+     require(last->finish({&y},unused,true) && y==oy, "second admission changed bytes");
+-    last.reset(); saved.reset();
++    last.reset(); saved.reset(); unused.reset();
+     require(pager.used()==0, "owned files/quota leaked");
+     std::puts("PASS: move-only complete components, capacity-aware RAM bound, two requests, hot RAM reuse, quota and owned cleanup");
+ }
+@@ -117,7 +119,7 @@
+     open_gate(); destroyer.get();
+     require(survivor->ready() && survivor->finish({&a},saved,true) && a==original,
+             "worker move/teardown invalidated surviving request");
+-    survivor.reset(); require(pager.used()==0,"teardown leaked quota");
++    survivor.reset(); saved.reset(); require(pager.used()==0,"teardown leaked quota");
+     std::puts("PASS: failed disk admission restores vectors, erasure waits, model teardown drains, live worker move/assignment");
+ }
+ static void concurrent_pool(const std::filesystem::path & directory) {
+diff --git a/tests/test-server-prefix-cache.cpp b/tests/test-server-prefix-cache.cpp
+--- a/tests/test-server-prefix-cache.cpp
++++ b/tests/test-server-prefix-cache.cpp
+@@ -141,6 +141,81 @@
+     const size_t before = cache.states.size();
+     require(!cache.alloc(make_prompt({99}), {}), "empty capture published");
+     require(cache.states.size() == before, "failed capture evicted snapshots");
++}
++
++static void warm_disk_backing(const std::filesystem::path & directory) {
++    require(directory.is_absolute(), "state test directory must be explicit and absolute");
++    server_prompt_cache cache(1, 0);
++    cache.limit_size = 64*1024;
++    constexpr uint64_t disk_limit = 2*1024*1024;
++    require(cache.pager.configure(directory, disk_limit), "state cache pager configure failed");
++    cache.writer.set_enabled(true);
++    for (int i = 0; i < 4; ++i) {
++        auto prompt = make_prompt({llama_token(i+1),2,3,4});
++        common_prompt_checkpoint checkpoint {};
++        checkpoint.n_tokens = 2; checkpoint.pos_min = 0; checkpoint.pos_max = 1;
++        checkpoint.data_tgt.assign(31,uint8_t(i+21));
++        checkpoint.data_dft.assign(19,uint8_t(i+23));
++        checkpoint.data_spec.assign(13,uint8_t(i+29));
++        prompt.checkpoints.push_back(std::move(checkpoint));
++        require(cache.alloc(prompt, make_data(14*1024,uint8_t(i+10))), "prewrite test cache insertion failed");
++    }
++    cache.queue_writebacks();
++    size_t pending = 0;
++    for (auto & state : cache.states) { if (state.writeback) { ++pending; state.writeback->wait(); } }
++    require(pending == 2, "initial prewrites bypassed the two-request bound");
++    cache.collect_writebacks();
++    size_t warm = 0;
++    for (const auto & state : cache.states) {
++        require(!state.writeback, "completed prewrite retained a writer ticket");
++        if (state.backing) { require(!state.is_cold(), "completed prewrite discarded hot RAM"); ++warm; }
++    }
++    require(warm == 2 && cache.size() <= cache.limit_size, "warm backing escaped RAM accounting");
++    cache.queue_writebacks();
++    pending = 0;
++    for (auto & state : cache.states) { if (state.writeback) { ++pending; state.writeback->wait(); } }
++    require(pending == 2, "completed prewrites blocked subsequent prefixes");
++    cache.collect_writebacks();
++    for (const auto & state : cache.states) {
++        require(state.backing && !state.writeback && !state.is_cold(), "prewrite collection lost a complete warm snapshot");
++    }
++    auto state = cache.states.begin();
++    const auto expected = state->data;
++    const auto checkpoint = state->prompt.checkpoints.front();
++    const auto path = state->backing->path;
++    const auto used = cache.pager.used();
++    cache.prompt_us_per_token = 10000;
++    cache.restore_us_per_byte = 0.001;
++    cache.disk_restore_us_per_byte = 1e8;
++    require(cache.find_best(make_prompt({}),server_tokens({1,2,3,4,99},false)) == state,
++            "warm backed snapshot was scored as an SSD read");
++    for (int round = 0; round < 8; ++round) {
++        require(cache.spill(*state) && state->is_cold() && state->data.main.capacity() == 0,
++                "backed eviction did not release RAM capacity");
++        require(cache.pager.used() == used && state->backing->path == path, "backed eviction rewrote snapshot");
++        require(cache.materialize(state) && !state->is_cold() && state->backing->path == path &&
++                state->data.main == expected.main && state->data.drft == expected.drft && state->data.spec == expected.spec &&
++                state->prompt.checkpoints.front().data_tgt == checkpoint.data_tgt &&
++                state->prompt.checkpoints.front().data_dft == checkpoint.data_dft &&
++                state->prompt.checkpoints.front().data_spec == checkpoint.data_spec,
++                "warm/cold round trip changed target/draft/spec/checkpoint bytes");
++        require(cache.size() <= cache.limit_size && cache.pager.used() <= disk_limit, "warm/cold round trip exceeded quota");
++    }
++    std::filesystem::remove(path);
++    require(cache.materialize(state) && state->data.main == expected.main, "hot data depended on a missing backing file");
++    require(cache.spill(*state) && state->is_cold() && state->backing->path != path,
++            "missing backing was reused instead of rewriting valid RAM");
++    require(cache.materialize(state) && state->data.main == expected.main, "replacement backing changed bytes");
++    {
++        std::fstream out(state->backing->path,std::ios::binary|std::ios::in|std::ios::out);
++        out.seekp(100); const char corrupt = 42; out.write(&corrupt,1);
++    }
++    require(cache.spill(*state) && state->is_cold(), "corruption test eviction failed");
++    require(!cache.materialize(state) && state->data.main.empty() && state->data.drft.empty() && state->data.spec.empty(),
++            "corrupt retained backing published partial state");
++    cache.states.clear();
++    require(cache.pager.used() == 0, "warm/cold backing lifetime leaked disk quota");
++    std::puts("PASS: four prefixes through two tickets; 8 exact warm/cold cycles without rewrites; warm scoring; missing/corrupt backing and quotas");
+ }
+ 
+ static void benchmark() {
+@@ -183,6 +258,7 @@
+     try {
+         selection_and_mutation();
+         fallback_paths();
++        if (argc == 3 && std::string(argv[1]) == "--state-dir") { warm_disk_backing(argv[2]); }
+         if (argc > 1 && std::string(argv[1]) == "--bench") { benchmark(); }
+         std::puts("server prefix cache: PASS");
+         return 0;

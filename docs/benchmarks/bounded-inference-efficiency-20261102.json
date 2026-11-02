@@ -1,0 +1,138 @@
+{
+  "schema": 1,
+  "date": "2026-11-02",
+  "source_base": "e73c3f7339891db7fafee379645a28fcc1ccec8f",
+  "native_base": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "patches": [
+    {
+      "file": "067-adaptive-prefill-chunks.patch",
+      "sha256": "521a58a0776b2e368f17ba60705efc70d07fe49ff2fbf659b282426050174f97"
+    },
+    {
+      "file": "068-sampling-pipeline-efficiency.patch",
+      "sha256": "fa5197121feef379ebd2405a3537730f4941bbc32e68f0fdafa5f5bef177ea50"
+    },
+    {
+      "file": "069-state-cache-efficiency.patch",
+      "sha256": "e550c3d17dba892e794cffe25ce261181111ff702182d8da58626d497d67cdfa"
+    },
+    {
+      "file": "070-indexed-kv-branches.patch",
+      "sha256": "539f8aa3381c1b9ad9804ccfa2db536a58518e3dcfdfdceefb847dccac5ab4d7"
+    },
+    {
+      "file": "071-shared-quantized-activations.patch",
+      "sha256": "025776dee5ce38076798ce453576b823ff07a0e2bced2788a0b80669f3b75808"
+    }
+  ],
+  "build": "Guarded Windows x64 SM120 CUDA build passed; no tools installed or production binaries replaced",
+  "cpu": {
+    "status": "passed",
+    "targets": [
+      "test-kv-indexed-copy",
+      "test-sampling-probability",
+      "test-state-pager",
+      "test-state-writeback",
+      "test-server-prefix-cache",
+      "test-adaptive-prefill",
+      "test-cuda-dense",
+      "test-sampler-overlap",
+      "test-mtp-state",
+      "test-speculative-graphs",
+      "test-retained-prefix"
+    ],
+    "kv_copy_trials": 256,
+    "residual_draws_and_rng_checks": 4096,
+    "adaptive_mixed_graph_logit_comparisons": 16,
+    "cold_cache_round_trips_without_rewrite": 8,
+    "prefixes_through_two_writer_tickets": 4
+  },
+  "component_timings": {
+    "kv_copy": {
+      "capacity": 131072,
+      "live_cells": 64,
+      "repeats": 256,
+      "old_scan_ms": 26.9753,
+      "indexed_ms": 2.5047,
+      "visited_source_cells": 64
+    },
+    "rejection_index": {
+      "support": 131072,
+      "repeats": 8,
+      "old_sorted_ms": 159.533,
+      "direct_ms": 5.68,
+      "workspace_bytes": 524288
+    },
+    "residual_entry": {
+      "old_bytes": 12,
+      "new_bytes": 8
+    },
+    "interpretation": "CPU components, not trained-model tokens/s or SGLang comparisons"
+  },
+  "cuda": {
+    "status": "passed",
+    "models_loaded": 0,
+    "quantizations": 10,
+    "token_batch_sizes": [
+      1,
+      4
+    ],
+    "mixed_quantization_case": true,
+    "iterations_per_case": 3,
+    "settings": [
+      "GGML_CUDA_DENSE_OPT=0",
+      "GGML_CUDA_DENSE_OPT=1"
+    ],
+    "reference": "CPU numerical comparison and bit-exact GPU enabled/disabled outputs",
+    "output_bytes": 207360,
+    "output_sha256": "4e7150a670c95ebf73c4b76002f4930459f3163a3950118aa3cde82aee577211",
+    "managed_limit_bytes": 67108864,
+    "managed_peak_before_bytes": 2194944,
+    "managed_peak_after_bytes": 2194944,
+    "shared_input_quantization_events": 42,
+    "reuse_events": 126,
+    "counter_scope": "Host submissions/captures with tracing enabled, not every replayed kernel",
+    "shared_gpu": true,
+    "performance_claim": false,
+    "memory_scope": "Tracked backend allocations only; driver/library allocations and other programs separate"
+  },
+  "http_cpu": {
+    "status": "passed",
+    "cases_per_payload": 6,
+    "device": "CPU only",
+    "fixture_bytes": 28628288,
+    "trained_weights": false,
+    "gpu_overlap_activated": false,
+    "responses_equal": true
+  },
+  "http_adaptive_prefill": {
+    "status": "passed",
+    "requests": 4,
+    "device": "CPU",
+    "fixture_bytes": 28628288,
+    "actual_scheduler_activated": true,
+    "greedy_sse_equal": true,
+    "chunked_admissions": 8,
+    "deferrals": 8,
+    "forced_admissions": 8,
+    "primary_growth_bytes": 0,
+    "secondary_growth_bytes": 0,
+    "fixture_metadata_override": "llama.context_length=int:1024 equally in both controls, no file modified"
+  },
+  "patch_replay": {
+    "status": "passed",
+    "patches": 68,
+    "native_files": 200
+  },
+  "defaults": "Exact probability lookup and indexed sequence memberships are automatic; existing experimental opt-ins and saved profiles unchanged",
+  "memory": "No new budget or context reduction. Existing managed CUDA quota, bounded host-weight cache, graph/transport allowances and prompt-cache quotas retain their scopes.",
+  "installed": false,
+  "remaining": [
+    "Trained-model end-to-end throughput and language-quality comparison",
+    "General shared paged KV/radix allocator across memory classes",
+    "Page-granular hierarchical KV movement",
+    "Broader hybrid/speculative/weight-streaming prompt scheduler",
+    "Fully device-resident verification/commit pipeline",
+    "Linux/HIP/Metal validation"
+  ]
+}

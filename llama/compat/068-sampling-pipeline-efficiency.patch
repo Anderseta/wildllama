@@ -1,0 +1,200 @@
+diff --git a/common/sampling-probability.h b/common/sampling-probability.h
+--- a/common/sampling-probability.h
++++ b/common/sampling-probability.h
+@@ -10,8 +10,8 @@
+ #include <vector>
+ 
+ // A rejection residual repeatedly looks up q(token) for each target token.
+-// Index only large supports. Sorting indexes (not probabilities) preserves the
+-// first duplicate, all float bits and the caller's original arithmetic order.
++// Index only large supports. A direct table covers dense token IDs; other
++// supports sort indexes. Neither path changes probability bits or row order.
+ class common_sampling_probability_index {
+ public:
+     static constexpr size_t max_entries = 262144; // at most 1 MiB of uint32_t indexes
+@@ -32,6 +32,22 @@
+         } catch (const std::bad_alloc &) {
+             return; // The optimization must not make an otherwise viable sample fail.
+         }
++        std::fill(workspace.begin(), workspace.end(), UINT32_MAX);
++        direct = true;
++        for (size_t i = 0; i < size; ++i) {
++            const auto token = uint32_t(data[i].id);
++            if (token >= size) {
++                direct = false;
++                break;
++            }
++            if (workspace[token] == UINT32_MAX) {
++                workspace[token] = uint32_t(i);
++            }
++        }
++        if (direct) {
++            order = workspace.data();
++            return;
++        }
+         std::iota(workspace.begin(), workspace.end(), uint32_t{0});
+         std::sort(workspace.begin(), workspace.end(), [data](uint32_t a, uint32_t b) {
+             return data[a].id < data[b].id || (data[a].id == data[b].id && a < b);
+@@ -46,6 +62,10 @@
+             }
+             return 0.0f;
+         }
++        if (direct) {
++            const auto token = uint32_t(id);
++            return token < size && order[token] != UINT32_MAX ? data[order[token]].p : 0.0f;
++        }
+         const auto * found = std::lower_bound(order, order + size, id, [this](uint32_t index, llama_token token) {
+             return data[index].id < token;
+         });
+@@ -53,9 +73,19 @@
+     }
+ 
+     bool indexed() const { return order != nullptr; }
++    bool directly_indexed() const { return direct && order != nullptr; }
+ 
+ private:
+     const llama_token_data * data;
+     const size_t size;
+     const uint32_t * order = nullptr;
++    bool direct = false;
+ };
++
++struct common_sampling_residual_entry {
++    llama_token id;
++    float p;
++};
++
++static_assert(sizeof(common_sampling_residual_entry) == sizeof(llama_token) + sizeof(float),
++              "residual entries must not store unused logit values");
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -877,7 +877,7 @@
+     // draws come from the sampler's own stream, so they stay independent of what was drafted
+     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+ 
+-    std::vector<llama_token_data> residual;
++    std::vector<common_sampling_residual_entry> residual;
+ 
+     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+@@ -945,7 +945,7 @@
+         for (size_t k = 0; k < cur_p->size; ++k) {
+             const float r = p_of(k) - q_index.probability(cur_p->data[k].id);
+             if (r > 0.0f) {
+-                residual.push_back({ cur_p->data[k].id, 0.0f, r });
++                residual.push_back({ cur_p->data[k].id, r });
+                 sum += r;
+             }
+         }
+diff --git a/tests/test-sampling-probability.cpp b/tests/test-sampling-probability.cpp
+--- a/tests/test-sampling-probability.cpp
++++ b/tests/test-sampling-probability.cpp
+@@ -38,6 +38,7 @@
+         q.push_back({q[2].id, 0.f, .8f});
+         const common_sampling_probability_index indexed(q.data(), q.size(), 2048, workspace);
+         require(indexed.indexed(), "large support did not index");
++        require(!indexed.directly_indexed(), "signed token IDs used direct indexing");
+         for (int id = -2048; id <= 2048; ++id) {
+             require(same_bits(indexed.probability(id), linear(q, id)), "lookup changed probability bits or first duplicate");
+         }
+@@ -63,20 +64,25 @@
+         constexpr size_t count = 8192;
+         for (size_t i = 0; i < count; ++i) { q.push_back({llama_token((i * 97) % count), 0.f, float(i % 7) / float(8 * count)}); }
+         const common_sampling_probability_index residual_index(q.data(), q.size(), count, workspace);
+-        std::vector<llama_token_data> old_residual, new_residual;
++        require(residual_index.directly_indexed(), "full vocabulary did not use linear-time direct indexing");
++        std::vector<llama_token_data> old_residual;
++        std::vector<common_sampling_residual_entry> new_residual;
+         float old_sum = 0.f, new_sum = 0.f;
+         for (size_t k = 0; k < count; ++k) {
+             const float p = float(k % 11) / float(9 * count);
+             const float a = p - linear(q, llama_token(k));
+             const float b = p - residual_index.probability(llama_token(k));
+             if (a > 0.f) { old_residual.push_back({llama_token(k), 0.f, a}); old_sum += a; }
+-            if (b > 0.f) { new_residual.push_back({llama_token(k), 0.f, b}); new_sum += b; }
++            if (b > 0.f) { new_residual.push_back({llama_token(k), b}); new_sum += b; }
+         }
+-        require(same_bits(old_sum, new_sum) && old_residual.size() == new_residual.size() &&
+-                std::memcmp(old_residual.data(), new_residual.data(), old_residual.size() * sizeof(llama_token_data)) == 0,
++        require(same_bits(old_sum, new_sum) && old_residual.size() == new_residual.size(),
+                 "residual order or arithmetic changed");
++        for (size_t k = 0; k < old_residual.size(); ++k) {
++            require(old_residual[k].id == new_residual[k].id && same_bits(old_residual[k].p, new_residual[k].p),
++                    "compact residual entry changed token or probability bits");
++        }
+         std::mt19937 old_rng(424242), new_rng(424242);
+-        auto sample = [](const std::vector<llama_token_data> & residual, float sum, std::mt19937 & rng) {
++        auto sample = [](const auto & residual, float sum, std::mt19937 & rng) {
+             std::uniform_real_distribution<float> uniform(0.f, 1.f);
+             float u = uniform(rng) * sum;
+             for (const auto & item : residual) { u -= item.p; if (u <= 0.f) { return item.id; } }
+@@ -86,6 +92,26 @@
+             require(sample(old_residual, old_sum, old_rng) == sample(new_residual, new_sum, new_rng), "residual token changed");
+         }
+         require(old_rng == new_rng, "residual RNG state changed");
++
++        // Dense tables must preserve holes and first duplicates, including float payload bits.
++        std::vector<llama_token_data> dense(128);
++        for (size_t k = 0; k < dense.size(); ++k) { dense[k] = {llama_token(k), 0.f, float(k)}; }
++        dense[4] = {3, 0.f, 7.f};
++        dense[3].p = -0.f;
++        dense[6].p = std::numeric_limits<float>::quiet_NaN();
++        dense[8].p = std::numeric_limits<float>::infinity();
++        const common_sampling_probability_index dense_index(dense.data(), dense.size(), 128, workspace);
++        require(dense_index.directly_indexed(), "dense duplicate support did not use direct indexing");
++        for (int token = -1; token <= 128; ++token) {
++            require(same_bits(dense_index.probability(token), linear(dense, token)), "direct index changed holes or float bits");
++        }
++        dense.back().id = std::numeric_limits<llama_token>::max();
++        const common_sampling_probability_index sparse_index(dense.data(), dense.size(), 128, workspace);
++        require(sparse_index.indexed() && !sparse_index.directly_indexed(), "late sparse token did not use sorted fallback");
++        for (int token = -1; token <= 128; ++token) {
++            require(same_bits(sparse_index.probability(token), linear(dense, token)), "partial direct build polluted sorted fallback");
++        }
++        require(same_bits(sparse_index.probability(dense.back().id), dense.back().p), "late extreme token was lost");
+ 
+         // Component benchmark includes rebuilding the index each rejection,
+         // with retained storage as on a warm sampler; it is not model tokens/s.
+@@ -104,8 +130,40 @@
+         };
+         const auto old_ms = measure(false), new_ms = measure(true);
+         std::printf("PASS: 4097 bit-exact lookups, duplicates/nonfinite/extreme IDs, allocation fallback, bounded warm reuse, 4096 residual draws and RNG\n");
+-        std::printf("BENCH: 8192-support x 8192 lookups, 3 repeats including index sort: linear=%.3f ms indexed=%.3f ms workspace=%zu bytes checksum=%f\n",
++        std::printf("BENCH: 8192-support x 8192 lookups, 3 repeats including index build: linear=%.3f ms indexed=%.3f ms workspace=%zu bytes checksum=%f\n",
+                     old_ms, new_ms, workspace.capacity() * sizeof(uint32_t), double(checksum));
++
++        // Compare the old sorted index with the direct index at LLM vocabulary scale.
++        constexpr size_t vocabulary = 131072;
++        q.resize(vocabulary);
++        for (size_t k = 0; k < vocabulary; ++k) { q[k] = {llama_token((k * 97) % vocabulary), 0.f, float(k % 7)}; }
++        std::vector<uint32_t> sorted_order(vocabulary);
++        workspace.resize(vocabulary);
++        auto measure_index = [&](bool direct) {
++            const auto begin = std::chrono::steady_clock::now();
++            for (int repeat = 0; repeat < 8; ++repeat) {
++                if (direct) {
++                    const common_sampling_probability_index index(q.data(), vocabulary, vocabulary, workspace);
++                    for (size_t k = 0; k < vocabulary; ++k) { checksum += index.probability(llama_token(k)); }
++                } else {
++                    std::iota(sorted_order.begin(), sorted_order.end(), uint32_t{0});
++                    std::sort(sorted_order.begin(), sorted_order.end(), [&](uint32_t a, uint32_t b) {
++                        return q[a].id < q[b].id || (q[a].id == q[b].id && a < b);
++                    });
++                    for (size_t k = 0; k < vocabulary; ++k) {
++                        const auto found = std::lower_bound(sorted_order.begin(), sorted_order.end(), llama_token(k),
++                            [&](uint32_t row, llama_token token) { return q[row].id < token; });
++                        checksum += q[*found].p;
++                    }
++                }
++            }
++            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
++        };
++        const auto sorted_ms = measure_index(false), direct_ms = measure_index(true);
++        require(workspace.capacity() * sizeof(uint32_t) <= common_sampling_probability_index::max_entries * sizeof(uint32_t),
++                "direct index exceeded the existing workspace ceiling");
++        std::printf("BENCH: 131072-support build + lookups, 8 repeats: sorted=%.3f ms direct=%.3f ms workspace=%zu bytes residual-entry=%zu (previous=%zu) checksum=%f\n",
++                    sorted_ms, direct_ms, workspace.capacity() * sizeof(uint32_t), sizeof(common_sampling_residual_entry), sizeof(llama_token_data), double(checksum));
+         return 0;
+     } catch (const std::exception & error) {
+         fail_allocation = false;
