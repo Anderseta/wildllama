@@ -116,6 +116,8 @@ type Server struct {
 	modelCaches   *modelCaches
 	admissionOnce sync.Once
 	admission     *inferenceAdmission
+	imagesOnce    sync.Once
+	images        *imageService
 }
 
 func init() {
@@ -2478,6 +2480,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.Use(
 		cors.New(corsConfig),
 		allowedHostsMiddleware(s.addr),
+		s.imageInferenceGate(),
 		s.inferenceGuard(),
 	)
 
@@ -2489,6 +2492,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog", "download_cleanup"}, "wildllama": s.protocolCapabilities()})
 	})
 	r.GET("/api/activity", s.RuntimeActivityHandler)
+	s.registerImageRoutes(r)
 	r.GET("/api/huggingface/search", s.HuggingFaceSearchHandler)
 	r.GET("/api/huggingface/files", s.HuggingFaceFilesHandler)
 	r.GET("/api/status", s.StatusHandler)
@@ -2633,6 +2637,7 @@ func Serve(ln net.Listener) error {
 	schedCtx, schedDone := context.WithCancel(ctx)
 	sched := InitScheduler(schedCtx)
 	s.sched = sched
+	defer s.stopImageJobs()
 	s.modelCaches.Start(ctx)
 
 	slog.Info(fmt.Sprintf("Listening on %s (version %s)", ln.Addr(), version.Version))
@@ -2654,6 +2659,7 @@ func Serve(ln net.Listener) error {
 	go func() {
 		<-signals
 		srvr.Close()
+		s.stopImageJobs()
 		schedDone()
 		sched.unloadAllRunners()
 		done()
@@ -3757,6 +3763,11 @@ func countChatImages(msgs []api.Message) int {
 }
 
 func handleScheduleError(c *gin.Context, name string, err error) {
+	if errors.Is(err, errImageResidentOnly) {
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "code": "image_gpu_resident_only", "retryable": true})
+		return
+	}
 	status, message := scheduleError(name, err)
 	c.JSON(status, gin.H{"error": message})
 }
@@ -3770,6 +3781,8 @@ func scheduleError(name string, err error) (int, string) {
 	case errors.Is(err, context.Canceled):
 		return 499, "request canceled"
 	case errors.Is(err, ErrMaxQueue):
+		return http.StatusServiceUnavailable, err.Error()
+	case errors.Is(err, errImageResidentOnly):
 		return http.StatusServiceUnavailable, err.Error()
 	case errors.Is(err, os.ErrNotExist):
 		return http.StatusNotFound, fmt.Sprintf("model %q not found, try pulling it first", name)

@@ -297,6 +297,7 @@ func (s *Server) protocolCapabilities() gin.H {
 	return gin.H{"protocol_version": 1, "features": gin.H{
 		"tool_call_ids": true, "request_id": true, "structured_errors": true, "prompt_progress": true,
 		"request_admission": true, "embedding_input_limits": true, "multimodal_token_budget": true,
+		"image_jobs": true, "image_profiles": true, "image_gpu_coordination": true, "image_local_import": true, "image_loras": true,
 	}, "limits": gin.H{"request_body_bytes": l.BodyBytes, "max_in_flight": l.InFlight, "max_queue": l.Queue,
 		"embedding_items": l.EmbedItems, "embedding_decoded_bytes": l.DecodedBytes, "embedding_output_bytes": l.OutputBytes}}
 }

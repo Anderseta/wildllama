@@ -79,6 +79,8 @@ type Scheduler struct {
 	activeStatus   *loadedModel
 	loaded         map[string]*runnerRef
 	loadedSnapshot atomic.Pointer[loadedRunnerSnapshot]
+	imageGate      atomic.Pointer[imageGPUGate]
+	imageLoads     atomic.Int32 // construction/cleanup may outlive a cancelled HTTP reader
 
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
@@ -271,6 +273,12 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 		runner = snapshot.byKey[key]
 	}
 	if c.Err() == nil && runner != nil && !runner.needsReload(c, req) && req.useLoadedRunner(runner, s.finishedReqCh) {
+		return req.successCh, req.errCh
+	}
+	// A simultaneous image job permits only the existing healthy reservation
+	// above, never a new model load, profile reload or memory-changing context.
+	if gate := s.imageGate.Load(); gate != nil && gate.shared.Load() {
+		req.errCh <- errImageResidentOnly
 		return req.successCh, req.errCh
 	}
 	if err := c.Err(); err != nil {
@@ -641,6 +649,8 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 }
 
 func (s *Scheduler) discardPendingLoading(req *LlmRequest) {
+	s.imageLoads.Add(1)
+	defer s.imageLoads.Add(-1)
 	wantPath := req.model.ModelPath
 	if wantPath == "" {
 		wantPath = req.model.ShortName
@@ -740,6 +750,8 @@ func (s *Scheduler) expireIdleRunner(ctx, requestCtx context.Context, runner *ru
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
+	s.imageLoads.Add(1)
+	defer s.imageLoads.Add(-1)
 	loadStarted := time.Now()
 	var policy api.GPUExecutionConfig
 	var policyErr error
@@ -876,6 +888,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					"system_limited", systemLimited)
 			}
 
+			if req.ctx.Err() != nil {
+				s.loadedMu.Unlock()
+				return false
+			}
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
@@ -886,6 +902,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				}
 			}
 		} else {
+			if req.ctx.Err() != nil {
+				s.loadedMu.Unlock()
+				return false
+			}
 			modelName := req.model.ShortName
 			llama, err = mlxrunner.NewClient(modelName, req.opts.NumCtx)
 		}
