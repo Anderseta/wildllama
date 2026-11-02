@@ -1,0 +1,257 @@
+{
+  "schema": 1,
+  "date": "2026-11-02",
+  "source_base": "727cfc21da78305dcccd84b2e63f0b67c913355e",
+  "native_base": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "patches": [
+    {
+      "file": "072-paged-kv-reclamation.patch",
+      "sha256": "ed33dee978df92b7b6f1d3fdf0f681bdcda00aa8675114c1f99a9f2a8945310f"
+    },
+    {
+      "file": "073-bounded-device-verification.patch",
+      "sha256": "05594cf8d52e1e1f2c862d809086a9acd8716c7b065450e57810a769efa59704"
+    },
+    {
+      "file": "074-bounded-runtime-integration.patch",
+      "sha256": "d9c67b1ce75f99dff51945bbc0aa5a3a070cb3c6ffd476e4afe3f342799476e5"
+    }
+  ],
+  "build": "Guarded Windows x64 SM120 CUDA build passed; final staged native binaries preserve exact source snapshot",
+  "cpu": {
+    "status": "passed",
+    "targets": [
+      "test-device-verification",
+      "test-kv-trim-ranges",
+      "test-mtp-state",
+      "test-hybrid-prefix",
+      "test-sampler-overlap",
+      "test-speculative-graphs",
+      "test-sampler-output-view",
+      "test-retained-prefix"
+    ],
+    "policies": [
+      "0-64 MiB verifier allowance",
+      "64-observation allocation retry backoff",
+      "positive physical KV initial setting retains original verifier",
+      "bounded physical map segmentation and dense read-span retention"
+    ],
+    "go": "Focused api/llm parsing and child-environment tests passed; existing context/RAM/VRAM settings retained"
+  },
+  "cuda": {
+    "status": "passed",
+    "trained_models": false,
+    "shared_gpu": true,
+    "physical_mapping": {
+      "test_quota_bytes": 16777216,
+      "released_bytes": 4194304,
+      "retained_bytes_exact": true,
+      "address_unchanged": true,
+      "recommit_zero_filled": true
+    },
+    "hybrid_paging": {
+      "model": "Synthetic Qwen3.5 hybrid; no downloaded weights",
+      "logical_context": 16384,
+      "retained_prefix_tokens": 64,
+      "long_prompt_tokens": 4160,
+      "released_bytes": 8388608,
+      "managed_peak_bytes": 97166720,
+      "test_quota_bytes": 134217728,
+      "state_bit_exact": true,
+      "continuation_logits_bit_exact": true,
+      "shared_owner_view_reclamation_rejected": true,
+      "dummy_storage_reclamation_rejected": true
+    },
+    "device_verification": {
+      "model": "Nonzero synthetic Qwen/MTP fixture below 4 MiB",
+      "device_hits": 1,
+      "scratch_bytes": 9216,
+      "scratch_allowance_bytes": 1048576,
+      "cumulative_deferred_bytes": 48,
+      "materialized_bytes_before_explicit_getters": 12,
+      "byte_scope": "Prefix row plus three verification rows, twelve bytes each. Normal greedy output is compact, not vocabulary-sized.",
+      "accepted_tokens_and_public_views_bit_exact": true,
+      "empty_decode_preserves_public_views": true,
+      "positive_initial_kv_fallback_exact": true,
+      "positive_initial_kv_scratch_bytes": 0,
+      "managed_pressure_peak_bytes": 100654336,
+      "managed_test_quota_bytes": 100663296,
+      "pressure_note": "Deliberate near-quota allocation validates optional scratch denial/retry. This peak is not verifier overhead."
+    }
+  },
+  "driver_component_benchmark": {
+    "method": "Model-free pinned D2H scalar proxies and exact prefix decisions; 4 ABBA cycles, 16 repeats, 8 warmups each",
+    "cases": [
+      {
+        "draft": 2,
+        "arrays": 3,
+        "bytes_per_row": 12,
+        "baseline_D2H_calls": 9,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 4,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 222.8375,
+        "device_us": 194.853125,
+        "outputs_exact": 1
+      },
+      {
+        "draft": 2,
+        "arrays": 4,
+        "bytes_per_row": 16,
+        "baseline_D2H_calls": 12,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 5,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 298.115625,
+        "device_us": 197.115625,
+        "outputs_exact": 1
+      },
+      {
+        "draft": 8,
+        "arrays": 3,
+        "bytes_per_row": 12,
+        "baseline_D2H_calls": 27,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 4,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 720.934375,
+        "device_us": 191.64375,
+        "outputs_exact": 1
+      },
+      {
+        "draft": 8,
+        "arrays": 4,
+        "bytes_per_row": 16,
+        "baseline_D2H_calls": 36,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 5,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 961.503125,
+        "device_us": 207.728125,
+        "outputs_exact": 1
+      },
+      {
+        "draft": 16,
+        "arrays": 3,
+        "bytes_per_row": 12,
+        "baseline_D2H_calls": 51,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 4,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 1280.209375,
+        "device_us": 194.20625,
+        "outputs_exact": 1
+      },
+      {
+        "draft": 16,
+        "arrays": 4,
+        "bytes_per_row": 16,
+        "baseline_D2H_calls": 68,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 5,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 1698.628125,
+        "device_us": 200.3875,
+        "outputs_exact": 1
+      },
+      {
+        "draft": 64,
+        "arrays": 3,
+        "bytes_per_row": 12,
+        "baseline_D2H_calls": 195,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 4,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 4758.91875,
+        "device_us": 191.759375,
+        "outputs_exact": 1
+      },
+      {
+        "draft": 64,
+        "arrays": 4,
+        "bytes_per_row": 16,
+        "baseline_D2H_calls": 260,
+        "device_H2D_calls": 2,
+        "device_D2H_calls": 5,
+        "device_kernels": 1,
+        "baseline_fences": 1,
+        "device_fences": 2,
+        "cycles": 4,
+        "repeats": 16,
+        "baseline_us": 6697.240625,
+        "device_us": 216.7375,
+        "outputs_exact": 1
+      }
+    ],
+    "interpretation": "CUDA driver/copy/synchronization overhead only. No neural inference, trained-model throughput, language-quality or SGLang comparison. Shared GPU timings may vary; default remains off."
+  },
+  "http_cpu": {
+    "status": "passed",
+    "cases_per_payload": 6,
+    "device": "CPU only",
+    "fixture_bytes": 28628288,
+    "trained_weights": false,
+    "gpu_overlap_activated": false,
+    "responses_equal": true,
+    "flags": [
+      "WILDLLAMA_KV_CACHE_PAGING=1",
+      "WILDLLAMA_KV_CACHE_INITIAL_TOKENS=256",
+      "WILDLLAMA_VERIFY_DEVICE_MIB=1"
+    ],
+    "baseline": "727cfc21 staged payload",
+    "responses": "Exact text/tokens/stop/count/probability SSE fields"
+  },
+  "ui": {
+    "repository": "Anderseta/wildgoose",
+    "source_revision": "385b5f66ec63c19722e3978d5bd40c5c85e35f18",
+    "initial_focused_suite": 67,
+    "manager_integration": 1,
+    "followup_estimator_cases": 35,
+    "followup_profile_case": 1,
+    "followup_counts_overlap_initial_suite": true,
+    "typescript": "passed",
+    "package_source_guard_artifacts": 75
+  },
+  "patch_replay": {
+    "status": "passed",
+    "patches": 71,
+    "native_files": 205
+  },
+  "defaults": "Paging off and device verifier allowance zero. No user profiles, context, temperature, draft depth or memory quotas changed automatically.",
+  "limits": "Device scratch is demand-driven within its per-context allowance and tracked CUDA quota. Driver/library allocations and other programs are separate. MoE RAM policy remains a weight-cache allowance, not process RSS.",
+  "coverage": "Physical tail reclamation only, not interior-hole PagedAttention. Device acceptance only for compatible stateless greedy CUDA single-sequence/single-microbatch layouts; physical KV growth and unsupported sampling retain the original path.",
+  "deferred": [
+    "Trained-model throughput/language-quality measurements",
+    "General paged-attention/radix allocator and interior-hole reclamation",
+    "Stochastic rejection and fully autonomous GPU commit/generation",
+    "Broader backend/platform execution"
+  ]
+}

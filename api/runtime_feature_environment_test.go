@@ -4,7 +4,7 @@ import "testing"
 
 func TestRuntimeFeatureRunnerEnvironment(t *testing.T) {
 	keys := []string{
-		"WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP", "WILDLLAMA_MTP_DEVICE_STATE",
+		"WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP", "WILDLLAMA_MTP_DEVICE_STATE", "WILDLLAMA_KV_CACHE_PAGING",
 	}
 	for _, key := range keys {
 		t.Run(key, func(t *testing.T) {
@@ -49,6 +49,16 @@ func TestRuntimeFeatureRunnerEnvironment(t *testing.T) {
 	for _, key := range []string{"WILDLLAMA_PREFILL_TRACE", "WILDLLAMA_PREFILL_LATENCY_US", "PATH", "HF_TOKEN"} {
 		if _, err := ParseRunnerEnvironment(map[string]string{key: "1"}); err == nil {
 			t.Fatalf("profile runtime controls admitted unrelated or diagnostic key %q", key)
+		}
+	}
+	for _, value := range []string{"", "0", "1", "64"} {
+		if _, err := ParseRunnerEnvironment(map[string]string{"WILDLLAMA_VERIFY_DEVICE_MIB": value}); err != nil {
+			t.Fatalf("device verification budget %q: %v", value, err)
+		}
+	}
+	for _, value := range []string{"-1", "+1", "-0", "65", "1.5", "64\n", "99999999999999999999"} {
+		if _, err := ParseRunnerEnvironment(map[string]string{"WILDLLAMA_VERIFY_DEVICE_MIB": value}); err == nil {
+			t.Fatalf("accepted invalid device verification budget %q", value)
 		}
 	}
 }

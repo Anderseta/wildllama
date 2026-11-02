@@ -1,0 +1,28 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3885,6 +3885,12 @@
+                 metrics_flush_idle();
+                 prefill_budget_idle();
+ 
++                const size_t reclaimed_tgt = llama_memory_trim_unused(ctx_tgt);
++                const size_t reclaimed_dft = ctx_dft && ctx_dft != ctx_tgt ? llama_memory_trim_unused(ctx_dft) : 0;
++                if (reclaimed_tgt || reclaimed_dft) {
++                    SRV_DBG("KV paging: released %zu target bytes and %zu draft bytes while idle\n", reclaimed_tgt, reclaimed_dft);
++                }
++
+                 return; // skip further processing
+ 
+             } else {

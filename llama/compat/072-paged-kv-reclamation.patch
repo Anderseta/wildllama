@@ -1,0 +1,538 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -219,7 +219,7 @@
+ std::shared_ptr<llama_memory_prefix> llama_kv_cache::retain_prefix(llama_seq_id sequence, uint32_t max_tokens) {
+     // DSA/MSA/other derived caches own extra state not represented by aliases.
+     if (typeid(*this)!=typeid(llama_kv_cache)) { return {}; }
+-    if (!max_tokens || other || growth_initial_tokens || v_cells_impl.use_count() != 1 || n_stream != 1 || n_swa ||
++    if (!max_tokens || other || (growth_initial_tokens && !growth_paging) || v_cells_impl.use_count() != 1 || n_stream != 1 || n_swa ||
+             seq_to_stream.size() != LLAMA_MAX_SEQ ||
+             sequence < 0 || uint32_t(sequence) >= n_seq_max || get_has_shift()) { return {}; }
+     auto & cells = v_cells[0];
+@@ -334,7 +334,8 @@
+     GGML_ASSERT(kv_size % n_pad == 0);
+ 
+     growth_initial_tokens=llama_kv_growth_initial();
+-    if (growth_initial_tokens && (v_trans || n_stream!=1 || n_seq_max!=1 || n_swa || other)) {
++    growth_paging=ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING"));
++    if (growth_initial_tokens && (v_trans || n_stream!=1 || (n_seq_max!=1 && !growth_paging) || n_swa || other)) {
+         LLAMA_LOG_WARN("KV growth: this cache layout uses conventional fully allocated storage\n");
+         growth_initial_tokens=0;
+     }
+@@ -662,9 +663,24 @@
+ size_t llama_kv_cache::trim_empty() {
+     if (!growth_initial_tokens || other) { return 0; }
+     for (const auto & cells : v_cells) { if (cells.get_used()) { return 0; } }
++    return trim_to(growth_initial_tokens, "ggml_backend_cuda_kv_trim_empty");
++}
++
++size_t llama_kv_cache::trim_unused() {
++    if (!growth_paging || !growth_initial_tokens || other || v_cells_impl.use_count() != 1 || hparams.no_alloc || get_has_shift() ||
++            typeid(*this) != typeid(llama_kv_cache)) { return 0; }
++    uint32_t live_end = 0;
++    for (const auto & cells : v_cells) { live_end = std::max(live_end, cells.used_max_p1()); }
++    const uint32_t keep = ggml_kv_paging_keep_tokens(get_size(), growth_initial_tokens,
++        live_end, std::max(n_pad, 256u));
++    if (keep >= growth_committed_tokens) { return 0; }
++    return trim_to(keep, "ggml_backend_cuda_kv_trim_unused");
++}
++
++size_t llama_kv_cache::trim_to(uint32_t keep_tokens, const char * proc) {
+     // Lower the commitment watermark before any mapping is released, including
+     // partial failure or allocation exceptions while staging another buffer.
+-    growth_committed_tokens = growth_initial_tokens;
++    growth_committed_tokens = keep_tokens;
+     size_t released = 0;
+     for (auto & entry : ctxs_bufs) {
+         auto & ctx = entry.first;
+@@ -673,14 +689,14 @@
+         if (!api) { continue; }
+         auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf.get()));
+         auto trim = reinterpret_cast<ggml_backend_cuda_kv_trim_t>(ggml_backend_reg_get_proc_address(
+-                ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_trim_empty"));
++                ggml_backend_dev_backend_reg(dev), proc));
+         if (!trim) { continue; }
+         auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf.get()));
+         std::vector<ggml_kv_trim_range> keep;
+         for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+             if (tensor->view_src) { continue; }
+             const size_t offset = static_cast<uint8_t *>(tensor->data) - base;
+-            keep.push_back({offset, tensor->nb[1]*growth_initial_tokens});
++            keep.push_back({offset, tensor->nb[1]*keep_tokens});
+             const size_t actual = ggml_nbytes(tensor);
+             const size_t allocated = ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(buf.get()), tensor);
+             if (allocated > actual) { keep.push_back({offset + actual, allocated - actual}); }
+@@ -693,6 +709,19 @@
+         if (before != SIZE_MAX && after < before) { released += before - after; }
+     }
+     return released;
++}
++
++size_t llama_memory_trim_unused(llama_context * ctx) {
++    if (!ctx || !ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING"))) { return 0; }
++    try {
++        if (!llama_kv_growth_initial()) { return 0; }
++        ctx->synchronize();
++        auto * memory = ctx->get_memory();
++        return memory ? memory->trim_unused() : 0;
++    } catch (const std::exception & error) {
++        LLAMA_LOG_WARN("KV paging: physical reclamation skipped or incomplete: %s\n", error.what());
++        return 0;
++    }
+ }
+ 
+ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -100,7 +100,7 @@
+     // TODO: refactor the memory instances to not depend on `llama_model`
+     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
+     //       likely through `struct llama_memory_params`
+-    llama_kv_cache(
++    LLAMA_API llama_kv_cache(
+             const llama_model & model,
+           const llama_hparams & hparams,
+                     ggml_type   type_k,
+@@ -120,7 +120,7 @@
+         // a model can hold more than one cache, so the tensor names have to stay unique
+                  const char *   name_tag = "");
+ 
+-    ~llama_kv_cache();
++    LLAMA_API ~llama_kv_cache();
+ 
+     //
+     // llama_memory_i
+@@ -139,6 +139,7 @@
+ 
+     void clear(bool data) override;
+     size_t trim_empty() override;
++    LLAMA_API size_t trim_unused() override;
+     std::shared_ptr<llama_memory_prefix> retain_prefix(llama_seq_id sequence, uint32_t max_tokens) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+@@ -308,7 +309,9 @@
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+     uint32_t growth_initial_tokens = 0;
+     uint32_t growth_committed_tokens = 0;
++    bool growth_paging = false;
+     bool grow_to(uint32_t tokens);
++    size_t trim_to(uint32_t tokens, const char * proc);
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+diff --git a/src/llama-kv-growth.h b/src/llama-kv-growth.h
+--- a/src/llama-kv-growth.h
++++ b/src/llama-kv-growth.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "ggml-cuda-kv-growth.h"
++#include "ggml-kv-paging.h"
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+ #include "ggml-cpp.h"
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -112,6 +112,7 @@
+     // Optional physical reclamation. Caller must synchronize the context first.
+     // Unsupported layouts/backends retain their storage; logical capacity stays fixed.
+     virtual size_t trim_empty() { return 0; }
++    virtual size_t trim_unused() { return 0; }
+ 
+     // Optional immutable same-stream prefix sharing. Unsupported memory types
+     // retain serialized snapshot behavior. A zero budget disables retention.
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -808,6 +808,8 @@
+     // reclaims CUDA VMM mappings only when every sequence is empty. Returns
+     // physically released bytes; logical context and tensor addresses are unchanged.
+     LLAMA_API size_t llama_memory_trim_empty(struct llama_context * ctx);
++    // Opt-in synchronized tail-page reclamation; preserves live KV and logical capacity.
++    LLAMA_API size_t llama_memory_trim_unused(struct llama_context * ctx);
+ 
+     LLAMA_API void llama_memory_clear(
+             llama_memory_t mem,
+diff --git a/ggml/src/ggml-cuda/kv-growth.cuh b/ggml/src/ggml-cuda/kv-growth.cuh
+--- a/ggml/src/ggml-cuda/kv-growth.cuh
++++ b/ggml/src/ggml-cuda/kv-growth.cuh
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include "ggml-kv-paging.h"
+ 
+ // Included after the shared CUDA allocation policy, before device buffers.
+ struct ggml_cuda_kv_vmm {
+@@ -10,9 +12,12 @@
+     std::vector<uint8_t> pages;
+     std::mutex mutex;
+     uint8_t fill = 0;
++    size_t segment_pages;
+ 
+     ggml_cuda_kv_vmm(int device, size_t capacity, size_t granularity) :
+-        device(device), capacity(capacity), granularity(granularity), pages(capacity/granularity, 0) {}
++        device(device), capacity(capacity), granularity(granularity), pages(capacity/granularity, 0),
++        segment_pages(ggml_kv_paging_segment_pages(capacity, granularity,
++            ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING")))) {}
+ 
+     ~ggml_cuda_kv_vmm() {
+ #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -37,14 +42,14 @@
+         size_t runs = 0;
+         for (size_t i=first; i<end;) {
+             if (pages[i]) { ++i; continue; }
+-            ++runs; while (i<end && !pages[i]) { ++i; }
++            ++runs; i = ggml_kv_paging_run_end(pages, i, end, segment_pages);
+         }
+         try { mappings.reserve(mappings.size()+runs); } catch (...) { return false; }
+         ggml_cuda_set_device(device);
+         for (size_t i=first; i<end;) {
+             if (pages[i]) { ++i; continue; }
+             const size_t start = i;
+-            while (i<end && !pages[i]) { ++i; }
++            i = ggml_kv_paging_run_end(pages, i, end, segment_pages);
+             const size_t bytes = (i-start)*granularity;
+             ggml_cuda_memory_reservation reservation(device, bytes);
+             if (!reservation.valid) { return false; }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7340,7 +7340,8 @@
+     if (strcmp(name, "ggml_backend_cuda_kv_growth_api") == 0) {
+         return const_cast<ggml_backend_cuda_kv_growth_api *>(&ggml_cuda_kv_growth_api);
+     }
+-    if (strcmp(name, "ggml_backend_cuda_kv_trim_empty") == 0) {
++    if (strcmp(name, "ggml_backend_cuda_kv_trim_empty") == 0 ||
++            strcmp(name, "ggml_backend_cuda_kv_trim_unused") == 0) {
+         return (void *) ggml_cuda_kv_trim_empty;
+     }
+     if (strcmp(name, "ggml_backend_cuda_set_memory_limit") == 0) {
+diff --git a/ggml/include/ggml-cuda-kv-growth.h b/ggml/include/ggml-cuda-kv-growth.h
+--- a/ggml/include/ggml-cuda-kv-growth.h
++++ b/ggml/include/ggml-cuda-kv-growth.h
+@@ -19,3 +19,7 @@
+ // Optional separate proc address preserves the version-1 growth API ABI.
+ // Caller must fence all users of this buffer first, and discard all KV cells.
+ using ggml_backend_cuda_kv_trim_t = bool (*)(ggml_backend_buffer_t, const ggml_kv_trim_range *, size_t);
++
++// Caller must fence users and protect every byte that subsequent kernels may
++// read, including dense masked cells and quantized padding. Live cells may stay.
++using ggml_backend_cuda_kv_trim_unused_t = ggml_backend_cuda_kv_trim_t;
+diff --git a/tests/test-kv-trim-ranges.cpp b/tests/test-kv-trim-ranges.cpp
+--- a/tests/test-kv-trim-ranges.cpp
++++ b/tests/test-kv-trim-ranges.cpp
+@@ -1,4 +1,5 @@
+ #include "../ggml/include/ggml-kv-trim.h"
++#include "../ggml/include/ggml-kv-paging.h"
+ #include <cstdio>
+ #include <limits>
+ #include <stdexcept>
+@@ -10,6 +11,26 @@
+ 
+ int main() {
+     try {
++        require(!ggml_kv_paging_enabled(nullptr) && !ggml_kv_paging_enabled("0") &&
++                !ggml_kv_paging_enabled("true") && ggml_kv_paging_enabled("1"), "paging opt-in changed");
++        require(ggml_kv_paging_segment_pages(64*1024*1024,64*1024,true)==32 &&
++                ggml_kv_paging_segment_pages(64*1024*1024,2*1024*1024,true)==1,
++                "paging did not bound mapping spans to two MiB");
++        require(ggml_kv_paging_segment_pages(size_t(65537)*65536,65536,true)==0 &&
++                ggml_kv_paging_segment_pages(64*1024*1024,65536,false)==0,
++                "paging expanded optional metadata or ignored disable");
++        std::vector<uint8_t> present(96,0);present[40]=1;
++        require(ggml_kv_paging_run_end(present,0,present.size(),32)==32 &&
++                ggml_kv_paging_run_end(present,32,present.size(),32)==40 &&
++                ggml_kv_paging_run_end(present,41,present.size(),32)==64 &&
++                ggml_kv_paging_run_end(present,41,present.size(),0)==96,
++                "mapping segmentation crossed an existing page or segment");
++        require(ggml_kv_paging_keep_tokens(131072,8192,0,256)==8192 &&
++                ggml_kv_paging_keep_tokens(131072,256,65535,256)==65536 &&
++                ggml_kv_paging_keep_tokens(131072,256,257,256)==512 &&
++                ggml_kv_paging_keep_tokens(UINT32_MAX,256,UINT32_MAX-1,256)==UINT32_MAX,
++                "paging floor/read span/padding arithmetic changed");
++        std::puts("PASS: paging exact opt-in, bounded metadata/segments, initial floor and dense masked-hole read span");
+         constexpr size_t page = 2*1024*1024, capacity = 64*page;
+         // A mapping can cover several CUDA pages. Neither a prefix boundary
+         // nor a tiny quantized padding tail may cause a partial unmap.
+diff --git a/tests/test-cuda-kv-growth.cpp b/tests/test-cuda-kv-growth.cpp
+--- a/tests/test-cuda-kv-growth.cpp
++++ b/tests/test-cuda-kv-growth.cpp
+@@ -5,6 +5,8 @@
+ #include <algorithm>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <limits>
+ #include <stdexcept>
+ #include <vector>
+@@ -20,8 +22,16 @@
+             "committed or future page has an unexpected fill value");
+ }
+ 
+-int main() {
++int main(int argc,char ** argv) {
+     try {
++        const bool paging=argc>1&&std::strcmp(argv[1],"--paging")==0;
++        if(paging) {
++#ifdef _WIN32
++            require(_putenv_s("WILDLLAMA_KV_CACHE_PAGING","1")==0,"cannot opt into physical paging");
++#else
++            require(setenv("WILDLLAMA_KV_CACHE_PAGING","1",1)==0,"cannot opt into physical paging");
++#endif
++        }
+         ggml_backend_load_all();
+         auto * registry = ggml_backend_reg_by_name("CUDA");
+         if (!registry || !ggml_backend_reg_dev_count(registry)) {
+@@ -70,6 +80,42 @@
+         };
+         const size_t baseline = stats().managed_used_bytes;
+         require(stats().enabled && stats().limit_bytes == 16*mib, "test quota was not activated");
++        if(paging) {
++            auto live_trim=reinterpret_cast<ggml_backend_cuda_kv_trim_unused_t>(
++                ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_kv_trim_unused"));
++            require(live_trim!=nullptr,"live-prefix trim proc unavailable");
++            trim=live_trim;
++            const size_t segment=std::max(page,size_t(2*mib));
++            const size_t filled=std::max(3*page,size_t(6*mib)), logical=64*mib;
++            ggml_backend_buffer_ptr storage(api->reserve(buft,logical));
++            require(storage!=nullptr,"cannot reserve paging test buffer");
++            void * const address=ggml_backend_buffer_get_base(storage.get());
++            ggml_context_ptr context(ggml_init({4*ggml_tensor_overhead(),nullptr,true}));
++            auto * flat=ggml_new_tensor_1d(context.get(),GGML_TYPE_I8,logical);
++            require(ggml_backend_tensor_alloc(storage.get(),flat,address)==GGML_STATUS_SUCCESS,"cannot attach paging tensor");
++            require(api->commit(storage.get(),0,filled)&&api->commit(storage.get(),logical-page,page),"cannot commit bounded paging intervals");
++            std::vector<uint8_t> prefix(257,0x39), padding(17,0x87);
++            ggml_backend_tensor_set(flat,prefix.data(),13,prefix.size());
++            ggml_backend_tensor_set(flat,padding.data(),logical-page+13,padding.size());
++            const ggml_kv_trim_range keep[]={{13,prefix.size()},{logical-page+13,padding.size()}};
++            const auto before=stats();
++            require(trim(storage.get(),keep,2),"live-prefix/padding trim failed");
++            require(api->committed(storage.get())==segment+page &&
++                    before.managed_used_bytes-stats().managed_used_bytes==filled-segment,
++                    "segmented tail paging did not release exact quota");
++            expect_fill(flat,13,prefix.size(),0x39);expect_fill(flat,logical-page+13,padding.size(),0x87);
++            require(trim(storage.get(),keep,2)&&api->committed(storage.get())==segment+page,"segmented trim was not idempotent");
++            require(api->commit(storage.get(),segment+13,1)&&api->committed(storage.get())==segment+2*page,
++                    "page regrowth did not use the managed quota");
++            expect_fill(flat,segment+13,257,0);
++            require(ggml_backend_buffer_get_base(storage.get())==address&&ggml_backend_buffer_get_size(storage.get())==logical,
++                    "paging changed logical address/capacity");
++            storage.reset();
++            require(stats().managed_used_bytes==baseline,"paging cleanup leaked physical quota");
++            std::printf("CUDA_KV_PAGING page=%zu segment=%zu released=%zu quota=16777216 bytes=preserved regrowth=zero address=stable PASS\n",
++                page,segment,filled-segment);
++            return 0;
++        }
+ 
+         // Reserve more logical capacity than either physical quota, including
+         // a non-page-aligned tail. No tensor-sized cudaMalloc is permitted.
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -290,6 +290,10 @@
+     return mem_attn->trim_empty();
+ }
+ 
++size_t llama_memory_hybrid::trim_unused() {
++    return mem_attn->trim_unused();
++}
++
+ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // Try removing from the recurrent cache first since it may fail. If it does
+     // fail, the cache will not have been mutated.
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -62,6 +62,7 @@
+ 
+     void clear(bool data) override;
+     size_t trim_empty() override;
++    size_t trim_unused() override;
+ 
+     std::shared_ptr<llama_memory_prefix> retain_prefix(llama_seq_id sequence, uint32_t max_tokens) override;
+     void invalidate_prefixes() const override;
+diff --git a/tests/test-hybrid-prefix.cpp b/tests/test-hybrid-prefix.cpp
+--- a/tests/test-hybrid-prefix.cpp
++++ b/tests/test-hybrid-prefix.cpp
+@@ -4,6 +4,7 @@
+ #include "server-task.h"
+ #include "../src/llama-ext.h"
+ #include "../src/llama-memory-hybrid.h"
++#include "../src/llama-model.h"
+ #include "../src/llama-hybrid-prefix-transaction.h"
+ #include "../src/llama-prefix-text.h"
+ #include <algorithm>
+@@ -23,7 +24,7 @@
+     setenv("WILDLLAMA_PREFIX_RECURRENT_MIB",value,1);
+ #endif
+ }
+-static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, const std::string & export_path = {}) {
++static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, const std::string & export_path = {}, uint32_t quota_mib = 0) {
+     const int dim=embedding_width, vocab=259;
+     gguf_context_ptr metadata(gguf_init_empty());
+     gguf_set_val_str(metadata.get(), "general.architecture", "qwen35");
+@@ -85,6 +86,7 @@
+     ggml_backend_dev_t devices[]={gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
+     params.devices=devices; params.n_gpu_layers=gpu ? 99 : 0; params.gpu_exclusive=gpu; params.load_mode=LLAMA_LOAD_MODE_NONE;
+     params.use_extra_bufts=false; params.no_host=true; params.load_mtp=true;
++    if (quota_mib) { params.gpu_vram_limit_mib = quota_mib; }
+     llama_model_ptr model(llama_model_init_from_user(metadata.get(),initialize,&capture_state,params));
+     require(bool(model),"cannot initialize nonzero tiny recurrent fixture");
+     if(!export_path.empty()){require(gguf_write_to_file(exported.get(),export_path.c_str(),false),"cannot export tiny hybrid fixture");}
+@@ -92,12 +94,16 @@
+ }
+ 
+ 
+-static llama_context_ptr context(llama_model * model,int tokens=256) {
++static llama_context_ptr context(llama_model * model,int tokens=256,bool paging=false) {
+     auto p=llama_context_default_params();
+     p.n_ctx=tokens;p.n_batch=256;p.n_ubatch=256;p.n_seq_max=1;p.kv_unified=true;
+     p.n_rs_seq=2;p.n_threads=p.n_threads_batch=1;
+     p.op_offload=gpu;p.offload_kqv=gpu;
+     p.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    if (paging) {
++        p.type_k = p.type_v = GGML_TYPE_F32;
++        p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    }
+     llama_context_ptr ctx(llama_init_from_model(model,p));
+     require(bool(ctx),"cannot create tiny hybrid prefix context");
+     require(dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx.get())),"fixture is not hybrid");
+@@ -121,6 +127,81 @@
+     std::printf("HYBRID_LOGITS stage=%s max_scaled=%.9g\n",stage,max);require(max<=1e-5f,"hybrid prefix logits differ");
+ }
+ static void clear(llama_context * ctx){llama_memory_clear(llama_get_memory(ctx),true);}
++static void set_paging_environment(const char * name, const char * value) {
++#ifdef _WIN32
++    require(_putenv_s(name,value)==0,"cannot set paging test environment");
++#else
++    require(setenv(name,value,1)==0,"cannot set paging test environment");
++#endif
++}
++static std::vector<uint8_t> sequence_state(llama_context * ctx) {
++    std::vector<uint8_t> state(llama_state_seq_get_size(ctx,0));
++    require(llama_state_seq_get_data(ctx,state.data(),state.size(),0)==state.size(),"cannot capture hybrid sequence");
++    return state;
++}
++static void paging_case() {
++    constexpr uint32_t tokens=16384, quota_mib=128;
++    set_paging_environment("WILDLLAMA_KV_CACHE_INITIAL_TOKENS","256");
++    set_paging_environment("WILDLLAMA_KV_CACHE_PAGING","1");
++    recurrent_cap("32");
++    auto model=tiny_model(true,512,{},quota_mib);
++    auto ctx=context(model.get(),tokens,true);
++    decode(ctx.get(),pattern(64),0);
++    auto held=llama_memory_prefix_retain(ctx.get(),0,4096);
++    require(held&&held->valid(),"VMM hybrid prefix was not retained");
++    for(int position=64;position<4160;position+=256) {
++        decode(ctx.get(),pattern(256,position),position);
++    }
++    require(llama_memory_prefix_restore(ctx.get(),held,0),"cannot restore shared hybrid prefix before trim");
++    const auto expected=decode(ctx.get(),{17},64);
++    require(llama_memory_prefix_restore(ctx.get(),held,0),"cannot restore recurrent prefix checkpoint");
++    const auto before_state=sequence_state(ctx.get());
++    llama_gpu_memory_stats before{},after{};
++    require(llama_model_get_gpu_memory_stats(model.get(),&before)&&before.enabled&&before.limit_bytes==quota_mib*1024ull*1024,
++            "hybrid paging quota unavailable");
++    const size_t released=llama_memory_trim_unused(ctx.get());
++    require(llama_model_get_gpu_memory_stats(model.get(),&after)&&released>0&&
++            before.managed_used_bytes-after.managed_used_bytes==released,
++            "live-prefix paging did not release exact physical bytes");
++    require(before_state==sequence_state(ctx.get())&&held->valid(),"paging changed attention/recurrent prefix bytes");
++    require(llama_memory_trim_unused(ctx.get())==0&&llama_n_ctx(ctx.get())==tokens,"paging changed context or was not idempotent");
++    const auto actual=decode(ctx.get(),{17},64);
++    require(actual.size()==expected.size()&&std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float))==0,
++            "paging changed hybrid continuation logits");
++    require(llama_memory_prefix_restore(ctx.get(),held,0),"paged prefix handle became stale");
++    held.reset();
++    require(llama_model_get_gpu_memory_stats(model.get(),&after)&&after.managed_peak_bytes<=after.limit_bytes,
++            "hybrid paging exceeded managed CUDA quota");
++    ctx.reset();
++    auto shared_ctx=context(model.get(),tokens,true);
++    auto * hybrid=dynamic_cast<llama_memory_hybrid *>(llama_get_memory(shared_ctx.get()));
++    require(hybrid!=nullptr,"shared paging fixture is not hybrid");
++    auto filter=[](int32_t layer){return layer==1;};
++    auto share=[](int32_t layer){return layer;};
++    {
++        llama_kv_cache view(*model,model->hparams,GGML_TYPE_F32,GGML_TYPE_F32,false,true,true,
++            tokens,1,256,0,LLAMA_SWA_TYPE_NONE,hybrid->get_mem_attn(),filter,nullptr,share,"paging-view");
++        decode(shared_ctx.get(),pattern(64),0);
++        const auto prefix_state=sequence_state(shared_ctx.get());
++        for(int position=64;position<4160;position+=256) {
++            decode(shared_ctx.get(),pattern(256,position),position);
++        }
++        require(llama_state_seq_set_data(shared_ctx.get(),prefix_state.data(),prefix_state.size(),0)==prefix_state.size(),
++                "cannot restore shared owner prefix");
++        const auto owner_state=sequence_state(shared_ctx.get());
++        require(llama_model_get_gpu_memory_stats(model.get(),&before),"cannot sample shared owner memory");
++        require(llama_memory_trim_unused(shared_ctx.get())==0&&view.trim_unused()==0,
++                "shared owner/view released potentially in-flight physical pages");
++        require(llama_model_get_gpu_memory_stats(model.get(),&after)&&before.managed_used_bytes==after.managed_used_bytes&&
++                owner_state==sequence_state(shared_ctx.get()),"shared-owner fallback changed bytes or physical mappings");
++    }
++    auto dummy_hparams=model->hparams;dummy_hparams.no_alloc=true;
++    llama_kv_cache dummy(*model,dummy_hparams,GGML_TYPE_F32,GGML_TYPE_F32,false,true,true,
++        tokens,1,256,0,LLAMA_SWA_TYPE_NONE,nullptr,filter,nullptr,nullptr,"paging-no-alloc");
++    require(dummy.trim_unused()==0,"no-alloc cache attempted physical reclamation");
++    std::printf("HYBRID_PAGING context=%u prefix=64 peak_tokens=4160 released=%zu managed_peak=%llu quota=%llu state=exact logits=bitwise prefix_handle=valid\n",
++        tokens,released,(unsigned long long)after.managed_peak_bytes,(unsigned long long)after.limit_bytes);
++}
+ static void transactions() {
+     constexpr size_t mib=1024*1024;
+     require(llama_prefix_recurrent_limit(nullptr)==32*mib,"missing cap default changed");
+@@ -235,10 +316,13 @@
+ }
+ int main(int argc,char ** argv) {
+     try{
+-        std::setvbuf(stdout,nullptr,_IONBF,0);gpu=argc>1&&std::strcmp(argv[1],"--cuda")==0;
++        std::setvbuf(stdout,nullptr,_IONBF,0);
++        const bool paging=argc>1&&std::strcmp(argv[1],"--cuda-paging")==0;
++        gpu=argc>1&&(std::strcmp(argv[1],"--cuda")==0||paging);
+         ggml_backend_load_all();
+         if(argc==3&&std::strcmp(argv[1],"--write-fixture")==0){auto model=tiny_model(false,32,argv[2]);return 0;}
+         if(gpu&&!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))return 77;
++        if(paging){paging_case();return 0;}
+         transactions();auto model=tiny_model(gpu);native_cases(model.get());cache_cases(model.get());
+         std::printf("HYBRID_PREFIX backend=%s native+server+checkpoint+transaction PASS\n",gpu?"CUDA":"CPU");return 0;
+     }catch(const std::exception & e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
+diff --git a/ggml/include/ggml-kv-paging.h b/ggml/include/ggml-kv-paging.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/include/ggml-kv-paging.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++inline bool ggml_kv_paging_enabled(const char * value) {
++    return value && std::strcmp(value, "1") == 0;
++}
++
++// Limit optional map descriptors to at most one per minimum physical page.
++// Larger reservations retain the original whole-run mapping policy.
++inline size_t ggml_kv_paging_segment_pages(size_t capacity, size_t granularity, bool enabled) {
++    if (!enabled || !capacity || !granularity || capacity % granularity || capacity/granularity > 65536) { return 0; }
++    return std::max<size_t>(1, (2 * 1024 * 1024)/granularity);
++}
++
++template <typename Pages>
++size_t ggml_kv_paging_run_end(const Pages & pages, size_t first, size_t end, size_t segment_pages) {
++    size_t stop = end;
++    if (segment_pages) { stop = std::min(stop, first + segment_pages - first % segment_pages); }
++    while (first < stop && !pages[first]) { ++first; }
++    return first;
++}
++
++// Dense attention can read masked holes. Keep the entire padded physical span,
++// not just the logically occupied cells within it.
++inline uint32_t ggml_kv_paging_keep_tokens(uint32_t capacity, uint32_t initial,
++        uint32_t live_end, uint32_t alignment) {
++    if (!capacity || !initial || initial > capacity || live_end > capacity || !alignment) { return capacity; }
++    const uint64_t needed = std::max(initial, live_end);
++    return uint32_t(std::min<uint64_t>(capacity, ((needed + alignment - 1)/alignment)*alignment));
++}

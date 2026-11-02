@@ -278,6 +278,13 @@ endforeach()
 
 # Real tiny CPU MTP/carryover regressions (no model downloads or GPU use).
 validation_target(test-mtp-state llama-common)
+validation_target(test-device-verification llama-common)
+add_dependencies(test-device-verification ggml-cpu)
+target_compile_definitions(test-device-verification PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+add_test(NAME device-verification COMMAND test-device-verification)
+if(TARGET ggml-cuda)
+    add_dependencies(test-device-verification ggml-cuda)
+endif()
 add_dependencies(test-mtp-state ggml-cpu)
 target_compile_definitions(test-mtp-state PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
 add_test(NAME mtp-state COMMAND test-mtp-state)

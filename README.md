@@ -47,6 +47,8 @@ The next extensions add bounded multi-sequence and neural draft-response overlap
 
 The [bounded inference follow-ups](docs/bounded-inference-efficiency.md) add adaptive prompt slices, exact dense speculative lookup, reusable warm SSD backings, indexed KV branching, and broader optional quantized-activation reuse. Existing context, memory budgets and saved profiles are preserved; their validation scope is reported separately from trained-model throughput.
 
+Optional [physical KV paging](docs/physical-kv-paging.md) can reclaim compatible unused tail mappings while preserving live prefixes and logical context. Separately, [bounded CUDA verification](docs/bounded-device-verification.md) computes eligible greedy speculative acceptance on the GPU and defers unnecessary vocabulary-sized host transfers. Its scratch allowance stays inside the existing CUDA quota. The initial verifier retains the original path when physical KV growth is configured; neither option changes saved sampling or memory settings automatically.
+
 ## Large MoE models on smaller machines
 
 A MoE model uses only its router-selected experts for each token, but the full set of expert weights can still be much larger than VRAM or available RAM. WildLlama's selective-weight path keeps bounded working sets in memory and reads missing weights from the original GGUF files on SSD.

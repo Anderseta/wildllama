@@ -54,6 +54,39 @@ func TestMTPTransportEnvironmentPreservesMemoryPolicies(t *testing.T) {
 	}
 }
 
+func TestBoundedDeviceFeaturesPreserveRunnerPolicies(t *testing.T) {
+	t.Setenv("WILDLLAMA_VERIFY_DEVICE_MIB", "32")
+	for _, budget := range []string{"", "0", "64"} {
+		t.Run("budget="+budget, func(t *testing.T) {
+			cmd := &exec.Cmd{}
+			SetupLlamaServerCommandEnv(cmd, "llama-server", nil, map[string]string{
+				"WILDLLAMA_VERIFY_DEVICE_MIB": budget, "WILDLLAMA_KV_CACHE_PAGING": "1",
+				"LLAMA_ARG_GPU_VRAM_LIMIT_MIB": "12288", "LLAMA_ARG_MOE_RAM_LIMIT_MIB": "10240",
+				"WILDLLAMA_KV_CACHE_INITIAL_TOKENS": "8192", "LLAMA_ARG_CTX_SIZE": "131072",
+			})
+			policies := map[string]string{}
+			for _, entry := range cmd.Env {
+				key, value, _ := strings.Cut(entry, "=")
+				policies[key] = value
+			}
+			if value, present := policies["WILDLLAMA_VERIFY_DEVICE_MIB"]; present != (budget != "") || value != budget {
+				t.Fatalf("explicit off/default budget changed: %q present=%v", value, present)
+			}
+			for key, value := range map[string]string{
+				"WILDLLAMA_KV_CACHE_PAGING": "1", "LLAMA_ARG_GPU_VRAM_LIMIT_MIB": "12288",
+				"LLAMA_ARG_MOE_RAM_LIMIT_MIB": "10240", "WILDLLAMA_KV_CACHE_INITIAL_TOKENS": "8192", "LLAMA_ARG_CTX_SIZE": "131072",
+			} {
+				if policies[key] != value {
+					t.Fatalf("feature changed %s: %q", key, policies[key])
+				}
+			}
+		})
+	}
+	if os.Getenv("WILDLLAMA_VERIFY_DEVICE_MIB") != "32" {
+		t.Fatal("profile changed the parent process")
+	}
+}
+
 func TestLogicalAndPhysicalBatchAreIndependent(t *testing.T) {
 	opts := api.DefaultOptions()
 	opts.NumBatch = 2048
