@@ -135,8 +135,11 @@ func (v *imageService) registerImageResult(job *imageJob, result imagegen.Result
 	if filepath.Clean(result.Path) != filepath.Clean(expected) {
 		return errors.New("image runner returned an unexpected output path")
 	}
-	asset := imageAssetRecord{imageAsset: imageAsset{AssetID: job.ID + "/" + filename, JobID: job.ID, Filename: filename, MIMEType: "image/png", Path: expected,
+	asset := imageAssetRecord{imageAsset: imageAsset{AssetID: job.ID + "/" + filename, RequestID: job.RequestID, SessionID: job.SessionID, JobID: job.ID, Filename: filename, MIMEType: "image/png", Path: expected,
 		Width: result.Width, Height: result.Height, Seed: result.Seed, DurationSeconds: result.DurationSeconds, BatchIndex: index, BatchCount: count, ParentAssetID: job.ParentAssetID}, OutputRoot: job.Config.OutputDir}
+	if job.Generation != nil {
+		asset.ReferenceAssetIDs = append([]string(nil), job.Generation.ReferenceAssetIDs...)
+	}
 	file, err := openImageAsset(asset)
 	if err != nil {
 		return err

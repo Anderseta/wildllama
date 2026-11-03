@@ -15,19 +15,26 @@ import (
 
 type imageAssetRecord struct {
 	imageAsset
-	OutputRoot        string `json:"output_root"`
-	Input             bool   `json:"input,omitempty"`
-	UploadFingerprint string `json:"upload_fingerprint,omitempty"`
+	OutputRoot        string   `json:"output_root"`
+	Input             bool     `json:"input,omitempty"`
+	UploadFingerprint string   `json:"upload_fingerprint,omitempty"`
+	ReferenceAssetIDs []string `json:"reference_asset_ids,omitempty"`
 }
 
 func (v *imageService) persistJobsLocked() error {
+	if v.assetOwnersDirty {
+		if err := writeImageJSON(filepath.Join(v.root, "assets.json"), v.assets); err != nil {
+			return err
+		}
+		v.assetOwnersDirty = false
+	}
 	// Bound history metadata without deleting output files or their asset index.
 	jobs := v.jobs
 	if len(v.jobs) > 200 {
 		remove := len(v.jobs) - 200
 		kept := make([]*imageJob, 0, len(v.jobs))
 		for _, job := range v.jobs {
-			if remove > 0 && imageTerminal(job.Status) {
+			if remove > 0 && imageTerminal(job.Status) && !job.executing {
 				remove--
 				continue
 			}
@@ -56,6 +63,16 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 	if v.closed {
 		return nil, errors.New("image service is shutting down")
 	}
+	if err := v.checkImageSessionLocked(job.SessionID, job.RequestID); err != nil {
+		return nil, err
+	}
+	if job.Kind == "generate" {
+		for _, id := range imageJobReferences(job) {
+			if _, exists := v.assets[id]; !exists {
+				return nil, errors.New("reference image is no longer available")
+			}
+		}
+	}
 	if job.RequestID != "" {
 		if !imageSafeID(job.RequestID) {
 			return nil, errors.New("invalid image request_id")
@@ -83,6 +100,12 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 	job.Phase = "queued"
 	job.CreatedAt = time.Now().UTC()
 	job.ctx, job.cancel = context.WithCancel(v.ctx)
+	if job.Kind == "generate" && job.SessionID != "" {
+		if err := v.recordImageDirectoryLocked(job); err != nil {
+			job.cancel()
+			return nil, err
+		}
+	}
 	previous := v.jobs
 	v.jobs = append(v.jobs, job)
 	if err := v.persistJobsLocked(); err != nil {
@@ -168,6 +191,7 @@ func (v *imageService) work() {
 		started := time.Now().UTC()
 		job.StartedAt = &started
 		job.Status = "running"
+		job.executing = true
 		_ = v.persistJobsLocked()
 		v.mu.Unlock()
 		var err error
@@ -181,6 +205,7 @@ func (v *imageService) work() {
 			err = v.generate(job)
 		}
 		v.mu.Lock()
+		job.executing = false
 		if job.TextRestoreDeferred && job.Status == "completed" {
 			// Full successful delivery was committed while holding the lease.
 			// A later cancellation cannot undo saved output or require a reload.
@@ -590,6 +615,11 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 	}
 	fingerprint := imageFingerprint(request)
 	v.mu.Lock()
+	if err := v.checkImageSessionLocked(request.SessionID, request.RequestID); err != nil {
+		v.mu.Unlock()
+		c.JSON(410, gin.H{"error": err.Error()})
+		return
+	}
 	config := cloneImageConfig(v.config)
 	for _, job := range v.jobs {
 		if request.RequestID != "" && job.RequestID == request.RequestID {

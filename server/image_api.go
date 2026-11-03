@@ -122,6 +122,7 @@ type imageJob struct {
 	LoRA                *imagegen.Component     `json:"-"`
 	cancel              context.CancelFunc
 	ctx                 context.Context
+	executing           bool
 }
 
 type imageService struct {
@@ -142,6 +143,11 @@ type imageService struct {
 	shutdownCancel    context.CancelFunc
 	cancelledRequests map[string]time.Time
 	uploadSlot        chan struct{}
+	deletedSessions   map[string]bool
+	deletedRequests   map[string]bool
+	sessionDeleteErr  error
+	assetOwnersDirty  bool
+	ownedDirectories  map[string]imageOwnedDirectory
 	newEngine         func(imagegen.Config) (imagegen.Runner, error)
 	text              imageTextBackend
 }
@@ -223,6 +229,7 @@ func (s *Server) imageService() *imageService {
 		if service.assets == nil {
 			service.assets = map[string]imageAssetRecord{}
 		}
+		service.loadDeletedImageSessions()
 		s.images = service
 	})
 	return s.images
@@ -415,6 +422,10 @@ func (s *Server) registerImageRoutes(r *gin.Engine) {
 	r.POST("/api/images/jobs/by-request/:request_id/cancel", s.imageCancelHandler)
 	r.GET("/api/images/assets/:id/:filename", s.imageAssetHandler)
 	r.POST("/api/images/assets", s.imageUploadHandler)
+	r.DELETE("/api/images/sessions/:session_id", s.imageSessionDeleteHandler)
+	r.GET("/api/images/capabilities", func(c *gin.Context) {
+		c.JSON(200, gin.H{"session_deletion": true})
+	})
 }
 
 func (s *Server) imageConfigHandler(c *gin.Context) {

@@ -130,6 +130,11 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 		return
 	}
 	v.mu.Lock()
+	if err := v.checkImageSessionLocked(sessionID, requestID); err != nil {
+		v.mu.Unlock()
+		c.JSON(410, gin.H{"error": err.Error()})
+		return
+	}
 	outputRoot := v.config.OutputDir
 	existing, repeated := v.imageUploadByRequestIDLocked(requestID)
 	v.mu.Unlock()
@@ -218,6 +223,12 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 		asset.UploadFingerprint = fingerprint
 	}
 	v.mu.Lock()
+	if err := v.checkImageSessionLocked(sessionID, requestID); err != nil {
+		v.mu.Unlock()
+		_ = os.Remove(path)
+		c.JSON(410, gin.H{"error": err.Error()})
+		return
+	}
 	v.assets[asset.AssetID] = asset
 	err = writeImageJSON(filepath.Join(v.root, "assets.json"), v.assets)
 	if err != nil {
