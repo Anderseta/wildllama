@@ -685,15 +685,16 @@ var stepPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,3})/([0-9]{1,3})(?:[^
 var byteRatePattern = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:[kmgt]i?)?b/s\b`)
 
 type progressLog struct {
-	mu          sync.Mutex
-	pending     string
-	lines       []string
-	callback    func(Progress)
-	start       time.Time
-	pid         int
-	lastPhase   string
-	lastCurrent int
-	lastEmit    time.Time
+	mu           sync.Mutex
+	pending      string
+	lines        []string
+	callback     func(Progress)
+	start        time.Time
+	pid          int
+	lastPhase    string
+	lastCurrent  int
+	lastEmit     time.Time
+	counterPhase string
 }
 
 func (p *progressLog) Write(data []byte) (int, error) {
@@ -728,11 +729,16 @@ func (p *progressLog) line(line string) {
 		p.lines = p.lines[len(p.lines)-16:]
 	}
 	lower := strings.ToLower(line)
+	imageBatchHeader := strings.Contains(lower, "generating image:")
+	samplingStart := imageBatchHeader || strings.Contains(lower, "sampling using ") || strings.Contains(lower, "sampling(high noise) using ")
 	update := Progress{}
 	switch {
 	case strings.Contains(lower, "conditioning disk cache hit"):
 		update.Phase = "conditioning_cache_hit"
 		update.Message = "Reusing cached prompt encoding"
+	case samplingStart:
+		update.Phase = "sampling"
+		update.Message = "Generating image"
 	case strings.Contains(lower, "loading") || strings.Contains(lower, "load tensors"):
 		update.Phase = "loading"
 		update.Message = "Loading image model components"
@@ -746,16 +752,30 @@ func (p *progressLog) line(line string) {
 		update.Phase = "saving"
 		update.Message = "Saving the image"
 	}
-	if match := stepPattern.FindStringSubmatch(line); match != nil {
+	switch update.Phase {
+	case "sampling", "encoding", "decoding", "saving":
+		p.counterPhase = update.Phase
+	}
+	if match := stepPattern.FindStringSubmatch(line); match != nil && !imageBatchHeader {
 		current, _ := strconv.Atoi(match[1])
 		total, _ := strconv.Atoi(match[2])
 		if total > 1 && current <= total {
 			// Native tensor transfers and denoising both print unlabelled N/M
-			// bars. Byte rates identify transfers; explicit phase labels win.
+			// bars. Byte rates identify transfers; VAE tiles retain their semantic
+			// phase even when loading weights interrupted the preceding message.
 			if update.Phase == "" {
 				if byteRatePattern.MatchString(line) {
 					update.Phase = "loading"
 					update.Message = "Loading image model components"
+				} else if p.counterPhase == "decoding" {
+					update.Phase = "decoding"
+					update.Message = "Decoding the image"
+				} else if p.counterPhase == "encoding" {
+					update.Phase = "encoding"
+					update.Message = "Encoding the prompt and reference images"
+				} else if p.counterPhase == "saving" {
+					update.Phase = "saving"
+					update.Message = "Saving the image"
 				} else {
 					update.Phase = "sampling"
 					update.Message = "Generating image"
