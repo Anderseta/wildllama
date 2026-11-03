@@ -15,8 +15,9 @@ import (
 
 type imageAssetRecord struct {
 	imageAsset
-	OutputRoot string `json:"output_root"`
-	Input      bool   `json:"input,omitempty"`
+	OutputRoot        string `json:"output_root"`
+	Input             bool   `json:"input,omitempty"`
+	UploadFingerprint string `json:"upload_fingerprint,omitempty"`
 }
 
 func (v *imageService) persistJobsLocked() error {

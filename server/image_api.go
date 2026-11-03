@@ -76,6 +76,8 @@ type imageProgress struct {
 
 type imageAsset struct {
 	AssetID         string  `json:"asset_id"`
+	RequestID       string  `json:"request_id,omitempty"`
+	SessionID       string  `json:"session_id,omitempty"`
 	JobID           string  `json:"job_id"`
 	Filename        string  `json:"filename"`
 	MIMEType        string  `json:"mime_type"`

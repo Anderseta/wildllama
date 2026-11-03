@@ -192,6 +192,12 @@ edits use uploaded or generated asset IDs in `reference_images`, never model-gen
 commands or arbitrary server file paths. Progress distinguishes waiting, text
 unloading, image loading, generation, saving and text restoration.
 
+Reference uploads may include `request_id` and `session_id` query parameters.
+The original bytes are retained unchanged. An exact retry returns the same asset;
+reusing the ID with another body, media type or session returns a conflict. The
+`image_upload_idempotency` capability advertises this additive behavior. Missing
+or modified saved originals are reported rather than silently replaced.
+
 Image data directories default beside the configured model directory. Set
 `WILDLLAMA_IMAGES_DIR` or choose explicit directories in the configuration to keep
 models, working files and outputs on a dedicated drive. The portable Windows
