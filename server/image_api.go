@@ -132,6 +132,7 @@ type imageService struct {
 	assets            map[string]imageAssetRecord
 	gate              *imageGPUGate
 	queue             chan *imageJob
+	queueChanged      chan struct{}
 	active            imagegen.Runner
 	closed            bool
 	workerStarted     bool

@@ -57,7 +57,9 @@ encoder/LoRA/reference content hashes and every actual conditioning parameter.
 Reliable filesystem change times invalidate weight-digest memoization, including
 same-size edits with a restored mtime. The first unchanged encoder signature may
 need a full file read; its real progress is reported separately from generation.
-Sampling seeds do not invalidate deterministic conditioning. The supported lazy
+Sampling seeds, steps, CFG, sampler, sigmas and scheduler do not invalidate
+deterministic conditioning; model, adapter, encoder and backend changes still do.
+The supported lazy
 disk parameter backend can avoid encoder computation on a hit; actual loading
 time and peak memory still depend on the selected model and backend.
 
@@ -100,6 +102,9 @@ with one unload/restore cycle for text; results are published durably one by one
 `results` contains the ordered batch, while `result` remains its first output for
 older clients. Explicit seeds increment safely through the batch. Later failures
 or cancellation preserve already completed images and still attempt restoration.
+Cancelling a queued request records its terminal state immediately and releases
+its queue slot. Surviving requests retain FIFO order; a cancelled request does
+not unload or restore a text model when the worker reaches it.
 
 An explicit `defer_text_restore` request can defer a successful full batch's text
 warmup until the next text request. Failure or early cancellation retains normal

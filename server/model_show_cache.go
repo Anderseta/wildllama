@@ -58,6 +58,8 @@ const (
 	modelShowCloudFetchTimeout         = 3 * time.Second
 	modelShowCloudReadRefreshCooldown  = 5 * time.Second
 	modelShowCloudHydrationConcurrency = 4
+	modelShowCacheMaxEntries           = 128
+	modelShowCacheMaxBytes             = 64 << 20
 )
 
 var errModelShowNoCloud = errors.New("cloud disabled")
@@ -70,8 +72,11 @@ type modelShowCache struct {
 	mu           sync.RWMutex
 	localFlights singleflight.Group
 
-	local map[modelShowLocalKey]modelShowLocalEntry
-	cloud map[modelShowCloudKey]*api.ShowResponse
+	local                       map[modelShowLocalKey]modelShowLocalEntry
+	cloud                       map[modelShowCloudKey]*api.ShowResponse
+	cloudUsage                  map[modelShowCloudKey]modelShowCacheUsage
+	bytes, maxBytes, maxEntries int
+	clock                       uint64
 
 	cloudRefreshing           map[modelShowCloudKey]bool
 	cloudNextReadRefreshAfter map[modelShowCloudKey]time.Time
@@ -86,9 +91,8 @@ type modelShowCache struct {
 // recreated model overwrites the previous response for the same model/verbose
 // variant instead of leaving stale digest-keyed entries behind.
 //
-// Deleted models are not eagerly pruned from this process-local cache. Manifest
-// resolution happens before local cache lookup, so stale delete entries are not
-// served and disappear on process restart.
+// Manifest resolution happens before local cache lookup, so stale entries are
+// not served. A shared byte/entry budget evicts old local and cloud responses.
 type modelShowLocalKey struct {
 	Model   string
 	Runner  string
@@ -98,6 +102,12 @@ type modelShowLocalKey struct {
 type modelShowLocalEntry struct {
 	Digest   string
 	Response *api.ShowResponse
+	modelShowCacheUsage
+}
+
+type modelShowCacheUsage struct {
+	Bytes int
+	Used  uint64
 }
 
 // modelShowCloudKey intentionally excludes any local digest because cloud
@@ -111,6 +121,9 @@ func newModelShowCache() *modelShowCache {
 	return &modelShowCache{
 		local:                     make(map[modelShowLocalKey]modelShowLocalEntry),
 		cloud:                     make(map[modelShowCloudKey]*api.ShowResponse),
+		cloudUsage:                make(map[modelShowCloudKey]modelShowCacheUsage),
+		maxBytes:                  modelShowCacheMaxBytes,
+		maxEntries:                modelShowCacheMaxEntries,
 		cloudRefreshing:           make(map[modelShowCloudKey]bool),
 		cloudNextReadRefreshAfter: make(map[modelShowCloudKey]time.Time),
 		client:                    http.DefaultClient,
@@ -199,9 +212,14 @@ func (c *modelShowCache) GetCloudSWR(ctx context.Context, req api.ShowRequest) (
 }
 
 func (c *modelShowCache) getLocal(key modelShowLocalKey, digest string) (*api.ShowResponse, bool) {
-	c.mu.RLock()
+	c.mu.Lock()
 	entry, ok := c.local[key]
-	c.mu.RUnlock()
+	if ok && entry.Digest == digest && entry.Response != nil {
+		c.clock++
+		entry.Used = c.clock
+		c.local[key] = entry
+	}
+	c.mu.Unlock()
 	if !ok || entry.Digest != digest || entry.Response == nil {
 		return nil, false
 	}
@@ -209,12 +227,28 @@ func (c *modelShowCache) getLocal(key modelShowLocalKey, digest string) (*api.Sh
 }
 
 func (c *modelShowCache) setLocal(key modelShowLocalKey, digest string, resp *api.ShowResponse) {
-	c.mu.Lock()
-	c.local[key] = modelShowLocalEntry{
-		Digest:   digest,
-		Response: cloneShowResponse(resp),
+	c.mu.RLock()
+	limit := c.maxBytes
+	c.mu.RUnlock()
+	cost, fits := modelShowResponseBytes(resp, limit-len(key.Model)-len(key.Runner)-len(digest)-128)
+	cost += len(key.Model) + len(key.Runner) + len(digest) + 128
+	var response *api.ShowResponse
+	if fits {
+		response = cloneShowResponse(resp)
 	}
-	c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removeLocalLocked(key)
+	if !fits || response == nil || !c.reserveLocked(cost) {
+		return
+	}
+	c.clock++
+	c.local[key] = modelShowLocalEntry{
+		Digest:              digest,
+		Response:            response,
+		modelShowCacheUsage: modelShowCacheUsage{Bytes: cost, Used: c.clock},
+	}
+	c.bytes += cost
 }
 
 func (c *modelShowCache) invalidateLocal(name model.Name) {
@@ -224,15 +258,21 @@ func (c *modelShowCache) invalidateLocal(name model.Name) {
 	modelName := name.String()
 	for key := range c.local {
 		if key.Model == modelName {
-			delete(c.local, key)
+			c.removeLocalLocked(key)
 		}
 	}
 }
 
 func (c *modelShowCache) getCloud(key modelShowCloudKey) (*api.ShowResponse, bool) {
-	c.mu.RLock()
+	c.mu.Lock()
 	resp, ok := c.cloud[key]
-	c.mu.RUnlock()
+	if ok && resp != nil {
+		c.clock++
+		usage := c.cloudUsage[key]
+		usage.Used = c.clock
+		c.cloudUsage[key] = usage
+	}
+	c.mu.Unlock()
 	if !ok || resp == nil {
 		return nil, false
 	}
@@ -240,9 +280,25 @@ func (c *modelShowCache) getCloud(key modelShowCloudKey) (*api.ShowResponse, boo
 }
 
 func (c *modelShowCache) setCloud(key modelShowCloudKey, resp *api.ShowResponse) {
+	c.mu.RLock()
+	limit := c.maxBytes
+	c.mu.RUnlock()
+	cost, fits := modelShowResponseBytes(resp, limit-len(key.Model)-128)
+	cost += len(key.Model) + 128
+	var response *api.ShowResponse
+	if fits {
+		response = cloneShowResponse(resp)
+	}
 	c.mu.Lock()
-	c.cloud[key] = cloneShowResponse(resp)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.removeCloudLocked(key)
+	if !fits || response == nil || !c.reserveLocked(cost) {
+		return
+	}
+	c.clock++
+	c.cloud[key] = response
+	c.cloudUsage[key] = modelShowCacheUsage{Bytes: cost, Used: c.clock}
+	c.bytes += cost
 }
 
 func (c *modelShowCache) beginCloudReadRefresh(key modelShowCloudKey) bool {
@@ -260,8 +316,12 @@ func (c *modelShowCache) beginCloudReadRefresh(key modelShowCloudKey) bool {
 
 func (c *modelShowCache) endCloudReadRefresh(key modelShowCloudKey) {
 	c.mu.Lock()
-	c.cloudRefreshing[key] = false
-	c.cloudNextReadRefreshAfter[key] = time.Now().Add(modelShowCloudReadRefreshCooldown)
+	delete(c.cloudRefreshing, key)
+	if c.cloud[key] != nil {
+		c.cloudNextReadRefreshAfter[key] = time.Now().Add(modelShowCloudReadRefreshCooldown)
+	} else {
+		delete(c.cloudNextReadRefreshAfter, key)
+	}
 	c.mu.Unlock()
 }
 

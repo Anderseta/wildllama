@@ -735,3 +735,13 @@ allocation and callback failures, and exact before/after HTTP comparisons with
 the 27.3 MiB artificial CPU model. Fresh and repeated application of patches
 `001`–`024` reproduce the tested native sources. Linux runtime validation and
 new full-model throughput measurements remain outside this round's scope.
+
+## Bounded model metadata retention
+
+The process-local `/api/show` cache shares a 64 MiB estimated host-memory budget
+and a 128-entry limit across local and cloud models. Least-recently-used entries
+are evicted; responses that exceed the budget bypass retention and are returned
+in full. Verbose vocabulary and tensor metadata are never truncated to fit the
+cache. Manifest invalidation, request-specific overlays and the cloud proxy
+fallback retain their existing behavior. This budget adds no GPU buffers and is
+separate from model-weight RAM and VRAM controls.

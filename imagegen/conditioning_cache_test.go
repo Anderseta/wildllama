@@ -35,6 +35,42 @@ func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesIn
 	if err != nil || envValue(second, "WILDIMAGE_CONDITION_NAMESPACE") != key {
 		t.Fatal("sampling-only changes invalidated deterministic encoder namespace", second, err)
 	}
+	for name, mutate := range map[string]func(*Profile){
+		"steps":     func(p *Profile) { p.Steps++ },
+		"cfg":       func(p *Profile) { p.CFGScale++ },
+		"sampler":   func(p *Profile) { p.Sampler = "heun" },
+		"sigmas":    func(p *Profile) { p.Sigmas = "1,0.5,0" },
+		"scheduler": func(p *Profile) { p.Scheduler = "karras" },
+	} {
+		t.Run("sampling-"+name, func(t *testing.T) {
+			next := profile
+			mutate(&next)
+			value, err := conditioningCacheEnvironment(context.Background(), config, next, request, "native-v1")
+			if err != nil || envValue(value, "WILDIMAGE_CONDITION_NAMESPACE") != key {
+				t.Fatal("sampling-only setting invalidated encoder namespace", value, err)
+			}
+		})
+	}
+	for name, mutate := range map[string]func(*Profile){
+		"width":             func(p *Profile) { p.Width += 64 },
+		"height":            func(p *Profile) { p.Height += 64 },
+		"flash-attention":   func(p *Profile) { p.FlashAttention = !p.FlashAttention },
+		"threads":           func(p *Profile) { p.CPUThreads++ },
+		"encoder-placement": func(p *Profile) { p.EncoderOnCPU = !p.EncoderOnCPU },
+		"vae-placement":     func(p *Profile) { p.VAEOnCPU = !p.VAEOnCPU },
+		"staging":           func(p *Profile) { p.StageComponents = !p.StageComponents },
+		"offload":           func(p *Profile) { p.OffloadToCPU = !p.OffloadToCPU },
+		"vram":              func(p *Profile) { p.MaxVRAMMiB++ },
+	} {
+		t.Run("conditioning-"+name, func(t *testing.T) {
+			next := profile
+			mutate(&next)
+			value, err := conditioningCacheEnvironment(context.Background(), config, next, request, "native-v1")
+			if err != nil || envValue(value, "WILDIMAGE_CONDITION_NAMESPACE") == key {
+				t.Fatal("changed encoder environment reused namespace", value, err)
+			}
+		})
+	}
 	for _, mutation := range []string{"encoder", "runtime", "profile"} {
 		t.Run(mutation, func(t *testing.T) {
 			putModel(t, profile.TextEncoder, modelBytes())

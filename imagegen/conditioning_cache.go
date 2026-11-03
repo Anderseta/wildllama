@@ -183,12 +183,18 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 	// Sampling seed/output path do not affect deterministic prompt encoding.
 	// Native code additionally hashes every actual ConditionerParams field and
 	// reference tensor before accepting any serialized conditioning result.
+	conditioningProfile := profile
+	conditioningProfile.Steps = 0
+	conditioningProfile.CFGScale = 0
+	conditioningProfile.Sampler = ""
+	conditioningProfile.Sigmas = ""
+	conditioningProfile.Scheduler = ""
 	encoded, err := json.Marshal(struct {
 		Schema     int               `json:"schema"`
 		Runtime    string            `json:"runtime"`
 		Profile    Profile           `json:"profile"`
 		Components map[string]string `json:"components"`
-	}{1, runtimeRevision, profile, components})
+	}{1, runtimeRevision, conditioningProfile, components})
 	if err != nil {
 		return nil, err
 	}

@@ -72,7 +72,10 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 		}
 	}
 	if len(v.queue) >= cap(v.queue) {
-		return nil, errImageGPUQueueFull
+		v.compactImageQueueLocked()
+		if len(v.queue) >= cap(v.queue) {
+			return nil, errImageGPUQueueFull
+		}
 	}
 	job.ID = newImageID()
 	job.Status = "queued"
@@ -91,12 +94,66 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 		go v.work()
 	}
 	v.queue <- job
+	v.notifyImageQueueLocked()
 	return job, nil
 }
 
+func (v *imageService) notifyImageQueueLocked() {
+	if v.queueChanged == nil {
+		v.queueChanged = make(chan struct{}, 1)
+	}
+	select {
+	case v.queueChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (v *imageService) nextImageJob() (*imageJob, bool) {
+	v.mu.Lock()
+	for {
+		select {
+		case job, open := <-v.queue:
+			v.mu.Unlock()
+			return job, open
+		default:
+			changed := v.queueChanged
+			v.mu.Unlock()
+			<-changed
+			v.mu.Lock()
+		}
+	}
+}
+
+func (v *imageService) compactImageQueueLocked() {
+	if v.closed {
+		return
+	}
+	// Dequeue uses the same mutex, so temporarily draining the channel cannot
+	// let the worker take a later request ahead of an earlier survivor.
+	count := len(v.queue)
+	kept := make([]*imageJob, 0, count)
+	for range count {
+		job := <-v.queue
+		if !imageTerminal(job.Status) {
+			kept = append(kept, job)
+		}
+	}
+	for _, job := range kept {
+		v.queue <- job
+	}
+}
+
 func (v *imageService) work() {
-	for job := range v.queue {
+	for {
+		job, open := v.nextImageJob()
+		if !open {
+			return
+		}
 		v.mu.Lock()
+		if imageTerminal(job.Status) {
+			v.mu.Unlock()
+			continue
+		}
 		closed := v.closed
 		if job.ctx.Err() != nil || closed {
 			now := time.Now().UTC()
@@ -640,6 +697,16 @@ func (s *Server) imageCancelHandler(c *gin.Context) {
 		if job.cancel != nil && !imageTerminal(job.Status) {
 			job.cancel()
 		}
+		if job.Status == "queued" {
+			now := time.Now().UTC()
+			job.Status, job.Phase = "cancelled", "cancelled"
+			job.FinishedAt = &now
+			v.compactImageQueueLocked()
+			if err := v.persistJobsLocked(); err != nil {
+				c.JSON(500, gin.H{"error": "image request was cancelled but its status could not be persisted: " + err.Error(), "job": job})
+				return
+			}
+		}
 		c.JSON(200, gin.H{"job": job})
 		return
 	}
@@ -715,5 +782,6 @@ func (s *Server) stopImageJobs() {
 	v.gate.shutdown()
 	v.mu.Lock()
 	close(v.queue)
+	v.notifyImageQueueLocked()
 	v.mu.Unlock()
 }
