@@ -77,6 +77,12 @@ func TestProgressNativeCounterPhases(t *testing.T) {
 	}
 }
 func fakeChild(mode string) {
+	if path := os.Getenv("WILDIMAGE_FAKE_ARGS"); path != "" {
+		encoded, _ := json.Marshal(os.Args[1:])
+		if err := os.WriteFile(path, encoded, 0600); err != nil {
+			os.Exit(8)
+		}
+	}
 	values := map[string]string{}
 	for i := 1; i+1 < len(os.Args); i++ {
 		if strings.HasPrefix(os.Args[i], "--") {

@@ -36,6 +36,8 @@ type Profile struct {
 	Scheduler       string  `json:"scheduler,omitempty"`
 	LoRAs           []LoRA  `json:"loras,omitempty"`
 	StageComponents bool    `json:"stage_components"`
+	// PreserveReferenceSize prefers a supported canvas from the first reference.
+	PreserveReferenceSize bool `json:"preserve_reference_size"`
 	// MaxVRAMMiB is the runner's streaming/fitting target, not a process hard cap.
 	MaxVRAMMiB     int  `json:"max_vram_mib"`
 	CPUThreads     int  `json:"cpu_threads"`

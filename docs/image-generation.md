@@ -88,6 +88,18 @@ The Turbo preset uses **Euler, 8 steps, CFG 1** and its matching sigma schedule.
 Width and height must be multiples of 32. Advanced overrides remain configurable;
 changing a distilled model's steps or guidance is not automatically an improvement.
 
+Each profile can enable `preserve_reference_size` (default `false`). With one or
+more references, the first original's verified pixel dimensions select the nearest
+supported output size. Each axis rounds to a multiple of 32 within 64–4096; if the
+original exceeds 4096 on either axis, both axes first scale proportionally to fit.
+For example, 1920×1080 selects 1920×1088, and 8192×4096 selects 4096×2048. The
+native pipeline resamples its working tensors normally: the uploaded original is
+not modified, copied, padded or cropped. Width/height request overrides are ignored
+only while this preference and a reference are both present. Without a reference,
+the profile defaults and normal request overrides retain their existing behavior.
+Job generation summaries record the effective native width/height and the profile
+preference; retries with the same request ID preserve the original job snapshot.
+
 ## GPU coordination
 
 The default **exclusive** mode closes admission for new text inference, waits for
@@ -138,6 +150,7 @@ unexpectedly consuming the memory admitted for the image.
 | `offload_to_cpu`, `encoder_on_cpu`, `vae_on_cpu` | Placement of pipeline work; may reduce GPU demand at the cost of transfer or CPU time. |
 | `stage_components` | Lazy disk-backed component weights with CPU/GPU release at phase boundaries, instead of retaining all component weights in host memory. |
 | `vae_tiling` | Optional VAE memory reduction, separate from diffusion sampling. |
+| `preserve_reference_size` | Choose the nearest supported canvas from the first reference's pixel dimensions; defaults to `false` and leaves original files unchanged. |
 | Text `moe_ram_limit_mib` / `gpu_vram_limit_mib` | Continue to apply to their documented text-runner scopes; they do not become diffusion-process limits. |
 
 There is no claim of a process-wide image RAM cap, system-wide swap prevention or

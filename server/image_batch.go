@@ -57,10 +57,18 @@ func imageGenerationFor(request imageJobRequest, profile imageProfile) (*imageGe
 		return nil, err
 	}
 	profile = cloneImageProfile(profile)
-	if request.Width != 0 {
+	refs := append([]string{}, request.ReferenceImages...)
+	if request.InputAssetID != "" {
+		refs = append(refs, request.InputAssetID)
+	}
+	if len(refs) > 4 {
+		return nil, errors.New("at most four reference images are supported per job")
+	}
+	preferReference := profile.PreserveReferenceSize && len(refs) > 0
+	if request.Width != 0 && !preferReference {
 		profile.Width = request.Width
 	}
-	if request.Height != 0 {
+	if request.Height != 0 && !preferReference {
 		profile.Height = request.Height
 	}
 	if request.Steps != 0 {
@@ -75,16 +83,37 @@ func imageGenerationFor(request imageJobRequest, profile imageProfile) (*imageGe
 	if err := imagegen.ValidateProfile(profile.Profile); err != nil {
 		return nil, err
 	}
-	refs := append([]string{}, request.ReferenceImages...)
-	if request.InputAssetID != "" {
-		refs = append(refs, request.InputAssetID)
-	}
-	if len(refs) > 4 {
-		return nil, errors.New("at most four reference images are supported per job")
-	}
 	return &imageGenerationSummary{UserPrompt: request.Prompt, UserNegativePrompt: request.NegativePrompt,
 		Prompt: strings.TrimSpace(strings.TrimSpace(profile.PromptPrefix) + "\n" + request.Prompt), NegativePrompt: strings.TrimSpace(strings.TrimSpace(profile.NegativePrompt) + "\n" + request.NegativePrompt),
 		ProfileID: profile.ID, Profile: profile, ReferenceAssetIDs: refs, Count: count}, nil
+}
+
+// Resolve the registered original before admission/unloading and again before
+// execution. The stored generation profile records the actual native canvas,
+// while the saved profile and idempotent request retain their original values.
+func (v *imageService) resolveImageGenerationDimensions(generation *imageGenerationSummary) error {
+	if !generation.Profile.PreserveReferenceSize || len(generation.ReferenceAssetIDs) == 0 {
+		return nil
+	}
+	v.mu.Lock()
+	asset, ok := v.assets[generation.ReferenceAssetIDs[0]]
+	v.mu.Unlock()
+	if !ok {
+		return errors.New("reference image is not a registered image asset")
+	}
+	file, err := openImageAsset(asset)
+	if err != nil {
+		return err
+	}
+	file.Close()
+	profile, err := imagegen.ResolveProfileDimensions(generation.Profile.Profile, imagegen.Request{
+		ReferenceImages: []string{filepath.Join(asset.OutputRoot, asset.relativePath())},
+	})
+	if err != nil {
+		return err
+	}
+	generation.Profile.Profile = profile
+	return nil
 }
 
 func imageBatchFilename(index int) string {

@@ -277,6 +277,9 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	if err != nil {
 		return err
 	}
+	if err := v.resolveImageGenerationDimensions(generation); err != nil {
+		return err
+	}
 	profile := generation.Profile.Profile
 	seed, err := imageBatchSeed(request, generation.Profile, generation.Count)
 	if err != nil {
@@ -633,6 +636,10 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 	}
 	generation, err := imageGenerationFor(request, profile)
 	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if err := v.resolveImageGenerationDimensions(generation); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}

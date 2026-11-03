@@ -54,6 +54,7 @@ func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesIn
 	for name, mutate := range map[string]func(*Profile){
 		"width":             func(p *Profile) { p.Width += 64 },
 		"height":            func(p *Profile) { p.Height += 64 },
+		"reference-size":    func(p *Profile) { p.PreserveReferenceSize = !p.PreserveReferenceSize },
 		"flash-attention":   func(p *Profile) { p.FlashAttention = !p.FlashAttention },
 		"threads":           func(p *Profile) { p.CPUThreads++ },
 		"encoder-placement": func(p *Profile) { p.EncoderOnCPU = !p.EncoderOnCPU },

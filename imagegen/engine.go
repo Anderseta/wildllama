@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
@@ -209,11 +208,10 @@ func ValidateProfile(p Profile) error {
 }
 
 func ValidateRequest(p Profile, r Request) error {
-	if r.Width != 0 {
-		p.Width = r.Width
-	}
-	if r.Height != 0 {
-		p.Height = r.Height
+	var err error
+	p, err = ResolveProfileDimensions(p, r)
+	if err != nil {
+		return err
 	}
 	if err := ValidateProfile(p); err != nil {
 		return err
@@ -262,22 +260,8 @@ func ValidateRequest(p Profile, r Request) error {
 		}
 	}
 	for _, path := range r.ReferenceImages {
-		if !filepath.IsAbs(path) {
-			return errors.New("reference image paths must be absolute")
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("reference image: %w", err)
-		}
-		info, statErr := f.Stat()
-		if statErr != nil || !info.Mode().IsRegular() || info.Size() > 48<<20 {
-			f.Close()
-			return errors.New("reference image must be a regular image of at most 48 MiB")
-		}
-		cfg, format, decodeErr := image.DecodeConfig(io.LimitReader(f, 48<<20))
-		f.Close()
-		if decodeErr != nil || (format != "png" && format != "jpeg" && format != "webp") || cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > 64<<20 {
-			return errors.New("reference image must be a valid PNG, JPEG or WebP with at most 64 megapixels")
+		if _, err := referenceImageConfig(path); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -363,11 +347,10 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if err := ValidateRequest(p, r); err != nil {
 		return Result{}, err
 	}
-	if r.Width != 0 {
-		p.Width = r.Width
-	}
-	if r.Height != 0 {
-		p.Height = r.Height
+	var err error
+	p, err = ResolveProfileDimensions(p, r)
+	if err != nil {
+		return Result{}, err
 	}
 	output := filepath.Clean(r.OutputPath)
 	if !filepath.IsAbs(output) || !within(filepath.Clean(e.config.OutputDir), output) || strings.ToLower(filepath.Ext(output)) != ".png" || strings.Contains(filepath.Base(output), "%") {
