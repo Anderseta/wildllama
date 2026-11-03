@@ -23,7 +23,7 @@ type imageAssetRecord struct {
 
 func (v *imageService) persistJobsLocked() error {
 	if v.assetOwnersDirty {
-		if err := writeImageJSON(filepath.Join(v.root, "assets.json"), v.assets); err != nil {
+		if err := v.persistImageAssetsLocked(v.assets, nil); err != nil {
 			return err
 		}
 		v.assetOwnersDirty = false
@@ -89,9 +89,17 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 			}
 		}
 	}
-	if len(v.queue) >= cap(v.queue) {
+	transfer := imageTransferJob(job)
+	queue := v.queue
+	if transfer {
+		if v.transferQueue == nil {
+			v.transferQueue = make(chan *imageJob, 16)
+		}
+		queue = v.transferQueue
+	}
+	if len(queue) >= cap(queue) {
 		v.compactImageQueueLocked()
-		if len(v.queue) >= cap(v.queue) {
+		if len(queue) >= cap(queue) {
 			return nil, errImageGPUQueueFull
 		}
 	}
@@ -100,6 +108,7 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 	job.Phase = "queued"
 	job.CreatedAt = time.Now().UTC()
 	job.ctx, job.cancel = context.WithCancel(v.ctx)
+	job.ctx = imagegen.WithDiskReserve(job.ctx, job.Config.MinFreeDiskMiB)
 	if job.Kind == "generate" && job.SessionID != "" {
 		if err := v.recordImageDirectoryLocked(job); err != nil {
 			job.cancel()
@@ -113,34 +122,58 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 		job.cancel()
 		return nil, err
 	}
-	if !v.workerStarted {
+	if transfer && !v.transferStarted {
+		v.transferStarted = true
+		v.workers.Add(1)
+		go func() { defer v.workers.Done(); v.workQueue(true) }()
+	} else if !transfer && !v.workerStarted {
 		v.workerStarted = true
-		go v.work()
+		v.workers.Add(1)
+		go func() { defer v.workers.Done(); v.work() }()
 	}
-	v.queue <- job
-	v.notifyImageQueueLocked()
+	queue <- job
+	v.notifyImageQueueForLocked(transfer)
 	return job, nil
 }
 
 func (v *imageService) notifyImageQueueLocked() {
-	if v.queueChanged == nil {
-		v.queueChanged = make(chan struct{}, 1)
+	v.notifyImageQueueForLocked(false)
+}
+
+func imageTransferJob(job *imageJob) bool {
+	return job.Kind == "install" || job.Kind == "import" || job.Kind == "install_lora"
+}
+
+func (v *imageService) notifyImageQueueForLocked(transfer bool) {
+	changed := &v.queueChanged
+	if transfer {
+		changed = &v.transferChanged
+	}
+	if *changed == nil {
+		*changed = make(chan struct{}, 1)
 	}
 	select {
-	case v.queueChanged <- struct{}{}:
+	case *changed <- struct{}{}:
 	default:
 	}
 }
 
 func (v *imageService) nextImageJob() (*imageJob, bool) {
+	return v.nextImageJobFor(false)
+}
+
+func (v *imageService) nextImageJobFor(transfer bool) (*imageJob, bool) {
 	v.mu.Lock()
 	for {
+		queue, changed := v.queue, v.queueChanged
+		if transfer {
+			queue, changed = v.transferQueue, v.transferChanged
+		}
 		select {
-		case job, open := <-v.queue:
+		case job, open := <-queue:
 			v.mu.Unlock()
 			return job, open
 		default:
-			changed := v.queueChanged
 			v.mu.Unlock()
 			<-changed
 			v.mu.Lock()
@@ -154,22 +187,28 @@ func (v *imageService) compactImageQueueLocked() {
 	}
 	// Dequeue uses the same mutex, so temporarily draining the channel cannot
 	// let the worker take a later request ahead of an earlier survivor.
-	count := len(v.queue)
-	kept := make([]*imageJob, 0, count)
-	for range count {
-		job := <-v.queue
-		if !imageTerminal(job.Status) {
-			kept = append(kept, job)
+	for _, queue := range []chan *imageJob{v.queue, v.transferQueue} {
+		count := len(queue)
+		kept := make([]*imageJob, 0, count)
+		for range count {
+			job := <-queue
+			if !imageTerminal(job.Status) {
+				kept = append(kept, job)
+			}
 		}
-	}
-	for _, job := range kept {
-		v.queue <- job
+		for _, job := range kept {
+			queue <- job
+		}
 	}
 }
 
 func (v *imageService) work() {
+	v.workQueue(false)
+}
+
+func (v *imageService) workQueue(transfer bool) {
 	for {
-		job, open := v.nextImageJob()
+		job, open := v.nextImageJobFor(transfer)
 		if !open {
 			return
 		}
@@ -184,7 +223,7 @@ func (v *imageService) work() {
 			job.Status = "cancelled"
 			job.Phase = "cancelled"
 			job.FinishedAt = &now
-			_ = v.persistJobsLocked()
+			v.persistImageJobStateLocked(job)
 			v.mu.Unlock()
 			continue
 		}
@@ -192,7 +231,17 @@ func (v *imageService) work() {
 		job.StartedAt = &started
 		job.Status = "running"
 		job.executing = true
-		_ = v.persistJobsLocked()
+		if err := v.persistJobsLocked(); err != nil {
+			job.executing = false
+			job.Status, job.Phase = "failed", "failed"
+			finished := time.Now().UTC()
+			job.FinishedAt = &finished
+			job.Error = "Cannot durably start image task: " + err.Error()
+			v.persistImageJobStateLocked(job)
+			job.cancel()
+			v.mu.Unlock()
+			continue
+		}
 		v.mu.Unlock()
 		var err error
 		if job.Kind == "install_lora" {
@@ -230,7 +279,7 @@ func (v *imageService) work() {
 			job.Error = err.Error()
 		}
 		job.cancel()
-		_ = v.persistJobsLocked()
+		v.persistImageJobStateLocked(job)
 		v.mu.Unlock()
 	}
 }
@@ -306,6 +355,13 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		return err
 	}
 	profile := generation.Profile.Profile
+	budgetCtx := imagegen.WithDiskReserve(job.ctx, job.Config.MinFreeDiskMiB)
+	if err := imagegen.CheckDiskSpace(budgetCtx, job.Config.OutputDir, int64(profile.Width)*int64(profile.Height)*4+(16<<20)); err != nil {
+		return err
+	}
+	if err := imagegen.CheckDiskSpace(budgetCtx, job.Config.WorkDir, 16<<20); err != nil {
+		return err
+	}
 	seed, err := imageBatchSeed(request, generation.Profile, generation.Count)
 	if err != nil {
 		return err
@@ -593,15 +649,15 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 	v := s.imageService()
 	if c.Request.Method == http.MethodGet {
 		v.mu.Lock()
-		defer v.mu.Unlock()
 		jobs := make([]*imageJob, 0, len(v.jobs))
 		requestID := c.Query("request_id")
 		sessionID := c.Query("session_id")
 		for i := len(v.jobs) - 1; i >= 0; i-- {
 			if (requestID == "" || v.jobs[i].RequestID == requestID) && (sessionID == "" || v.jobs[i].SessionID == sessionID) {
-				jobs = append(jobs, v.jobs[i])
+				jobs = append(jobs, cloneImageJobLocked(v.jobs[i]))
 			}
 		}
+		v.mu.Unlock()
 		c.JSON(200, gin.H{"jobs": jobs})
 		return
 	}
@@ -628,8 +684,9 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 				c.JSON(409, gin.H{"error": "request_id belongs to a different image request"})
 				return
 			}
-			c.JSON(202, gin.H{"job": job})
+			response := cloneImageJobLocked(job)
 			v.mu.Unlock()
+			c.JSON(202, gin.H{"job": response})
 			return
 		}
 	}
@@ -707,27 +764,29 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 
 func (v *imageService) writeJob(c *gin.Context, status int, job *imageJob) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	c.JSON(status, gin.H{"job": job})
+	response := cloneImageJobLocked(job)
+	v.mu.Unlock()
+	c.JSON(status, gin.H{"job": response})
 }
 
 func (s *Server) imageJobHandler(c *gin.Context) {
 	v := s.imageService()
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	for _, job := range v.jobs {
 		if job.ID == c.Param("id") {
-			c.JSON(200, gin.H{"job": job})
+			response := cloneImageJobLocked(job)
+			v.mu.Unlock()
+			c.JSON(200, gin.H{"job": response})
 			return
 		}
 	}
+	v.mu.Unlock()
 	c.JSON(404, gin.H{"error": "image job not found"})
 }
 
 func (s *Server) imageCancelHandler(c *gin.Context) {
 	v := s.imageService()
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	for _, job := range v.jobs {
 		if job.ID != c.Param("id") && (c.Param("request_id") == "" || job.RequestID != c.Param("request_id")) {
 			continue
@@ -741,15 +800,20 @@ func (s *Server) imageCancelHandler(c *gin.Context) {
 			job.FinishedAt = &now
 			v.compactImageQueueLocked()
 			if err := v.persistJobsLocked(); err != nil {
-				c.JSON(500, gin.H{"error": "image request was cancelled but its status could not be persisted: " + err.Error(), "job": job})
+				response := cloneImageJobLocked(job)
+				v.mu.Unlock()
+				c.JSON(500, gin.H{"error": "image request was cancelled but its status could not be persisted: " + err.Error(), "job": response})
 				return
 			}
 		}
-		c.JSON(200, gin.H{"job": job})
+		response := cloneImageJobLocked(job)
+		v.mu.Unlock()
+		c.JSON(200, gin.H{"job": response})
 		return
 	}
 	if id := c.Param("request_id"); id != "" {
 		if !imageSafeID(id) {
+			v.mu.Unlock()
 			c.JSON(400, gin.H{"error": "invalid image request_id"})
 			return
 		}
@@ -771,9 +835,11 @@ func (s *Server) imageCancelHandler(c *gin.Context) {
 			delete(v.cancelledRequests, oldest)
 		}
 		v.cancelledRequests[id] = now.Add(5 * time.Minute)
+		v.mu.Unlock()
 		c.JSON(200, gin.H{"cancelled": true, "request_id": id})
 		return
 	}
+	v.mu.Unlock()
 	c.JSON(404, gin.H{"error": "image job not found"})
 }
 
@@ -821,5 +887,10 @@ func (s *Server) stopImageJobs() {
 	v.mu.Lock()
 	close(v.queue)
 	v.notifyImageQueueLocked()
+	if v.transferQueue != nil {
+		close(v.transferQueue)
+		v.notifyImageQueueForLocked(true)
+	}
 	v.mu.Unlock()
+	v.workers.Wait()
 }

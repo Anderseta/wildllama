@@ -24,6 +24,7 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/format"
+	"github.com/ollama/ollama/imagegen"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/transfer"
 	"github.com/ollama/ollama/types/model"
@@ -56,6 +57,7 @@ type blobDownload struct {
 	err         error
 	references  atomic.Int32
 	referenceMu sync.Mutex
+	disk        *modelDiskReservation
 }
 
 type blobDownloadPart struct {
@@ -66,6 +68,7 @@ type blobDownloadPart struct {
 
 	lastUpdatedMu sync.Mutex
 	lastUpdated   time.Time
+	diskWritten   int64 // physical high-water mark, owned by this part's worker
 
 	*blobDownload `json:"-"`
 }
@@ -213,6 +216,12 @@ func newBackoff(maxBackoff time.Duration) func(ctx context.Context) error {
 }
 
 func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *registryOptions) error {
+	reservation, err := modelTransfersDisk.reserve(ctx, b.Name, max(0, b.Total-b.Completed.Load()))
+	if err != nil {
+		return err
+	}
+	defer reservation.close()
+	b.disk = reservation
 	file, err := os.OpenFile(b.Name+"-partial", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
@@ -220,7 +229,9 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 	defer file.Close()
 	setSparse(file)
 
-	_ = file.Truncate(b.Total)
+	if err := file.Truncate(b.Total); err != nil {
+		return err
+	}
 
 	directURL, err := func() (*url.URL, error) {
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -271,6 +282,7 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 	g.SetLimit(numDownloadParts)
 	for i := range b.Parts {
 		part := b.Parts[i]
+		part.diskWritten = part.Completed.Load()
 		if part.Completed.Load() == part.Size {
 			continue
 		}
@@ -278,10 +290,13 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 		g.Go(func() error {
 			var err error
 			for try := 0; try < maxRetries; try++ {
-				w := io.NewOffsetWriter(file, part.StartsAt())
+				var w io.Writer = io.NewOffsetWriter(file, part.StartsAt())
+				if b.disk != nil {
+					w = &modelDiskWriter{writer: w, reservation: b.disk, part: part, position: part.Completed.Load()}
+				}
 				err = b.downloadChunk(inner, client, directURL, w, part)
 				switch {
-				case errors.Is(err, context.Canceled), errors.Is(err, syscall.ENOSPC):
+				case errors.Is(err, context.Canceled), errors.Is(err, syscall.ENOSPC), imagegen.IsDiskSpaceError(err):
 					// return immediately if the context is canceled or the device is out of space
 					return err
 				case errors.Is(err, errPartStalled):
@@ -381,8 +396,8 @@ func (b *blobDownload) downloadChunk(ctx context.Context, client *http.Client, r
 		}
 		defer resp.Body.Close()
 
-		n, err := io.CopyN(w, io.TeeReader(resp.Body, part), part.Size-part.Completed.Load())
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		n, err := io.CopyN(downloadProgressWriter{writer: w, part: part}, resp.Body, part.Size-part.Completed.Load())
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrUnexpectedEOF) && !imagegen.IsDiskSpaceError(err) && !errors.Is(err, syscall.ENOSPC) {
 			// rollback progress
 			b.Completed.Add(-n)
 			return err
@@ -428,6 +443,19 @@ func (b *blobDownload) downloadChunk(ctx context.Context, client *http.Client, r
 	})
 
 	return g.Wait()
+}
+
+type downloadProgressWriter struct {
+	writer io.Writer
+	part   *blobDownloadPart
+}
+
+func (w downloadProgressWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		_, _ = w.part.Write(p[:n])
+	}
+	return n, err
 }
 
 func (b *blobDownload) newPart(offset, size int64) error {

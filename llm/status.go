@@ -18,6 +18,8 @@ type StatusWriter struct {
 	activityTail           []byte
 	activityDiscardingLine bool
 	activity               RuntimeActivity
+	activeRuntimeRequests  int
+	activeRuntimeRequestID string
 }
 
 const maxCapturedErrorBytes = 8 * 1024

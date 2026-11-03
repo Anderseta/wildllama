@@ -4009,7 +4009,7 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
 			t.Errorf("invalid request body: %v", err)
 			return
 		}
-		if len(reqBody.ResponseFields) > 0 {
+		if reflect.DeepEqual(reqBody.ResponseFields, []string{"generation_settings/grammar"}) {
 			conversions.Add(1)
 			if !reflect.DeepEqual(reqBody.Prompt, []any{[]any{}}) || reqBody.NPredict == nil || *reqBody.NPredict != 0 {
 				t.Errorf("conversion request prompt %v n_predict %v, want an empty token prompt and no generation", reqBody.Prompt, reqBody.NPredict)

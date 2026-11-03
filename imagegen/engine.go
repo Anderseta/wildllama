@@ -42,6 +42,9 @@ type Engine struct {
 // NewEngine is read-only: status/configuration requests never create a cache,
 // start a process, or download weights. Write directories are created by Run.
 func NewEngine(config Config) (*Engine, error) {
+	if config.MinFreeDiskMiB < 0 || config.MinFreeDiskMiB > 1024*1024 {
+		return nil, errors.New("invalid minimum free disk space")
+	}
 	for name, path := range map[string]string{"runner_path": config.RunnerPath, "work_dir": config.WorkDir, "models_dir": config.ModelsDir, "output_dir": config.OutputDir} {
 		if path == "" || !filepath.IsAbs(path) {
 			return nil, fmt.Errorf("image %s must be an absolute path", name)
@@ -340,6 +343,7 @@ func within(root, path string) bool {
 }
 
 func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Progress)) (Result, error) {
+	ctx = WithDiskReserve(ctx, e.config.MinFreeDiskMiB)
 	runnerStatus := e.Status()
 	if !runnerStatus.Ready {
 		return Result{}, errors.New(runnerStatus.Error)
@@ -375,7 +379,17 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Result{}, err
 	}
+	if err := CheckDiskSpace(ctx, output, int64(p.Width)*int64(p.Height)*4+(16<<20)); err != nil {
+		return Result{}, err
+	}
+	if err := CheckDiskSpace(ctx, e.config.WorkDir, 16<<20); err != nil {
+		return Result{}, err
+	}
 	ctx, cancel := context.WithCancel(ctx)
+	var diskGuard <-chan error
+	if e.config.MinFreeDiskMiB > 0 {
+		diskGuard = monitorImageDisks(ctx, cancel, []string{e.config.WorkDir, filepath.Dir(output)})
+	}
 	e.mu.Lock()
 	if e.closed || e.done != nil {
 		e.mu.Unlock()
@@ -484,7 +498,14 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	err = cmd.Wait()
 	log.flush()
 	var runErr error
-	if ctx.Err() != nil {
+	select {
+	case diskErr := <-diskGuard:
+		runErr = diskErr
+	default:
+	}
+	if runErr != nil {
+		// Keep the actionable disk reason instead of reporting a generic cancel.
+	} else if ctx.Err() != nil {
 		runErr = ctx.Err()
 	} else if err != nil {
 		runErr = fmt.Errorf("image runner failed: %w: %s", err, log.tail())

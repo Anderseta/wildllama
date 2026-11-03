@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/ollama/ollama/imagegen"
 	"golang.org/x/image/webp"
 )
 
@@ -136,6 +137,7 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 		return
 	}
 	outputRoot := v.config.OutputDir
+	reserveDisk := v.config.MinFreeDiskMiB
 	existing, repeated := v.imageUploadByRequestIDLocked(requestID)
 	v.mu.Unlock()
 	if repeated {
@@ -162,6 +164,15 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 	id := "input-" + newImageID()
 	filename := "image" + extension
 	directory := filepath.Join(outputRoot, "inputs", id)
+	budgetCtx := imagegen.WithDiskReserve(c.Request.Context(), reserveDisk)
+	needed := c.Request.ContentLength
+	if needed < 0 {
+		needed = imageUploadLimit
+	}
+	if err := imagegen.CheckDiskSpace(budgetCtx, directory, needed); err != nil {
+		c.JSON(507, gin.H{"error": err.Error()})
+		return
+	}
 	if err = imageWriteAllowed(directory); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -230,7 +241,7 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 		return
 	}
 	v.assets[asset.AssetID] = asset
-	err = writeImageJSON(filepath.Join(v.root, "assets.json"), v.assets)
+	err = v.persistImageAssetsLocked(map[string]imageAssetRecord{asset.AssetID: asset}, nil)
 	if err != nil {
 		delete(v.assets, asset.AssetID)
 	}

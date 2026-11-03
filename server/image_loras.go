@@ -145,8 +145,9 @@ func (s *Server) imageLoRAInstallHandler(c *gin.Context) {
 				c.JSON(409, gin.H{"error": "request_id belongs to a different image request"})
 				return
 			}
-			c.JSON(202, gin.H{"job": existing})
+			response := cloneImageJobLocked(existing)
 			v.mu.Unlock()
+			c.JSON(202, gin.H{"job": response})
 			return
 		}
 	}

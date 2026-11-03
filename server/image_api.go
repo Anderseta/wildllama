@@ -106,6 +106,7 @@ type imageJob struct {
 	StartedAt           *time.Time              `json:"started_at,omitempty"`
 	FinishedAt          *time.Time              `json:"finished_at,omitempty"`
 	Error               string                  `json:"error,omitempty"`
+	PersistenceError    string                  `json:"persistence_error,omitempty"`
 	Result              *imageAsset             `json:"result,omitempty"`
 	Results             []imageAsset            `json:"results,omitempty"`
 	Generation          *imageGenerationSummary `json:"generation,omitempty"`
@@ -136,6 +137,10 @@ type imageService struct {
 	gate              *imageGPUGate
 	queue             chan *imageJob
 	queueChanged      chan struct{}
+	transferQueue     chan *imageJob
+	transferChanged   chan struct{}
+	transferStarted   bool
+	workers           sync.WaitGroup
 	active            imagegen.Runner
 	closed            bool
 	workerStarted     bool
@@ -147,6 +152,7 @@ type imageService struct {
 	deletedRequests   map[string]bool
 	sessionDeleteErr  error
 	assetOwnersDirty  bool
+	assetCatalogError error
 	ownedDirectories  map[string]imageOwnedDirectory
 	newEngine         func(imagegen.Config) (imagegen.Runner, error)
 	text              imageTextBackend
@@ -166,7 +172,7 @@ func defaultImageConfig(root string) imageConfig {
 	}
 	profile := imagegen.DefaultProfile(imagegen.DefaultRecipeID)
 	return imageConfig{Version: 1, Revision: 1, DefaultProfileID: profile.ID, ExecutionMode: "exclusive", RestoreTextModels: true,
-		ReserveVRAMMiB: 1024, Config: imagegen.Config{ConditioningCacheMiB: 256, RunnerPath: filepath.Join(filepath.Dir(root), "lib", "wildimage", executable),
+		ReserveVRAMMiB: 1024, Config: imagegen.Config{ConditioningCacheMiB: 256, MinFreeDiskMiB: 1024, RunnerPath: filepath.Join(filepath.Dir(root), "lib", "wildimage", executable),
 			WorkDir: filepath.Join(root, "work"), ModelsDir: filepath.Join(root, "models"), OutputDir: filepath.Join(root, "outputs")},
 		Profiles: []imageProfile{{Profile: profile, Name: "Qwen Image 2.1 Turbo"}}}
 }
@@ -223,12 +229,20 @@ func (s *Server) imageService() *imageService {
 		if data, err := os.ReadFile(filepath.Join(service.root, "assets.json")); err == nil {
 			if json.Unmarshal(data, &service.assets) != nil {
 				service.configError = "Invalid saved image asset catalog"
+				service.assetCatalogError = errors.New(service.configError)
 				service.assets = map[string]imageAssetRecord{}
 			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			service.assetCatalogError = err
 		}
 		if service.assets == nil {
 			service.assets = map[string]imageAssetRecord{}
 		}
+		if err := service.loadImageCatalog(); err != nil {
+			service.assetCatalogError = err
+			service.configError = "Cannot load image asset catalog: " + err.Error()
+		}
+		service.recoverImageJobStates()
 		service.loadDeletedImageSessions()
 		s.images = service
 	})
@@ -283,7 +297,7 @@ func newImageID() string {
 }
 
 func validateImageConfig(config imageConfig) error {
-	if config.Version != 1 || len(config.Profiles) > 128 || config.ReserveVRAMMiB < 0 || config.ReserveVRAMMiB > 1024*1024 || config.ConditioningCacheMiB < 0 || config.ConditioningCacheMiB > 8192 {
+	if config.Version != 1 || len(config.Profiles) > 128 || config.ReserveVRAMMiB < 0 || config.ReserveVRAMMiB > 1024*1024 || config.ConditioningCacheMiB < 0 || config.ConditioningCacheMiB > 8192 || config.MinFreeDiskMiB < 0 || config.MinFreeDiskMiB > 1024*1024 {
 		return errors.New("invalid image configuration bounds")
 	}
 	if !validImageMode(config.ExecutionMode, false) {
@@ -485,7 +499,7 @@ func (s *Server) imageConfigHandler(c *gin.Context) {
 	v.mu.Lock()
 	config := cloneImageConfig(v.config)
 	v.mu.Unlock()
-	c.JSON(200, gin.H{"config": config, "runtime": v.runtime()})
+	c.JSON(200, gin.H{"config": config, "config_path": filepath.Join(v.root, "config.json"), "runtime": v.runtime()})
 }
 
 func (s *Server) imageModelsHandler(c *gin.Context) {

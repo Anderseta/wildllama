@@ -290,6 +290,8 @@ var (
 	// no effect on GGUF transfers, which use the legacy upload/download
 	// paths.
 	MaxTransferStreams = Uint("OLLAMA_MAX_TRANSFER_STREAMS", 4)
+	// MinFreeDiskMiB leaves free disk headroom for model pulls/imports. Zero disables the guard.
+	MinFreeDiskMiB = Uint("WILDLLAMA_MIN_FREE_DISK_MIB", 1024)
 )
 
 func Uint64(key string, defaultValue uint64) func() uint64 {
@@ -338,6 +340,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_LOAD_TIMEOUT":            {"OLLAMA_LOAD_TIMEOUT", LoadTimeout(), "How long to allow model loads to stall before giving up (default \"5m\")"},
 		"OLLAMA_MAX_LOADED_MODELS":       {"OLLAMA_MAX_LOADED_MODELS", MaxRunners(), "Maximum number of loaded models per GPU"},
 		"OLLAMA_MAX_TRANSFER_STREAMS":    {"OLLAMA_MAX_TRANSFER_STREAMS", MaxTransferStreams(), "Maximum parallel transfer streams for safetensors model pulls/pushes (default 4)"},
+		"WILDLLAMA_MIN_FREE_DISK_MIB":    {"WILDLLAMA_MIN_FREE_DISK_MIB", MinFreeDiskMiB(), "Minimum free disk space after model pulls/imports in MiB (default 1024; 0 disables); concurrent transfers reserve remaining bytes"},
 		"OLLAMA_MAX_QUEUE":               {"OLLAMA_MAX_QUEUE", MaxQueue(), "Maximum number of queued requests"},
 		"OLLAMA_MODELS":                  {"OLLAMA_MODELS", Models(), "The path to the models directory"},
 		"OLLAMA_NO_CLOUD":                {"OLLAMA_NO_CLOUD", NoCloud(), "Disable Ollama cloud features (remote inference and web search)"},

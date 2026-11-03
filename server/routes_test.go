@@ -863,9 +863,33 @@ func TestRoutes(t *testing.T) {
 				if err != nil {
 					t.Fatalf("failed to read response body: %v", err)
 				}
-				expectedBody := fmt.Sprintf(`{"capabilities":["runner_env","num_ubatch","embedding_batch","gpu_exclusive","gpu_vram_limit_mib","gpu_diagnostics","live_activity","moe_runtime","kv_cache_initial_tokens","reasoning_budget","huggingface_catalog","download_cleanup"],"version":"%s","wildllama":{"features":{"embedding_input_limits":true,"multimodal_token_budget":true,"prompt_progress":true,"request_admission":true,"request_id":true,"structured_errors":true,"tool_call_ids":true},"limits":{"embedding_decoded_bytes":50331648,"embedding_items":4096,"embedding_output_bytes":33554432,"max_in_flight":8,"max_queue":128,"request_body_bytes":67108864},"protocol_version":1}}`, version.Version)
-				if string(body) != expectedBody {
-					t.Errorf("expected body %s, got %s", expectedBody, string(body))
+				var response struct {
+					Version      string   `json:"version"`
+					Capabilities []string `json:"capabilities"`
+					Wildllama    struct {
+						Version  int              `json:"protocol_version"`
+						Features map[string]bool  `json:"features"`
+						Limits   map[string]int64 `json:"limits"`
+					} `json:"wildllama"`
+				}
+				if err := json.Unmarshal(body, &response); err != nil {
+					t.Fatal(err)
+				}
+				if response.Version != version.Version || response.Wildllama.Version != 1 {
+					t.Fatalf("unexpected version contract: %s", body)
+				}
+				for _, capability := range []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog", "download_cleanup", "model_disk_headroom"} {
+					if !slices.Contains(response.Capabilities, capability) {
+						t.Errorf("missing capability %s", capability)
+					}
+				}
+				for _, feature := range []string{"embedding_input_limits", "multimodal_token_budget", "prompt_progress", "request_admission", "request_id", "structured_errors", "tool_call_ids", "image_jobs", "image_profiles", "image_gpu_coordination", "image_local_import", "image_loras", "image_upload_idempotency"} {
+					if !response.Wildllama.Features[feature] {
+						t.Errorf("missing negotiated feature %s", feature)
+					}
+				}
+				if response.Wildllama.Limits["request_body_bytes"] != 64<<20 || response.Wildllama.Limits["embedding_items"] != 4096 {
+					t.Errorf("unexpected request limits: %v", response.Wildllama.Limits)
 				}
 			},
 		},

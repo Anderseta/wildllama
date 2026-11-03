@@ -39,6 +39,7 @@ import (
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/fs/gguf"
+	"github.com/ollama/ollama/imagegen"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
 	"github.com/ollama/ollama/internal/proxy"
 	"github.com/ollama/ollama/llm"
@@ -2339,8 +2340,20 @@ func (s *Server) CreateBlobHandler(c *gin.Context) {
 		return
 	}
 
-	layer, err := manifest.NewLayer(c.Request.Body, "")
+	size := c.Request.ContentLength
+	reservation, err := modelTransfersDisk.reserve(c.Request.Context(), path, max(0, size))
 	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInsufficientStorage, gin.H{"error": err.Error(), "code": "insufficient_disk_space", "retryable": false})
+		return
+	}
+	defer reservation.close()
+	reader := &modelDiskReader{source: c.Request.Body, reservation: reservation, unknown: size < 0}
+	layer, err := manifest.NewLayer(reader, "")
+	if err != nil {
+		if imagegen.IsDiskSpaceError(err) {
+			c.AbortWithStatusJSON(http.StatusInsufficientStorage, gin.H{"error": err.Error(), "code": "insufficient_disk_space", "retryable": false})
+			return
+		}
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -2489,7 +2502,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/version", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog", "download_cleanup"}, "wildllama": s.protocolCapabilities()})
+		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog", "download_cleanup", "model_disk_headroom"}, "wildllama": s.protocolCapabilities()})
 	})
 	r.GET("/api/activity", s.RuntimeActivityHandler)
 	s.registerImageRoutes(r)

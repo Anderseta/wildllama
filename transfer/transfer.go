@@ -61,6 +61,8 @@ type Blob struct {
 
 // DownloadOptions configures a parallel download operation.
 type DownloadOptions struct {
+	ReserveSpace      func(context.Context, string, int64) (DiskReservation, error)      // optional destination-space admission
+	PermanentError    func(error) bool                                                   // optional non-retryable local failure classifier
 	Blobs             []Blob                                                             // Blobs to download
 	BaseURL           string                                                             // Registry base URL
 	DestDir           string                                                             // Destination directory for blobs
@@ -75,6 +77,14 @@ type DownloadOptions struct {
 	UserAgent         string                                                             // User-Agent header (optional, has default)
 	StallTimeout      time.Duration                                                      // Timeout for stall detection (default 10s)
 	AllowPrivateHosts bool                                                               // Permits cross-host redirects to local addresses
+}
+
+// DiskReservation protects known remaining bytes without coupling transfers to
+// a server or filesystem policy. Implementations must support concurrent calls.
+type DiskReservation interface {
+	Check() error
+	Written(int64)
+	Close()
 }
 
 // UploadOptions configures a parallel upload operation.

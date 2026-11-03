@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"sync"
 	"time"
 )
 
 // RuntimeActivity is an observed runner snapshot, shared by its active slots.
 // It intentionally contains no prompts, responses, file paths or raw log lines.
 type RuntimeActivity struct {
-	SpeculativeDraftTokens    *int  `json:"speculative_draft_tokens,omitempty"`
-	SpeculativeAcceptedTokens *int  `json:"speculative_accepted_tokens,omitempty"`
-	SpeculativeObservedAt     int64 `json:"speculative_observed_at,omitempty"`
+	RequestID                 string `json:"request_id,omitempty"`
+	SpeculativeDraftTokens    *int   `json:"speculative_draft_tokens,omitempty"`
+	SpeculativeAcceptedTokens *int   `json:"speculative_accepted_tokens,omitempty"`
+	SpeculativeObservedAt     int64  `json:"speculative_observed_at,omitempty"`
 	speculativeGeneration     uint64
 	Phase                     string            `json:"phase"`
 	PhaseStartedAt            int64             `json:"phase_started_at"`
@@ -27,6 +29,35 @@ type RuntimeActivity struct {
 	Operation                 *RuntimeOperation `json:"operation,omitempty"`
 	Memory                    *RuntimeMemory    `json:"memory,omitempty"`
 	History                   []RuntimePhase    `json:"history"`
+}
+
+// A runner's native log is shared by slots. Attribute it only while one request
+// owns the entire observation interval; overlap stays unattributed until idle.
+func (w *StatusWriter) beginRuntimeRequest(id string) func() {
+	if w == nil {
+		return func() {}
+	}
+	w.activityMu.Lock()
+	if w.activeRuntimeRequests == 0 {
+		w.activeRuntimeRequestID = id
+		w.activity.setPhase("prefill", time.Now().UnixMilli())
+		w.activity.PromptProcessed, w.activity.PromptTotal, w.activity.GeneratedTokens, w.activity.TokensPerSecond = nil, nil, nil, nil
+	} else {
+		w.activeRuntimeRequestID = ""
+	}
+	w.activeRuntimeRequests++
+	w.activityMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			w.activityMu.Lock()
+			w.activeRuntimeRequests--
+			if w.activeRuntimeRequests == 0 {
+				w.activeRuntimeRequestID = ""
+			}
+			w.activityMu.Unlock()
+		})
+	}
 }
 
 type RuntimePhase struct {
@@ -246,6 +277,7 @@ func (w *StatusWriter) ActivitySnapshot() RuntimeActivity {
 	w.activityMu.Lock()
 	defer w.activityMu.Unlock()
 	value := w.activity
+	value.RequestID = w.activeRuntimeRequestID
 	value.Progress = activityValueCopy(value.Progress)
 	value.PromptProcessed = activityValueCopy(value.PromptProcessed)
 	value.PromptTotal = activityValueCopy(value.PromptTotal)

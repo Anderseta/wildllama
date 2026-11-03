@@ -148,7 +148,7 @@ func (v *imageService) registerImageResult(job *imageJob, result imagegen.Result
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.assets[asset.AssetID] = asset
-	if err = writeImageJSON(filepath.Join(v.root, "assets.json"), v.assets); err != nil {
+	if err = v.persistImageAssetsLocked(map[string]imageAssetRecord{asset.AssetID: asset}, nil); err != nil {
 		delete(v.assets, asset.AssetID)
 		return err
 	}

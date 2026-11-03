@@ -35,6 +35,7 @@ func (s *llamaServerRunner) SystemOne(ctx context.Context, state, questions json
 		return nil, nil, err
 	}
 	defer s.sem.Release(1)
+	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/systemone", s.port), bytes.NewReader(data))
 	if err != nil {

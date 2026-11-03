@@ -27,19 +27,21 @@ var (
 )
 
 type downloader struct {
-	client       *http.Client
-	baseURL      string
-	destDir      string
-	repository   string // Repository path for blob URLs (e.g., "library/model")
-	tokenMu      sync.RWMutex
-	token        string
-	getToken     func(context.Context, AuthChallenge) (string, error)
-	userAgent    string
-	stallTimeout time.Duration
-	progress     *progressTracker
-	speeds       *speedTracker
-	logger       *slog.Logger
-	allowPrivate bool
+	client         *http.Client
+	baseURL        string
+	destDir        string
+	repository     string // Repository path for blob URLs (e.g., "library/model")
+	tokenMu        sync.RWMutex
+	token          string
+	getToken       func(context.Context, AuthChallenge) (string, error)
+	userAgent      string
+	stallTimeout   time.Duration
+	progress       *progressTracker
+	speeds         *speedTracker
+	logger         *slog.Logger
+	allowPrivate   bool
+	reserveSpace   func(context.Context, string, int64) (DiskReservation, error)
+	permanentError func(error) bool
 	// bodySem caps the number of simultaneous body-bearing transfers so a
 	// modest home downlink isn't saturated. Always set by download(); nil
 	// only when tests build downloader directly (in which case holdBody is
@@ -121,18 +123,20 @@ func download(ctx context.Context, opts DownloadOptions) error {
 	progress.add(alreadyCompleted) // Report already-downloaded bytes upfront
 
 	d := &downloader{
-		client:       cmp.Or(opts.Client, checkedClient(opts.BaseURL, opts.AllowPrivateHosts)),
-		baseURL:      opts.BaseURL,
-		destDir:      opts.DestDir,
-		repository:   cmp.Or(opts.Repository, "library/_"),
-		token:        opts.Token,
-		getToken:     opts.GetToken,
-		userAgent:    cmp.Or(opts.UserAgent, defaultUserAgent),
-		stallTimeout: cmp.Or(opts.StallTimeout, defaultStallTimeout),
-		progress:     progress,
-		speeds:       &speedTracker{},
-		logger:       opts.Logger,
-		allowPrivate: opts.AllowPrivateHosts,
+		client:         cmp.Or(opts.Client, checkedClient(opts.BaseURL, opts.AllowPrivateHosts)),
+		baseURL:        opts.BaseURL,
+		destDir:        opts.DestDir,
+		repository:     cmp.Or(opts.Repository, "library/_"),
+		token:          opts.Token,
+		getToken:       opts.GetToken,
+		userAgent:      cmp.Or(opts.UserAgent, defaultUserAgent),
+		stallTimeout:   cmp.Or(opts.StallTimeout, defaultStallTimeout),
+		progress:       progress,
+		speeds:         &speedTracker{},
+		logger:         opts.Logger,
+		allowPrivate:   opts.AllowPrivateHosts,
+		reserveSpace:   opts.ReserveSpace,
+		permanentError: opts.PermanentError,
 	}
 	// 0 or negative serializes; never unbounded.
 	d.bodySem = semaphore.NewWeighted(int64(max(1, opts.BodyConcurrency)))
@@ -194,6 +198,9 @@ func (d *downloader) download(ctx context.Context, blob Blob) error {
 		}
 
 		d.progress.add(-n) // rollback
+		if d.permanentError != nil && d.permanentError(err) {
+			return err
+		}
 
 		// Preserve partial .tmp files for large blobs to enable resume
 		if blob.Size < resumeThreshold {
@@ -278,7 +285,7 @@ func (d *downloader) downloadOnce(ctx context.Context, blob Blob) (int64, error)
 	if err != nil {
 		return 0, err
 	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -296,7 +303,10 @@ func (d *downloader) downloadOnce(ctx context.Context, blob Blob) (int64, error)
 func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, blob Blob, r io.Reader, existingSize int64) (int64, error) {
 	dest := filepath.Join(d.destDir, digestToPath(blob.Digest))
 	tmp := dest + ".tmp"
-	os.MkdirAll(filepath.Dir(dest), 0o755)
+	var reservation DiskReservation
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return 0, err
+	}
 
 	h := sha256.New()
 
@@ -315,6 +325,7 @@ func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, b
 				f.Close()
 				os.Remove(tmp)
 				existingSize = 0
+				h.Reset()
 			} else {
 				// Report resumed bytes as progress
 				d.progress.add(existingSize)
@@ -322,6 +333,18 @@ func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, b
 		}
 	}
 
+	if d.reserveSpace != nil {
+		reservation, err = d.reserveSpace(ctx, tmp, max(0, blob.Size-existingSize))
+		if err != nil {
+			if f != nil {
+				f.Close()
+			}
+			return 0, err
+		}
+		if reservation != nil {
+			defer reservation.Close()
+		}
+	}
 	if existingSize == 0 {
 		f, err = os.Create(tmp)
 		if err != nil {
@@ -331,7 +354,11 @@ func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, b
 	}
 	defer f.Close()
 
-	n, err := d.copy(ctx, cancel, f, r, h)
+	var destination io.Writer = f
+	if reservation != nil {
+		destination = reservedDiskWriter{writer: f, reservation: reservation}
+	}
+	n, err := d.copy(ctx, cancel, destination, r, h)
 	if err != nil {
 		// Don't remove .tmp here — download() handles cleanup based on blob size
 		return existingSize + n, err
@@ -399,10 +426,20 @@ func (d *downloader) copy(ctx context.Context, cancel context.CancelCauseFunc, d
 		nr, err := src.Read(buf)
 		if nr > 0 {
 			lastRead.Store(time.Now().UnixNano())
-			dst.Write(buf[:nr])
-			h.Write(buf[:nr])
-			d.progress.add(int64(nr))
-			n.Add(int64(nr))
+			nw, writeErr := dst.Write(buf[:nr])
+			if nw > 0 {
+				if _, hashErr := h.Write(buf[:nw]); hashErr != nil {
+					return n.Load(), hashErr
+				}
+				d.progress.add(int64(nw))
+				n.Add(int64(nw))
+			}
+			if writeErr != nil {
+				return n.Load(), writeErr
+			}
+			if nw != nr {
+				return n.Load(), io.ErrShortWrite
+			}
 		}
 		if err == io.EOF {
 			return n.Load(), nil
@@ -430,8 +467,8 @@ func (d *downloader) resolve(ctx context.Context, rawURL string) (*url.URL, erro
 		if err != nil {
 			return nil, err
 		}
-		// Drain body before close to enable HTTP connection reuse
-		io.Copy(io.Discard, resp.Body)
+		// A 200 response can be the entire multi-GB blob. Discovery only needs
+		// status/headers: draining it would download the model twice.
 		resp.Body.Close()
 
 		switch resp.StatusCode {
@@ -462,6 +499,22 @@ func (d *downloader) resolve(ctx context.Context, rawURL string) (*url.URL, erro
 		}
 	}
 	return nil, fmt.Errorf("too many redirects")
+}
+
+type reservedDiskWriter struct {
+	writer      io.Writer
+	reservation DiskReservation
+}
+
+func (w reservedDiskWriter) Write(p []byte) (int, error) {
+	if err := w.reservation.Check(); err != nil {
+		return 0, err
+	}
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		w.reservation.Written(int64(n))
+	}
+	return n, err
 }
 
 type speedTracker struct {

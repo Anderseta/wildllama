@@ -74,13 +74,14 @@ type Scheduler struct {
 	// including by evicting one or more other models. We can only load
 	// one model at a time but new requests to models that already loaded can
 	// happen in parallel
-	activeLoading  llm.LlamaServer
-	activeActivity *runnerActivityEntry
-	activeStatus   *loadedModel
-	loaded         map[string]*runnerRef
-	loadedSnapshot atomic.Pointer[loadedRunnerSnapshot]
-	imageGate      atomic.Pointer[imageGPUGate]
-	imageLoads     atomic.Int32 // construction/cleanup may outlive a cancelled HTTP reader
+	activeLoading     llm.LlamaServer
+	activeActivity    *runnerActivityEntry
+	activeStatus      *loadedModel
+	loaded            map[string]*runnerRef
+	loadedSnapshot    atomic.Pointer[loadedRunnerSnapshot]
+	preparingActivity atomic.Pointer[runnerActivityEntry]
+	imageGate         atomic.Pointer[imageGPUGate]
+	imageLoads        atomic.Int32 // construction/cleanup may outlive a cancelled HTTP reader
 
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
@@ -750,6 +751,10 @@ func (s *Scheduler) expireIdleRunner(ctx, requestCtx context.Context, runner *ru
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
+	now := time.Now().UnixMilli()
+	s.preparingActivity.Store(&runnerActivityEntry{model: req.model.ShortName, context: req.opts.NumCtx,
+		reporter: fixedRuntimeActivity{Phase: "starting", Stage: "preparing_model", PhaseStartedAt: now, UpdatedAt: now, RequestID: api.RequestID(req.ctx)}})
+	defer s.preparingActivity.Store(nil)
 	s.imageLoads.Add(1)
 	defer s.imageLoads.Add(-1)
 	loadStarted := time.Now()
@@ -918,6 +923,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 		s.activeLoading = llama
 		s.activeActivity = newRunnerActivity(req.model, llama, launchOpts)
+		if s.activeActivity != nil {
+			s.activeActivity.loadingRequestID = api.RequestID(req.ctx)
+		}
 		s.activeStatus = &loadedModel{model: req.model, runner: loadedRunnerName(req.model, llama),
 			contextLength: req.opts.NumCtx, sessionDuration: sessionDuration, loading: true, llama: llama}
 		s.publishLoadedSnapshotLocked()
@@ -1044,6 +1052,9 @@ iGPUScan:
 		trainContext:    trainContext,
 	}
 	runner.model.Store(req.model)
+	if runner.activity != nil {
+		runner.activity.loadingRequestID = api.RequestID(req.ctx)
+	}
 	runner.numParallel = numParallel
 	runner.publishStatusLocked()
 	runner.refMu.Lock() // hold lock until running or aborted
@@ -2199,9 +2210,10 @@ type loadedModel struct {
 }
 
 type loadedRunnerSnapshot struct {
-	runners []*runnerRef
-	byKey   map[string]*runnerRef
-	loading *loadedModel
+	runners    []*runnerRef
+	byKey      map[string]*runnerRef
+	loading    *loadedModel
+	activities []*runnerActivityEntry
 }
 
 func loadedRunnerName(model *Model, runner llm.LlamaServer) string {
@@ -2219,9 +2231,19 @@ func loadedRunnerName(model *Model, runner llm.LlamaServer) string {
 // The caller holds loadedMu; published registries are immutable.
 func (s *Scheduler) publishLoadedSnapshotLocked() {
 	snapshot := &loadedRunnerSnapshot{runners: make([]*runnerRef, 0, len(s.loaded)), byKey: make(map[string]*runnerRef, len(s.loaded)), loading: s.activeStatus}
+	if s.activeActivity != nil {
+		value := *s.activeActivity
+		snapshot.activities = append(snapshot.activities, &value)
+	}
 	for key, runner := range s.loaded {
 		snapshot.runners = append(snapshot.runners, runner)
 		snapshot.byKey[key] = runner
+		if runner.activity != nil {
+			value := *runner.activity
+			value.modelRef = &runner.model
+			value.statusRef = &runner.status
+			snapshot.activities = append(snapshot.activities, &value)
+		}
 	}
 	s.loadedSnapshot.Store(snapshot)
 }

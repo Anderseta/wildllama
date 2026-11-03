@@ -110,6 +110,9 @@ func (v *imageService) loadDeletedImageSessions() {
 }
 
 func (v *imageService) checkImageSessionLocked(id string, requestIDs ...string) error {
+	if v.assetCatalogError != nil {
+		return fmt.Errorf("cannot verify image asset catalog: %w", v.assetCatalogError)
+	}
 	if v.sessionDeleteErr != nil {
 		return fmt.Errorf("cannot verify image session deletion journal: %w", v.sessionDeleteErr)
 	}
@@ -178,6 +181,11 @@ func (s *Server) imageSessionDeleteHandler(c *gin.Context) {
 	}
 	v := s.imageService()
 	v.mu.Lock()
+	if v.assetCatalogError != nil {
+		v.mu.Unlock()
+		c.JSON(500, gin.H{"error": "cannot verify image asset catalog before deletion: " + v.assetCatalogError.Error()})
+		return
+	}
 	if v.sessionDeleteErr != nil {
 		v.mu.Unlock()
 		c.JSON(500, gin.H{"error": v.sessionDeleteErr.Error()})
@@ -427,7 +435,7 @@ func (v *imageService) deleteImageSessionFilesLocked(id string, legacy []string)
 	if err := writeImageJSON(filepath.Join(v.root, "session-directories.json"), v.ownedDirectories); err != nil {
 		return 0, removed, retained, err
 	}
-	if err := writeImageJSON(filepath.Join(v.root, "assets.json"), v.assets); err != nil {
+	if err := v.syncImageAssetsLocked(); err != nil {
 		return 0, removed, retained, err
 	}
 	kept := make([]*imageJob, 0, len(v.jobs))

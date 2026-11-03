@@ -23,6 +23,7 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/imagegen"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/mlx"
 	"github.com/ollama/ollama/model/parsers"
@@ -1546,9 +1547,27 @@ func downloadWithTransfer(ctx context.Context, n model.Name, layers []manifest.L
 	baseURL := base.String()
 
 	var totalSize int64
+	var remainingSize int64
 	for _, blob := range blobs {
 		totalSize += blob.Size
+		path := filepath.Join(destDir, strings.ReplaceAll(blob.Digest, ":", "-"))
+		if info, err := os.Stat(path); err == nil && info.Size() == blob.Size {
+			continue
+		}
+		remaining := blob.Size
+		if info, err := os.Stat(path + ".tmp"); err == nil && blob.Size >= 64<<20 && info.Size() >= 0 && info.Size() < blob.Size {
+			remaining -= info.Size()
+		}
+		if remaining < 0 || remaining > (1<<62)-remainingSize {
+			return errors.New("invalid model download size")
+		}
+		remainingSize += remaining
 	}
+	guard, err := modelTransfersDisk.reserve(ctx, destDir, remainingSize)
+	if err != nil {
+		return err
+	}
+	guard.close() // per-blob reservations below own actual transfers
 
 	progress := func(completed, total int64) {
 		fn(api.ProgressResponse{
@@ -1568,6 +1587,8 @@ func downloadWithTransfer(ctx context.Context, n model.Name, layers []manifest.L
 	}
 
 	if err := transfer.Download(ctx, transfer.DownloadOptions{
+		ReserveSpace:      reserveTensorDisk,
+		PermanentError:    imagegen.IsDiskSpaceError,
 		Blobs:             blobs,
 		BaseURL:           baseURL,
 		DestDir:           destDir,

@@ -378,7 +378,7 @@ func TestImageUploadAndRegisteredPreview(t *testing.T) {
 
 func TestImageInstallRecipeAliasDefaultsVisionWithoutDownloading(t *testing.T) {
 	_, service, router, _, _ := newImageTestService(t)
-	service.workerStarted = true
+	service.transferStarted = true // inspect the I/O queue without starting a transfer
 	body := []byte(`{"recipe_id":"` + imagegen.DefaultRecipeID + `","request_id":"recipe-request"}`)
 	response := imageTestHTTP(router, "POST", "/api/images/models/install", body, "application/json")
 	require.Equal(t, 202, response.Code, response.Body.String())

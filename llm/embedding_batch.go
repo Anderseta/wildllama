@@ -73,6 +73,7 @@ func (s *llamaServerRunner) EmbeddingBatch(ctx context.Context, inputs []string)
 		return nil, 0, err
 	}
 	defer s.sem.Release(int64(len(inputs)))
+	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 	request := map[string]any{"input": inputs}
 	if s.rawEmbeddings {
 		request["embd_normalize"] = -1

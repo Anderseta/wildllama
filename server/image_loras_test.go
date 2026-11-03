@@ -31,7 +31,7 @@ func TestImageLoRAFilesRequirePinnedHashAndSafeSafetensorsPath(t *testing.T) {
 
 func TestImageLoRAInstallEnqueuesPinnedSelectionWithoutGPUOrDownload(t *testing.T) {
 	_, service, router, events, _ := newImageTestService(t)
-	service.workerStarted = true
+	service.transferStarted = true // inspect the I/O queue without starting a transfer
 	revision := strings.Repeat("b", 40)
 	file := huggingFaceTestFile("adapter.safetensors")
 	t.Setenv("HF_TOKEN", "private-test-token")

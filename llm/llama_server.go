@@ -1859,6 +1859,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		return err
 	}
 	defer s.sem.Release(1)
+	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
 
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
@@ -2281,6 +2282,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		return err
 	}
 	defer s.sem.Release(1)
+	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
 
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
@@ -2787,6 +2789,7 @@ func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [
 		return nil, 0, err
 	}
 	defer s.sem.Release(1)
+	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 
 	var prompt any = input
 	if len(media) > 0 {

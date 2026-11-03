@@ -54,6 +54,23 @@ func Install(ctx context.Context, modelsDir, recipeID string, includeVision bool
 	}
 	bindProfile(&b)
 	refreshBundle(&b)
+	var remaining int64
+	for _, component := range b.Components {
+		if component.Ready {
+			continue
+		}
+		needed := component.Size
+		if info, err := os.Stat(component.Path + ".part"); err == nil && info.Size() >= 0 && info.Size() <= needed {
+			needed -= info.Size()
+		}
+		if needed < 0 || needed > (1<<62)-remaining {
+			return b, errors.New("invalid image pipeline download size")
+		}
+		remaining += needed
+	}
+	if err := CheckDiskSpace(ctx, directory, remaining); err != nil {
+		return b, err
+	}
 	if err := writeBundle(filepath.Join(directory, ManifestName), b); err != nil {
 		return b, err
 	}
@@ -127,6 +144,9 @@ func downloadComponent(ctx context.Context, client *http.Client, base string, c 
 		return err
 	}
 	if offset < c.Size {
+		if err := CheckDiskSpace(ctx, part, c.Size-offset); err != nil {
+			return err
+		}
 		parts := strings.Split(c.Repo, "/")
 		if len(parts) != 2 || c.Revision == "" {
 			return errors.New("invalid pinned model repository")
@@ -185,9 +205,17 @@ func downloadComponent(ctx context.Context, client *http.Client, base string, c 
 		buffer := make([]byte, 1<<20)
 		total := offset
 		last := time.Now()
+		lastSpaceCheck := time.Now()
 		for {
 			n, readErr := response.Body.Read(buffer)
 			if n > 0 {
+				if time.Since(lastSpaceCheck) >= time.Second {
+					if err := CheckDiskSpace(ctx, part, c.Size-total); err != nil {
+						file.Close()
+						return err
+					}
+					lastSpaceCheck = time.Now()
+				}
 				if int64(n) > c.Size-total {
 					file.Close()
 					return errors.New("download exceeded the verified component size")

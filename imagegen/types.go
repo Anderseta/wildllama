@@ -18,6 +18,7 @@ type Config struct {
 	ModelsDir            string `json:"models_dir"`
 	OutputDir            string `json:"output_dir"`
 	ConditioningCacheMiB int    `json:"conditioning_cache_mib"`
+	MinFreeDiskMiB       int    `json:"min_free_disk_mib"`
 }
 
 type Profile struct {

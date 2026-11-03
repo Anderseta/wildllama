@@ -241,8 +241,9 @@ func (s *Server) imageCopyHandler(c *gin.Context) {
 				c.JSON(409, gin.H{"error": "request_id belongs to a different image request"})
 				return
 			}
-			c.JSON(202, gin.H{"job": existing})
+			response := cloneImageJobLocked(existing)
 			v.mu.Unlock()
+			c.JSON(202, gin.H{"job": response})
 			return
 		}
 	}
@@ -279,6 +280,9 @@ func copyImageFile(ctx context.Context, source, destination string, expected os.
 	if expected != nil && !stable(expected) {
 		return "", 0, errors.New("source component changed after selection")
 	}
+	if err := imagegen.CheckDiskSpace(ctx, destination, before.Size()); err != nil {
+		return "", 0, err
+	}
 	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return "", 0, err
@@ -294,12 +298,19 @@ func copyImageFile(ctx context.Context, source, destination string, expected os.
 	buffer := make([]byte, 2<<20)
 	var copied int64
 	last := time.Time{}
+	lastSpaceCheck := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", 0, err
 		}
 		n, readErr := input.Read(buffer)
 		if n > 0 {
+			if time.Since(lastSpaceCheck) >= time.Second {
+				if err := imagegen.CheckDiskSpace(ctx, destination, before.Size()-copied); err != nil {
+					return "", 0, err
+				}
+				lastSpaceCheck = time.Now()
+			}
 			if _, err = output.Write(buffer[:n]); err != nil {
 				return "", 0, err
 			}
@@ -378,6 +389,20 @@ func (v *imageService) copyLocal(job *imageJob) error {
 	request := job.Copy
 	if request == nil || request.Profile == nil {
 		return errors.New("missing local copy request")
+	}
+	var required int64
+	for _, component := range request.Components {
+		info, err := os.Stat(component.Path)
+		if err != nil {
+			return err
+		}
+		if info.Size() < 0 || info.Size() > (1<<62)-required {
+			return errors.New("invalid image import size")
+		}
+		required += info.Size()
+	}
+	if err := imagegen.CheckDiskSpace(job.ctx, job.Config.ModelsDir, required); err != nil {
+		return err
 	}
 	id := "local-" + job.ID
 	final := filepath.Join(job.Config.ModelsDir, id)
