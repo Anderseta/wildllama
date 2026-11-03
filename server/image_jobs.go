@@ -45,7 +45,7 @@ func (v *imageService) update(job *imageJob, phase, message string, current, tot
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	job.Phase = phase
-	job.Progress = imageProgress{Current: current, Total: total, Message: message}
+	job.Progress = imageProgress{Current: current, Total: total, Message: message, BatchIndex: job.Progress.BatchIndex, BatchCount: job.Progress.BatchCount}
 	// Byte/step progress is live; persisted running/terminal states avoid disk churn.
 }
 
@@ -123,6 +123,13 @@ func (v *imageService) work() {
 			err = v.generate(job)
 		}
 		v.mu.Lock()
+		if job.TextRestoreDeferred && job.Status == "completed" {
+			// Full successful delivery was committed while holding the lease.
+			// A later cancellation cannot undo saved output or require a reload.
+			job.cancel()
+			v.mu.Unlock()
+			continue
+		}
 		finished := time.Now().UTC()
 		job.FinishedAt = &finished
 		switch {
@@ -207,22 +214,29 @@ func (v *imageService) recordBundle(bundle imagegen.Bundle) error {
 }
 
 func (v *imageService) generate(job *imageJob) (runErr error) {
-	profile := job.Profile.Profile
 	request := job.Request
-	outputRoot := filepath.Join(job.Config.OutputDir, job.ID)
-	outputPath := filepath.Join(outputRoot, "image.png")
-	prompt := strings.TrimSpace(strings.TrimSpace(job.Profile.PromptPrefix) + "\n" + request.Prompt)
-	negative := strings.TrimSpace(strings.TrimSpace(job.Profile.NegativePrompt) + "\n" + request.NegativePrompt)
-	seed := int64(-1)
-	if request.Seed != nil {
-		seed = *request.Seed
-	} else if job.Profile.Seed != nil {
-		seed = *job.Profile.Seed
+	generation, err := imageGenerationFor(request, job.Profile)
+	if err != nil {
+		return err
 	}
-	input := imagegen.Request{Prompt: prompt, NegativePrompt: negative, Width: request.Width, Height: request.Height, Seed: seed, OutputPath: outputPath}
-	refs := append([]string(nil), request.ReferenceImages...)
-	if request.InputAssetID != "" {
-		refs = append(refs, request.InputAssetID)
+	profile := generation.Profile.Profile
+	seed, err := imageBatchSeed(request, generation.Profile, generation.Count)
+	if err != nil {
+		return err
+	}
+	input := imagegen.Request{Prompt: generation.Prompt, NegativePrompt: generation.NegativePrompt, Width: profile.Width, Height: profile.Height, Seed: seed, OutputPath: filepath.Join(job.Config.OutputDir, job.ID, "image.png")}
+	refs := generation.ReferenceAssetIDs
+	parent := request.ParentAssetID
+	if parent == "" && len(refs) > 0 {
+		parent = refs[0]
+	}
+	if parent != "" {
+		v.mu.Lock()
+		_, exists := v.assets[parent]
+		v.mu.Unlock()
+		if !exists {
+			return errors.New("parent image is not a registered image asset")
+		}
 	}
 	for _, id := range refs {
 		v.mu.Lock()
@@ -241,6 +255,11 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	if err := imagegen.ValidateRequest(profile, input); err != nil {
 		return err
 	}
+	v.mu.Lock()
+	job.Generation = generation
+	job.ParentAssetID = parent
+	job.Progress.BatchCount = generation.Count
+	v.mu.Unlock()
 	mode := request.ExecutionMode
 	if mode == "" {
 		mode = job.Profile.ExecutionMode
@@ -273,16 +292,8 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		if release != nil {
 			defer release()
 		}
-		v.mu.Lock()
-		shuttingDown := v.closed
-		v.mu.Unlock()
 		if closeErr := engine.Close(); closeErr != nil && runErr == nil {
 			runErr = closeErr
-		}
-		if activeOwned {
-			v.mu.Lock()
-			v.active = nil
-			v.mu.Unlock()
 		}
 		needsRestore := false
 		for _, state := range saved {
@@ -291,7 +302,28 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 				break
 			}
 		}
-		if job.Config.RestoreTextModels && needsRestore && !shuttingDown {
+		v.mu.Lock()
+		if activeOwned {
+			v.active = nil
+		}
+		shuttingDown := v.closed
+		restoreDeferred := false
+		if job.Config.RestoreTextModels && needsRestore && !shuttingDown && request.DeferTextRestore && runErr == nil && job.ctx.Err() == nil && len(job.Results) == generation.Count {
+			oldStatus, oldPhase, oldFinished := job.Status, job.Phase, job.FinishedAt
+			finished := time.Now().UTC()
+			job.Status, job.Phase = "completed", "completed"
+			job.FinishedAt = &finished
+			job.TextRestoreDeferred = true
+			if err := v.persistJobsLocked(); err != nil {
+				job.Status, job.Phase, job.FinishedAt = oldStatus, oldPhase, oldFinished
+				job.TextRestoreDeferred = false
+				runErr = errors.Join(runErr, fmt.Errorf("images saved but deferred completion could not be persisted: %w", err))
+			} else {
+				restoreDeferred = true
+			}
+		}
+		v.mu.Unlock()
+		if job.Config.RestoreTextModels && needsRestore && !shuttingDown && !restoreDeferred {
 			v.update(job, "restoring_text", "Restoring previously resident text models and profiles", 0, 0)
 			cleanup, cancel := context.WithTimeout(v.ctx, 10*time.Minute)
 			if imageStarted && beforeImageFree > 0 {
@@ -344,33 +376,42 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	v.active = engine
 	activeOwned = true
 	v.mu.Unlock()
-	v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
-	imageStarted = true
-	result, generationErr := engine.Run(job.ctx, profile, input, func(progress imagegen.Progress) {
-		v.update(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total))
-	})
-	if result.Path == "" && generationErr != nil {
-		return generationErr
+	for index := 1; index <= generation.Count; index++ {
+		if err := job.ctx.Err(); err != nil {
+			return err
+		}
+		filename := imageBatchFilename(index)
+		input.OutputPath = filepath.Join(job.Config.OutputDir, job.ID, filename)
+		input.Seed = seed
+		if seed >= 0 {
+			input.Seed += int64(index - 1)
+		}
+		v.setImageBatchProgress(job, index, generation.Count)
+		if index > 1 {
+			v.update(job, "checking_memory", "Checking free CUDA memory for the next batch image", 0, 0)
+			free, err := v.waitForMemory(job.ctx, profile.MaxVRAMMiB, job.Config.ReserveVRAMMiB)
+			if err != nil {
+				return err
+			}
+			beforeImageFree = free
+		}
+		v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
+		imageStarted = true
+		result, generationErr := engine.Run(job.ctx, profile, input, func(progress imagegen.Progress) {
+			v.update(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total))
+		})
+		if result.Path != "" {
+			if err := v.registerImageResult(job, result, filename, index, generation.Count); err != nil {
+				return errors.Join(generationErr, err)
+			}
+		} else if generationErr == nil {
+			return errors.New("image runner returned no output")
+		}
+		if generationErr != nil {
+			return generationErr
+		}
 	}
-	if filepath.Clean(result.Path) != filepath.Clean(outputPath) {
-		return errors.New("image runner returned an unexpected output path")
-	}
-	asset := imageAssetRecord{imageAsset: imageAsset{AssetID: job.ID + "/image.png", JobID: job.ID, Filename: "image.png", MIMEType: "image/png", Path: outputPath,
-		Width: result.Width, Height: result.Height, Seed: result.Seed, DurationSeconds: result.DurationSeconds}, OutputRoot: job.Config.OutputDir}
-	file, err := openImageAsset(asset)
-	if err != nil {
-		return err
-	}
-	file.Close()
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.assets[asset.AssetID] = asset
-	if err = writeImageJSON(filepath.Join(v.root, "assets.json"), v.assets); err != nil {
-		delete(v.assets, asset.AssetID)
-		return err
-	}
-	job.Result = &asset.imageAsset
-	return generationErr
+	return nil
 }
 
 func (v *imageService) waitForMemory(ctx context.Context, target, reserve int) (uint64, error) {
@@ -469,8 +510,9 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		defer v.mu.Unlock()
 		jobs := make([]*imageJob, 0, len(v.jobs))
 		requestID := c.Query("request_id")
+		sessionID := c.Query("session_id")
 		for i := len(v.jobs) - 1; i >= 0; i-- {
-			if requestID == "" || v.jobs[i].RequestID == requestID {
+			if (requestID == "" || v.jobs[i].RequestID == requestID) && (sessionID == "" || v.jobs[i].SessionID == sessionID) {
 				jobs = append(jobs, v.jobs[i])
 			}
 		}
@@ -481,7 +523,7 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 	if !imageBind(c, &request) {
 		return
 	}
-	if strings.TrimSpace(request.Prompt) == "" || len(request.Prompt) > 32768 || len(request.NegativePrompt) > 32768 || len(request.SessionID) > 256 || len(request.ReferenceImages) > 4 || !validImageMode(request.ExecutionMode, true) || request.Seed != nil && *request.Seed < -1 {
+	if strings.TrimSpace(request.Prompt) == "" || len(request.Prompt) > 32768 || len(request.NegativePrompt) > 32768 || len(request.SessionID) > 256 || len(request.ReferenceImages) > 4 || !validImageMode(request.ExecutionMode, true) || request.Seed != nil && *request.Seed < -1 || request.Count < 0 || request.Count > 8 || len(request.ParentAssetID) > 512 {
 		c.JSON(400, gin.H{"error": "invalid image job request"})
 		return
 	}
@@ -531,6 +573,24 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+	generation, err := imageGenerationFor(request, profile)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	parent := request.ParentAssetID
+	if parent == "" && len(generation.ReferenceAssetIDs) > 0 {
+		parent = generation.ReferenceAssetIDs[0]
+	}
+	if parent != "" {
+		v.mu.Lock()
+		_, exists := v.assets[parent]
+		v.mu.Unlock()
+		if !exists {
+			c.JSON(400, gin.H{"error": "parent image is not a registered image asset"})
+			return
+		}
+	}
 	probe, err := v.newEngine(config.Config)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -542,7 +602,7 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "image runtime is not ready: " + status.Error})
 		return
 	}
-	job, err := v.enqueue(&imageJob{Kind: "generate", RequestID: request.RequestID, SessionID: request.SessionID, ProfileID: profile.ID, ModelID: profile.ModelID, Request: request, Config: config, Profile: profile, Fingerprint: fingerprint})
+	job, err := v.enqueue(&imageJob{Kind: "generate", RequestID: request.RequestID, SessionID: request.SessionID, ProfileID: profile.ID, ModelID: profile.ModelID, Request: request, Config: config, Profile: profile, Fingerprint: fingerprint, Generation: generation, ParentAssetID: parent})
 	if err != nil {
 		c.JSON(409, gin.H{"error": err.Error()})
 		return

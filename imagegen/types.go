@@ -13,10 +13,11 @@ const (
 )
 
 type Config struct {
-	RunnerPath string `json:"runner_path"`
-	WorkDir    string `json:"work_dir"`
-	ModelsDir  string `json:"models_dir"`
-	OutputDir  string `json:"output_dir"`
+	RunnerPath           string `json:"runner_path"`
+	WorkDir              string `json:"work_dir"`
+	ModelsDir            string `json:"models_dir"`
+	OutputDir            string `json:"output_dir"`
+	ConditioningCacheMiB int    `json:"conditioning_cache_mib"`
 }
 
 type Profile struct {
@@ -91,12 +92,13 @@ type Result struct {
 }
 
 type RunnerStatus struct {
-	Ready      bool   `json:"ready"`
-	Running    bool   `json:"running"`
-	PID        int    `json:"pid,omitempty"`
-	RunnerPath string `json:"runner_path"`
-	Revision   string `json:"revision"`
-	Error      string `json:"error,omitempty"`
+	Ready                      bool   `json:"ready"`
+	Running                    bool   `json:"running"`
+	PID                        int    `json:"pid,omitempty"`
+	RunnerPath                 string `json:"runner_path"`
+	Revision                   string `json:"revision"`
+	Error                      string `json:"error,omitempty"`
+	ConditioningCacheSupported bool   `json:"conditioning_cache_supported"`
 }
 
 type Component struct {

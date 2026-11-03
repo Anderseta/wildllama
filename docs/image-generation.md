@@ -42,6 +42,29 @@ the encoder to CPU is a separate placement choice. The existing per-device fitti
 target and graph segmentation still bound managed image work. The image engine's
 storage/cache implementation is isolated from text inference.
 
+### Exact conditioning cache on SSD
+
+The private patched runner can persist prompt-encoder outputs using the
+`conditioning_cache_mib` budget (default 256 MiB; 0 disables it). It stores the
+original float32/int32 tensor bits, without quantization or approximate reuse.
+The cache has checksummed entries, bounded allocations, atomic publication,
+cross-process locking and LRU eviction. Unsupported conditioning structures or
+cache/filesystem failures use the normal encoder path. No persistent GPU tensor
+or RAM model cache is added.
+
+Keys include the native runtime manifest, effective profile, model file identities,
+encoder/LoRA/reference content hashes and every actual conditioning parameter.
+Reliable filesystem change times invalidate weight-digest memoization, including
+same-size edits with a restored mtime. The first unchanged encoder signature may
+need a full file read; its real progress is reported separately from generation.
+Sampling seeds do not invalidate deterministic conditioning. The supported lazy
+disk parameter backend can avoid encoder computation on a hit; actual loading
+time and peak memory still depend on the selected model and backend.
+
+`scripts/build-wildimage.ps1` applies the maintained patch to the pinned source and
+uses the released GGML DLLs after an ABI/name-length probe. Only image-core/CLI
+code is rebuilt; the text engine and the released GGML CUDA kernels are separate.
+
 ## Qwen Image 2.1 Turbo
 
 The supported download recipes assemble a complete pipeline:
@@ -71,6 +94,19 @@ removal before generating. It saves the image before restoring the previous text
 models and their effective profiles. Restore failures are reported separately and
 do not delete a successful image. Conversation messages are unaffected, although
 an unloaded model's KV cache must be rebuilt on its next turn.
+
+Requests may set `count` from 1 to 8. Images run sequentially under one GPU lease,
+with one unload/restore cycle for text; results are published durably one by one.
+`results` contains the ordered batch, while `result` remains its first output for
+older clients. Explicit seeds increment safely through the batch. Later failures
+or cancellation preserve already completed images and still attempt restoration.
+
+An explicit `defer_text_restore` request can defer a successful full batch's text
+warmup until the next text request. Failure or early cancellation retains normal
+restoration. Completion and late cancellation have a single synchronization point
+so a committed deferred success cannot become a cancelled job without restoration.
+Jobs retain chat IDs, parent asset IDs and effective generation summaries for
+recovery and reference-image follow-ups; API queries can filter by session ID.
 
 The queued job rechecks runner availability before unloading text. Restoration
 briefly observes released GPU memory to allow delayed CUDA accounting to catch up,

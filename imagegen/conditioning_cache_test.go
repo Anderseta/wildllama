@@ -1,0 +1,100 @@
+package imagegen
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func envValue(env []string, key string) string {
+	for _, entry := range env {
+		if value, ok := strings.CutPrefix(entry, key+"="); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesInputs(t *testing.T) {
+	dir := t.TempDir()
+	profile := testProfile(t, dir)
+	config := Config{WorkDir: filepath.Join(dir, "work"), ConditioningCacheMiB: 256}
+	request := Request{Prompt: "first prompt", Seed: 1, OutputPath: filepath.Join(dir, "one.png")}
+	first, err := conditioningCacheEnvironment(context.Background(), config, profile, request, "native-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := envValue(first, "WILDIMAGE_CONDITION_NAMESPACE")
+	if len(key) != 64 || envValue(first, "WILDIMAGE_CONDITION_CACHE_BYTES") != "268435456" {
+		t.Fatal("invalid native cache contract", first)
+	}
+	request.Seed, request.OutputPath = 999, filepath.Join(dir, "other.png")
+	second, err := conditioningCacheEnvironment(context.Background(), config, profile, request, "native-v1")
+	if err != nil || envValue(second, "WILDIMAGE_CONDITION_NAMESPACE") != key {
+		t.Fatal("sampling-only changes invalidated deterministic encoder namespace", second, err)
+	}
+	for _, mutation := range []string{"encoder", "runtime", "profile"} {
+		t.Run(mutation, func(t *testing.T) {
+			putModel(t, profile.TextEncoder, modelBytes())
+			next := profile
+			revision := "native-v1"
+			switch mutation {
+			case "encoder":
+				putModel(t, profile.TextEncoder, append(modelBytes(), 1))
+			case "runtime":
+				revision = "native-v2"
+			case "profile":
+				next.Width = 128
+			}
+			value, err := conditioningCacheEnvironment(context.Background(), config, next, request, revision)
+			if err != nil || envValue(value, "WILDIMAGE_CONDITION_NAMESPACE") == key {
+				t.Fatal("changed encoder environment reused old namespace", value, err)
+			}
+		})
+	}
+	if _, err := os.Stat(config.WorkDir); !os.IsNotExist(err) {
+		t.Fatal("preparation created cache or work directory", err)
+	}
+}
+
+func TestConditioningDigestDetectsSameSizeChangesWithRestoredMtime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "encoder.gguf")
+	putModel(t, path, modelBytes())
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := conditioningFileIdentity(context.Background(), path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := modelBytes()
+	data[1024] ^= 1
+	putModel(t, path, data)
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := conditioningFileIdentity(context.Background(), path, true)
+	if err != nil || first == second {
+		t.Fatal("stale encoder digest survived content change with identical size/mtime", err)
+	}
+}
+
+func TestConditioningCacheDisabledAndInheritedEnvironmentIsolation(t *testing.T) {
+	for _, limit := range []int{0, -1, 8193} {
+		value, err := conditioningCacheEnvironment(context.Background(), Config{ConditioningCacheMiB: limit}, Profile{}, Request{}, "")
+		if err != nil || len(value) != 0 {
+			t.Fatal("disabled cache touched model files", value, err)
+		}
+	}
+	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES"} {
+		t.Setenv(key, "untrusted-parent-value")
+	}
+	for _, entry := range isolatedEnvironment(Config{WorkDir: t.TempDir(), RunnerPath: filepath.Join(t.TempDir(), "sd-cli")}, t.TempDir()) {
+		if strings.HasPrefix(entry, "WILDIMAGE_CONDITION_") {
+			t.Fatal("inherited cache override reached image process", entry)
+		}
+	}
+}

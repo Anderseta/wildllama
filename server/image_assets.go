@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/image/webp"
@@ -49,7 +51,7 @@ func imageDecode(reader io.Reader, kind string) (image.Image, error) {
 }
 
 func openImageAsset(asset imageAssetRecord) (*os.File, error) {
-	validName := asset.Filename == "image.png" || asset.Input && (asset.Filename == "image.jpg" || asset.Filename == "image.webp")
+	validName := asset.Filename == "image.png" || !asset.Input && imageBatchOutputName(asset.Filename) || asset.Input && (asset.Filename == "image.jpg" || asset.Filename == "image.webp")
 	if !imageSafeID(asset.JobID) || !validName {
 		return nil, errors.New("invalid image asset identity")
 	}
@@ -78,6 +80,15 @@ func openImageAsset(asset imageAssetRecord) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+func imageBatchOutputName(filename string) bool {
+	if !strings.HasPrefix(filename, "image-") || !strings.HasSuffix(filename, ".png") {
+		return false
+	}
+	index := strings.TrimSuffix(strings.TrimPrefix(filename, "image-"), ".png")
+	value, err := strconv.Atoi(index)
+	return err == nil && value >= 2 && value <= 8 && strconv.Itoa(value) == index
 }
 
 func (s *Server) imageUploadHandler(c *gin.Context) {

@@ -61,6 +61,7 @@ func TestProgressNativeCounterPhases(t *testing.T) {
 		{"seconds per iteration", "|====>     | 1/25 - 0.20s/it\x1b[K", "sampling", 1, 25},
 		{"iterations per second", "|====>     | 1/25 - 5.00it/s\x1b[K", "sampling", 1, 25},
 		{"unlabelled count", "1/25", "sampling", 1, 25},
+		{"conditioning cache hit", "conditioning disk cache hit", "conditioning_cache_hit", 0, 0},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

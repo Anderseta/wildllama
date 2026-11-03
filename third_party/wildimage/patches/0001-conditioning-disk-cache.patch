@@ -1,0 +1,44 @@
+--- a/src/conditioning/conditioning_cache.h
++++ b/src/conditioning/conditioning_cache.h
+@@ -6,6 +6,7 @@
+ #include <tuple>
+ 
+ #include "conditioning/conditioner.hpp"
++#include "conditioning/wildimage_conditioning_cache.h"
+ 
+ class ConditioningCache {
+     struct Entry {
+@@ -83,8 +84,22 @@
+     }
+ 
+     SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& params) {
++        wildimage_conditioning::Cache<SDCondition, ConditionerParams> disk_cache;
++        const auto disk_key = disk_cache.key(params, conditioner.resolve_clip_skip(params.clip_skip));
++        SDCondition cached;
++        if (disk_cache.load(disk_key, cached)) {
++            LOG_INFO("conditioning disk cache hit");
++            return cached;
++        }
++        if (!disk_key.empty()) {
++            LOG_VERBOSE("conditioning disk cache miss");
++        }
+         if (capacity_ == 0) {
+-            return conditioner.get_learned_condition(n_threads, params);
++            auto condition = conditioner.get_learned_condition(n_threads, params);
++            if (disk_cache.save(disk_key, condition)) {
++                LOG_VERBOSE("conditioning disk cache stored");
++            }
++            return condition;
+         }
+         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+             if (same_params(it->params, params)) {
+@@ -94,6 +109,9 @@
+             }
+         }
+         auto condition = conditioner.get_learned_condition(n_threads, params);
++        if (disk_cache.save(disk_key, condition)) {
++            LOG_VERBOSE("conditioning disk cache stored");
++        }
+         if (!condition.empty()) {
+             if (entries_.size() == capacity_) {
+                 entries_.pop_back();

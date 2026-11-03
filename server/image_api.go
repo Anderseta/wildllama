@@ -43,30 +43,35 @@ type imageConfig struct {
 }
 
 type imageJobRequest struct {
-	RequestID       string   `json:"request_id,omitempty"`
-	SessionID       string   `json:"session_id,omitempty"`
-	ProfileID       string   `json:"profile_id,omitempty"`
-	Prompt          string   `json:"prompt"`
-	NegativePrompt  string   `json:"negative_prompt,omitempty"`
-	Width           int      `json:"width,omitempty"`
-	Height          int      `json:"height,omitempty"`
-	Seed            *int64   `json:"seed"`
-	Steps           int      `json:"steps,omitempty"`
-	CFGScale        *float64 `json:"cfg_scale,omitempty"`
-	Sampler         string   `json:"sampler,omitempty"`
-	ExecutionMode   string   `json:"execution_mode,omitempty"`
-	ReferenceImages []string `json:"reference_images,omitempty"`
-	InputAssetID    string   `json:"input_asset_id,omitempty"`
+	RequestID        string   `json:"request_id,omitempty"`
+	SessionID        string   `json:"session_id,omitempty"`
+	ProfileID        string   `json:"profile_id,omitempty"`
+	Prompt           string   `json:"prompt"`
+	NegativePrompt   string   `json:"negative_prompt,omitempty"`
+	Width            int      `json:"width,omitempty"`
+	Height           int      `json:"height,omitempty"`
+	Seed             *int64   `json:"seed"`
+	Steps            int      `json:"steps,omitempty"`
+	CFGScale         *float64 `json:"cfg_scale,omitempty"`
+	Sampler          string   `json:"sampler,omitempty"`
+	ExecutionMode    string   `json:"execution_mode,omitempty"`
+	ReferenceImages  []string `json:"reference_images,omitempty"`
+	InputAssetID     string   `json:"input_asset_id,omitempty"`
+	Count            int      `json:"count,omitempty"`
+	DeferTextRestore bool     `json:"defer_text_restore,omitempty"`
+	ParentAssetID    string   `json:"parent_asset_id,omitempty"`
 }
 
 type imageProgress struct {
-	Current   int64  `json:"current"`
-	Total     int64  `json:"total"`
-	Message   string `json:"message"`
-	Role      string `json:"role,omitempty"`
-	Filename  string `json:"filename,omitempty"`
-	FileIndex int    `json:"file_index,omitempty"`
-	FileCount int    `json:"file_count,omitempty"`
+	Current    int64  `json:"current"`
+	Total      int64  `json:"total"`
+	Message    string `json:"message"`
+	Role       string `json:"role,omitempty"`
+	Filename   string `json:"filename,omitempty"`
+	FileIndex  int    `json:"file_index,omitempty"`
+	FileCount  int    `json:"file_count,omitempty"`
+	BatchIndex int    `json:"batch_index,omitempty"`
+	BatchCount int    `json:"batch_count,omitempty"`
 }
 
 type imageAsset struct {
@@ -79,35 +84,42 @@ type imageAsset struct {
 	Height          int     `json:"height"`
 	Seed            int64   `json:"seed"`
 	DurationSeconds float64 `json:"duration_seconds"`
+	BatchIndex      int     `json:"batch_index,omitempty"`
+	BatchCount      int     `json:"batch_count,omitempty"`
+	ParentAssetID   string  `json:"parent_asset_id,omitempty"`
 }
 
 type imageJob struct {
-	ID            string              `json:"id"`
-	Kind          string              `json:"kind"`
-	RequestID     string              `json:"request_id,omitempty"`
-	SessionID     string              `json:"session_id,omitempty"`
-	ProfileID     string              `json:"profile_id,omitempty"`
-	ModelID       string              `json:"model_id,omitempty"`
-	Status        string              `json:"status"`
-	Phase         string              `json:"phase"`
-	EffectiveMode string              `json:"effective_mode,omitempty"`
-	Progress      imageProgress       `json:"progress"`
-	CreatedAt     time.Time           `json:"created_at"`
-	StartedAt     *time.Time          `json:"started_at,omitempty"`
-	FinishedAt    *time.Time          `json:"finished_at,omitempty"`
-	Error         string              `json:"error,omitempty"`
-	Result        *imageAsset         `json:"result,omitempty"`
-	RestoreErrors []string            `json:"restore_errors,omitempty"`
-	Fingerprint   string              `json:"fingerprint,omitempty"`
-	Request       imageJobRequest     `json:"-"`
-	Config        imageConfig         `json:"-"`
-	Profile       imageProfile        `json:"-"`
-	RecipeID      string              `json:"-"`
-	IncludeVision bool                `json:"-"`
-	Copy          *imageCopyRequest   `json:"-"`
-	LoRA          *imagegen.Component `json:"-"`
-	cancel        context.CancelFunc
-	ctx           context.Context
+	ID                  string                  `json:"id"`
+	Kind                string                  `json:"kind"`
+	RequestID           string                  `json:"request_id,omitempty"`
+	SessionID           string                  `json:"session_id,omitempty"`
+	ProfileID           string                  `json:"profile_id,omitempty"`
+	ModelID             string                  `json:"model_id,omitempty"`
+	Status              string                  `json:"status"`
+	Phase               string                  `json:"phase"`
+	EffectiveMode       string                  `json:"effective_mode,omitempty"`
+	Progress            imageProgress           `json:"progress"`
+	CreatedAt           time.Time               `json:"created_at"`
+	StartedAt           *time.Time              `json:"started_at,omitempty"`
+	FinishedAt          *time.Time              `json:"finished_at,omitempty"`
+	Error               string                  `json:"error,omitempty"`
+	Result              *imageAsset             `json:"result,omitempty"`
+	Results             []imageAsset            `json:"results,omitempty"`
+	Generation          *imageGenerationSummary `json:"generation,omitempty"`
+	ParentAssetID       string                  `json:"parent_asset_id,omitempty"`
+	TextRestoreDeferred bool                    `json:"text_restore_deferred,omitempty"`
+	RestoreErrors       []string                `json:"restore_errors,omitempty"`
+	Fingerprint         string                  `json:"fingerprint,omitempty"`
+	Request             imageJobRequest         `json:"-"`
+	Config              imageConfig             `json:"-"`
+	Profile             imageProfile            `json:"-"`
+	RecipeID            string                  `json:"-"`
+	IncludeVision       bool                    `json:"-"`
+	Copy                *imageCopyRequest       `json:"-"`
+	LoRA                *imagegen.Component     `json:"-"`
+	cancel              context.CancelFunc
+	ctx                 context.Context
 }
 
 type imageService struct {
@@ -145,7 +157,7 @@ func defaultImageConfig(root string) imageConfig {
 	}
 	profile := imagegen.DefaultProfile(imagegen.DefaultRecipeID)
 	return imageConfig{Version: 1, Revision: 1, DefaultProfileID: profile.ID, ExecutionMode: "exclusive", RestoreTextModels: true,
-		ReserveVRAMMiB: 1024, Config: imagegen.Config{RunnerPath: filepath.Join(filepath.Dir(root), "lib", "wildimage", executable),
+		ReserveVRAMMiB: 1024, Config: imagegen.Config{ConditioningCacheMiB: 256, RunnerPath: filepath.Join(filepath.Dir(root), "lib", "wildimage", executable),
 			WorkDir: filepath.Join(root, "work"), ModelsDir: filepath.Join(root, "models"), OutputDir: filepath.Join(root, "outputs")},
 		Profiles: []imageProfile{{Profile: profile, Name: "Qwen Image 2.1 Turbo"}}}
 }
@@ -182,6 +194,13 @@ func (s *Server) imageService() *imageService {
 					continue
 				}
 				valid = append(valid, job)
+				if len(job.Results) == 0 && job.Result != nil {
+					job.Results = []imageAsset{*job.Result}
+				}
+				if job.Result == nil && len(job.Results) > 0 {
+					first := job.Results[0]
+					job.Result = &first
+				}
 				if !imageTerminal(job.Status) {
 					now := time.Now().UTC()
 					job.Status = "interrupted"
@@ -213,13 +232,18 @@ func imageTerminal(status string) bool {
 func cloneImageConfig(config imageConfig) imageConfig {
 	config.Profiles = append([]imageProfile(nil), config.Profiles...)
 	for i := range config.Profiles {
-		if config.Profiles[i].Seed != nil {
-			value := *config.Profiles[i].Seed
-			config.Profiles[i].Seed = &value
-		}
-		config.Profiles[i].LoRAs = append([]imagegen.LoRA(nil), config.Profiles[i].LoRAs...)
+		config.Profiles[i] = cloneImageProfile(config.Profiles[i])
 	}
 	return config
+}
+
+func cloneImageProfile(profile imageProfile) imageProfile {
+	if profile.Seed != nil {
+		value := *profile.Seed
+		profile.Seed = &value
+	}
+	profile.LoRAs = append([]imagegen.LoRA(nil), profile.LoRAs...)
+	return profile
 }
 
 func imageSafeID(id string) bool {
@@ -249,7 +273,7 @@ func newImageID() string {
 }
 
 func validateImageConfig(config imageConfig) error {
-	if config.Version != 1 || len(config.Profiles) > 128 || config.ReserveVRAMMiB < 0 || config.ReserveVRAMMiB > 1024*1024 {
+	if config.Version != 1 || len(config.Profiles) > 128 || config.ReserveVRAMMiB < 0 || config.ReserveVRAMMiB > 1024*1024 || config.ConditioningCacheMiB < 0 || config.ConditioningCacheMiB > 8192 {
 		return errors.New("invalid image configuration bounds")
 	}
 	if !validImageMode(config.ExecutionMode, false) {

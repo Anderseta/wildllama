@@ -77,7 +77,10 @@ func (e *Engine) Status() RunnerStatus {
 	if manifestInfo, err := os.Stat(manifestPath); err == nil {
 		var manifest struct {
 			Revision string `json:"revision"`
-			Files    []struct {
+			Features struct {
+				ConditioningCache bool `json:"conditioning_cache"`
+			} `json:"features"`
+			Files []struct {
 				Name   string `json:"name"`
 				Size   int64  `json:"size"`
 				SHA256 string `json:"sha256"`
@@ -132,6 +135,7 @@ func (e *Engine) Status() RunnerStatus {
 			e.runtimeRevision = manifest.Revision
 		}
 		status.Revision = e.runtimeRevision
+		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 	}
 	status.Ready = true
 	return status
@@ -445,6 +449,17 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	cmd := exec.CommandContext(ctx, e.config.RunnerPath, args...)
 	cmd.Dir = jobDir
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
+	if runnerStatus.ConditioningCacheSupported && e.config.ConditioningCacheMiB > 0 {
+		cacheEnv, cacheErr := conditioningCacheEnvironment(ctx, e.config, p, r, runnerStatus.Revision, progress)
+		if ctx.Err() != nil {
+			return Result{}, ctx.Err()
+		}
+		if cacheErr == nil {
+			cmd.Env = append(cmd.Env, cacheEnv...)
+		}
+		// Cache preparation is optional; filesystem failures never prevent an
+		// otherwise valid image request from using the normal encoder path.
+	}
 	prepareCommand(cmd)
 	start := time.Now()
 	log := &progressLog{callback: progress, start: start}
@@ -659,6 +674,9 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	// Clear a parent text-runner override; the image loader discovers its own
 	// modules beside sd-cli and dependent DLLs resolve from that private folder.
 	set("GGML_BACKEND_PATH", "")
+	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES"} {
+		set(key, "")
+	}
 	set("PATH", filepath.Dir(config.RunnerPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return env
 }
@@ -712,6 +730,9 @@ func (p *progressLog) line(line string) {
 	lower := strings.ToLower(line)
 	update := Progress{}
 	switch {
+	case strings.Contains(lower, "conditioning disk cache hit"):
+		update.Phase = "conditioning_cache_hit"
+		update.Message = "Reusing cached prompt encoding"
 	case strings.Contains(lower, "loading") || strings.Contains(lower, "load tensors"):
 		update.Phase = "loading"
 		update.Message = "Loading image model components"
