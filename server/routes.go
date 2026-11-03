@@ -119,6 +119,8 @@ type Server struct {
 	admission     *inferenceAdmission
 	imagesOnce    sync.Once
 	images        *imageService
+	identityOnce  sync.Once
+	instanceID    string
 }
 
 func init() {
@@ -2501,9 +2503,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.HEAD("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
-	r.GET("/api/version", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog", "download_cleanup", "model_disk_headroom"}, "wildllama": s.protocolCapabilities()})
-	})
+	r.GET("/api/version", s.versionHandler)
 	r.GET("/api/activity", s.RuntimeActivityHandler)
 	s.registerImageRoutes(r)
 	r.GET("/api/huggingface/search", s.HuggingFaceSearchHandler)

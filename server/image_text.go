@@ -19,6 +19,7 @@ type imageTextState struct {
 	options                  api.Options
 	duration                 time.Duration
 	numCtxAuto, numBatchAuto bool
+	useMMapAuto              bool
 	shift                    bool
 	key                      string
 	pid                      int
@@ -68,7 +69,7 @@ func (b *schedulerImageText) Suspend(ctx context.Context) ([]imageTextState, err
 			return saved, err
 		}
 		saved = append(saved, imageTextState{model: runner.model.Load(), options: options, duration: runner.sessionDuration,
-			numCtxAuto: runner.numCtxAuto, numBatchAuto: runner.numBatchAuto, shift: runner.contextShift, key: runner.modelKey, pid: runner.pid})
+			numCtxAuto: runner.numCtxAuto, numBatchAuto: runner.numBatchAuto, useMMapAuto: runner.useMMapAuto, shift: runner.contextShift, key: runner.modelKey, pid: runner.pid})
 		runner.sessionDuration = 0
 		if runner.expireTimer != nil {
 			runner.expireTimer.Stop()
@@ -146,7 +147,7 @@ func (b *schedulerImageText) Restore(ctx context.Context, states []imageTextStat
 		loadCtx, cancel := context.WithCancel(ctx)
 		keep := &api.Duration{Duration: state.duration}
 		shift := state.shift
-		success, failed := b.server.sched.getRunner(loadCtx, state.model, state.options, keep, state.numCtxAuto, state.numBatchAuto, &shift)
+		success, failed := b.server.sched.getRunnerWithMmapOrigin(loadCtx, state.model, state.options, keep, state.numCtxAuto, state.numBatchAuto, &shift, state.useMMapAuto)
 		select {
 		case <-success:
 		case err := <-failed:

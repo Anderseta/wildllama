@@ -38,6 +38,9 @@ type LlmRequest struct {
 	successCh       chan *runnerRef
 	errCh           chan error
 	schedAttempts   uint
+	background      bool
+	queuedAt        time.Time
+	queueOwned      atomic.Bool
 
 	// oomRetryAttempted is set after a llama-server load crash triggers an
 	// evict-all-and-retry. Prevents infinite retry on persistent load failures.
@@ -62,10 +65,12 @@ type LlmRequest struct {
 }
 
 type Scheduler struct {
-	pendingReqCh  chan *LlmRequest
-	finishedReqCh chan *LlmRequest
-	expiredCh     chan *runnerRef
-	unloadedCh    chan any
+	pendingReqCh   chan *LlmRequest
+	finishedReqCh  chan *LlmRequest
+	expiredCh      chan *runnerRef
+	unloadedCh     chan any
+	pendingOwned   atomic.Int64
+	pendingBacklog atomic.Int64
 
 	// loadedMu protects loaded and activeLoading
 	loadedMu sync.Mutex
@@ -223,6 +228,12 @@ func effectiveContext(numCtx, trainCtx int) int {
 }
 
 func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool) (chan *runnerRef, chan error) {
+	return s.getRunnerWithMmapOrigin(c, m, opts, sessionDuration, numCtxAuto, numBatchAuto, shift, false)
+}
+
+// Internal image handoff retains the origin of the resolved mmap choice. Public
+// calls always use getRunner, so explicit user choices cannot become automatic.
+func (s *Scheduler) getRunnerWithMmapOrigin(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool, useMMapAuto bool) (chan *runnerRef, chan error) {
 	var policy api.GPUExecutionConfig
 	var policyErr error
 	opts, policy, policyErr = api.NormalizeGPUExecution(opts)
@@ -266,7 +277,14 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 		numBatchAuto:    numBatchAuto,
 		contextShift:    contextShift,
 		shift:           shift,
+		useMMapAuto:     useMMapAuto && opts.UseMMap != nil,
+		queuedAt:        time.Now(),
 	}
+	interactive, specified := api.RequestPriority(c)
+	if !specified {
+		interactive = m.CheckCapabilities(model.CapabilityCompletion) == nil
+	}
+	req.background = !interactive
 
 	key := schedulerModelKey(req.model)
 	var runner *runnerRef
@@ -285,11 +303,21 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	if err := c.Err(); err != nil {
 		req.errCh <- err
 	} else {
+		if !s.reservePendingSlot(req) {
+			if err := c.Err(); err != nil {
+				req.errCh <- err
+			} else {
+				req.errCh <- ErrMaxQueue
+			}
+			return req.successCh, req.errCh
+		}
 		select {
 		case <-c.Done():
+			s.releasePendingSlot(req)
 			req.errCh <- c.Err()
 		case s.pendingReqCh <- req:
 		default:
+			s.releasePendingSlot(req)
 			req.errCh <- ErrMaxQueue
 		}
 	}
@@ -310,166 +338,164 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 func (s *Scheduler) processPending(ctx context.Context) {
 	maxRunners := envconfig.MaxRunners()
+	queue := &pendingModelQueue{}
+	defer s.discardPendingQueue(queue)
 
 	for {
-		select {
-		case <-ctx.Done():
+		pending := s.nextPendingRequest(ctx, queue)
+		if pending == nil {
 			slog.Debug("shutting down scheduler pending loop")
 			return
-		case pending := <-s.pendingReqCh:
-			// Block other requests until we get this pending request running
-			pending.schedAttempts++
+		}
+		// Block other requests until we get this pending request running
+		pending.schedAttempts++
 
-			if pending.ctx.Err() != nil {
-				slog.Debug("pending request cancelled or timed out, skipping scheduling")
-				continue
+		if pending.ctx.Err() != nil {
+			slog.Debug("pending request cancelled or timed out, skipping scheduling")
+			continue
+		}
+		logutil.Trace("processing incoming request", "model", pending.model.ModelPath)
+
+	pendingLoop:
+		for {
+			if ctx.Err() != nil {
+				s.discardPendingLoading(pending)
+				return
 			}
-			logutil.Trace("processing incoming request", "model", pending.model.ModelPath)
+			if pending.ctx.Err() != nil {
+				s.discardPendingLoading(pending)
+				break
+			}
+			var runnerToExpire *runnerRef
+			pendingKey := schedulerModelKey(pending.model)
+			s.loadedMu.Lock()
+			runner := s.loaded[pendingKey]
+			loadedCount := len(s.loaded)
+			runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
+			for _, r := range s.loaded {
+				runnersSnapshot = append(runnersSnapshot, r)
+			}
+			s.loadedMu.Unlock()
 
-		pendingLoop:
-			for {
-				if ctx.Err() != nil {
-					s.discardPendingLoading(pending)
-					return
+			if runner != nil {
+				if runner.needsReload(pending.ctx, pending) {
+					if pending.ctx.Err() != nil {
+						break
+					}
+					slog.Debug("reloading", "runner", runner)
+					runnerToExpire = runner
+				} else {
+					// Runner is usable, return it
+					logutil.Trace("using existing loaded runner", "model", pendingKey)
+					if pending.useLoadedRunner(runner, s.finishedReqCh) || pending.ctx.Err() != nil {
+						break
+					}
+					continue // the runner unloaded between its health check and reservation
 				}
-				if pending.ctx.Err() != nil {
+			} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
+				slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
+				runnerToExpire = s.findRunnerToUnload()
+			} else {
+				// Either no models are loaded or below envconfig.MaxRunners
+				// Get a refreshed GPU list
+				var gpus []ml.DeviceInfo
+				if pending.opts.NumGPU == 0 {
+					gpus = []ml.DeviceInfo{}
+				} else {
+					logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
+					gpus = s.getGpuFn(ctx, runnersSnapshot)
+				}
+				logutil.Trace("refreshing system information", "model", pending.model.ModelPath)
+				systemInfo := s.getSystemInfoFn()
+				if maxRunners <= 0 {
+					// No user specified MaxRunners, so figure out what automatic setting to use for the next load attempt
+					if pending.opts.NumGPU == 0 {
+						// Need to get actual GPU list to set the correct default max models
+						logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
+						g := s.getGpuFn(ctx, runnersSnapshot)
+						maxRunners = uint(defaultModelsPerGPU * max(len(g), 1))
+					} else {
+						maxRunners = uint(defaultModelsPerGPU * max(len(gpus), 1))
+					}
+					slog.Debug("updating default concurrency", "OLLAMA_MAX_LOADED_MODELS", maxRunners, "gpu_count", len(gpus))
+				}
+
+				// Update free memory from currently loaded models
+				logutil.Trace("updating free space", "gpu_count", len(gpus), "model", pending.model.ModelPath)
+				s.updateFreeSpace(gpus)
+				if ctx.Err() != nil || pending.ctx.Err() != nil {
 					s.discardPendingLoading(pending)
+					if ctx.Err() != nil {
+						return
+					}
 					break
 				}
-				var runnerToExpire *runnerRef
-				pendingKey := schedulerModelKey(pending.model)
-				s.loadedMu.Lock()
-				runner := s.loaded[pendingKey]
-				loadedCount := len(s.loaded)
-				runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
-				for _, r := range s.loaded {
-					runnersSnapshot = append(runnersSnapshot, r)
+
+				if loadedCount == 0 {
+					// No models loaded. Load the model but prefer the best fit.
+					slog.Debug("loading first model", "model", pending.model.ModelPath)
+					if s.loadFn(pending, systemInfo, gpus, false) {
+						slog.Debug("first model load requested retry", "model", pending.model.ModelPath)
+						continue
+					}
+					break
 				}
-				s.loadedMu.Unlock()
 
-				if runner != nil {
-					if runner.needsReload(pending.ctx, pending) {
-						if pending.ctx.Err() != nil {
-							break
-						}
-						slog.Debug("reloading", "runner", runner)
-						runnerToExpire = runner
-					} else {
-						// Runner is usable, return it
-						logutil.Trace("using existing loaded runner", "model", pendingKey)
-						if pending.useLoadedRunner(runner, s.finishedReqCh) || pending.ctx.Err() != nil {
-							break
-						}
-						continue // the runner unloaded between its health check and reservation
-					}
-				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
-					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
-					runnerToExpire = s.findRunnerToUnload()
-				} else {
-					// Either no models are loaded or below envconfig.MaxRunners
-					// Get a refreshed GPU list
-					var gpus []ml.DeviceInfo
-					if pending.opts.NumGPU == 0 {
-						gpus = []ml.DeviceInfo{}
-					} else {
-						logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
-						gpus = s.getGpuFn(ctx, runnersSnapshot)
-					}
-					logutil.Trace("refreshing system information", "model", pending.model.ModelPath)
-					systemInfo := s.getSystemInfoFn()
-					if maxRunners <= 0 {
-						// No user specified MaxRunners, so figure out what automatic setting to use for the next load attempt
-						if pending.opts.NumGPU == 0 {
-							// Need to get actual GPU list to set the correct default max models
-							logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
-							g := s.getGpuFn(ctx, runnersSnapshot)
-							maxRunners = uint(defaultModelsPerGPU * max(len(g), 1))
-						} else {
-							maxRunners = uint(defaultModelsPerGPU * max(len(gpus), 1))
-						}
-						slog.Debug("updating default concurrency", "OLLAMA_MAX_LOADED_MODELS", maxRunners, "gpu_count", len(gpus))
-					}
+				// More than one loaded model, so we have to see if the
+				// new one fits
+				logutil.Trace("loading additional model", "model", pending.model.ModelPath)
+				needEvict := s.loadFn(pending, systemInfo, gpus, true)
+				if !needEvict {
+					slog.Debug("new model fits with existing models, loading")
+					break
+				}
 
-					// Update free memory from currently loaded models
-					logutil.Trace("updating free space", "gpu_count", len(gpus), "model", pending.model.ModelPath)
-					s.updateFreeSpace(gpus)
-					if ctx.Err() != nil || pending.ctx.Err() != nil {
+				// OOM retry path: load() crashed post-spawn and we still
+				// have other models resident. Evict all of them, wait for
+				// every unload, then loop back to retry the load once.
+				// load() has already set oomRetryAttempted so a second
+				// crash falls through to the fail-fast path.
+				if pending.oomRetryAttempted {
+					if !s.evictAllAndWait(ctx, pending.ctx, pendingKey) {
 						s.discardPendingLoading(pending)
 						if ctx.Err() != nil {
 							return
 						}
 						break
 					}
-
-					if loadedCount == 0 {
-						// No models loaded. Load the model but prefer the best fit.
-						slog.Debug("loading first model", "model", pending.model.ModelPath)
-						if s.loadFn(pending, systemInfo, gpus, false) {
-							slog.Debug("first model load requested retry", "model", pending.model.ModelPath)
-							continue
-						}
-						break
-					}
-
-					// More than one loaded model, so we have to see if the
-					// new one fits
-					logutil.Trace("loading additional model", "model", pending.model.ModelPath)
-					needEvict := s.loadFn(pending, systemInfo, gpus, true)
-					if !needEvict {
-						slog.Debug("new model fits with existing models, loading")
-						break
-					}
-
-					// OOM retry path: load() crashed post-spawn and we still
-					// have other models resident. Evict all of them, wait for
-					// every unload, then loop back to retry the load once.
-					// load() has already set oomRetryAttempted so a second
-					// crash falls through to the fail-fast path.
-					if pending.oomRetryAttempted {
-						if !s.evictAllAndWait(ctx, pending.ctx, pendingKey) {
-							s.discardPendingLoading(pending)
-							if ctx.Err() != nil {
-								return
-							}
-							break
-						}
-						continue
-					}
-
-					runnerToExpire = s.findRunnerToUnload()
-				}
-
-				if runnerToExpire == nil {
-					// While we were performing load calculations, the loaded runner(s) unloaded in parallel
-					// so findRunnerToUnload returned no runners.  We'll try again and the loadedCount should be zero
-					slog.Debug("runner to expire was nil, retrying")
 					continue
 				}
-				enqueued, ok := s.expireIdleRunner(ctx, pending.ctx, runnerToExpire)
-				if !ok {
-					s.discardPendingLoading(pending)
-					break
-				}
-				if !enqueued {
-					continue
-				}
-				// Wait for the unload to happen
-				slog.Debug("waiting for pending requests to complete and unload to occur", "runner", runnerToExpire)
-				select {
-				case <-ctx.Done():
-					slog.Debug("shutting down scheduler pending loop")
-					return
-				case <-pending.ctx.Done():
-					s.discardPendingLoading(pending)
-					break pendingLoop
-				case <-s.unloadedCh:
-					slog.Debug("unload completed", "runner", runnerToExpire)
-					continue
-				}
+
+				runnerToExpire = s.findRunnerToUnload()
 			}
-		case <-s.unloadedCh:
-			// An unload request when there are no pending request can be ignored
-			slog.Debug("ignoring unload event with no pending requests")
+
+			if runnerToExpire == nil {
+				// While we were performing load calculations, the loaded runner(s) unloaded in parallel
+				// so findRunnerToUnload returned no runners.  We'll try again and the loadedCount should be zero
+				slog.Debug("runner to expire was nil, retrying")
+				continue
+			}
+			enqueued, ok := s.expireIdleRunner(ctx, pending.ctx, runnerToExpire)
+			if !ok {
+				s.discardPendingLoading(pending)
+				break
+			}
+			if !enqueued {
+				continue
+			}
+			// Wait for the unload to happen
+			slog.Debug("waiting for pending requests to complete and unload to occur", "runner", runnerToExpire)
+			select {
+			case <-ctx.Done():
+				slog.Debug("shutting down scheduler pending loop")
+				return
+			case <-pending.ctx.Done():
+				s.discardPendingLoading(pending)
+				break pendingLoop
+			case <-s.unloadedCh:
+				slog.Debug("unload completed", "runner", runnerToExpire)
+				continue
+			}
 		}
 	}
 }

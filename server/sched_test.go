@@ -74,7 +74,10 @@ func TestModelFileSize(t *testing.T) {
 }
 
 func TestSchedLoad(t *testing.T) {
-	ctx, done := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	// This fixture exercises three load outcomes and performs metadata/file I/O;
+	// it does not test a 20 ms deadline. Race instrumentation can exceed that
+	// before the third phase, which previously waited forever on its channels.
+	ctx, done := context.WithTimeout(t.Context(), 2*time.Second)
 	defer done()
 	s := InitScheduler(ctx)
 	s.waitForRecovery = 10 * time.Millisecond
@@ -124,6 +127,8 @@ func TestSchedLoad(t *testing.T) {
 	}
 	s.load(req, systemInfo, gpus, false)
 	select {
+	case <-ctx.Done():
+		t.Fatal("mock model load timed out:", ctx.Err())
 	case err := <-req.errCh:
 		require.NoError(t, err)
 	case resp := <-req.successCh:
@@ -153,6 +158,8 @@ func TestSchedLoad(t *testing.T) {
 	server.waitResp = errors.New("wait failure")
 	s.load(req, systemInfo, gpus, false)
 	select {
+	case <-ctx.Done():
+		t.Fatal("mock load-failure phase timed out:", ctx.Err())
 	case err := <-req.errCh:
 		require.Contains(t, err.Error(), "wait failure")
 	case resp := <-req.successCh:

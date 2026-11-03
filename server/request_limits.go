@@ -255,6 +255,7 @@ func (s *Server) inferenceGuard() gin.HandlerFunc {
 		weight := size*3 + extra
 		priority := c.GetHeader("X-Wildgoose-Priority")
 		interactive := priority == "interactive" || priority != "background" && !strings.HasSuffix(c.Request.URL.Path, "/embed") && !strings.HasSuffix(c.Request.URL.Path, "/embeddings")
+		c.Request = c.Request.WithContext(api.WithRequestPriority(c.Request.Context(), interactive))
 		started := time.Now()
 		reservation, err := admission.acquireReservation(c.Request.Context(), weight, interactive)
 		if err != nil {

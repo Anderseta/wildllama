@@ -81,3 +81,40 @@ Tensor transfer discovery closes an HTTP 200 body without downloading it before
 the real request. Copy/hash/progress counters use successful writes, including
 partial writes; write errors and short writes cannot be reported as saved bytes.
 These are transfer fixes, with no change to inference parameters or model quality.
+
+## Text-model handoff and pending-load priority
+
+Image suspension saves both the resolved mmap choice and its automatic/explicit
+origin. Restoration passes that origin through the internal scheduler path; the
+next ordinary request can reuse the restored runner without interpreting the
+automatic value as an explicit profile change. Explicit mmap settings remain
+explicit, and a genuinely different profile still reloads normally.
+
+Inference admission carries chat/background priority into pending model loads.
+Requests keep independent prompts, contexts, options and result channels. The
+pending selector serves at most four interactive requests while background work
+waits; once the oldest background item has waited thirty seconds, it serves at
+most one interactive item before returning to background work. FIFO order applies
+inside each class, with one bounded exception: one compatible request for the
+previous still-resident model may pass a fresh older item. An older item, a queued
+profile change for that model, a different context/memory budget, adapter or draft
+configuration prevents that shortcut.
+
+The channel and reorder window share the existing maximum pending-request count.
+Cancellation releases admission without launching a model; shutdown rejects
+queued work explicitly. Already-resident requests retain their fast path. An
+in-progress native load is not preempted. The change adds bounded queue metadata,
+without new model copies, KV allocations or an increase to RAM/VRAM quotas.
+Mock tests establish selection order, fairness, cancellation and reuse; they do
+not establish a model throughput or end-to-end latency speedup.
+
+## Fresh profile identity
+
+`GET /api/version` also advertises protocol-1 `features.profile_identity` and a
+per-server `instance_id`. A request with `X-Wildllama-Profile-Model` or a `model`
+query parameter receives `wildllama.profile_check` with the requested name and
+its current named-manifest digest (or a bounded error code). This lookup reads
+metadata only: it does not enumerate the model catalogue, read weights or load a
+runner. The digest is checked on each probe, so externally replaced manifests
+cannot reuse an older profile confirmation. Existing version requests are
+unchanged, and clients without this optional feature retain their strict checks.

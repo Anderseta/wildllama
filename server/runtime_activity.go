@@ -46,7 +46,7 @@ func (s *Server) RuntimeActivityHandler(c *gin.Context) {
 	entries := make([]*runnerActivityEntry, 0)
 	queueLength, busy := 0, false
 	if s.sched != nil {
-		queueLength = len(s.sched.pendingReqCh)
+		queueLength = len(s.sched.pendingReqCh) + int(s.sched.pendingBacklog.Load())
 		// Loading can hold loadedMu while constructing a runner. A progress
 		// endpoint must never wait for the operation it is meant to describe.
 		if snapshot := s.sched.loadedSnapshot.Load(); snapshot != nil {
