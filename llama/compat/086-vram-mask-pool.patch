@@ -828,7 +828,7 @@ diff --git a/tests/test-compact-attn-mask.cpp b/tests/test-compact-attn-mask.cpp
 new file mode 100644
 --- /dev/null
 +++ b/tests/test-compact-attn-mask.cpp
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,289 @@
 +#include "ggml.h"
 +#include "ggml-backend.h"
 +#include "ggml-cpp.h"
@@ -863,10 +863,12 @@ new file mode 100644
 +    const auto dense_bytes=ggml_nbytes(mask);
 +    make_compact(mask);
 +    require(ggml_attn_mask_compact_valid(mask),"valid compact representation rejected");
-+    require(ggml_nbytes(mask)<dense_bytes/16,"packed representation did not reduce mask storage");
++    const size_t expected_packed=2*sizeof(int32_t)*(size_t(k->ne[0])+size_t(q->ne[0]))*size_t(k->ne[2]);
++    require(ggml_nbytes(mask)==expected_packed && ggml_nbytes(mask)<dense_bytes/8,
++        "packed representation byte accounting or storage reduction is incorrect");
 +    auto invalid=*mask;invalid.ne[0]++;
 +    require(!ggml_attn_mask_compact_valid(&invalid),"invalid compact shape accepted");
-+    invalid=*mask;invalid.nb[1]++;
++    invalid=*mask;invalid.nb[3]++; // Both streams are live: this stride is semantically used.
 +    require(!ggml_attn_mask_compact_valid(&invalid),"invalid compact stride accepted");
 +    invalid=*mask;invalid.op_params[0]^=1;
 +    require(!ggml_attn_mask_compact_valid(&invalid),"invalid metadata version accepted");

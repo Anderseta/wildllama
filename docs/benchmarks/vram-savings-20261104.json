@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "date": "2026-11-04",
+  "scope": "Small synthetic CPU/CUDA correctness and memory contracts; no pretrained-model quality or throughput claim",
+  "pinned_native_revision": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "patch_sha256": {
+    "085-vram-compute-growth.patch": "9fbbb91af5bf3b04b82b18775666cdcaa1183febb7d457e70c3efc42b75f721a",
+    "086-vram-mask-pool.patch": "1133c4eefea5442396c398589a92740f0ee2e5139c358edef124390804597d68"
+  },
+  "backend": "NVIDIA CUDA 12.8, SM120; CPU fallback checks",
+  "cpu_checks_passed": 11,
+  "cuda_checks_passed": 8,
+  "compute_growth": {
+    "cases_per_backend": 12,
+    "coverage": "Dense/hybrid, paged/conventional, F32/F16/Q8 KV, growth, state restore and continuation",
+    "initial_compute_rows": 256,
+    "final_compute_rows": 1536,
+    "logical_context_rows": 1536,
+    "continuation_logits": "bitwise identical in the twelve compute-only cases",
+    "kv_initial_zero_independence": true,
+    "optimizer_transition_preserves_prior_state": true,
+    "automatic_fa_fallback_head_width": 48,
+    "automatic_fa_fallback_scaled_logit_error": 0,
+    "automatic_fa_fallback_greedy_selection": "identical",
+    "mtp_attention_only_owner_and_actual_paged_reads": true,
+    "mtp_catchup_growth_and_greedy_proposals": "passed",
+    "gpu_managed_limit_mib": 192,
+    "repeated_denials_per_dense_or_hybrid_case": 2,
+    "denied_state": "byte-exact KV/recurrent state, no sequence advancement; retry after release succeeds"
+  },
+  "compact_attention": {
+    "host_exact_visibility_predicates": 249600,
+    "cuda_cases": 12,
+    "stored_kv_types": ["f16", "q8_0"],
+    "query_counts": [1, 2, 5, 65, 1024, 1025],
+    "coverage": "GQA, streams, partial query tiles, changed metadata/replay, sinks, soft caps, shape/version rejection and CPU fallback",
+    "maximum_scaled_error_against_dense_flash_attention": 0,
+    "admitted_qwen_hybrid_implicit_execution": true,
+    "integrated_dense_and_partial_offload_fallback": true
+  },
+  "cuda_scratch_pool": {
+    "managed_limit_mib": 248,
+    "high_managed_bytes": 240664576,
+    "low_managed_bytes": 205012992,
+    "released_bytes": 35651584,
+    "released_mib": 34,
+    "all_graph_tensor_buffers_remain_live_during_release": true,
+    "stable_warm_reuse": true,
+    "large_graph_reentry_outputs": "exact",
+    "managed_bytes_after_backend_destruction": 0
+  },
+  "commands": [
+    "test-compute-growth",
+    "test-compute-growth --cuda",
+    "test-compact-attn-mask --host-only",
+    "test-compact-attn-mask --cuda",
+    "test-device-attn-mask --compact FIXTURE_DIRECTORY",
+    "test-device-attn-mask --cuda --compact FIXTURE_DIRECTORY"
+  ],
+  "combined_gpu_scope": "Compute-growth matrix repeated with compact masks and CUDA pool trimming enabled; actual ordinary Qwen hybrid implicit execution observed",
+  "defaults": "All new savings switches remain opt-in; no automatic profile migration",
+  "pretrained_models_loaded": 0,
+  "downloads": 0,
+  "trained_model_tps_benchmark": false
+}

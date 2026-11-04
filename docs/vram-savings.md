@@ -72,6 +72,15 @@ dimensions. These allocations have overlapping lifetimes and reservations:
 **do not add the estimates or promise the same savings for another model**.
 CPU host allocations can grow when a graph's placement changes.
 
+The [small validation record](benchmarks/vram-savings-20261104.json) reports
+eleven CPU checks and eight CUDA checks. Compute-only continuations stayed
+bitwise identical in twelve dense/hybrid cache combinations per backend. Twelve
+CUDA mask fixtures matched dense Flash Attention exactly, and a separate bounded
+GEMM fixture returned 34 MiB of actual scratch backing with live inputs preserved.
+Repeated allocation denial preserved KV/recurrent state and succeeded after
+pressure was removed. Automatic FA fallback and optimizer-mode transitions
+restore conventional full reservation before execution.
+
 Analytical VRAM estimates remain conservative rather than subtracting hypothetical
 savings. Numerical/resource fixture tests establish their stated correctness
 scope; they do not establish trained-model quality or throughput on every GPU.

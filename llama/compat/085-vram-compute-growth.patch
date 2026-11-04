@@ -10,14 +10,15 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      }
  
      // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
-@@ -866,6 +868,49 @@
+@@ -866,6 +868,51 @@
      ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
  }
  
 +llama_kv_cache * llama_context::compute_growth_cache() const {
-+    if (!compute_growth_requested || !memory || cparams.training || cparams.pipeline_parallel ||
-+            !cparams.causal_attn || !cparams.flash_attn || model.hparams.no_alloc ||
-+            model.n_devices() > 1 || model.has_tensor_overrides()) { return nullptr; }
++    // Raw ownership lookup must remain available after a mode/capability
++    // changes. Otherwise a previously bounded cache could keep a small dummy
++    // reservation while future preflights silently stop tracking its growth.
++    if (!memory) { return nullptr; }
 +    if (typeid(*memory) == typeid(llama_kv_cache)) { return static_cast<llama_kv_cache *>(memory.get()); }
 +    if (typeid(*memory) == typeid(llama_memory_hybrid)) {
 +        auto * hybrid = static_cast<llama_memory_hybrid *>(memory.get());
@@ -28,6 +29,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 +}
 +
 +bool llama_context::preflight_compute_growth(const llama_memory_context_i * mctx) {
++    if (!compute_growth_requested) { return true; }
 +    auto * cache = compute_growth_cache();
 +    if (!cache || !mctx) { return true; }
 +    const llama_kv_cache_context * attention = nullptr;
@@ -60,20 +62,42 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -883,6 +928,12 @@
+@@ -883,6 +930,18 @@
  
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
-+    if (auto * cache = compute_growth_cache()) {
-+        if (cache->enable_compute_growth(std::max(n_tokens, n_seqs))) {
++    auto * growth_cache = compute_growth_cache();
++    const bool growth_eligible = compute_growth_requested && !cparams.training && !cparams.pipeline_parallel &&
++        cparams.causal_attn && cparams.flash_attn && !model.hparams.no_alloc && model.n_devices() <= 1 &&
++        !model.has_tensor_overrides();
++    if (growth_cache) {
++        if (growth_eligible && growth_cache->enable_compute_growth(std::max(n_tokens, n_seqs))) {
 +            LLAMA_LOG_INFO("compute growth: reserving %u KV rows of %u logical rows\n",
-+                cache->get_compute_reservation(), cache->get_size());
++                growth_cache->get_compute_reservation(), growth_cache->get_size());
++        } else if (growth_cache->grow_compute_reservation(growth_cache->get_size())) {
++            LLAMA_LOG_INFO("compute growth: restoring full reservation after mode or ownership change\n");
 +        }
 +    }
  
      const size_t max_nodes = this->graph_max_nodes(n_tokens);
  
-@@ -2958,7 +3009,16 @@
+@@ -911,6 +970,15 @@
+     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+ 
+     resolve_fused_ops(mctx.get(), n_seqs);
++
++    // An automatic FA probe can disable Flash Attention after the bounded
++    // dummy context above was constructed. Rebuild that context at full size
++    // before allocating the unfused graph, never after a real batch apply().
++    if (growth_cache && !cparams.flash_attn && growth_cache->grow_compute_reservation(growth_cache->get_size())) {
++        LLAMA_LOG_INFO("compute growth: restoring full reservation after automatic Flash Attention fallback\n");
++        mctx = memory->init_full();
++        if (!mctx) { throw std::runtime_error("failed to initialize full memory after Flash Attention fallback"); }
++    }
+ 
+     // reserve worst-case graph
+     int n_splits_pp        = -1;
+@@ -2958,7 +3026,16 @@
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -91,7 +115,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
  
      bool did_optimize = false;
  
-@@ -3009,6 +3069,8 @@
+@@ -3009,6 +3086,8 @@
  
          break;
      }
@@ -322,11 +346,12 @@ diff --git a/tests/test-compute-growth.cpp b/tests/test-compute-growth.cpp
 new file mode 100644
 --- /dev/null
 +++ b/tests/test-compute-growth.cpp
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,340 @@
 +#include "llama.h"
 +#include "llama-cpp.h"
 +#include "ggml-cpp.h"
 +#include "gguf.h"
++#include "ggml-opt.h"
 +#include "speculative.h"
 +#include "../src/llama-ext.h"
 +#include "../src/llama-kv-cache.h"
@@ -351,15 +376,15 @@ new file mode 100644
 +#endif
 +}
 +
-+static llama_model_ptr model(bool hybrid, bool mtp = false) {
++static llama_model_ptr model(bool hybrid, bool mtp = false, uint32_t head_override = 0) {
 +    gguf_context_ptr metadata(gguf_init_empty());
 +    const std::string arch = hybrid ? "qwen35" : "llama";
 +    gguf_set_val_str(metadata.get(), "general.architecture", arch.c_str());
 +    gguf_set_val_str(metadata.get(), "general.name", "nonzero-compute-growth-fixture");
 +    auto u32 = [&](const char * key, uint32_t value) { gguf_set_val_u32(metadata.get(), (arch + "." + key).c_str(), value); };
-+    u32("context_length", 16384); u32("embedding_length", 128); u32("block_count", mtp ? 3 : 2);
-+    u32("feed_forward_length", 128); u32("attention.head_count", 2); u32("attention.head_count_kv", 1);
-+    const uint32_t head_size = gpu ? 256 : 64;
++    u32("context_length", 16384); u32("embedding_length", head_override ? head_override * 4 : 128); u32("block_count", mtp ? 3 : 2);
++    u32("feed_forward_length", 128); u32("attention.head_count", head_override ? 4 : 2); u32("attention.head_count_kv", 1);
++    const uint32_t head_size = head_override ? head_override : (gpu ? 256 : 64);
 +    u32("attention.key_length", head_size); u32("attention.value_length", head_size); u32("rope.dimension_count", head_size);
 +    gguf_set_val_f32(metadata.get(), (arch + ".attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
 +    if (hybrid) {
@@ -402,14 +427,16 @@ new file mode 100644
 +}
 +
 +static llama_context_ptr context(llama_model * weights, bool growth, bool paged, ggml_type type,
-+                                 uint32_t capacity = 1536, bool mtp = false, bool flash = true, llama_context * other = nullptr) {
++                                 uint32_t capacity = 1536, bool mtp = false, bool flash = true, llama_context * other = nullptr,
++                                 bool automatic_flash = false) {
 +    environment("WILDLLAMA_COMPUTE_GROWTH", growth ? "1" : "0");
 +    environment("WILDLLAMA_PAGED_ATTENTION", paged ? "1" : "0");
 +    auto p = llama_context_default_params();
 +    p.n_ctx = capacity; p.n_batch = 512; p.n_ubatch = 128; p.n_seq_max = 1; p.n_rs_seq = 2;
 +    p.kv_unified = true; p.n_threads = p.n_threads_batch = 1; p.type_k = p.type_v = type;
 +    p.n_outputs_max = 1; p.n_outputs_max_per_seq = 1; p.op_offload = p.offload_kqv = gpu;
-+    p.flash_attn_type = flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    p.flash_attn_type = automatic_flash ? LLAMA_FLASH_ATTN_TYPE_AUTO :
++        (flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED);
 +    p.ctx_type = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
 +    p.ctx_other = other;
 +    llama_context_ptr result(llama_init_from_model(weights, p));
@@ -486,6 +513,77 @@ new file mode 100644
 +    environment("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "256");
 +    { auto ctx = context(weights.get(), true, false, GGML_TYPE_F16, 1536, false, false);
 +      require(cache(ctx.get())->get_compute_reservation() == 1536, "unsupported non-FA layout did not retain full reservation"); }
++}
++
++struct fallback_log {
++    bool bounded = false;
++    bool auto_fallback = false;
++    bool mode_fallback = false;
++    static void write(enum ggml_log_level, const char * text, void * opaque) {
++        auto & record = *static_cast<fallback_log *>(opaque);
++        record.bounded |= std::strstr(text, "compute growth: reserving 256 KV rows") != nullptr;
++        record.auto_fallback |= std::strstr(text, "restoring full reservation after automatic Flash Attention fallback") != nullptr;
++        record.mode_fallback |= std::strstr(text, "restoring full reservation after mode or ownership change") != nullptr;
++        std::fputs(text, stderr);
++    }
++};
++
++static void capability_transitions() {
++    if (!gpu) {
++        // Real optimizer initialization turns FA off after this context already
++        // used its bounded reservation. Full graph reservation must be restored
++        // even though the old FA eligibility predicate is now false.
++        auto weights = model(false);
++        auto ctx = context(weights.get(), true, false, GGML_TYPE_F16);
++        decode(ctx.get(), 0, 128);
++        require(cache(ctx.get())->get_compute_reservation() == 256, "training transition fixture was not bounded");
++        const auto before = state(ctx.get());
++        fallback_log record;
++        llama_log_set(fallback_log::write, &record);
++        struct reset_log { ~reset_log() { llama_log_set(nullptr, nullptr); } } restore_log;
++        llama_opt_params options{};
++        options.n_ctx_train = 1536;
++        options.param_filter = [](const ggml_tensor *, void *) { return false; };
++        options.get_opt_pars = ggml_opt_get_default_optimizer_params;
++        options.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
++        llama_opt_init(ctx.get(), weights.get(), options);
++        require(record.mode_fallback && cache(ctx.get())->get_compute_reservation() == 1536,
++            "losing FA after context initialization kept the bounded reservation");
++        require(state(ctx.get()) == before, "full reservation fallback changed existing KV state");
++        std::puts("COMPUTE_GROWTH_FALLBACK optimizer_FA_off=1 prior_state=exact full_reservation=1536 PASS");
++    } else {
++        // Head40 is supported by the pinned CUDA tile kernel. Head48 is not;
++        // its ordinary unfused GEMM path is supported. Strict GPU mode makes
++        // the automatic FA probe reject its CPU-only fusion before execution.
++        auto weights = model(false, false, 48);
++        fallback_log record;
++        llama_log_set(fallback_log::write, &record);
++        struct reset_log { ~reset_log() { llama_log_set(nullptr, nullptr); } } restore_log;
++        auto automatic = context(weights.get(), true, false, GGML_TYPE_F16, 1536, false, true, nullptr, true);
++        require(record.bounded && record.auto_fallback && cache(automatic.get())->get_compute_reservation() == 1536,
++            "automatic FA fallback was not exercised or retained a bounded dummy context");
++        auto conventional = context(weights.get(), false, false, GGML_TYPE_F16, 1536, false, false);
++        float maximum_error = 0;
++        for (int position = 0; position < 384; position += 128) {
++            const auto expected = decode(conventional.get(), position, 128);
++            const auto actual = decode(automatic.get(), position, 128);
++            require(expected.size() == actual.size(), "auto-FA fallback changed vocabulary size");
++            // Auto FA allocated ordinary V storage before its probe disabled
++            // the fusion; explicit FA-off uses transposed V storage. Both keep
++            // F16 bytes, but different GEMM layouts need a numerical gate.
++            for (size_t i = 0; i < expected.size(); ++i) {
++                require(std::isfinite(expected[i]) && std::isfinite(actual[i]), "auto-FA fallback produced nonfinite logits");
++                maximum_error = std::max(maximum_error, std::fabs(expected[i] - actual[i]) / std::max(1.f, std::fabs(expected[i])));
++            }
++            require(maximum_error <= 2e-4f &&
++                std::max_element(expected.begin(), expected.end()) - expected.begin() ==
++                    std::max_element(actual.begin(), actual.end()) - actual.begin(),
++                "auto-FA fallback changed greedy continuation or exceeded numerical gate");
++        }
++        require(llama_memory_seq_pos_max(llama_get_memory(automatic.get()), 0) == 383,
++            "auto-FA fallback could not continue past its old compute floor");
++        std::printf("COMPUTE_GROWTH_FALLBACK automatic_FA_unsupported_head=48 actual_probe=1 unfused_CUDA_scaled_error=%.9g greedy=identical full_reservation=1536 PASS\n", maximum_error);
++    }
 +}
 +
 +static void quota_denial(bool hybrid) {
@@ -584,7 +682,7 @@ new file mode 100644
 +                for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) { growth_cases(hybrid, paged, type); }
 +            }
 +        }
-+        independent_and_fallback(); draft_ownership(); quota_denial(false); quota_denial(true);
++        independent_and_fallback(); capability_transitions(); draft_ownership(); quota_denial(false); quota_denial(true);
 +        llama_backend_free();
 +        std::printf("COMPUTE_GROWTH backend=%s model_cases=12 pretrained_models=0 downloads=0 PASS\n", gpu ? "CUDA" : "CPU"); return 0;
 +    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
