@@ -1,0 +1,1786 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -846,7 +846,7 @@
+ 
+     // All rows belong to the same completed decode. Sampling and acceptance
+     // update only host sampler state; no context work is submitted between rows.
+-    llama_synchronize(ctx);
++    llama_synchronize_sampler_outputs(ctx);
+ 
+     llama_sampler_output last_backend{};
+     last_backend.sampled_token = LLAMA_TOKEN_NULL;
+@@ -912,7 +912,9 @@
+     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+ 
+-    llama_synchronize(ctx);
++    // Rejection sampling needs p and q, not just target token equality. Keep
++    // its existing algorithm and batch all deferred output transfers first.
++    llama_synchronize_sampler_outputs(ctx);
+ 
+     size_t i = 0;
+     for (; i < draft.size(); i++) {
+diff --git a/ggml/src/ggml-cuda/affine-gate.h b/ggml/src/ggml-cuda/affine-gate.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/affine-gate.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++#include "affine-fusion.h"
++
++inline bool ggml_cuda_affine_gate_unary(ggml_unary_op op) {
++    return op == GGML_UNARY_OP_SOFTPLUS || op == GGML_UNARY_OP_SIGMOID || op == GGML_UNARY_OP_SILU;
++}
++
++inline bool ggml_cuda_affine_gate_shape(const ggml_tensor * tensor, int64_t & count) {
++    if (!tensor || tensor->type != GGML_TYPE_F32) { return false; }
++    count = 1;
++    for (const auto dimension : tensor->ne) {
++        if (dimension <= 0 || dimension > INT32_MAX / count) { return false; }
++        count *= dimension;
++    }
++    return ggml_is_contiguous(tensor);
++}
++
++inline bool ggml_cuda_affine_gate_operand(const ggml_tensor * tensor, const ggml_tensor * input) {
++    int64_t count = 0;
++    return ggml_cuda_affine_gate_shape(tensor, count) &&
++        (ggml_are_same_shape(tensor, input) || ggml_cuda_column_vector(tensor, input->ne[0]));
++}
++
++inline bool ggml_cuda_match_affine_gate(const ggml_cgraph * graph, int i, bool allocated) {
++    if (!graph || i < 0 || graph->n_nodes < 3 || i > graph->n_nodes - 3) { return false; }
++    const auto * add = graph->nodes[i];
++    const auto * unary = graph->nodes[i + 1];
++    const auto * output = graph->nodes[i + 2];
++    if (!add || !unary || !output || add->op != GGML_OP_ADD || unary->op != GGML_OP_UNARY ||
++        output->op != GGML_OP_MUL || unary->src[0] != add ||
++        (output->src[0] != unary && output->src[1] != unary) ||
++        !ggml_cuda_affine_gate_unary(ggml_get_unary_op(unary))) { return false; }
++    const auto * input = add->src[0];
++    const auto * bias = add->src[1];
++    const auto * factor = output->src[0] == unary ? output->src[1] : output->src[0];
++    int64_t count = 0;
++    if (!ggml_cuda_affine_gate_shape(input, count) ||
++        !ggml_cuda_affine_gate_operand(bias, input) || !ggml_cuda_affine_gate_operand(factor, input)) { return false; }
++    for (const auto * tensor : { add, unary, output }) {
++        int64_t tensor_count = 0;
++        if (!ggml_cuda_affine_gate_shape(tensor, tensor_count) || !ggml_are_same_shape(input, tensor)) { return false; }
++    }
++    if (!ggml_can_fuse_subgraph(graph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { i + 2 })) { return false; }
++    if (!allocated) { return true; }
++    for (const auto * tensor : { input, bias, factor, output }) {
++        if (!tensor->data || (reinterpret_cast<uintptr_t>(tensor->data) % alignof(float)) != 0) { return false; }
++    }
++    // Keep allocator lifetimes unchanged; only exact element aliases are safe.
++    for (const auto * source : { input, bias, factor }) {
++        if (!ggml_cuda_residual_norm_disjoint(output, source) && !ggml_cuda_same_element_storage(output, source)) { return false; }
++    }
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -44,6 +44,7 @@
+ #include "ggml-cuda/dense-reuse.h"
+ #include "ggml-cuda/residual-norm.h"
+ #include "ggml-cuda/affine-fusion.h"
++#include "ggml-cuda/affine-gate.h"
+ #include "ggml-cuda/verify.cuh"
+ #include "ggml-cuda/graph-reuse.h"
+ #include "ggml-cuda/resident-tuning-policy.h"
+@@ -4602,6 +4603,11 @@
+ static std::atomic<uint64_t> ggml_cuda_residual_norm_fusions{0};
+ static std::atomic<uint64_t> ggml_cuda_norm_affine_fusions{0};
+ static std::atomic<uint64_t> ggml_cuda_bias_activation_fusions{0};
++static std::atomic<uint64_t> ggml_cuda_affine_gate_fusions{0};
++
++static uint64_t ggml_backend_cuda_test_affine_gate_fusions() {
++    return ggml_cuda_affine_gate_fusions.load(std::memory_order_relaxed);
++}
+ 
+ static uint64_t ggml_backend_cuda_test_residual_norm_fusions() {
+     return ggml_cuda_residual_norm_fusions.load(std::memory_order_relaxed);
+@@ -4637,6 +4643,11 @@
+     }
+ 
+     if (cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_dense_opt_enabled()) {
++        if (node->op == GGML_OP_ADD && ggml_cuda_match_affine_gate(cgraph, i, true)) {
++            ggml_cuda_op_affine_gate_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++            ggml_cuda_affine_gate_fusions.fetch_add(1, std::memory_order_relaxed);
++            return 2;
++        }
+         if (node->op == GGML_OP_NORM && ggml_cuda_match_norm_affine(cgraph, i, true)) {
+             ggml_cuda_op_norm_affine_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+             ggml_cuda_norm_affine_fusions.fetch_add(1, std::memory_order_relaxed);
+@@ -7303,6 +7314,9 @@
+ }
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_cuda_test_affine_gate_fusions") == 0) {
++        return (void *) ggml_backend_cuda_test_affine_gate_fusions;
++    }
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+     if (strcmp(name, "ggml_backend_cuda_tuning_api") == 0) {
+         return const_cast<ggml_backend_cuda_tuning_api *>(&ggml_cuda_resident_tuning_api);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -814,3 +814,41 @@
+         default: GGML_ABORT("unsupported fused bias activation");
+     }
+ }
++
++template <float (*op)(float)>
++static __global__ void affine_gate_f32(const float * input, const float * bias, const float * factor,
++        float * output, int count, bool bias_vector, bool factor_vector, uint3 columns) {
++    ggml_cuda_pdl_lc();
++    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++    if (i >= count) { return; }
++    const int column = bias_vector || factor_vector ? fastmodulo(int(i), columns) : 0;
++    ggml_cuda_pdl_sync();
++    const float sum = __fadd_rn(input[i], bias[bias_vector ? column : i]);
++    const float activated = op(sum);
++    output[i] = __fmul_rn(activated, factor[factor_vector ? column : i]);
++}
++
++template <float (*op)(float)>
++static void affine_gate_f32_launch(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * add, const ggml_tensor * unary, ggml_tensor * output) {
++    const auto * input = add->src[0];
++    const auto * bias = add->src[1];
++    const auto * factor = output->src[0] == unary ? output->src[1] : output->src[0];
++    const int count = int(ggml_nelements(output));
++    const dim3 blocks((int64_t(count) + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE);
++    const ggml_cuda_kernel_launch_params launch_params{ blocks, dim3(CUDA_GLU_BLOCK_SIZE), 0, ctx.stream() };
++    ggml_cuda_kernel_launch(affine_gate_f32<op>, launch_params,
++        (const float *) input->data, (const float *) bias->data, (const float *) factor->data,
++        (float *) output->data, count, ggml_nelements(bias) != count, ggml_nelements(factor) != count,
++        init_fastdiv_values(int(input->ne[0])));
++}
++
++void ggml_cuda_op_affine_gate_fused(ggml_backend_cuda_context & ctx,
++        ggml_tensor * add, ggml_tensor * unary, ggml_tensor * output) {
++    switch (ggml_get_unary_op(unary)) {
++        case GGML_UNARY_OP_SOFTPLUS: affine_gate_f32_launch<op_softplus>(ctx, add, unary, output); break;
++        case GGML_UNARY_OP_SIGMOID: affine_gate_f32_launch<op_sigmoid>(ctx, add, unary, output); break;
++        case GGML_UNARY_OP_SILU: affine_gate_f32_launch<op_silu>(ctx, add, unary, output); break;
++        default: GGML_ABORT("unsupported fused affine gate");
++    }
++}
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -123,3 +123,5 @@
+ }
+ 
+ void ggml_cuda_op_bias_activation_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * output);
++
++void ggml_cuda_op_affine_gate_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * output);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1165,16 +1165,38 @@
+     return ctx && ctx->draft_response_overlap_supported();
+ }
+ 
+-bool llama_context::adaptive_prefill_supported(bool allow_pending_reservation) const {
+-    // The first scheduling policy only alternates ordinary pure-decode and
+-    // original prompt rounds. Unknown memory/provider layouts retain admission.
+-    if (!memory || typeid(*memory) != typeid(llama_kv_cache) || !sched || (!allow_pending_reservation && sched_need_reserve) ||
++bool llama_context::adaptive_prefill_supported(bool allow_pending_reservation, bool allow_neural_outputs) const {
++    // Scheduling only changes the number of OTHER prompt rows admitted beside
++    // an intact generating/verification batch. Unknown memory/provider classes
++    // keep ordinary admission. This does not grant parallelism to the wrapper.
++    if (!memory || !sched || (!allow_pending_reservation && sched_need_reserve) ||
+             cparams.training || cparams.pipeline_parallel || cparams.warmup || cparams.embeddings ||
+-            cparams.embeddings_nextn || !cparams.causal_attn || !cparams.kv_unified || cparams.n_seq_max < 2 ||
+-            model.hparams.n_pos_per_embd() != 1 || model.hparams.ple_n_heads || model.hparams.n_swa ||
++            (cparams.embeddings_nextn && !allow_neural_outputs) || !cparams.causal_attn || !cparams.kv_unified || cparams.n_seq_max < 2 ||
++            model.hparams.ple_n_heads || model.hparams.n_swa ||
+             moe_cache || model.ram_cache || model.hparams.no_alloc || model.n_devices() > 1 ||
+             model.has_tensor_overrides()) { return false; }
+-    return static_cast<const llama_kv_cache *>(memory.get())->get_n_stream() == 1;
++    const auto positions = model.hparams.n_pos_per_embd();
++    if (positions != 1 && positions != GGML_MROPE_SECTIONS) { return false; }
++    const llama_kv_cache * attention = nullptr;
++    const llama_memory_recurrent * recurrent = nullptr;
++    if (typeid(*memory) == typeid(llama_kv_cache)) {
++        attention = static_cast<const llama_kv_cache *>(memory.get());
++    } else if (typeid(*memory) == typeid(llama_memory_hybrid)) {
++        const auto * hybrid = static_cast<const llama_memory_hybrid *>(memory.get());
++        attention = hybrid->get_mem_attn();
++        recurrent = hybrid->get_mem_recr();
++    } else if (typeid(*memory) == typeid(llama_memory_recurrent)) {
++        recurrent = static_cast<const llama_memory_recurrent *>(memory.get());
++    } else {
++        return false;
++    }
++    if (attention && (typeid(*attention) != typeid(llama_kv_cache) || attention->get_n_stream() != 1 ||
++            attention->get_n_seq_max() < cparams.n_seq_max)) { return false; }
++    // Recurrent rollback cursors are independently allocated per sequence.
++    // Parent/child or media tasks are excluded by the server admission proof;
++    // derived recurrent/indexed layouts must establish their own contract.
++    return !recurrent || (typeid(*recurrent) == typeid(llama_memory_recurrent) &&
++        recurrent->rs_idx.size() >= cparams.n_seq_max && recurrent->size >= cparams.n_seq_max);
+ }
+ 
+ bool llama_output_overlap_supported(const llama_context * ctx) {
+@@ -1526,13 +1548,17 @@
+     if (fence) { synchronize(); }
+ }
+ 
+-void llama_context::materialize_sampler_outputs() {
++void llama_context::materialize_sampler_outputs(bool always_fence) {
+     bool copied = false;
+     for (size_t row = 0; row < deferred_sampler_rows.size(); ++row) {
+         copied |= !deferred_sampler_rows[row].materialized;
+         materialize_sampler_row(row, false);
+     }
+-    if (copied) { synchronize(); }
++    if (copied || always_fence) { synchronize(); }
++}
++
++void llama_context::synchronize_sampler_outputs() {
++    materialize_sampler_outputs(true);
+ }
+ 
+ void llama_context::release_device_verifier_local(bool preflight) {
+@@ -2078,6 +2104,7 @@
+     dst.active = gf_res_prev_active;
+     dst.bytes = graph_variant_bytes;
+     dst.last_used = graph_variant_last_used;
++    dst.shape = graph_variant_shape;
+     gf_res_prev_active = nullptr;
+ }
+ 
+@@ -2089,6 +2116,7 @@
+     gf_res_prev_active = src.active;
+     graph_variant_bytes = src.bytes;
+     graph_variant_last_used = src.last_used;
++    graph_variant_shape = src.shape;
+     graph_variant_active = index;
+     src.active = nullptr;
+     src.bytes = 0;
+@@ -2109,6 +2137,7 @@
+     }
+     variant.active = nullptr;
+     variant.bytes = 0;
++    variant.shape = {};
+     // Keep metadata arenas in fixed slots, rather than allocating new metadata
+     // addresses (and therefore new potential CUDA graph keys) on every eviction.
+     for (auto & result : variant.results) { if (result) { result->reset(); } }
+@@ -2119,6 +2148,7 @@
+     output_overlap_checked = nullptr;
+     draft_overlap_checked = nullptr;
+     graph_prefill_admission.clear();
++    graph_execution_plan.clear();
+     if (graph_variant_active) {
+         ggml_backend_sched_synchronize(sched.get());
+         graph_variant_save();
+@@ -2271,9 +2301,17 @@
+             }
+             continue;
+         }
+-        if (!chosen || variant.last_used < graph_variants[chosen].last_used) { chosen = i; }
++        if (!chosen || graph_execution_plan.prefer_victim(variant.shape, variant.bytes,
++                graph_variants[chosen].shape, graph_variants[chosen].bytes) ||
++                (!graph_execution_plan.prefer_victim(graph_variants[chosen].shape,
++                    graph_variants[chosen].bytes, variant.shape, variant.bytes) &&
++                 variant.last_used < graph_variants[chosen].last_used)) { chosen = i; }
+     }
+     if (!chosen) { graph_prefill_admission.deny(shape); return graph_variant_selection::none; }
++    if (graph_variants[chosen].sched && !graph_execution_plan.replace(shape,
++            graph_variants[chosen].shape, graph_variants[chosen].bytes)) {
++        return graph_variant_selection::none;
++    }
+ 
+     ggml_backend_sched_synchronize(sched.get());
+     graph_variant_save();
+@@ -2342,12 +2380,17 @@
+             size_t victim = 0;
+             for (size_t i = 1; i < graph_variants.size(); ++i) {
+                 if (!graph_variants[i].sched) { continue; }
+-                if (!victim || graph_variants[i].last_used < graph_variants[victim].last_used) { victim = i; }
++                if (!victim || graph_execution_plan.prefer_victim(graph_variants[i].shape,
++                        graph_variants[i].bytes, graph_variants[victim].shape, graph_variants[victim].bytes) ||
++                        (!graph_execution_plan.prefer_victim(graph_variants[victim].shape,
++                            graph_variants[victim].bytes, graph_variants[i].shape, graph_variants[i].bytes) &&
++                         graph_variants[i].last_used < graph_variants[victim].last_used)) { victim = i; }
+             }
+             if (!victim) { restore_primary(); return graph_variant_selection::none; }
+             graph_variant_evict(victim);
+         }
+ 
++        const int64_t plan_preparation_start_us = ggml_time_us();
+         gf = create();
+         if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             restore_primary(); return graph_variant_selection::none;
+@@ -2363,6 +2406,8 @@
+         }
+         graph_variant_bytes = actual;
+         graph_variant_last_used = ++graph_variant_clock;
++        graph_variant_shape = shape;
++        graph_execution_plan.prepared(shape, ggml_time_us() - plan_preparation_start_us);
+         gf_res_prev_active = get_gf_res_prev();
+         LLAMA_LOG_DEBUG("%s: retained exact graph in arena %zu (%zu bytes, total %zu)\n",
+                 __func__, chosen, actual, graph_variant_retained_bytes());
+@@ -2384,6 +2429,26 @@
+ 
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
++
++    // Learn only from work already requested. Context ownership keys this
++    // bounded host policy to the loaded model/backend/options. No extra GPU
++    // execution or calibration allocation is needed, on any backend.
++    llama_execution_plan::shape plan_shape = {};
++    const bool plan_enabled = graph_variant_budget && !graph_reuse_disable && !graph_variant_reuse_only &&
++        !cparams.warmup && !cparams.training && !cparams.pipeline_parallel && !moe_cache && !model.ram_cache &&
++        ubatch.n_tokens && ubatch.n_tokens <= llama_graph_variant_policy::max_tokens;
++    if (plan_enabled) {
++        uint32_t position_bucket = 0;
++        if (ubatch.n_tokens > llama_graph_variant_policy::max_decode_tokens && ubatch.pos) {
++            llama_pos maximum = 0;
++            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) { maximum = std::max(maximum, ubatch.pos[i]); }
++            position_bucket = uint32_t(maximum) / 256;
++        }
++        plan_shape = {ubatch.n_tokens, n_outputs, position_bucket, ubatch.n_seqs_unq, uint32_t(gtype),
++            uint32_t(bool(ubatch.token)) | (uint32_t(bool(ubatch.embd)) << 1) |
++                (uint32_t(bool(ubatch.embd_state)) << 2), cparams.nextn_layer_offset};
++        graph_execution_plan.observe(plan_shape);
++    }
+ 
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+@@ -2423,6 +2488,7 @@
+     } else {
+         output_overlap_checked = nullptr;
+         draft_overlap_checked = nullptr;
++        const int64_t preparation_start_us = plan_enabled ? ggml_time_us() : 0;
+         gf_res_prev_active = nullptr;
+         res->reset();
+ 
+@@ -2468,7 +2534,10 @@
+         }
+ 
+         gf_res_prev_active = res;
+-    }
++        if (plan_enabled) { graph_execution_plan.prepared(plan_shape, ggml_time_us() - preparation_start_us); }
++    }
++
++    if (plan_enabled) { graph_variant_shape = plan_shape; }
+ 
+     // set the input data for the input tensors
+     {
+@@ -5767,6 +5836,10 @@
+     return llama_get_sampler_output_ith_synchronized(ctx, i);
+ }
+ 
++void llama_synchronize_sampler_outputs(llama_context * ctx) {
++    ctx->synchronize_sampler_outputs();
++}
++
+ llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i) {
+     llama_sampler_output output {};
+     // Preserve the individual getter order used by common_sampler::set_logits.
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -5,6 +5,7 @@
+ #include "llama-cparams.h"
+ #include "llama-graph.h"
+ #include "llama-graph-variant-policy.h"
++#include "llama-execution-plan.h"
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
+@@ -74,7 +75,7 @@
+         return previous;
+     }
+     // Internal server scheduling capability; this is not a new public C API.
+-    LLAMA_API bool adaptive_prefill_supported(bool allow_pending_reservation = false) const;
++    LLAMA_API bool adaptive_prefill_supported(bool allow_pending_reservation = false, bool allow_neural_outputs = false) const;
+ 
+     bool set_graph_variant_reuse_only(bool value) {
+         const bool previous = graph_variant_reuse_only;
+@@ -127,6 +128,8 @@
+         uint64_t build_attempts = 0;
+         uint64_t encoder_hits = 0;
+         uint64_t token_embedding_hits = 0;
++        uint64_t plan_selections = 0;
++        uint64_t plans_preserved = 0;
+     };
+     // Internal diagnostic: secondary buffers and host graph metadata,
+     // excluding the primary reservation. No graph/scheduler pointers escape.
+@@ -136,6 +139,8 @@
+         stats.build_attempts = graph_variant_build_attempts;
+         stats.encoder_hits = graph_variant_encoder_hits;
+         stats.token_embedding_hits = graph_variant_token_embedding_hits;
++        stats.plan_selections = graph_execution_plan.selections;
++        stats.plans_preserved = graph_execution_plan.preserved;
+         // The primary tensor arena is baseline memory, but its new sampler
+         // snapshots exist only for the optional cache and count towards it.
+         const auto & primary = graph_variant_active ? graph_variants[0].results : gf_res_prev;
+@@ -189,6 +194,7 @@
+     float * get_embeddings_layer_inp(uint32_t lid);
+ 
+     llama_token * get_sampled_tokens() const;
++    void synchronize_sampler_outputs();
+     bool verify_draft_device(const std::vector<int> & indexes, const std::vector<llama_token> & draft,
+             std::vector<llama_token> & accepted);
+     llama_device_verification_stats get_device_verification_stats() const;
+@@ -493,7 +499,7 @@
+         std::getenv("WILDLLAMA_KV_CACHE_INITIAL_TOKENS"));
+     bool defer_sampler_outputs(const llm_graph_result * result, uint32_t row_offset, uint32_t total_rows);
+     void materialize_sampler_row(size_t row, bool fence = true);
+-    void materialize_sampler_outputs();
++    void materialize_sampler_outputs(bool always_fence = false);
+     void release_device_verifier_local(bool preflight = false);
+     void release_device_verifier_resources(bool preflight = false);
+     void preflight_device_verifier(const llama_memory_context_i * memory_context);
+@@ -577,6 +583,7 @@
+         llm_graph_result * active = nullptr;
+         size_t bytes = 0;
+         uint64_t last_used = 0;
++        llama_execution_plan::shape shape = {};
+     };
+     // Index zero is the original scheduler; at most four secondary arenas.
+     std::array<graph_variant_runtime, 5> graph_variants;
+@@ -596,6 +603,8 @@
+     mutable const llm_graph_result * draft_overlap_checked = nullptr;
+     mutable bool draft_overlap_cached = false;
+     llama_graph_variant_policy::prefill_admission graph_prefill_admission;
++    llama_execution_plan::policy graph_execution_plan;
++    llama_execution_plan::shape graph_variant_shape = {};
+     bool graph_sampler_bindings_failed = false;
+     size_t graph_variant_bytes = 0;
+     uint64_t graph_variant_clock = 0;
+diff --git a/src/llama-execution-plan.h b/src/llama-execution-plan.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-execution-plan.h
+@@ -0,0 +1,133 @@
++#pragma once
++
++#include "llama-graph-variant-policy.h"
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++
++// Backend-independent selection of already-supported exact graph plans. This
++// learns host graph-preparation cost from real work; it does not time GPU work,
++// run a second inference, alter kernels, pad batches, or grant extra memory.
++namespace llama_execution_plan {
++using shape = llama_graph_variant_policy::prefill_shape;
++
++class policy {
++    struct observation {
++        shape key = {};
++        uint64_t last = 0;
++        uint32_t uses = 0;
++        uint32_t preparation_us = 0;
++        uint64_t last_prepared = 0;
++        bool occupied = false;
++    };
++    std::array<observation, 16> observations = {};
++    uint64_t clock = 0;
++    size_t last_observation = 0;
++
++    const observation * find(const shape & key) const {
++        for (const auto & item : observations) {
++            if (item.occupied && item.key == key) { return &item; }
++        }
++        return nullptr;
++    }
++
++    static bool valid(const shape & key) {
++        return key.tokens && key.tokens <= llama_graph_variant_policy::max_tokens &&
++            key.outputs <= key.tokens && key.sequences && key.sequences <= key.tokens;
++    }
++
++    uint64_t value(const observation & item, size_t bytes) const {
++        // Cost saved per bounded unit of retained memory. Aging is in workload
++        // observations, not wall time, so a sleeping laptop does not lose its
++        // useful plan. Long-running contexts cannot overflow these products.
++        const uint64_t age = (clock - item.last) / 8;
++        const uint64_t pages = bytes / 65536 + (bytes % 65536 != 0);
++        // Successful retained hits do not refresh an old timing sample. Decay
++        // confidence separately so a one-off startup/driver stall cannot pin
++        // a plan forever merely because its shape stays frequent.
++        const uint64_t sample_age = (clock - item.last_prepared) / 32;
++        const uint64_t divisor = std::max<uint64_t>(1, std::min<uint64_t>(pages, 1 << 16)) *
++            (1 + std::min<uint64_t>(age, 1 << 16)) *
++            (1 + std::min<uint64_t>(sample_age, 1 << 16));
++        return uint64_t(item.preparation_us) * std::min<uint32_t>(item.uses, 1024) / divisor;
++    }
++
++public:
++    uint64_t preserved = 0;
++    uint64_t selections = 0;
++
++    void clear() { *this = {}; }
++
++    void observe(const shape & key) {
++        if (!valid(key)) { return; }
++        if (clock == std::numeric_limits<uint64_t>::max()) { clear(); }
++        ++clock;
++        auto & recent = observations[last_observation];
++        if (recent.occupied && recent.key == key) {
++            recent.last = clock;
++            recent.uses = std::min<uint32_t>(recent.uses + 1, 1024);
++            return;
++        }
++        observation * selected = nullptr;
++        for (auto & item : observations) {
++            if (item.occupied && item.key == key) { selected = &item; break; }
++            if (!selected || !item.occupied || (selected->occupied && item.last < selected->last)) {
++                selected = &item;
++            }
++        }
++        if (!selected->occupied || !(selected->key == key)) { *selected = {key, 0, 0, 0, 0, true}; }
++        selected->last = clock;
++        selected->uses = std::min<uint32_t>(selected->uses + 1, 1024);
++        last_observation = size_t(selected - observations.data());
++    }
++
++    // Only successful original graph construction supplies this measurement.
++    // No synchronization/event is inserted to obtain it. The bounded EWMA
++    // prevents a single slow driver/host episode from dominating indefinitely.
++    void prepared(const shape & key, int64_t elapsed_us) {
++        if (elapsed_us <= 0 || elapsed_us > 60 * 1000000) { return; }
++        for (auto & item : observations) {
++            if (!item.occupied || !(item.key == key)) { continue; }
++            const auto sample = uint32_t(elapsed_us);
++            item.preparation_us = item.preparation_us ?
++                uint32_t((uint64_t(item.preparation_us) * 3 + sample) / 4) : sample;
++            item.last_prepared = clock;
++            return;
++        }
++    }
++
++    // Prefer the original LRU decision when measurements are missing. Where
++    // both plans have been observed, keep a frequently reused expensive plan
++    // instead of replacing it for a one-off shape. This changes retention only;
++    // the complete native can_reuse check still decides actual compatibility.
++    bool replace(const shape & candidate, const shape & resident, size_t resident_bytes) {
++        ++selections;
++        const auto * next = find(candidate);
++        const auto * old = find(resident);
++        if (!next || !old || !old->preparation_us || old->uses < 3 || clock - old->last > 32) { return true; }
++        if (next->uses < 2) { ++preserved; return false; }
++        if (!next->preparation_us) { return true; }
++        // Candidate size is unknown until preflight. Compare at the resident's
++        // current charge; never pretend this predicts a device allocation.
++        if (value(*next, resident_bytes) < value(*old, resident_bytes)) {
++            ++preserved; return false;
++        }
++        return true;
++    }
++
++    // Among inactive owners, select the lowest measured rebuild saving per
++    // byte. Unknown measurements preserve the caller's original LRU ordering.
++    bool prefer_victim(const shape & candidate, size_t candidate_bytes,
++                       const shape & previous, size_t previous_bytes) const {
++        const auto * a = find(candidate);
++        const auto * b = find(previous);
++        return a && b && a->preparation_us && b->preparation_us &&
++            value(*a, candidate_bytes) < value(*b, previous_bytes);
++    }
++};
++
++static_assert(sizeof(policy) <= 2048, "execution planning must remain bounded host metadata");
++}
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -35,6 +35,9 @@
+ // It performs no synchronization. General callers must use the safe public
+ // llama_get_sampler_output_ith instead. Borrowed pointer lifetime is unchanged.
+ LLAMA_API llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i);
++// Host batch verification consumes every candidate row. Queue any deferred
++// output copies before one completion fence, including device-verify fallback.
++LLAMA_API void llama_synchronize_sampler_outputs(llama_context * ctx);
+ // Same completed-generation borrowing contract. Device-backed lazy output
+ // materialization still performs its required copy/completion when requested.
+ LLAMA_API float * llama_get_embeddings_nextn_ith_synchronized(llama_context * ctx, int32_t i);
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -5237,10 +5237,12 @@
+ static bool llama_sampler_device_verify_chain(const llama_sampler * sampler) {
+     if (!sampler || sampler->iface != &llama_sampler_chain_i) { return false; }
+     const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
+-    if (chain.samplers.empty() || chain.samplers.back().ptr->iface != &llama_sampler_greedy_i) { return false; }
+-    for (const auto & entry : chain.samplers) {
+-        const auto * iface = entry.ptr->iface;
+-        if (iface != &llama_sampler_empty_i && iface != &llama_sampler_greedy_i &&
++    if (chain.samplers.empty()) { return false; }
++    const auto * terminal = chain.samplers.back().ptr->iface;
++    if (terminal != &llama_sampler_greedy_i && terminal != &llama_sampler_dist_i) { return false; }
++    for (size_t i = 0; i + 1 < chain.samplers.size(); ++i) {
++        const auto * iface = chain.samplers[i].ptr->iface;
++        if (iface != &llama_sampler_empty_i &&
+                 iface != &llama_sampler_temp_i && iface != &llama_sampler_temp_ext_i &&
+                 iface != &llama_sampler_top_k_i && iface != &llama_sampler_top_p_i &&
+                 iface != &llama_sampler_min_p_i && iface != &llama_sampler_typical_i &&
+@@ -5261,6 +5263,11 @@
+     if (!sampler || sampler->iface != &llama_sampler_chain_i) { return false; }
+     const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
+     if (!chain.device_verify || !llama_sampler_device_verify_chain(sampler)) { return false; }
++    const auto * terminal = chain.samplers.back().ptr;
++    // Matching consumes already sampled target IDs. Rejected rows must not
++    // advance the terminal distribution sampler's committed RNG stream.
++    if (terminal->iface == &llama_sampler_dist_i &&
++            !static_cast<const llama_sampler_dist *>(terminal->ctx)->backend_transactional) { return false; }
+     return chain.is_init && chain.backend_selects_token && !chain.selected_only &&
+         std::all_of(chain.samplers.begin(), chain.samplers.end(), [](const auto & entry) { return entry.is_backend; });
+ }
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -59,6 +59,8 @@
+ LLAMA_API bool llama_sampler_backend_set_selected_only(llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only(const llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only_ready(const llama_sampler * sampler);
++// Target-sample matching only. Stochastic selectors must commit entropy only
++// for accepted rows; p/q rejection sampling keeps its host verification path.
+ LLAMA_API bool llama_sampler_backend_enable_device_verify(llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_device_verify_ready(const llama_sampler * sampler);
+ LLAMA_API void llama_sampler_backend_begin(llama_sampler * sampler);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -162,6 +162,26 @@
+         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+         ARGS https://huggingface.co/ggml-org/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
+     )
++endif()
++
++# Portable execution planning and bounded prompt-span contracts need no GPU.
++add_executable(test-execution-plan test-execution-plan.cpp)
++target_compile_features(test-execution-plan PRIVATE cxx_std_17)
++llama_test(test-execution-plan LABEL "main behavior")
++add_executable(test-prefill-batch-contract test-prefill-batch-contract.cpp)
++target_compile_features(test-prefill-batch-contract PRIVATE cxx_std_17)
++llama_test(test-prefill-batch-contract LABEL "main behavior")
++
++llama_build(test-affine-gate.cpp LINK ggml)
++target_include_directories(test-affine-gate PRIVATE ../ggml/src)
++add_dependencies(test-affine-gate ggml-cpu)
++target_compile_definitions(test-affine-gate PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
++llama_test(test-affine-gate NAME test-affine-gate-host ARGS --host-only LABEL "main behavior")
++llama_test(test-affine-gate NAME test-affine-gate-cpu ARGS --cpu LABEL "backend cpu")
++if(TARGET ggml-cuda)
++    add_dependencies(test-affine-gate ggml-cuda)
++    llama_test(test-affine-gate NAME test-affine-gate-cuda ARGS --cuda LABEL "backend cuda")
++    set_tests_properties(test-affine-gate-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+ endif()
+ 
+ llama_build_and_test(test-moe-work-batch.cpp LABEL "main behavior" LINK ggml)
+diff --git a/tests/test-affine-gate.cpp b/tests/test-affine-gate.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-affine-gate.cpp
+@@ -0,0 +1,251 @@
++#include "ggml-cpp.h"
++#include "../ggml/include/ggml-cuda.h"
++#include "../ggml/src/ggml-cuda/affine-gate.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static ggml_context_ptr context() {
++    return ggml_context_ptr(ggml_init({64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
++}
++
++struct gate_graph {
++    ggml_context_ptr ctx = context();
++    ggml_cgraph * graph = ggml_new_graph(ctx.get());
++    ggml_tensor * input;
++    ggml_tensor * bias;
++    ggml_tensor * factor;
++    ggml_tensor * add;
++    ggml_tensor * unary;
++    ggml_tensor * output;
++
++    gate_graph(int width, int rows, ggml_unary_op activation, bool bias_vector, bool factor_vector) {
++        input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, rows);
++        bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, bias_vector ? 1 : rows);
++        factor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, factor_vector ? 1 : rows);
++        add = ggml_add(ctx.get(), input, bias);
++        unary = ggml_unary(ctx.get(), add, activation);
++        output = ggml_mul(ctx.get(), unary, factor);
++        ggml_set_input(input);
++        ggml_set_input(bias);
++        ggml_set_input(factor);
++        ggml_set_output(output);
++        ggml_build_forward_expand(graph, output);
++    }
++
++    void addresses() {
++        uintptr_t address = 0x10000000;
++        for (auto * tensor : { input, bias, factor, add, unary, output }) {
++            tensor->data = reinterpret_cast<void *>(address);
++            address += 0x10000000;
++        }
++    }
++};
++
++static void host_contracts() {
++    for (const auto activation : { GGML_UNARY_OP_SOFTPLUS, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
++        for (const int width : { 1, 31, 64, 128, 257, 4096 }) {
++            for (const int rows : { 1, 2, 19 }) {
++                for (bool bias_vector : { false, true }) for (bool factor_vector : { false, true }) {
++                    gate_graph f(width, rows, activation, bias_vector, factor_vector);
++                    require(ggml_cuda_match_affine_gate(f.graph, 0, false), "supported affine gate rejected");
++                    require(!ggml_cuda_match_affine_gate(f.graph, 0, true), "unallocated gate admitted");
++                    f.addresses();
++                    require(ggml_cuda_match_affine_gate(f.graph, 0, true), "disjoint gate rejected");
++                    std::swap(f.output->src[0], f.output->src[1]);
++                    require(ggml_cuda_match_affine_gate(f.graph, 0, true), "commuted multiplication rejected");
++                    std::swap(f.output->src[0], f.output->src[1]);
++                    const auto saved_output = f.output->data;
++                    for (const auto * source : { f.input, f.bias, f.factor }) {
++                        f.output->data = source->data;
++                        require(ggml_cuda_match_affine_gate(f.graph, 0, true) == ggml_are_same_shape(source, f.output),
++                            "broadcast or exact alias admission mismatch");
++                        f.output->data = static_cast<char *>(source->data) +
++                            (ggml_nelements(source) > 1 ? sizeof(float) : 1);
++                        require(!ggml_cuda_match_affine_gate(f.graph, 0, true), "shifted alias admitted");
++                    }
++                    f.output->data = saved_output;
++                    for (auto * intermediate : { f.add, f.unary }) {
++                        intermediate->flags |= GGML_TENSOR_FLAG_OUTPUT;
++                        require(!ggml_cuda_match_affine_gate(f.graph, 0, false), "observable intermediate elided");
++                        intermediate->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
++                    }
++                }
++            }
++        }
++    }
++    gate_graph f(64, 3, GGML_UNARY_OP_SOFTPLUS, true, true);
++    f.addresses();
++    require(!ggml_cuda_match_affine_gate(nullptr, 0, false) &&
++        !ggml_cuda_match_affine_gate(f.graph, -1, false) &&
++        !ggml_cuda_match_affine_gate(f.graph, 1, false), "invalid graph index admitted");
++    for (auto * tensor : { f.input, f.bias, f.factor, f.add, f.unary, f.output }) {
++        const auto type = tensor->type;
++        tensor->type = GGML_TYPE_F16;
++        require(!ggml_cuda_match_affine_gate(f.graph, 0, false), "changed precision admitted");
++        tensor->type = type;
++        const auto stride = tensor->nb[1];
++        tensor->nb[1] += sizeof(float);
++        if (tensor->ne[1] > 1) {
++            require(!ggml_cuda_match_affine_gate(f.graph, 0, false), "strided tensor admitted");
++        }
++        tensor->nb[1] = stride;
++    }
++    const auto factor_dim = f.factor->ne[0];
++    f.factor->ne[0] = 1;
++    require(!ggml_cuda_match_affine_gate(f.graph, 0, false), "unsupported factor broadcast admitted");
++    f.factor->ne[0] = factor_dim;
++    ggml_set_op_params_i32(f.unary, 0, GGML_UNARY_OP_TANH);
++    require(!ggml_cuda_match_affine_gate(f.graph, 0, false), "unsupported activation admitted");
++    ggml_set_op_params_i32(f.unary, 0, GGML_UNARY_OP_SOFTPLUS);
++    const auto old_dim = f.input->ne[3];
++    f.input->ne[3] = INT64_MAX;
++    require(!ggml_cuda_match_affine_gate(f.graph, 0, false), "overflowing element count admitted");
++    f.input->ne[3] = old_dim;
++    f.unary->src[0] = f.input;
++    require(!ggml_cuda_match_affine_gate(f.graph, 0, false), "disconnected activation admitted");
++    f.unary->src[0] = f.add;
++    f.factor->data = reinterpret_cast<void *>(0x10000001);
++    require(!ggml_cuda_match_affine_gate(f.graph, 0, true), "misaligned operand admitted");
++}
++
++struct runtime_graph {
++    gate_graph tensors;
++    ggml_backend_ptr sentinel;
++    ggml_backend_sched_ptr scheduler;
++    bool cuda;
++
++    runtime_graph(ggml_backend_t backend, int width, int rows, ggml_unary_op activation,
++            bool bias_vector, bool factor_vector, int keep) :
++        tensors(width, rows, activation, bias_vector, factor_vector),
++        cuda(ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++        if (keep & 1) { ggml_set_output(tensors.add); }
++        if (keep & 2) { ggml_set_output(tensors.unary); }
++        std::vector<ggml_backend_t> backends{ backend };
++        if (cuda) {
++            sentinel.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++            require(sentinel != nullptr, "CPU scheduler sentinel unavailable");
++            backends.push_back(sentinel.get());
++        }
++        scheduler.reset(ggml_backend_sched_new(backends.data(), nullptr, backends.size(), 64, false, true));
++        require(scheduler != nullptr, "scheduler initialization failed");
++        if (cuda) { ggml_backend_sched_set_gpu_exclusive(scheduler.get(), true); }
++        for (int i = 0; i < ggml_graph_n_nodes(tensors.graph); ++i) {
++            ggml_backend_sched_set_tensor_backend(scheduler.get(), ggml_graph_node(tensors.graph, i), backend);
++        }
++        require(ggml_backend_sched_alloc_graph(scheduler.get(), tensors.graph), "small gate graph allocation failed");
++    }
++
++    std::vector<float> run(int iteration) {
++        static const float edge[] = { -100.0f, -20.000002f, -20.0f, -0.0f, 0.0f, 19.999998f, 20.0f, 20.000002f, 100.0f };
++        for (auto * tensor : { tensors.input, tensors.bias, tensors.factor }) {
++            std::vector<float> data(ggml_nelements(tensor));
++            for (size_t i = 0; i < data.size(); ++i) {
++                data[i] = std::sin(float(i) * .07f + iteration * .3f) * 3.0f;
++                if (tensor == tensors.input && i % 13 < std::size(edge)) { data[i] = edge[i % 13]; }
++                if (tensor == tensors.factor) { data[i] = std::cos(float(i) * .13f + iteration) * -2.0f; }
++            }
++            ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
++        }
++        require(ggml_backend_sched_graph_compute(scheduler.get(), tensors.graph) == GGML_STATUS_SUCCESS,
++            "gate compute failed");
++        if (cuda) {
++            const auto stats = ggml_backend_sched_get_gpu_stats(scheduler.get());
++            require(stats.cpu_heavy_ops_submitted == 0, "gate arithmetic fell back to CPU");
++        }
++        std::vector<float> result(ggml_nelements(tensors.output));
++        ggml_backend_tensor_get(tensors.output, result.data(), 0, ggml_nbytes(tensors.output));
++        return result;
++    }
++};
++
++int main(int argc, char ** argv) {
++    try {
++        host_contracts();
++        if (argc < 2 || std::string(argv[1]) == "--host-only") {
++            std::puts("PASS affine gate host admission, precision, observable outputs, broadcasting, aliases and overflow");
++            return 0;
++        }
++        require(std::string(argv[1]) == "--cuda" || std::string(argv[1]) == "--cpu", "use --host-only, --cpu or --cuda");
++        const bool use_cuda = std::string(argv[1]) == "--cuda";
++        if (use_cuda) {
++            ggml_backend_load_all();
++        } else {
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH) != nullptr, "CPU backend cannot be loaded");
++#else
++            const char * cpu_path = std::getenv("GGML_TEST_CPU_BACKEND_PATH");
++            require(cpu_path && ggml_backend_load(cpu_path), "set GGML_TEST_CPU_BACKEND_PATH to the CPU backend file");
++#endif
++        }
++        ggml_backend_ptr backend;
++        uint64_t (*counter)() = nullptr;
++        decltype(&ggml_backend_cuda_get_memory_stats) get_stats = nullptr;
++        if (use_cuda) {
++            auto * registry = ggml_backend_reg_by_name("CUDA");
++            if (!registry || !ggml_backend_reg_dev_count(registry)) { std::puts("SKIP no CUDA backend"); return 77; }
++            auto * device = ggml_backend_reg_dev_get(registry, 0);
++            auto set_limit = reinterpret_cast<bool (*)(ggml_backend_dev_t, size_t, bool)>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_set_memory_limit"));
++            get_stats = reinterpret_cast<decltype(get_stats)>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_get_memory_stats"));
++            counter = reinterpret_cast<decltype(counter)>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_affine_gate_fusions"));
++            require(set_limit && get_stats && counter, "gate counter or managed CUDA quota API unavailable");
++            require(set_limit(device, 128 * 1024 * 1024, true), "cannot set 128 MiB test quota");
++            backend.reset(ggml_backend_dev_init(device, nullptr));
++        } else {
++            backend.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++        }
++        require(backend != nullptr, "selected backend unavailable");
++        const bool enabled = use_cuda && std::getenv("GGML_CUDA_DENSE_OPT") &&
++            std::strcmp(std::getenv("GGML_CUDA_DENSE_OPT"), "1") == 0;
++        size_t cases = 0;
++        for (const auto activation : { GGML_UNARY_OP_SOFTPLUS, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
++            for (const auto shape : { std::array<int, 2>{64, 1}, {63, 3}, {128, 7}, {257, 2}, {4096, 1}, {128, 128} }) {
++                for (bool bias_vector : { false, true }) for (bool factor_vector : { false, true }) {
++                    for (const int keep : { 0, 1, 2 }) {
++                        runtime_graph reference(backend.get(), shape[0], shape[1], activation, bias_vector, factor_vector, 3);
++                        const auto before = counter ? counter() : 0;
++                        runtime_graph candidate(backend.get(), shape[0], shape[1], activation, bias_vector, factor_vector, keep);
++                        for (int iteration = 0; iteration < 3; ++iteration) {
++                            const auto expected = reference.run(iteration);
++                            const auto actual = candidate.run(iteration);
++                            require(expected.size() == actual.size() &&
++                                std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(float)) == 0,
++                                "fused/unfused output bits changed");
++                        }
++                        const bool submitted = counter && counter() > before;
++                        require(submitted == (enabled && keep == 0), "fusion activation or live-output fallback mismatch");
++                        ++cases;
++                    }
++                }
++            }
++        }
++        if (use_cuda) {
++            ggml_backend_cuda_memory_stats memory{};
++            require(get_stats(ggml_backend_get_device(backend.get()), &memory) && memory.enabled &&
++                memory.managed_peak_bytes <= memory.limit_bytes, "gate fixture exceeded managed CUDA quota");
++            std::printf("GATE_MEMORY tracked_peak_bytes=%llu limit_bytes=%llu\n",
++                (unsigned long long) memory.managed_peak_bytes, (unsigned long long) memory.limit_bytes);
++        }
++        std::printf("PASS %zu affine gate cases; exact output bits, changed inputs, replay and observable-output fallback (%s)\n",
++            cases, use_cuda ? "CUDA" : "CPU");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL affine gate: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-device-verification.cpp b/tests/test-device-verification.cpp
+--- a/tests/test-device-verification.cpp
++++ b/tests/test-device-verification.cpp
+@@ -11,6 +11,7 @@
+ #include "ggml-cuda.h"
+ #include "ggml-cuda-verify.h"
+ #include <chrono>
++#include <numeric>
+ 
+ static void budget(const char * value) {
+ #ifdef _WIN32
+@@ -64,8 +65,22 @@
+     require(!llama_sampler_backend_device_verify_ready(greedy.get()), "uninitialized chain advertised device readiness");
+     llama_sampler_ptr stochastic(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+     llama_sampler_chain_add(stochastic.get(), llama_sampler_init_dist(123));
+-    require(!llama_sampler_backend_enable_device_verify(stochastic.get()), "stochastic chain admitted");
+-    std::puts("PASS: device verification policy, 0-64 MiB, exact opt-in and conservative greedy eligibility");
++    require(llama_sampler_backend_enable_device_verify(stochastic.get()), "transactional stochastic intent rejected");
++    require(!llama_sampler_backend_device_verify_ready(stochastic.get()), "uninitialized stochastic chain advertised readiness");
++    for (int unsupported = 0; unsupported < 4; ++unsupported) {
++        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        if (unsupported == 0) { llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(64, 8, 1.1f, 0.f, 0.f)); }
++        if (unsupported == 1) { llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(321)); }
++        if (unsupported == 2) { llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy()); }
++        if (unsupported == 3) {
++            auto * nested = llama_sampler_chain_init(llama_sampler_chain_default_params());
++            llama_sampler_chain_add(nested, llama_sampler_init_top_k(8));
++            llama_sampler_chain_add(chain.get(), nested);
++        }
++        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(123));
++        require(!llama_sampler_backend_enable_device_verify(chain.get()), "stateful/nested/early selector gained verification contract");
++    }
++    std::puts("PASS: device verification policy, 0-64 MiB, greedy/transactional stochastic intent and unsupported-chain fallback");
+ }
+ 
+ static void operators(ggml_backend_t gpu, const ggml_backend_cuda_verify_api * api) {
+@@ -208,11 +223,23 @@
+     llama_context_ptr target, draft;
+     common_speculative_ptr speculative;
+     llama_tokens last_proposals;
+-    explicit verify_session(llama_model * model, bool device, bool physical = false, bool cooperative = true) {
++    explicit verify_session(llama_model * model, bool device, bool physical = false, bool cooperative = true, bool stochastic = false, bool terminal_eog = false) {
+         budget(device ? "1" : "0");
+         common_params_sampling parameters;
+         parameters.samplers = {COMMON_SAMPLER_TYPE_TEMPERATURE};
+         parameters.temp = 0; parameters.dynatemp_range = 0;
++        if (stochastic) {
++            parameters.seed = 424242;
++            parameters.samplers = {COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE};
++            parameters.top_k = 16; parameters.temp = .8f;
++        }
++        if (terminal_eog) {
++            const auto * vocabulary = llama_model_get_vocab(model);
++            const auto eos = llama_vocab_eos(vocabulary);
++            require(eos >= 0 && eos < llama_vocab_n_tokens(vocabulary) && llama_vocab_is_eog(vocabulary, eos),
++                    "terminal fixture requires a configured valid EOG token");
++            parameters.logit_bias = {{eos, 100.f}};
++        }
+         parameters.n_probs = 0; parameters.backend_sampling = true;
+         sampler.reset(common_sampler_init(model, parameters)); require(bool(sampler), "fixture sampler missing");
+         auto p = llama_context_default_params();
+@@ -236,7 +263,7 @@
+             speculative.reset(common_speculative_init(config, 1)); require(bool(speculative), "fixture MTP implementation missing");
+         }
+     }
+-    llama_tokens run(const llama_tokens * replay = nullptr) {
++    llama_tokens run(const llama_tokens * replay = nullptr, bool rejection = false) {
+         common_batch prefix(target.get());
+         for (int i = 0; i < 4; ++i) { prefix.add(3+i, i, 0, i==3); }
+         require(llama_process(target.get(), LLAMA_PROCESS_TYPE_DECODE, prefix.get()) == 0 &&
+@@ -255,11 +282,63 @@
+         for (size_t i = 0; i < proposals.size(); ++i) { verify.add(proposals[i], 5+i, 0, true); }
+         require(llama_process(target.get(), LLAMA_PROCESS_TYPE_DECODE, verify.get()) == 0 &&
+             (!speculative || common_speculative_process(speculative.get(), verify)), "MTP verification decode failed");
+-        auto accepted = common_sampler_sample_and_accept_n(sampler.get(), target.get(), proposals);
++        llama_tokens accepted;
++        if (rejection) {
++            std::vector<std::vector<llama_token_data>> probabilities;
++            for (const auto token : proposals) { probabilities.push_back({{token, 0.f, 1.f}}); }
++            std::vector<int> indexes(proposals.size() + 1);
++            std::iota(indexes.begin(), indexes.end(), 0);
++            accepted = common_sampler_sample_and_accept_n_rejection(sampler.get(), target.get(), indexes, proposals, probabilities);
++        } else {
++            accepted = common_sampler_sample_and_accept_n(sampler.get(), target.get(), proposals);
++        }
+         if (speculative) { common_speculative_accept(speculative.get(), 0, uint16_t(accepted.size()-1)); }
+         return accepted;
+     }
+ };
++
++static void stochastic_pipeline() {
++    initial_kv("0");
++    for (const bool rejection : {false, true}) for (const bool terminal_eog : {false, true}) {
++        auto model = tiny_model(true, 32, 0, terminal_eog ? 63 : -1);
++        llama_tokens expected, proposals;
++        std::vector<llama_token_data> candidates;
++        int64_t selected = -1;
++        {
++            verify_session reference(model.get(), false, false, true, true, terminal_eog);
++            const auto eog = llama_vocab_eos(llama_model_get_vocab(model.get()));
++            const llama_tokens eog_draft{eog, eog};
++            expected = reference.run(terminal_eog ? &eog_draft : nullptr, rejection);
++            proposals = reference.last_proposals;
++            const auto * view = common_sampler_get_candidates(reference.sampler.get(), false);
++            candidates.assign(view->data, view->data + view->size); selected = view->selected;
++        }
++        verify_session candidate(model.get(), true, false, true, true, terminal_eog);
++        const auto actual = candidate.run(&proposals, rejection);
++        require(actual == expected && !actual.empty(), "stochastic verification changed accepted target tokens");
++        if (terminal_eog) {
++            require(actual == llama_tokens{llama_vocab_eos(llama_model_get_vocab(model.get()))}, "stochastic verification accepted tokens after EOG");
++        }
++        const auto stats = llama_get_device_verification_stats(candidate.target.get());
++        require(stats.deferred_bytes > 0 && stats.scratch_bytes > 0 && stats.scratch_bytes <= stats.allowance_bytes,
++                "stochastic fixture never reached the deferred device path");
++        require(stats.verified_batches == (rejection ? 0u : 1u), "p/q rejection was replaced by target-token matching");
++        if (rejection) {
++            require(stats.materialized_bytes == stats.deferred_bytes, "p/q host fallback lost a deferred candidate row");
++        } else {
++            require(stats.materialized_bytes < stats.deferred_bytes, "stochastic matching copied every candidate row");
++        }
++        const auto * view = common_sampler_get_candidates(candidate.sampler.get(), false);
++        require(view->size == candidates.size() && view->selected == selected, "stochastic final candidate shape changed");
++        for (size_t i = 0; i < candidates.size(); ++i) {
++            require(candidates[i].id == view->data[i].id && candidates[i].logit == view->data[i].logit && candidates[i].p == view->data[i].p,
++                    "stochastic final candidates changed");
++        }
++        std::printf("STOCHASTIC_VERIFY_PIPELINE rejection=%d terminal_eog=%d hits=%llu deferred=%llu materialized=%llu accepted=%zu exact=1\n",
++                int(rejection), int(terminal_eog), (unsigned long long) stats.verified_batches, (unsigned long long) stats.deferred_bytes,
++                (unsigned long long) stats.materialized_bytes, actual.size());
++    }
++}
+ 
+ static void pipeline() {
+     initial_kv("0");
+@@ -482,7 +561,7 @@
+             else if (!growth) { operators(gpu.get(),api); }
+         }
+         if (growth) { growth_pipeline(); }
+-        else if (!benchmark) { pipeline(); }
++        else if (!benchmark) { pipeline(); stochastic_pipeline(); }
+         ggml_backend_cuda_memory_stats memory{};
+         require(get_stats(device,&memory) && memory.managed_peak_bytes <= memory.limit_bytes,"test exceeded managed quota");
+         std::printf(benchmark ? "PASS: model-free CUDA driver-call ABBA comparisons; peak=%zu limit=%zu\n"
+diff --git a/tests/test-execution-plan.cpp b/tests/test-execution-plan.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-execution-plan.cpp
+@@ -0,0 +1,51 @@
++#include "../src/llama-execution-plan.h"
++
++#include <cstdio>
++#include <limits>
++#include <stdexcept>
++
++static void require(bool condition, const char * text) {
++    if (!condition) { throw std::runtime_error(text); }
++}
++
++int main() {
++    try {
++        using namespace llama_execution_plan;
++        const shape decode{1, 1, 0, 1, 0}, draft{3, 3, 0, 1, 0}, prompt{128, 1, 0, 1, 0};
++        policy plan;
++        require(plan.replace(prompt, decode, 1 << 20), "unknown measurement changed baseline");
++        for (int i = 0; i < 12; ++i) { plan.observe(decode); plan.prepared(decode, 1000); }
++        plan.observe(prompt);
++        require(!plan.replace(prompt, decode, 1 << 20), "one-off prompt evicted a proven decode plan");
++        plan.prepared(prompt, 100);
++        plan.observe(prompt);
++        require(!plan.replace(prompt, decode, 1 << 20), "cheap cold plan evicted expensive hot plan");
++        plan.observe(draft); plan.prepared(draft, 10000); plan.observe(draft);
++        require(plan.replace(draft, decode, 1 << 20), "measured more useful plan was never admitted");
++        require(plan.prefer_victim(prompt, 1 << 20, decode, 1 << 20), "victim ignored saved preparation cost");
++        require(!plan.prefer_victim(decode, 1 << 20, prompt, 1 << 20), "victim order reversed");
++        require(!plan.prefer_victim(draft, 1 << 20, decode, 1 << 20), "expensive reusable plan was victim");
++        for (int i = 0; i < 40; ++i) { plan.observe(draft); }
++        require(plan.replace(prompt, decode, 1 << 20), "stale plan suppressed a changed workload");
++        plan.prepared(prompt, -1); plan.prepared(prompt, std::numeric_limits<int64_t>::max());
++        require(plan.replace(prompt, decode, std::numeric_limits<size_t>::max()), "overflow changed stale fallback");
++        plan.observe({0, 0, 0, 0, 0}); plan.observe({513, 1, 0, 1, 0});
++        require(plan.preserved == 2, "invalid observations changed decisions");
++        plan.clear();
++        require(plan.preserved == 0 && plan.selections == 0 && plan.replace(prompt, decode, 0), "clear retained old device observations");
++        for (uint32_t i = 1; i <= 32; ++i) { plan.observe({i, 1, 0, 1, 0}); plan.prepared({i, 1, 0, 1, 0}, i); }
++        require(plan.replace(prompt, decode, 4096), "bounded history retained evicted measurements");
++        // A frequently hit startup plan must not keep an old timing spike
++        // indefinitely while fresh, increasingly useful alternatives appear.
++        plan.clear();
++        plan.observe(decode); plan.prepared(decode, 1000000);
++        for (int i = 0; i < 1024; ++i) { plan.observe(decode); }
++        for (int i = 0; i < 1024; ++i) { plan.observe(prompt); plan.observe(decode); }
++        plan.prepared(prompt, 20000);
++        require(plan.replace(prompt, decode, 4096), "stale timing confidence never decayed");
++        std::puts("PASS execution plans: measured cost, hot-plan protection, aging, bounded metadata, invalidation, fallback, no device allocations");
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1;
++    }
++    return 0;
++}
+diff --git a/tests/test-graph-variants.cpp b/tests/test-graph-variants.cpp
+--- a/tests/test-graph-variants.cpp
++++ b/tests/test-graph-variants.cpp
+@@ -75,6 +75,8 @@
+     size_t peak_arenas = 0;
+     size_t peak_compute_bytes = 0;
+     size_t peak_total_bytes = 0;
++    uint64_t plan_selections = 0;
++    uint64_t plans_preserved = 0;
+ };
+ 
+ static result run(llama_model * model, const char * budget, bool invalidate, bool backend = false, bool prefill = false) {
+@@ -109,7 +111,7 @@
+         // Larger repeated shapes exercise mature admission and exact reuse.
+         const std::vector<int> sizes = prefill ?
+             std::vector<int>{32, 64, 32, 64, 32, 64, 96, 64, 128, 64, 192, 64, 256, 64, 32, 64, 32, 64, 32, 64, 64} :
+-            std::vector<int>{32, 1, 3, 2, 3, 1, 4, 5, 6, 7, 8, 3, 2, 16, 1, 3, 2};
++            std::vector<int>{32, 1, 3, 1, 2, 1, 4, 1, 5, 1, 6, 1, 7, 1, 8, 1, 3, 2, 16, 1, 3, 2};
+         for (size_t step = 0; step < sizes.size(); ++step) {
+             if (invalidate && step == 13) {
+                 // A real parameter change must return to the primary arena and
+@@ -161,6 +163,8 @@
+             out.peak_arenas = std::max(out.peak_arenas, stats.arenas);
+             out.peak_compute_bytes = std::max(out.peak_compute_bytes, stats.compute_bytes);
+             out.peak_total_bytes = std::max(out.peak_total_bytes, stats.compute_bytes + stats.metadata_bytes);
++            out.plan_selections = std::max(out.plan_selections, stats.plan_selections);
++            out.plans_preserved = std::max(out.plans_preserved, stats.plans_preserved);
+             position += n;
+         }
+         out.reused = llama_perf_context(ctx).n_reused;
+@@ -221,6 +225,7 @@
+             require(baseline.logits == malformed.logits, "malformed budget changed baseline");
+             require(cached.peak_arenas > 0, "retained graph path was never exercised");
+             require(cached.reused > baseline.reused, "retained shapes were rebuilt rather than reused");
++            require(cached.plan_selections > 0, "measured execution-plan selection was not exercised");
+             require(malformed.peak_arenas == 0, "invalid budget enabled retention");
+             require(limited.peak_arenas < cached.peak_arenas, "small budget admission was not exercised");
+             require(sampler_baseline.sampled == sampler_cached.sampled, "fallback changed stochastic RNG");
+diff --git a/tests/test-hybrid-prefix.cpp b/tests/test-hybrid-prefix.cpp
+--- a/tests/test-hybrid-prefix.cpp
++++ b/tests/test-hybrid-prefix.cpp
+@@ -7,6 +7,8 @@
+ #include "../src/llama-model.h"
+ #include "../src/llama-hybrid-prefix-transaction.h"
+ #include "../src/llama-prefix-text.h"
++#include "../src/llama-context.h"
++#include "../tools/server/server-prefill-budget.h"
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -314,6 +316,103 @@
+         server_prompt media;media.tokens=server_tokens(query,true);require(!cache.save_resident(media,ctx.get(),0),"server admitted media prompt");
+     }
+ }
++static void scheduling_cases(llama_model * model) {
++    auto make = [&] {
++        auto p = llama_context_default_params();
++        p.n_ctx = 512; p.n_batch = p.n_ubatch = 64; p.n_seq_max = 2; p.kv_unified = true;
++        p.n_rs_seq = 4; p.n_threads = p.n_threads_batch = 1;
++        p.n_outputs_max = 8; p.n_outputs_max_per_seq = 4;
++        p.type_k = p.type_v = GGML_TYPE_F32;
++        p.op_offload = p.offload_kqv = gpu;
++        p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++        llama_context_ptr value(llama_init_from_model(model, p));
++        require(bool(value) && value->adaptive_prefill_supported(), "plain hybrid per-sequence layout was not admitted");
++        return value;
++    };
++    auto reference = make(), candidate = make(), isolated_a = make(), isolated_b = make();
++    auto single = context(model);
++    require(!single->adaptive_prefill_supported(), "hybrid scheduling silently granted missing parallel capacity");
++    single.reset();
++    std::vector<llama_pos> positions;
++    std::vector<llama_token> tokens;
++    std::vector<llama_seq_id> sequences;
++    auto append = [&](int sequence, int begin, int count) {
++        for (int i = 0; i < count; ++i) {
++            sequences.push_back(sequence); positions.push_back(begin + i);
++            tokens.push_back(3 + ((begin + i) * (sequence ? 17 : 13) + sequence * 7) % 64);
++        }
++    };
++    size_t comparisons = 0;
++    auto run = [&](llama_context * ctx, bool restricted, int only_sequence = -1) {
++        std::vector<size_t> selected;
++        for (size_t i = 0; i < tokens.size(); ++i) {
++            if (only_sequence < 0 || sequences[i] == only_sequence) { selected.push_back(i); }
++        }
++        if (selected.empty()) { return std::vector<float>{}; }
++        auto b = llama_batch_init(int(selected.size()), 0, 1);
++        b.n_tokens = int(selected.size());
++        std::free(b.pos);
++        b.pos = static_cast<llama_pos *>(std::malloc(4 * selected.size() * sizeof(llama_pos)));
++        if (!b.pos) { llama_batch_free(b); throw std::runtime_error("cannot allocate bounded text positions"); }
++        for (size_t i = 0; i < selected.size(); ++i) {
++            const size_t source = selected[i];
++            b.token[i] = tokens[source]; b.n_seq_id[i] = 1; b.seq_id[i][0] = sequences[source];
++            for (int coordinate = 0; coordinate < 4; ++coordinate) {
++                b.pos[coordinate * selected.size() + i] = coordinate == 3 ? 0 : positions[source];
++            }
++            b.logits[i] = only_sequence < 0 ? sequences[source] == 0 : i + 1 == selected.size();
++        }
++        int status = -1;
++        try {
++            server_prefill_reuse_scope<llama_context> scope(ctx, restricted);
++            status = llama_decode(ctx, b);
++        } catch (...) { llama_batch_free(b); throw; }
++        llama_batch_free(b);
++        require(status == 0, "mixed hybrid verification/prompt batch failed");
++        llama_synchronize(ctx);
++        require(!ctx->get_graph_variant_admission_stats().reuse_only, "hybrid scheduling scope leaked");
++        const auto * values = llama_get_logits_ith(ctx, -1);
++        require(values != nullptr, "hybrid verification outputs are missing");
++        return std::vector<float>(values, values + 259);
++    };
++    int position_a = 0, position_b = 0;
++    const auto initial_cache = candidate->get_graph_variant_stats();
++    for (int prompt : {0, 32, 0, 16, 0, 32}) {
++        tokens.clear(); positions.clear(); sequences.clear();
++        append(0, position_a, 4); position_a += 4;
++        append(1, position_b, prompt); position_b += prompt;
++        server_prefill_batch_contract contract(64, 4, true);
++        contract.sequence(0, 0, 4);
++        require(contract.complete() && tokens.size() <= 64, "hybrid verification span lost its intact first decode");
++        const auto a = run(reference.get(), false), b = run(candidate.get(), true);
++        run(isolated_a.get(), false, 0); run(isolated_b.get(), false, 1);
++        require(a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
++            "hybrid bounded scheduling changed actual verification logits");
++        for (int sequence : {0, 1}) {
++            std::vector<uint8_t> before(llama_state_seq_get_size(reference.get(), sequence));
++            std::vector<uint8_t> after(llama_state_seq_get_size(candidate.get(), sequence));
++            require(llama_state_seq_get_data(reference.get(), before.data(), before.size(), sequence) == before.size() &&
++                    llama_state_seq_get_data(candidate.get(), after.data(), after.size(), sequence) == after.size() && before == after,
++                "hybrid scheduling changed a sequence's attention/recurrent state");
++        }
++        const auto cache = candidate->get_graph_variant_stats();
++        require(cache.arenas == initial_cache.arenas && cache.compute_bytes == initial_cache.compute_bytes,
++            "hybrid prompt slices retained additional graph storage");
++        ++comparisons;
++    }
++    tokens.clear(); positions.clear(); sequences.clear(); append(0, position_a, 1);
++    equal(run(candidate.get(), true, 0), run(isolated_a.get(), false, 0), "scheduled-independent-sequence-A");
++    tokens.clear(); positions.clear(); sequences.clear(); append(1, position_b, 1);
++    equal(run(candidate.get(), true, 1), run(isolated_b.get(), false, 1), "scheduled-independent-sequence-B");
++    const auto state_a_size = llama_state_seq_get_size(candidate.get(), 0);
++    std::vector<uint8_t> state_a(state_a_size), after_a(state_a_size);
++    require(llama_state_seq_get_data(candidate.get(), state_a.data(), state_a.size(), 0) == state_a.size(), "cannot capture active hybrid sequence");
++    require(llama_memory_seq_rm(llama_get_memory(candidate.get()), 1, -1, -1), "cannot cancel independent hybrid prompt");
++    require(llama_state_seq_get_data(candidate.get(), after_a.data(), after_a.size(), 0) == after_a.size() && state_a == after_a,
++        "canceling pending hybrid prompt changed another sequence's state");
++    std::printf("HYBRID_PREFILL_SCHEDULING backend=%s comparisons=%zu actual_hybrid_capability=1 intact_verification_rows=4 exact_logits=1 exact_sequence_states=1 independent_sequence_continuations=1 cancellation_isolated=1 new_secondary_bytes=0 wrapper_parallelism_unchanged=1 PASS\n",
++        gpu ? "CUDA" : "CPU", comparisons);
++}
+ int main(int argc,char ** argv) {
+     try{
+         std::setvbuf(stdout,nullptr,_IONBF,0);
+@@ -323,7 +422,7 @@
+         if(argc==3&&std::strcmp(argv[1],"--write-fixture")==0){auto model=tiny_model(false,32,argv[2]);return 0;}
+         if(gpu&&!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))return 77;
+         if(paging){paging_case();return 0;}
+-        transactions();auto model=tiny_model(gpu);native_cases(model.get());cache_cases(model.get());
++        transactions();auto model=tiny_model(gpu);native_cases(model.get());cache_cases(model.get());scheduling_cases(model.get());
+         std::printf("HYBRID_PREFIX backend=%s native+server+checkpoint+transaction PASS\n",gpu?"CUDA":"CPU");return 0;
+     }catch(const std::exception & e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
+ }
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -13,8 +13,9 @@
+ 
+ static void require(bool condition, const char * message) { if (!condition) { throw std::runtime_error(message); } }
+ static void step(const char * message) { std::fprintf(stderr, "mtp-state STEP %s\n", message); std::fflush(stderr); }
+-static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, uint64_t gpu_vram_limit_mib = 0) {
++static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, uint64_t gpu_vram_limit_mib = 0, int32_t eos_token = -1) {
+     const int dim=embedding_width, vocab=64;
++    require(eos_token >= -1 && eos_token < vocab,"tiny fixture EOS is outside the vocabulary");
+     gguf_context_ptr metadata(gguf_init_empty());
+     gguf_set_val_str(metadata.get(), "general.architecture", "qwen35");
+     gguf_set_val_str(metadata.get(), "general.name", "mtp-rollback-diagnostic-fixture");
+@@ -35,9 +36,16 @@
+     std::vector<const char *> names;
+     std::vector<float> scores(vocab,0);
+     for (int i=0;i<vocab;++i) strings.push_back("tok_"+std::to_string(i));
++    if (eos_token >= 0) { strings[size_t(eos_token)] = "</s>"; }
+     for (auto & s:strings) names.push_back(s.c_str());
+     gguf_set_arr_str(metadata.get(),"tokenizer.ggml.tokens",names.data(),names.size());
+     gguf_set_arr_data(metadata.get(),"tokenizer.ggml.scores",GGUF_TYPE_FLOAT32,scores.data(),scores.size());
++    if (eos_token >= 0) {
++        std::vector<int32_t> types(vocab,LLAMA_TOKEN_TYPE_NORMAL);
++        types[size_t(eos_token)] = LLAMA_TOKEN_TYPE_CONTROL;
++        gguf_set_arr_data(metadata.get(),"tokenizer.ggml.token_type",GGUF_TYPE_INT32,types.data(),types.size());
++        gguf_set_val_u32(metadata.get(),"tokenizer.ggml.eos_token_id",uint32_t(eos_token));
++    }
+     auto initialize=[](ggml_tensor * tensor, void *) {
+         require(tensor->type == GGML_TYPE_F32,"unexpected tiny fixture type");
+         std::vector<float> values(ggml_nelements(tensor));
+diff --git a/tests/test-prefill-batch-contract.cpp b/tests/test-prefill-batch-contract.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-prefill-batch-contract.cpp
+@@ -0,0 +1,80 @@
++#include "../tools/server/server-prefill-budget.h"
++
++#include <cstdio>
++#include <stdexcept>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static uint64_t workload(uint32_t first, uint32_t second, uint32_t first_rows, uint32_t second_rows) {
++    server_prefill_batch_contract value(512, first_rows + second_rows, true);
++    value.sequence(first, 0, first_rows);
++    value.sequence(second, first_rows, second_rows);
++    require(value.complete(), "two independent verification spans were rejected");
++    return value.workload();
++}
++
++int main() {
++    try {
++        server_prefill_batch_contract empty(512, 0, false);
++        require(empty.complete(), "empty generating batch prevented ordinary prompt admission");
++        server_prefill_batch_contract full(512, 512, true);
++        full.sequence(0, 0, 256); full.sequence(1, 256, 256);
++        require(full.complete(), "full verification batch was rejected");
++        for (uint32_t capacity : {1u, 32u, 128u, 512u, UINT32_MAX}) {
++            for (uint32_t rows : {1u, 2u, 31u, 127u, 511u, UINT32_MAX}) {
++                server_prefill_batch_contract value(capacity, rows, true);
++                value.sequence(7, 0, rows);
++                require(value.complete() == (rows <= capacity), "logical batch boundary was not preserved");
++            }
++        }
++        server_prefill_batch_contract gap(512, 8, true);
++        gap.sequence(0, 0, 3); gap.sequence(1, 4, 4);
++        require(!gap.complete(), "unowned gap between verification spans was admitted");
++        server_prefill_batch_contract overlap(512, 8, true);
++        overlap.sequence(0, 0, 4); overlap.sequence(1, 3, 4);
++        require(!overlap.complete(), "overlapping sequence outputs were admitted");
++        server_prefill_batch_contract truncated(512, 8, true);
++        truncated.sequence(0, 0, 7);
++        require(!truncated.complete(), "unaccounted generated row was admitted");
++        server_prefill_batch_contract overflow(512, 8, true);
++        overflow.sequence(0, 0, UINT64_MAX);
++        require(!overflow.complete(), "overflowed proposal span was admitted");
++        server_prefill_batch_contract zero(512, 8, true);
++        zero.sequence(0, 0, 0);
++        require(!zero.complete(), "zero-length sequence was admitted");
++        const auto a = workload(0, 1, 2, 6);
++        require(a == workload(0, 1, 2, 6) && a != workload(0, 1, 6, 2) && a != workload(0, 2, 2, 6),
++            "equal row totals concealed changed sequence ownership/proposal shapes");
++
++        server_prefill_budget budget;
++        budget.reset(100);
++        budget.select_workload(a);
++        budget.observe(200, 8, 0, true); budget.observe(200, 8, 0, true);
++        budget.observe(500, 8, 64, true); budget.observe(500, 8, 64, true);
++        auto plan = budget.plan(512, 8, 1, true);
++        require(plan.deferred, "warm verification contention did not engage adaptation");
++        uint32_t consumed = 0;
++        for (int i = 0; i < 20; ++i) {
++            budget.select_workload(a);
++            plan = budget.plan(512, 8, 1, true);
++            if (!plan.deferred) {
++                require(plan.prompt_rows >= 32 && plan.prompt_rows <= 504, "prompt slice crossed intact verification span");
++                consumed += plan.prompt_rows;
++            }
++        }
++        require(consumed == 10 * 32, "verification fairness starved or duplicated pending prompt rows");
++        budget.select_workload(workload(0, 1, 6, 2));
++        plan = budget.plan(512, 8, 1, true);
++        require(!plan.deferred && !plan.chunked && budget.pure_latency_us() == 0,
++            "changed proposal lengths reused a different workload's learned latency");
++        budget.select_workload(workload(0, 2, 6, 2));
++        require(!budget.under_pressure(), "canceled/replaced sequence retained stale pressure");
++        std::puts("PREFILL_BATCH_CONTRACT whole_verification_spans=1 contiguous_ownership=1 overflow_safe=1 proposal_shape_reset=1 cancellation_owner_reset=1 prompt_progress=1 logical_limits_preserved=1 PASS");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -659,7 +659,7 @@
+     return result;
+ }
+ 
+-static void run_batch(llama_model * model, const char * name, common_params_sampling params, bool grammar_first = false) {
++static void run_batch(llama_model * model, const char * name, common_params_sampling params, bool grammar_first = false, bool device_intent = false) {
+     std::fprintf(stderr, "sampler-batch-view: %s\n", name);
+     for (bool rejection : {false, true}) {
+         for (int mismatch : {-1, 0, 1}) {
+@@ -668,7 +668,7 @@
+             auto next_params = params;
+             common_sampler_ptr next(common_sampler_init(model, next_params));
+             require(llama_set_sampler(left.get(), 0, common_sampler_get_backend(reference.chain.get())) &&
+-                    llama_set_sampler(right.get(), 0, common_sampler_get_backend(next.get())), "batch backend registration failed");
++                    llama_set_sampler(right.get(), 0, device_intent ? common_sampler_get_backend_speculative(next.get()) : common_sampler_get_backend(next.get())), "batch backend registration failed");
+             if (!params.reasoning_budget_start.empty()) {
+                 reference.accept(params.reasoning_budget_start.front());
+                 common_sampler_accept(next.get(), params.reasoning_budget_start.front(), true);
+@@ -680,6 +680,9 @@
+             }
+             require(llama_process(left.get(), LLAMA_PROCESS_TYPE_DECODE, a.get()) == 0 &&
+                     llama_process(right.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "batch sparse decode failed");
++            if (device_intent) {
++                require(llama_sampler_backend_device_verify_ready(common_sampler_get(next.get())), "stochastic backend verification was not ready");
++            }
+             const std::vector<int> idxs{0, 2, -1};
+             common_sampler_ptr preview(common_sampler_clone(next.get()));
+             llama_tokens draft;
+@@ -1472,6 +1475,24 @@
+         batch_params.reasoning_budget_tokens = -1;
+         batch_params.backend_sampling = true;
+         run_batch(model.get(), "backend seeded matching/rejection", batch_params);
++        {
++            const char * previous = std::getenv("WILDLLAMA_VERIFY_DEVICE_MIB");
++            const bool had_previous = previous != nullptr;
++            const std::string saved = previous ? previous : "";
++#ifdef _WIN32
++            require(_putenv_s("WILDLLAMA_VERIFY_DEVICE_MIB", "1") == 0, "verifier test allowance failed");
++#else
++            require(setenv("WILDLLAMA_VERIFY_DEVICE_MIB", "1", 1) == 0, "verifier test allowance failed");
++#endif
++            run_batch(model.get(), "stochastic verification intent: exact matching, p/q rejection and residual", batch_params, false, true);
++#ifdef _WIN32
++            require(_putenv_s("WILDLLAMA_VERIFY_DEVICE_MIB", saved.c_str()) == 0, "cannot restore verifier allowance");
++#else
++            require((had_previous ? setenv("WILDLLAMA_VERIFY_DEVICE_MIB", saved.c_str(), 1) : unsetenv("WILDLLAMA_VERIFY_DEVICE_MIB")) == 0,
++                    "cannot restore verifier allowance");
++#endif
++            (void) had_previous;
++        }
+         batch_params.temp = 0;
+         run_batch(model.get(), "backend greedy matching/rejection", batch_params);
+         run(model.get(), "CPU seeded", params);
+diff --git a/tests/test-sampler-overlap.cpp b/tests/test-sampler-overlap.cpp
+--- a/tests/test-sampler-overlap.cpp
++++ b/tests/test-sampler-overlap.cpp
+@@ -19,6 +19,7 @@
+     ggml_backend_buffer_ptr storage;
+     ggml_tensor * scores = nullptr;
+     ggml_tensor * selected = nullptr;
++    std::vector<ggml_tensor *> selected_rows;
+     ggml_cgraph * graph = nullptr;
+     const std::array<float, 32> logits = {{
+         -.9f, -.8f, -.7f, -.6f, .1f, .4f, -.1f, .8f,
+@@ -26,7 +27,7 @@
+         -.9f, -.8f, -.7f, -.6f, -.5f, -.4f, -.3f, -.2f,
+         -.1f, .0f, .1f, .2f, .3f, .4f, .5f, .6f}};
+ 
+-    sampling_graph(ggml_backend_t backend, bool stochastic, bool penalties, bool mask, int outputs = 1) {
++    sampling_graph(ggml_backend_t backend, bool stochastic, bool penalties, bool mask, int outputs = 1, bool verification = false) {
+         require(bool(context), "sampling metadata allocation failed");
+         if (mask) {
+             auto * allow = llama_sampler_init_token_mask(32);
+@@ -40,22 +41,31 @@
+             llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(.8f));
+         }
+         llama_sampler_chain_add(sampler.get(), stochastic ? llama_sampler_init_dist(12345) : llama_sampler_init_greedy());
+-        const bool compact = llama_sampler_backend_set_selected_only(sampler.get());
++        if (verification) { require(llama_sampler_backend_enable_device_verify(sampler.get()), "verification intent rejected"); }
++        const bool compact = !verification && llama_sampler_backend_set_selected_only(sampler.get());
+         // Penalty accept can allocate/throw. Preserve its existing full-output
+         // contract rather than weakening compact-output ownership guarantees.
+-        require(compact == !penalties, "legacy penalty compact-output contract changed");
++        require(compact == (!penalties && !verification), "legacy penalty compact-output contract changed");
+         require(sampler->iface->backend_init(sampler.get(), ggml_backend_get_default_buffer_type(backend), outputs),
+                 "CPU backend sampling unavailable");
+         graph = ggml_new_graph_custom(context.get(), 256, false);
+         scores = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 32);
+         ggml_set_input(scores);
+-        llama_sampler_data output{scores, nullptr, nullptr, nullptr};
+         sampler->iface->backend_reset(sampler.get());
+-        sampler->iface->backend_apply(sampler.get(), context.get(), graph, &output);
+-        selected = output.sampled;
++        for (int row = 0; row < outputs; ++row) {
++            llama_sampler_data output{scores, nullptr, nullptr, nullptr};
++            sampler->iface->backend_apply(sampler.get(), context.get(), graph, &output);
++            require(output.sampled, "sampling row missing");
++            selected_rows.push_back(output.sampled);
++            ggml_build_forward_expand(graph, output.sampled);
++        }
++        selected = selected_rows.front();
+         require(selected && llama_sampler_backend_can_overlap_output(sampler.get()), "complete backend not eligible for input transaction");
+         require(llama_sampler_backend_selected_only_ready(sampler.get()) == compact, "compact/full backend output contract changed");
+-        ggml_build_forward_expand(graph, selected);
++        if (verification) {
++            require(llama_sampler_backend_device_verify_ready(sampler.get()) == (!stochastic || outputs > 1),
++                    "nontransactional distribution gained verification readiness");
++        }
+         storage.reset(ggml_backend_alloc_ctx_tensors(context.get(), backend));
+         require(bool(storage) && ggml_backend_buffer_get_size(storage.get()) < 256*1024, "sampling compute allowance exceeded");
+     }
+@@ -71,7 +81,45 @@
+         ggml_backend_tensor_get(selected, &token, 0, sizeof(token));
+         return token;
+     }
++
++    std::vector<llama_token> run_rows(ggml_backend_t backend) {
++        (void) run(backend);
++        std::vector<llama_token> result(selected_rows.size());
++        for (size_t row = 0; row < selected_rows.size(); ++row) {
++            ggml_backend_tensor_get(selected_rows[row], &result[row], 0, sizeof(llama_token));
++        }
++        return result;
++    }
+ };
++
++static void stochastic_verification_transactions(ggml_backend_t backend) {
++    constexpr int rows = 4;
++    sampling_graph baseline(backend, true, false, false, rows), candidate(backend, true, false, false, rows, true);
++    size_t checks = 0;
++    for (int step = 0; step < 64; ++step) {
++        llama_sampler_overlap_checkpoint checkpoint;
++        require(llama_sampler_backend_overlap_save(candidate.sampler.get(), checkpoint), "verification checkpoint rejected");
++        // A cancelled or dropped optional verification must leave no entropy
++        // committed, including when its graph already completed.
++        if (step % 3 == 0) {
++            (void) candidate.run_rows(backend);
++            require(llama_sampler_backend_overlap_restore(candidate.sampler.get(), checkpoint), "discarded verification rollback failed");
++        }
++        const auto expected = baseline.run_rows(backend), actual = candidate.run_rows(backend);
++        require(expected == actual, "verification intent changed sampled rows or subsequent RNG");
++        // Zero covers a cancelled batch. Partial counts cover first/later
++        // mismatch and early EOG; full count covers the target bonus token.
++        const size_t accepted = size_t(step % (rows + 1));
++        for (size_t row = 0; row < accepted; ++row) {
++            llama_sampler_accept(baseline.sampler.get(), expected[row]);
++            llama_sampler_accept(candidate.sampler.get(), actual[row]);
++        }
++        checks += expected.size();
++    }
++    sampling_graph scalar(backend, true, false, false, 1, true);
++    require(!llama_sampler_backend_device_verify_ready(scalar.sampler.get()), "single-output eager RNG admitted");
++    std::printf("STOCHASTIC_VERIFY sampled_row_checks=%zu accepted_prefixes=0..4 dropped_completed_work=1 exact_rng_continuation=1 no_model_gpu=1 PASS\n", checks);
++}
+ 
+ static void rollback_cases(ggml_backend_t backend) {
+     size_t compared = 0;
+@@ -146,6 +194,7 @@
+         require(bool(backend), "CPU backend initialization failed");
+         rollback_cases(backend.get());
+         unsupported_cases(backend.get());
++        stochastic_verification_transactions(backend.get());
+         return 0;
+     } catch (const std::exception & error) {
+         std::fprintf(stderr, "sampler overlap: FAIL: %s\n", error.what());
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1120,6 +1120,7 @@
+     bool prefill_episode_active = false;
+     uint64_t prefill_summary_deferred = 0;
+     server_prefill_memory prefill_memory;
++    server_prefill_memory prefill_draft_memory;
+     bool prefill_memory_trace = false;
+     uint64_t prefill_memory_reported = 0;
+ 
+@@ -1653,6 +1654,7 @@
+             prefill_episode_active = false;
+             prefill_summary_deferred = 0;
+             prefill_memory.reset();
++            prefill_draft_memory.reset();
+             prefill_memory_trace = server_prefill_budget::enabled(std::getenv("WILDLLAMA_PREFILL_TRACE"));
+             prefill_memory_reported = 0;
+         }
+@@ -4318,9 +4320,27 @@
+         int32_t prompt_batch_limit = n_batch;
+ 
+         if (prefill_budget_enabled) {
+-            bool supported = !prefill_budget_failed && params_base.cont_batching && !mctx && !spec && !ctx_dft &&
+-                !params_base.embedding && ctx_tgt->adaptive_prefill_supported(true);
+-            const bool reservation_pending = supported && !ctx_tgt->adaptive_prefill_supported();
++            const bool neural_outputs = spec && ctx_dft;
++            bool supported = !prefill_budget_failed && params_base.cont_batching && !mctx &&
++                !params_base.embedding && ctx_tgt->adaptive_prefill_supported(true, neural_outputs) &&
++                (!ctx_dft || ctx_dft->adaptive_prefill_supported(true, neural_outputs));
++            const bool reservation_pending = supported &&
++                (!ctx_tgt->adaptive_prefill_supported(false, neural_outputs) ||
++                 (ctx_dft && !ctx_dft->adaptive_prefill_supported(false, neural_outputs)));
++            const uint32_t generation_rows = uint32_t(batch.size());
++            server_prefill_batch_contract contract(uint32_t(n_batch), generation_rows, bool(spec));
++            for (const auto * slot : generating) {
++                const auto & indices = slot->spec_i_batch;
++                const uint64_t begin = indices.empty() ? uint64_t(slot->i_batch) : uint64_t(indices.front());
++                const uint64_t count = indices.empty() ? 1 : indices.size();
++                for (size_t i = 0; i < indices.size(); ++i) {
++                    if (indices[i] < 0 || uint64_t(indices[i]) != begin + i) { supported = false; }
++                }
++                if (slot->id < 0) { supported = false; }
++                contract.sequence(uint32_t(slot->id), begin, count);
++            }
++            supported = supported && contract.complete();
++            if (supported) { prefill_budget.select_workload(contract.workload()); }
+             uint32_t pending_prompts = 0;
+             for (const auto & slot : slots) {
+                 if (!slot.is_processing()) { continue; }
+@@ -4328,16 +4348,15 @@
+                 if ((slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) &&
+                         slot.prompt.n_tokens() < slot.task->n_tokens()) { ++pending_prompts; }
+                 if (slot.task->type != SERVER_TASK_TYPE_COMPLETION ||
+-                        slot.task->is_parent() || slot.task->is_child() || slot.task->tokens.has_mtmd ||
++                        slot.task->is_parent() || slot.task->is_child() || slot.task->tokens.has_mtmd || slot.prompt.tokens.has_mtmd ||
+                         slot.need_embd() || !slot.can_split() || !slot.lora.empty() ||
+-                        !slot.task->params.sampling.grammar.empty() || slot.spec_control.enabled || slot.audio_stream) {
++                        !slot.task->params.sampling.grammar.empty() || slot.audio_stream) {
+                     supported = false;
+                 }
+             }
+             prefill_round_eligible = supported && !reservation_pending;
+-            const uint32_t generation_rows = uint32_t(batch.size());
+             if (supported && generation_rows && pending_prompts && uint32_t(n_batch) > generation_rows) {
+-                if (!prefill_episode_active) { prefill_memory.begin_episode(); }
++                if (!prefill_episode_active) { prefill_memory.begin_episode(); prefill_draft_memory.begin_episode(); }
+                 prefill_episode_active = true;
+             }
+             if (!pending_prompts) { prefill_episode_active = false; }
+@@ -4353,12 +4372,14 @@
+             if (prefill_plan.chunked && !prefill_plan.deferred) {
+                 prompt_batch_limit = int32_t(generation_rows + prefill_plan.prompt_rows);
+             }
+-            if (prefill_round_deferred || prefill_plan.chunked) { prefill_memory.mark_deferred(); }
++            if (prefill_round_deferred || prefill_plan.chunked) {
++                prefill_memory.mark_deferred(); prefill_draft_memory.mark_deferred();
++            }
+             const auto prefill_stats = prefill_budget.stats();
+             if ((prefill_round_deferred || prefill_plan.chunked) &&
+                     prefill_stats.deferred + prefill_stats.chunked_admissions == 1) {
+-                SRV_INF("ADAPTIVE_PREFILL_ACTIVE generation_rows=%u pending_prompts=%u target_us=%" PRIu64 " prompt_rows=%u max_consecutive_deferrals=1\n",
+-                    generation_rows, pending_prompts, prefill_budget.target_latency_us(), prefill_plan.prompt_rows);
++                SRV_INF("ADAPTIVE_PREFILL_ACTIVE generation_rows=%u pending_prompts=%u target_us=%" PRIu64 " prompt_rows=%u max_consecutive_deferrals=1 speculative=%d neural=%d\n",
++                    generation_rows, pending_prompts, prefill_budget.target_latency_us(), prefill_plan.prompt_rows, int(bool(spec)), int(neural_outputs));
+             }
+         }
+ 
+@@ -5204,7 +5225,32 @@
+         if (spec) {
+             bool ok = true;
+             queue_tasks.yield_to_queue([&]() {
+-                ok = common_speculative_process(spec.get(), batch.view);
++                const bool observe_memory = ctx_dft && (prefill_round_reuse_only || prefill_memory_trace);
++                const auto before = observe_memory ? ctx_dft->get_graph_variant_admission_stats() :
++                    llama_context::graph_variant_admission_stats{};
++                const auto secondary_before = observe_memory ? ctx_dft->get_graph_variant_stats().compute_bytes : 0;
++                {
++                    // A changed target prompt slice also changes draft catch-up.
++                    // It must not silently retain additional draft graph arenas.
++                    server_prefill_reuse_scope<llama_context> reuse_only(ctx_dft, ctx_dft && prefill_round_reuse_only);
++                    ok = common_speculative_process(spec.get(), batch.view);
++                }
++                if (observe_memory) {
++                    const auto after = ctx_dft->get_graph_variant_admission_stats();
++                    const auto secondary_after = ctx_dft->get_graph_variant_stats().compute_bytes;
++                    const auto growth = prefill_draft_memory.observe(before.primary_compute_bytes, after.primary_compute_bytes,
++                        before.primary_gpu_bytes, after.primary_gpu_bytes, secondary_before, secondary_after,
++                        prefill_round_reuse_only);
++                    if (growth.baseline_changed) {
++                        prefill_budget.reservation_changed();
++                        prefill_round_eligible = false;
++                    }
++                    if (growth.unexpected && !prefill_budget_failed) {
++                        prefill_budget_failed = true;
++                        SRV_WRN("adaptive prefill disabled after unexpected draft reservation growth: primary_delta=%zu primary_gpu_delta=%zu secondary_delta=%zu\n",
++                            growth.primary_delta, growth.primary_gpu_delta, growth.secondary_delta);
++                    }
++                }
+             });
+ 
+             if (!ok) {
+@@ -5666,8 +5712,15 @@
+         const auto memory = prefill_memory.stats();
+         if (prefill_memory_trace && memory.calls != prefill_memory_reported) {
+             const auto cache = ctx_tgt->get_graph_variant_admission_stats();
+-            SRV_INF("ADAPTIVE_PREFILL_MEMORY calls=%" PRIu64 " primary_peak_bytes=%zu primary_gpu_peak_bytes=%zu secondary_peak_bytes=%zu scope_restored=%d\n",
+-                memory.calls, memory.primary_peak_bytes, memory.primary_gpu_peak_bytes, memory.secondary_peak_bytes, int(!cache.reuse_only));
++            const auto draft_memory = prefill_draft_memory.stats();
++            const auto draft_cache = ctx_dft ? ctx_dft->get_graph_variant_admission_stats() :
++                llama_context::graph_variant_admission_stats{};
++            SRV_INF("ADAPTIVE_PREFILL_MEMORY calls=%" PRIu64 " primary_peak_bytes=%zu primary_gpu_peak_bytes=%zu secondary_peak_bytes=%zu scope_restored=%d"
++                    " draft_primary_peak_bytes=%zu draft_primary_gpu_peak_bytes=%zu draft_secondary_peak_bytes=%zu draft_scope_restored=%d"
++                    " draft_primary_growth_bytes=%zu draft_primary_gpu_growth_bytes=%zu draft_secondary_growth_bytes=%zu\n",
++                memory.calls, memory.primary_peak_bytes, memory.primary_gpu_peak_bytes, memory.secondary_peak_bytes, int(!cache.reuse_only),
++                draft_memory.primary_peak_bytes, draft_memory.primary_gpu_peak_bytes, draft_memory.secondary_peak_bytes, int(!draft_cache.reuse_only),
++                draft_memory.primary_growth_bytes, draft_memory.primary_gpu_growth_bytes, draft_memory.secondary_growth_bytes);
+             prefill_memory_reported = memory.calls;
+         }
+         if (!prefill_budget_enabled) { return; }
+diff --git a/tools/server/server-prefill-budget.h b/tools/server/server-prefill-budget.h
+--- a/tools/server/server-prefill-budget.h
++++ b/tools/server/server-prefill-budget.h
+@@ -4,6 +4,34 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++
++// Verify that each generating sequence, including every speculative proposal,
++// remains wholly inside the first ordinary logical decode. Prompt slicing may
++// only consume the capacity AFTER these spans. No token or sequence is moved.
++class server_prefill_batch_contract {
++public:
++    server_prefill_batch_contract(uint32_t capacity, uint32_t rows, bool neural)
++        : capacity(capacity), rows(rows) {
++        valid = capacity && rows <= capacity;
++        mix(neural ? 1 : 0);
++    }
++    void sequence(uint32_t id, uint64_t begin, uint64_t count) {
++        if (!valid || !count || begin != covered || begin > rows || count > uint64_t(rows) - begin) {
++            valid = false;
++            return;
++        }
++        covered += uint32_t(count);
++        mix(id); mix(uint32_t(count));
++    }
++    bool complete() const { return valid && covered == rows; }
++    uint64_t workload() const { return fingerprint; }
++private:
++    void mix(uint32_t value) { fingerprint = (fingerprint ^ value) * UINT64_C(1099511628211); }
++    uint64_t fingerprint = UINT64_C(1469598103934665603);
++    uint32_t capacity = 0, rows = 0, covered = 0;
++    bool valid = false;
++};
++static_assert(sizeof(server_prefill_batch_contract) <= 32, "batch proof must remain stack-only metadata");
+ 
+ // CPU-only admission controller. Configured batch/context limits stay intact.
+ // A bounded prompt slice can run beside generation when completed observations
+@@ -42,6 +70,12 @@
+     }
+ 
+     void reset(uint64_t target_us = 0) { *this = {}; target_override_us = target_us; }
++
++    // Equal row totals can represent different sequence/proposal shapes. Keep
++    // their measured costs separate; a changed workload relearns normally.
++    void select_workload(uint64_t value) {
++        if (workload_key != value) { clear_learning(); workload_key = value; }
++    }
+ 
+     void clear_learning() {
+         rows = 0;
+@@ -187,6 +221,7 @@
+     uint64_t mixed_us = 0;
+     uint64_t target_override_us = 0;
+     uint64_t prompt_row_us_q16 = 0;
++    uint64_t workload_key = 0;
+     uint32_t rows = 0;
+     uint32_t warm_pure = 0;
+     uint32_t slow_mixed = 0;

@@ -12,11 +12,11 @@ in the model profile's additional-VRAM controls.
 
 ## Eligible execution
 
-The first implementation accepts explicitly attached, complete greedy backend
-sampler chains with supported stateless filters. It requires one CUDA backend,
+The verifier accepts explicitly attached, complete greedy or transactional
+distribution backend sampler chains with supported stateless filters. It requires one CUDA backend,
 one sequence, one verification microbatch and at most 512 draft tokens plus the
 target correction. Grammar, requested probabilities, reasoning controllers,
-stochastic selectors, weight-streaming providers and unsupported layouts retain
+unsupported stochastic selectors, weight-streaming providers and unsupported layouts retain
 the original implementation. A positive allowance does not change temperature
 or automatically enable backend sampling.
 Positive `WILDLLAMA_KV_CACHE_INITIAL_TOKENS` configurations require an explicit
@@ -30,6 +30,11 @@ its existing tie rules and floating-point behavior. A CUDA kernel then compares
 those selected device tokens with the draft, applies the same end-of-generation
 boundary rule, and determines the accepted prefix and target correction. The
 decision does not read logits or probabilities on the CPU and consumes no RNG.
+Transactional distribution chains use the same pre-sampled target IDs and
+accepted-draw commit as ordinary target-sample-and-match verification. This
+does not replace p/q rejection sampling: that path keeps its host probability
+and residual algorithm, with deferred rows materialized in one batch. See
+[stochastic target matching](stochastic-device-verification.md) for coverage.
 The kernel returns a bounded token/count report. Common greedy chains usually
 already compact each row to scalar logits/candidates, so their possible benefit
 is fewer per-row driver-copy calls, not elimination of vocabulary-sized traffic.

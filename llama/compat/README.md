@@ -54,6 +54,11 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under
   this directory by numeric filename order.
+- `083-portable-runtime-planning.patch` - capability-based hybrid/speculative
+  prompt admission, backend-independent measured graph-plan retention, an
+  optional allocation-free CUDA affine-gate fusion, and transactional stochastic
+  target matching with bulk host fallback. Existing memory budgets and defaults
+  are preserved; see the four linked runtime guides in the main README.
 
 The compatibility source files stay in this directory and are linked into the
 fetched llama.cpp targets. Patch 001 adds compatibility call sites; the later

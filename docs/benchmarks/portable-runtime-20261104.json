@@ -1,0 +1,44 @@
+{
+  "scope": "Small synthetic correctness/resource validation and a model-free shared-GPU component benchmark; not trained-model throughput or SGLang parity",
+  "native_base": "b11845",
+  "implementation_patch_sha256": "0334e6dd1173c847ca1299a3bbe3af38ed8a025523b0e2d6445cdf048f8c42b3",
+  "ordered_patch_replay": {"patches": 80, "files": 223, "implementation_files": 23, "idempotent": true},
+  "cpu": {"passing_test_invocations": 14, "related_tests_repeated_after_fixture_fix": 6, "neural_scheduling_http_cases": 4, "http_fixture_bytes": 436544, "hybrid_same_batch_logits_and_states_exact": true, "hybrid_independent_continuations_and_cancellation": true},
+  "affine_gate": {
+    "backend": "Windows CUDA 12.8, RTX 5060 Ti 16 GiB",
+    "correctness_cases_per_mode": 216,
+    "changed_inputs_per_case": 3,
+    "modes": ["CPU fallback", "CUDA enabled", "CUDA disabled"],
+    "output_bits_exact": true,
+    "new_device_tensors_or_buffers": 0,
+    "benchmark_order": "three ABBA cycles, 32 graph replays per block",
+    "shared_gpu_memory_used_mib_before": 11956,
+    "fixture_tracked_peak_bytes": 3211264,
+    "fixture_tracked_limit_bytes": 134217728,
+    "completed_stream_microseconds": [
+      {"width": 128, "rows": 1, "reference": 300.759, "candidate": 283.461},
+      {"width": 128, "rows": 4, "reference": 293.727, "candidate": 293.280},
+      {"width": 128, "rows": 64, "reference": 311.943, "candidate": 321.645},
+      {"width": 4096, "rows": 1, "reference": 290.881, "candidate": 289.738},
+      {"width": 4096, "rows": 4, "reference": 359.106, "candidate": 330.959},
+      {"width": 4096, "rows": 64, "reference": 541.833, "candidate": 512.300}
+    ],
+    "interpretation": "Mixed component results with variable shared-GPU scheduling; retain the existing opt-in, not a default-enable or model tokens/s justification"
+  },
+  "stochastic_verification": {
+    "matching_cases": 2,
+    "probability_ratio_rejection_cases": 2,
+    "terminal_eog_covered": true,
+    "tokens_and_public_candidates_exact": true,
+    "matching_device_hits_per_case": 1,
+    "rejection_device_hits_per_case": 0,
+    "matching_deferred_bytes_per_case": 784,
+    "matching_materialized_bytes_per_case": 392,
+    "rejection_materialized_bytes_per_case": 784,
+    "managed_test_limit_bytes": 100663296,
+    "managed_test_peak_bytes": 100654336,
+    "note": "The test also deliberately exercises allocation denial and invalid-input fallback; its peak is not the feature's incremental memory"
+  },
+  "limits_and_defaults": {"saved_profiles_changed": false, "context_or_weight_precision_changed": false, "new_vram_budget": false, "generic_execution_plan_host_metadata_max_bytes": 2048, "general_paged_attention_implemented": false},
+  "validation_limits": ["No pretrained or large model tested", "No idle-GPU trained-model tokens/s comparison", "Linux, HIP, Vulkan and Metal execution not tested", "Go wrapper hybrid single-request restrictions preserved"]
+}
