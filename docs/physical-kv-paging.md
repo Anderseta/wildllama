@@ -44,6 +44,10 @@ would require a different read/write mapping contract across attention, shifts,
 defragmentation and state operations. No interior-page zero-alias shortcut is
 enabled here.
 
+The separate experimental [page-table attention](paged-attention.md) feature
+introduces that different read/write contract for admitted ordinary caches.
+Enabling the established tail-paging option does not automatically enable it.
+
 ## Small validation targets
 
 * `test-kv-trim-ranges`: opt-in parsing, bounded mapping segments/metadata,

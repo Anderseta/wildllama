@@ -95,6 +95,43 @@ func TestBoundedDeviceFeaturesPreserveRunnerPolicies(t *testing.T) {
 	}
 }
 
+func TestPagedAttentionEnvironmentPreservesRunnerPolicies(t *testing.T) {
+	t.Setenv("WILDLLAMA_PAGED_ATTENTION", "1")
+	for _, value := range []string{"", "0", "1"} {
+		t.Run("profile="+value, func(t *testing.T) {
+			input := map[string]string{
+				"WILDLLAMA_PAGED_ATTENTION":    value,
+				"WILDLLAMA_KV_CACHE_PAGING":    "0",
+				"LLAMA_ARG_GPU_VRAM_LIMIT_MIB": "12288", "LLAMA_ARG_MOE_RAM_LIMIT_MIB": "10240",
+				"WILDLLAMA_KV_CACHE_INITIAL_TOKENS": "8192", "LLAMA_ARG_CTX_SIZE": "131072",
+				"LLAMA_ARG_CACHE_TYPE_K": "q8_0", "LLAMA_ARG_CACHE_TYPE_V": "q8_0",
+			}
+			validated, err := api.ParseRunnerEnvironment(map[string]string{"WILDLLAMA_PAGED_ATTENTION": value})
+			if err != nil || validated["WILDLLAMA_PAGED_ATTENTION"] != value {
+				t.Fatalf("invalid explicit paged attention setting: %v %v", validated, err)
+			}
+			cmd := &exec.Cmd{}
+			SetupLlamaServerCommandEnv(cmd, "llama-server", nil, input)
+			policies := map[string]string{}
+			for _, entry := range cmd.Env {
+				key, item, _ := strings.Cut(entry, "=")
+				policies[key] = item
+			}
+			if actual, present := policies["WILDLLAMA_PAGED_ATTENTION"]; present != (value != "") || actual != value {
+				t.Fatalf("explicit off/default paged attention changed: %q present=%v", actual, present)
+			}
+			for key, expected := range input {
+				if key != "WILDLLAMA_PAGED_ATTENTION" && policies[key] != expected {
+					t.Fatalf("paged attention changed %s: %q", key, policies[key])
+				}
+			}
+		})
+	}
+	if os.Getenv("WILDLLAMA_PAGED_ATTENTION") != "1" {
+		t.Fatal("runner opt-in changed the parent process")
+	}
+}
+
 func TestLogicalAndPhysicalBatchAreIndependent(t *testing.T) {
 	opts := api.DefaultOptions()
 	opts.NumBatch = 2048

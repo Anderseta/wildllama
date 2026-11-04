@@ -6,6 +6,11 @@ and aging. A recurring expensive plan is protected from a one-off shape. Missing
 measurements retain the original LRU policy. Full topology, input and backend
 compatibility checks remain mandatory before every actual reuse.
 
+Cost comparisons stay within the same graph type, input kind and MTP-head role.
+Transitions between encoder and decoder roles retain their original LRU fairness,
+so host timing variation cannot let an expensive decoder starve its cheap encoder.
+The same arena count and memory allowance still apply.
+
 The policy is backend-independent and context-owned: it does not depend on a
 GPU brand or model-name list. It learns from the work the caller requested and
 resets with graph invalidation. It never runs duplicate inference or starts

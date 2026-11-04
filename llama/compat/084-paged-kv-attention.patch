@@ -1,0 +1,3582 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/ggml/include/ggml-cuda-kv-growth.h b/ggml/include/ggml-cuda-kv-growth.h
+--- a/ggml/include/ggml-cuda-kv-growth.h
++++ b/ggml/include/ggml-cuda-kv-growth.h
+@@ -23,3 +23,7 @@
+ // Caller must fence users and protect every byte that subsequent kernels may
+ // read, including dense masked cells and quantized padding. Live cells may stay.
+ using ggml_backend_cuda_kv_trim_unused_t = ggml_backend_cuda_kv_trim_t;
++
++// Metadata-only residency query, separate from version-1 allocation ABI.
++// False means that a range must be committed before any device access.
++using ggml_backend_cuda_kv_range_committed_t = bool (*)(ggml_backend_buffer_t, size_t, size_t);
+diff --git a/ggml/include/ggml-kv-trim.h b/ggml/include/ggml-kv-trim.h
+--- a/ggml/include/ggml-kv-trim.h
++++ b/ggml/include/ggml-kv-trim.h
+@@ -27,3 +27,15 @@
+     }
+     return false;
+ }
++
++// Requires validated, sorted, nonoverlapping ranges. Sparse page tables can
++// contain many live islands; do not scan every island for every CUDA mapping.
++inline bool ggml_kv_trim_keep_sorted(size_t offset, size_t size, const ggml_kv_trim_range * ranges, size_t count) {
++    size_t first = 0, end = count;
++    while (first < end) {
++        const size_t middle = first + (end - first)/2;
++        if (ranges[middle].offset + ranges[middle].size <= offset) { first = middle + 1; }
++        else { end = middle; }
++    }
++    return first < count && size && ranges[first].size && ranges[first].offset < offset + size;
++}
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -606,6 +606,8 @@
+         // Inference-only allowed-token bitset; appended to preserve op IDs.
+         GGML_OP_TOKEN_MASK,
+ 
++        GGML_OP_FLASH_ATTN_PAGED,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -2545,6 +2547,28 @@
+             float                 max_bias,
+             float                 logit_softcap);
+ 
++    // Exact attention over physical KV pages, without gathering a dense cache.
++    // q: [Dk,Nq,Hq,S], k/v: [Dk or Dv,physical_rows,Hkv,1 or S].
++    // block_table: contiguous I32 [logical_blocks,S], physical block IDs.
++    // logical_lengths: optional contiguous I32 [S]; NULL uses full pages.
++    // mask: optional F16/F32 [logical_blocks*page_tokens,Nq,Hmask,Smask].
++    // Mask head/stream dimensions broadcast as in flash_attn_ext. The caller
++    // supplies causal/sequence visibility in logical block-table order.
++    // sinks: optional F32 [Hq]. Result: F32 [Dv,Hq,Nq,S].
++    GGML_API struct ggml_tensor * ggml_flash_attn_paged(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * mask,
++            struct ggml_tensor  * sinks,
++            struct ggml_tensor  * block_table,
++            struct ggml_tensor  * logical_lengths,
++            int32_t               page_tokens,
++            float                 scale,
++            float                 max_bias,
++            float                 logit_softcap);
++
+     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
+             struct ggml_tensor * a,
+             enum ggml_prec       prec),
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1192,6 +1192,7 @@
+ 
+     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
+     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
++    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_PAGED;
+ 
+     if (allow) {
+         for (int i = 0; i < GGML_MAX_SRC; i++) {
+@@ -2381,6 +2382,7 @@
+ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
+     switch (op) {
+         case GGML_OP_FLASH_ATTN_EXT:
++        case GGML_OP_FLASH_ATTN_PAGED:
+         case GGML_OP_MUL_MAT:
+         case GGML_OP_MUL_MAT_ID:
+         case GGML_OP_CUMSUM:
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2110,6 +2110,10 @@
+             {
+                 ggml_compute_forward_flash_attn_ext(params, tensor);
+             } break;
++        case GGML_OP_FLASH_ATTN_PAGED:
++            {
++                ggml_compute_forward_flash_attn_paged(params, tensor);
++            } break;
+         case GGML_OP_FLASH_ATTN_BACK:
+             {
+                 int32_t t = ggml_get_op_params_i32(tensor, 0);
+@@ -2520,6 +2524,7 @@
+         case GGML_OP_ARGSORT:
+         case GGML_OP_TOP_K:
+         case GGML_OP_FLASH_ATTN_EXT:
++        case GGML_OP_FLASH_ATTN_PAGED:
+         case GGML_OP_FLASH_ATTN_BACK:
+         case GGML_OP_SSM_CONV:
+         case GGML_OP_SSM_SCAN:
+@@ -3078,6 +3083,12 @@
+                     {
+                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                     } break;
++                case GGML_OP_FLASH_ATTN_PAGED:
++                    {
++                        const size_t dk = node->src[0]->ne[0];
++                        const size_t dv = node->src[2]->ne[0];
++                        cur += sizeof(float) * (dk + 2 * dv + CACHE_LINE_SIZE_F32) * n_tasks;
++                    } break;
+                 case GGML_OP_FLASH_ATTN_EXT:
+                     {
+                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -4,6 +4,7 @@
+ #include "repack.h"
+ #include "traits.h"
+ #include "ggml-impl.h"
++#include "ggml-paged-attn.h"
+ #include "amx/amx.h"
+ 
+ #include <cctype>
+@@ -441,6 +442,8 @@
+     }
+ 
+     switch (op->op) {
++        case GGML_OP_FLASH_ATTN_PAGED:
++            return ggml_paged_attn_valid(op);
+         case GGML_OP_TOKEN_MASK:
+             if (ggml_get_op_params_i32(op, 1) == 3) {
+                 for (int i = 2; i < GGML_MAX_SRC; ++i) { if (op->src[i]) { return false; } }
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -5,6 +5,7 @@
+ #include "binary-ops.h"
+ #include "simd-gemm.h"
+ #include "ggml.h"
++#include "ggml-paged-attn.h"
+ #include "unary-ops.h"
+ #include "vec.h"
+ 
+@@ -8930,6 +8931,102 @@
+     }
+ }
+ 
++void ggml_compute_forward_flash_attn_paged(const ggml_compute_params * params, ggml_tensor * dst) {
++    GGML_ASSERT(ggml_paged_attn_valid(dst));
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    const ggml_tensor * v = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++    const ggml_tensor * table = dst->src[5];
++    const ggml_tensor * lengths = dst->src[6];
++    const auto options = ggml_paged_attn_get_params(dst);
++    const int64_t dk = q->ne[0], dv = v->ne[0];
++    const int64_t rows = q->ne[1] * q->ne[2] * q->ne[3];
++    const int64_t logical_capacity = table->ne[0] * options.page_tokens;
++    const size_t scratch_stride = size_t(dk + 2 * dv) + CACHE_LINE_SIZE_F32;
++    GGML_ASSERT(params->wdata && params->wsize >= scratch_stride * params->nth * sizeof(float));
++    float * accumulator = static_cast<float *>(params->wdata) + params->ith * scratch_stride;
++    float * decoded_key = accumulator + dv;
++    float * decoded_value = decoded_key + dk;
++    const auto key_to_float = ggml_get_type_traits(k->type)->to_float;
++    const auto value_to_float = ggml_get_type_traits(v->type)->to_float;
++    const uint32_t head_power = 1u << uint32_t(std::floor(std::log2(double(q->ne[2]))));
++    const float m0 = std::pow(2.f, -options.max_bias / head_power);
++    const float m1 = std::pow(2.f, -(options.max_bias / 2.f) / head_power);
++
++    for (int64_t row = params->ith; row < rows; row += params->nth) {
++        const int64_t query = row % q->ne[1];
++        const int64_t head = (row / q->ne[1]) % q->ne[2];
++        const int64_t stream = row / (q->ne[1] * q->ne[2]);
++        const int64_t kv_head = head / (q->ne[2] / k->ne[2]);
++        const int64_t kv_stream = k->ne[3] == 1 ? 0 : stream;
++        const int64_t length = lengths ? static_cast<const int32_t *>(lengths->data)[stream] : logical_capacity;
++        float * output = reinterpret_cast<float *>(static_cast<char *>(dst->data) +
++                head * dst->nb[1] + query * dst->nb[2] + stream * dst->nb[3]);
++        if (length < 0 || length > logical_capacity) {
++            std::fill(output, output + dv, NAN);
++            continue;
++        }
++        const auto * blocks = reinterpret_cast<const int32_t *>(static_cast<const char *>(table->data) + stream * table->nb[1]);
++        const float * query_data = reinterpret_cast<const float *>(static_cast<const char *>(q->data) +
++                query * q->nb[1] + head * q->nb[2] + stream * q->nb[3]);
++        const char * mask_data = mask ? static_cast<const char *>(mask->data) +
++                query * mask->nb[1] + (head % mask->ne[2]) * mask->nb[2] + (stream % mask->ne[3]) * mask->nb[3] : nullptr;
++        const float slope = options.max_bias > 0.f ? head < head_power ? std::pow(m0, head + 1) :
++                std::pow(m1, 2 * (head - head_power) + 1) : 1.f;
++        float maximum = -INFINITY, sum = 0.f;
++        bool invalid_page = false;
++        std::fill(accumulator, accumulator + dv, 0.f);
++
++        for (int64_t logical = 0; logical < length; ++logical) {
++            float bias = 0.f;
++            if (mask_data) {
++                bias = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(reinterpret_cast<const ggml_fp16_t *>(mask_data)[logical]) :
++                        reinterpret_cast<const float *>(mask_data)[logical];
++                if (bias == -INFINITY) { continue; }
++                bias *= slope;
++            }
++            const int32_t block = blocks[logical / options.page_tokens];
++            const int64_t physical = int64_t(block) * options.page_tokens + logical % options.page_tokens;
++            if (block < 0 || physical < 0 || physical >= k->ne[1]) { invalid_page = true; break; }
++            const char * key_data = static_cast<const char *>(k->data) +
++                    physical * k->nb[1] + kv_head * k->nb[2] + kv_stream * k->nb[3];
++            const char * value_data = static_cast<const char *>(v->data) +
++                    physical * v->nb[1] + kv_head * v->nb[2] + kv_stream * v->nb[3];
++            const float * key = reinterpret_cast<const float *>(key_data);
++            const float * value = reinterpret_cast<const float *>(value_data);
++            if (k->type != GGML_TYPE_F32) { key_to_float(key_data, decoded_key, dk); key = decoded_key; }
++            if (v->type != GGML_TYPE_F32) { value_to_float(value_data, decoded_value, dv); value = decoded_value; }
++            float score;
++            ggml_vec_dot_f32(int(dk), &score, 0, query_data, 0, key, 0, 1);
++            score *= options.logit_softcap != 0.f ? options.scale / options.logit_softcap : options.scale;
++            if (options.logit_softcap != 0.f) { score = options.logit_softcap * std::tanh(score); }
++            score += bias;
++            const float next_maximum = std::max(maximum, score);
++            const float rescale = std::exp(maximum - next_maximum);
++            const float probability = std::exp(score - next_maximum);
++            ggml_vec_scale_f32(int(dv), accumulator, rescale);
++            ggml_vec_mad_f32(int(dv), accumulator, value, probability);
++            sum = sum * rescale + probability;
++            maximum = next_maximum;
++        }
++        if (invalid_page) { std::fill(output, output + dv, NAN); continue; }
++        if (sinks) {
++            const float sink = static_cast<const float *>(sinks->data)[head];
++            if (sink != -INFINITY) {
++                const float next_maximum = std::max(maximum, sink);
++                const float rescale = std::exp(maximum - next_maximum);
++                ggml_vec_scale_f32(int(dv), accumulator, rescale);
++                sum = sum * rescale + std::exp(sink - next_maximum);
++            }
++        }
++        const float inverse = sum == 0.f ? 0.f : 1.f / sum;
++        ggml_vec_scale_f32(int(dv), accumulator, inverse);
++        memcpy(output, accumulator, size_t(dv) * sizeof(float));
++    }
++}
++
+ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -87,6 +87,7 @@
+ void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_flash_attn_paged(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_flash_attn_back(
+         const struct ggml_compute_params * params,
+         const bool masked,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -34,6 +34,7 @@
+ #include "ggml-cuda/diagmask.cuh"
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
++#include "ggml-cuda/paged-attn.cuh"
+ #include "ggml-cuda/fwht.cuh"
+ #include "ggml-cuda/getrows.cuh"
+ #include "ggml-cuda/im2col.cuh"
+@@ -1250,6 +1251,12 @@
+     if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) { return SIZE_MAX; }
+     auto * ctx=static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+     return ctx->kv_vmm ? ctx->kv_vmm->committed() : buffer->size;
++}
++
++static bool ggml_cuda_kv_range_committed(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
++    if (!buffer || !ggml_backend_buffer_is_cuda(buffer) || offset > buffer->size || size > buffer->size - offset) { return false; }
++    auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
++    return !ctx->kv_vmm || ctx->kv_vmm->range_committed(offset, size);
+ }
+ 
+ static bool ggml_cuda_kv_clear_existing(ggml_backend_buffer_t buffer,size_t offset,size_t size) {
+@@ -3168,6 +3175,9 @@
+         case GGML_OP_FLASH_ATTN_EXT:
+             ggml_cuda_flash_attn_ext(ctx, dst);
+             break;
++        case GGML_OP_FLASH_ATTN_PAGED:
++            ggml_cuda_flash_attn_paged(ctx, dst);
++            break;
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+             ggml_cuda_cross_entropy_loss(ctx, dst);
+             break;
+@@ -7138,6 +7148,8 @@
+                 op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
++        case GGML_OP_FLASH_ATTN_PAGED:
++            return ggml_cuda_flash_attn_paged_supported(dev_ctx->device, op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+         case GGML_OP_OPT_STEP_ADAMW:
+@@ -7314,6 +7326,9 @@
+ }
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_cuda_test_paged_attn_submissions") == 0) {
++        return (void *) ggml_cuda_paged_attn_submissions;
++    }
+     if (strcmp(name, "ggml_backend_cuda_test_affine_gate_fusions") == 0) {
+         return (void *) ggml_backend_cuda_test_affine_gate_fusions;
+     }
+@@ -7364,6 +7379,9 @@
+ #endif
+     if (strcmp(name, "ggml_backend_cuda_kv_growth_api") == 0) {
+         return const_cast<ggml_backend_cuda_kv_growth_api *>(&ggml_cuda_kv_growth_api);
++    }
++    if (strcmp(name, "ggml_backend_cuda_kv_range_committed") == 0) {
++        return (void *) ggml_cuda_kv_range_committed;
+     }
+     if (strcmp(name, "ggml_backend_cuda_kv_trim_empty") == 0 ||
+             strcmp(name, "ggml_backend_cuda_kv_trim_unused") == 0) {
+diff --git a/ggml/src/ggml-cuda/kv-growth.cuh b/ggml/src/ggml-cuda/kv-growth.cuh
+--- a/ggml/src/ggml-cuda/kv-growth.cuh
++++ b/ggml/src/ggml-cuda/kv-growth.cuh
+@@ -17,7 +17,8 @@
+     ggml_cuda_kv_vmm(int device, size_t capacity, size_t granularity) :
+         device(device), capacity(capacity), granularity(granularity), pages(capacity/granularity, 0),
+         segment_pages(ggml_kv_paging_segment_pages(capacity, granularity,
+-            ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING")))) {}
++            ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING")) ||
++            ggml_kv_paging_enabled(std::getenv("WILDLLAMA_PAGED_ATTENTION")))) {}
+ 
+     ~ggml_cuda_kv_vmm() {
+ #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -82,6 +83,16 @@
+ #endif
+     }
+ 
++    bool range_committed(size_t offset, size_t size) {
++        if (offset > capacity || size > capacity - offset) { return false; }
++        if (!size) { return true; }
++        std::lock_guard<std::mutex> lock(mutex);
++        const size_t first = offset / granularity;
++        const size_t end = (offset + size - 1) / granularity + 1;
++        return std::all_of(pages.begin() + first, pages.begin() + end,
++            [](uint8_t mapped) { return mapped != 0; });
++    }
++
+     void clear(uint8_t value) {
+         std::lock_guard<std::mutex> lock(mutex);
+         fill = value;
+@@ -106,20 +117,37 @@
+     bool trim(const ggml_kv_trim_range * keep, size_t count) {
+ #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+         if (!ggml_kv_trim_ranges_valid(capacity, keep, count)) { return false; }
++        bool sorted = true;
++        for (size_t i = 0; i < count; ++i) {
++            if (!keep[i].size || (i && keep[i - 1].offset + keep[i - 1].size > keep[i].offset)) {
++                sorted = false; break;
++            }
++        }
+         std::lock_guard<std::mutex> lock(mutex);
+         if (fill != 0) { return false; }
+         ggml_cuda_set_device(device);
+-        for (size_t i = 0; i < mappings.size();) {
++        const size_t original_size = mappings.size();
++        size_t retained = 0;
++        for (size_t i = 0; i < original_size; ++i) {
+             const auto m = mappings[i];
+-            if (ggml_kv_trim_keep(m.offset, m.size, keep, count)) { ++i; continue; }
++            const bool live = sorted ? ggml_kv_trim_keep_sorted(m.offset, m.size, keep, count) :
++                                       ggml_kv_trim_keep(m.offset, m.size, keep, count);
++            if (live) { mappings[retained++] = m; continue; }
+             // A failed unmap retains its mapping/accounting. Earlier successful
+             // removals remain valid even if a later driver call fails.
+-            if (cuMemUnmap(address + m.offset, m.size) != CUDA_SUCCESS) { return false; }
++            if (cuMemUnmap(address + m.offset, m.size) != CUDA_SUCCESS) {
++                // Preserve this and all unprocessed mappings after any error.
++                for (size_t remaining = i; remaining < original_size; ++remaining) {
++                    mappings[retained++] = mappings[remaining];
++                }
++                mappings.resize(retained);
++                return false;
++            }
+             std::fill(pages.begin() + m.offset/granularity,
+                       pages.begin() + (m.offset + m.size)/granularity, uint8_t(0));
+             ggml_cuda_memory_release_vmm(ggml_cuda_get_physical_device(device), m.tracked ? m.size : 0, m.tracked ? 0 : 1);
+-            mappings.erase(mappings.begin() + i);
+         }
++        mappings.resize(retained);
+         return true;
+ #else
+         GGML_UNUSED(keep); GGML_UNUSED(count); return false;
+diff --git a/ggml/src/ggml-cuda/paged-attn.cu b/ggml/src/ggml-cuda/paged-attn.cu
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/paged-attn.cu
+@@ -0,0 +1,242 @@
++#include "paged-attn.cuh"
++#include "ggml-paged-attn.h"
++
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++
++static std::atomic<uint64_t> paged_attn_submissions{0};
++
++uint64_t ggml_cuda_paged_attn_submissions() {
++    return paged_attn_submissions.load(std::memory_order_relaxed);
++}
++
++bool ggml_cuda_flash_attn_paged_supported(int device, const ggml_tensor * dst) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    GGML_UNUSED_VARS(device, dst);
++    return false;
++#else
++    if (!ggml_paged_attn_valid(dst) || !GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[device].cc)) { return false; }
++    const auto * q = dst->src[0];
++    const auto * k = dst->src[1];
++    const auto * v = dst->src[2];
++    if (q->ne[0] < 32 || q->ne[0] > 256 || q->ne[0] % 32 ||
++        v->ne[0] < 32 || v->ne[0] > 256 || v->ne[0] % 32 || k->ne[1] > INT32_MAX) { return false; }
++    int64_t rows = 1;
++    for (int dimension = 1; dimension < GGML_MAX_DIMS; ++dimension) {
++        if (q->ne[dimension] > INT32_MAX / rows) { return false; }
++        rows *= q->ne[dimension];
++    }
++    for (int source = 0; source < 7; ++source) {
++        const auto * tensor = dst->src[source];
++        if (!tensor) { continue; }
++        const size_t alignment = tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_Q8_0 ?
++            alignof(ggml_half) : alignof(float);
++        if (tensor->view_offs % alignment) { return false; }
++        for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
++            if (tensor->ne[dimension] > 1 && tensor->nb[dimension] % alignment) { return false; }
++        }
++    }
++    return q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) &&
++        v->nb[0] == ggml_type_size(v->type);
++#endif
++}
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++template<ggml_type Type>
++static __device__ __forceinline__ float paged_component(const char * row, int column) {
++    if constexpr (Type == GGML_TYPE_F32) {
++        return reinterpret_cast<const float *>(row)[column];
++    } else if constexpr (Type == GGML_TYPE_F16) {
++        return __half2float(reinterpret_cast<const half *>(row)[column]);
++    } else {
++        const auto & block = reinterpret_cast<const block_q8_0 *>(row)[column / QK8_0];
++        return __half2float(block.d) * float(block.qs[column % QK8_0]);
++    }
++}
++
++struct paged_attention_args {
++    const char * q;
++    const char * k;
++    const char * v;
++    const char * mask;
++    const float * sinks;
++    const int32_t * table;
++    const int32_t * lengths;
++    float * output;
++    int d_qk, d_v, queries, query_heads, kv_heads, sequences, physical_sequences;
++    int physical_rows, logical_blocks, page_tokens;
++    int mask_heads, mask_sequences;
++    size_t q_stride[3], k_stride[3], v_stride[3], mask_stride[3];
++    float scale, max_bias, logit_softcap, m0, m1;
++    uint32_t head_power;
++    uint3 page_divisor;
++    bool mask_f32;
++};
++
++template<ggml_type TypeK, ggml_type TypeV>
++static __global__ __launch_bounds__(128, 2) void paged_attention(paged_attention_args args) {
++    ggml_cuda_pdl_lc();
++    ggml_cuda_pdl_sync();
++    constexpr int warps = 4;
++    const int lane = threadIdx.x % WARP_SIZE;
++    const int warp = threadIdx.x / WARP_SIZE;
++    const int query = blockIdx.x % args.queries;
++    const int head = (blockIdx.x / args.queries) % args.query_heads;
++    const int sequence = blockIdx.x / (args.queries * args.query_heads);
++    const int physical_sequence = args.physical_sequences == 1 ? 0 : sequence;
++    const int kv_head = head / (args.query_heads / args.kv_heads);
++    const int64_t logical_capacity = int64_t(args.logical_blocks) * args.page_tokens;
++    const int64_t length = args.lengths ? args.lengths[sequence] : logical_capacity;
++    const char * q_row = args.q + sequence * args.q_stride[2] + head * args.q_stride[1] + query * args.q_stride[0];
++    const char * k_base = args.k + physical_sequence * args.k_stride[2] + kv_head * args.k_stride[1];
++    const char * v_base = args.v + physical_sequence * args.v_stride[2] + kv_head * args.v_stride[1];
++    const char * mask_row = args.mask ? args.mask +
++        (sequence % args.mask_sequences) * args.mask_stride[2] +
++        (head % args.mask_heads) * args.mask_stride[1] + query * args.mask_stride[0] : nullptr;
++    const float slope = get_alibi_slope(args.max_bias, head, args.head_power, args.m0, args.m1);
++    float q_values[8] = {};
++    float accumulator[8] = {};
++    float maximum = -INFINITY;
++    float mass = 0.0f;
++    bool invalid = length < 0 || length > logical_capacity;
++#pragma unroll
++    for (int part = 0; part < 8; ++part) {
++        const int column = lane + part * WARP_SIZE;
++        if (column < args.d_qk) { q_values[part] = reinterpret_cast<const float *>(q_row)[column]; }
++    }
++    for (int64_t logical = warp; !invalid && logical < length; logical += warps) {
++        float mask_value = 0.0f;
++        if (mask_row) {
++            mask_value = args.mask_f32 ? reinterpret_cast<const float *>(mask_row)[logical] :
++                __half2float(reinterpret_cast<const half *>(mask_row)[logical]);
++            if (mask_value == -INFINITY) { continue; }
++        }
++        const auto page = fast_div_modulo(uint32_t(logical), args.page_divisor);
++        const int block = args.table[int64_t(sequence) * args.logical_blocks + page.x];
++        const int64_t physical = int64_t(block) * args.page_tokens + page.y;
++        if (block < 0 || physical < 0 || physical >= args.physical_rows) { invalid = true; break; }
++        const char * k_row = k_base + physical * args.k_stride[0];
++        const char * v_row = v_base + physical * args.v_stride[0];
++        float dot = 0.0f;
++#pragma unroll
++        for (int part = 0; part < 8; ++part) {
++            const int column = lane + part * WARP_SIZE;
++            if (column < args.d_qk) { dot += q_values[part] * paged_component<TypeK>(k_row, column); }
++        }
++        dot = warp_reduce_sum(dot);
++        float score = dot * args.scale;
++        if (args.logit_softcap > 0.0f) { score = args.logit_softcap * tanhf(score); }
++        score += slope * mask_value;
++        if (score == -INFINITY) { continue; }
++        if (!isfinite(score)) { invalid = true; break; }
++        const float next_maximum = fmaxf(maximum, score);
++        const float previous_scale = mass == 0.0f ? 0.0f : expf(maximum - next_maximum);
++        const float weight = expf(score - next_maximum);
++        maximum = next_maximum;
++        mass = mass * previous_scale + weight;
++#pragma unroll
++        for (int part = 0; part < 8; ++part) {
++            const int column = lane + part * WARP_SIZE;
++            if (column < args.d_v) {
++                accumulator[part] = accumulator[part] * previous_scale + weight * paged_component<TypeV>(v_row, column);
++            }
++        }
++    }
++    __shared__ float partial[warps][256];
++    __shared__ float maxima[warps], masses[warps];
++    __shared__ int failures[warps];
++#pragma unroll
++    for (int part = 0; part < 8; ++part) {
++        const int column = lane + part * WARP_SIZE;
++        if (column < args.d_v) { partial[warp][column] = accumulator[part]; }
++    }
++    if (lane == 0) { maxima[warp] = maximum; masses[warp] = mass; failures[warp] = invalid; }
++    __syncthreads();
++    float global_maximum = -INFINITY;
++    bool failure = false;
++#pragma unroll
++    for (int i = 0; i < warps; ++i) { global_maximum = fmaxf(global_maximum, maxima[i]); failure |= failures[i] != 0; }
++    float sink = -INFINITY;
++    if (args.sinks) {
++        sink = args.sinks[head];
++        failure |= isnan(sink) || sink == INFINITY;
++        global_maximum = fmaxf(global_maximum, sink);
++    }
++    float scales[warps], normalizer = 0.0f;
++#pragma unroll
++    for (int i = 0; i < warps; ++i) {
++        scales[i] = masses[i] == 0.0f ? 0.0f : expf(maxima[i] - global_maximum);
++        normalizer += masses[i] * scales[i];
++    }
++    if (sink != -INFINITY) { normalizer += expf(sink - global_maximum); }
++    const int64_t output_row = (int64_t(sequence) * args.queries + query) * args.query_heads + head;
++    for (int column = threadIdx.x; column < args.d_v; column += blockDim.x) {
++        float value = 0.0f;
++#pragma unroll
++        for (int i = 0; i < warps; ++i) { value += partial[i][column] * scales[i]; }
++        args.output[output_row * args.d_v + column] = failure ? NAN : normalizer > 0.0f ? value / normalizer : 0.0f;
++    }
++}
++
++template<ggml_type TypeK>
++static void paged_attention_launch_v(ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
++        const paged_attention_args & args, dim3 blocks) {
++    const ggml_cuda_kernel_launch_params launch{blocks, dim3(128), 0, ctx.stream()};
++    switch (dst->src[2]->type) {
++        case GGML_TYPE_F32: ggml_cuda_kernel_launch(paged_attention<TypeK, GGML_TYPE_F32>, launch, args); break;
++        case GGML_TYPE_F16: ggml_cuda_kernel_launch(paged_attention<TypeK, GGML_TYPE_F16>, launch, args); break;
++        case GGML_TYPE_Q8_0: ggml_cuda_kernel_launch(paged_attention<TypeK, GGML_TYPE_Q8_0>, launch, args); break;
++        default: GGML_ABORT("unsupported paged V type");
++    }
++}
++#endif
++
++void ggml_cuda_flash_attn_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    GGML_UNUSED_VARS(ctx, dst);
++    GGML_ABORT("paged attention CUDA execution is unavailable on this backend");
++#else
++    GGML_ASSERT(ggml_cuda_flash_attn_paged_supported(ctx.device, dst));
++    const auto * q = dst->src[0];
++    const auto * k = dst->src[1];
++    const auto * v = dst->src[2];
++    const auto * mask = dst->src[3];
++    const auto params = ggml_paged_attn_get_params(dst);
++    paged_attention_args args{};
++    args.q = static_cast<const char *>(q->data); args.k = static_cast<const char *>(k->data);
++    args.v = static_cast<const char *>(v->data); args.mask = mask ? static_cast<const char *>(mask->data) : nullptr;
++    args.sinks = dst->src[4] ? static_cast<const float *>(dst->src[4]->data) : nullptr;
++    args.table = static_cast<const int32_t *>(dst->src[5]->data);
++    args.lengths = dst->src[6] ? static_cast<const int32_t *>(dst->src[6]->data) : nullptr;
++    args.output = static_cast<float *>(dst->data);
++    args.d_qk = int(q->ne[0]); args.d_v = int(v->ne[0]); args.queries = int(q->ne[1]);
++    args.query_heads = int(q->ne[2]); args.kv_heads = int(k->ne[2]);
++    args.sequences = int(q->ne[3]); args.physical_sequences = int(k->ne[3]);
++    args.physical_rows = int(k->ne[1]); args.logical_blocks = int(dst->src[5]->ne[0]);
++    args.page_tokens = params.page_tokens;
++    args.page_divisor = init_fastdiv_values(params.page_tokens);
++    args.mask_heads = mask ? int(mask->ne[2]) : 1; args.mask_sequences = mask ? int(mask->ne[3]) : 1;
++    args.mask_f32 = mask && mask->type == GGML_TYPE_F32;
++    for (int i = 0; i < 3; ++i) {
++        args.q_stride[i] = q->nb[i + 1]; args.k_stride[i] = k->nb[i + 1]; args.v_stride[i] = v->nb[i + 1];
++        args.mask_stride[i] = mask ? mask->nb[i + 1] : 0;
++    }
++    args.scale = params.logit_softcap > 0.0f ? params.scale / params.logit_softcap : params.scale;
++    args.max_bias = params.max_bias; args.logit_softcap = params.logit_softcap;
++    args.head_power = 1;
++    while (args.head_power <= uint32_t(args.query_heads) / 2) { args.head_power *= 2; }
++    args.m0 = powf(2.0f, -args.max_bias / args.head_power);
++    args.m1 = powf(2.0f, -(args.max_bias / 2.0f) / args.head_power);
++    const dim3 blocks(uint32_t(q->ne[1] * q->ne[2] * q->ne[3]));
++    switch (k->type) {
++        case GGML_TYPE_F32: paged_attention_launch_v<GGML_TYPE_F32>(ctx, dst, args, blocks); break;
++        case GGML_TYPE_F16: paged_attention_launch_v<GGML_TYPE_F16>(ctx, dst, args, blocks); break;
++        case GGML_TYPE_Q8_0: paged_attention_launch_v<GGML_TYPE_Q8_0>(ctx, dst, args, blocks); break;
++        default: GGML_ABORT("unsupported paged K type");
++    }
++    CUDA_CHECK(cudaGetLastError());
++    paged_attn_submissions.fetch_add(1, std::memory_order_relaxed);
++#endif
++}
+diff --git a/ggml/src/ggml-cuda/paged-attn.cuh b/ggml/src/ggml-cuda/paged-attn.cuh
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/paged-attn.cuh
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include "common.cuh"
++
++bool ggml_cuda_flash_attn_paged_supported(int device, const ggml_tensor * dst);
++void ggml_cuda_flash_attn_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++uint64_t ggml_cuda_paged_attn_submissions();
+diff --git a/ggml/src/ggml-paged-attn.h b/ggml/src/ggml-paged-attn.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-paged-attn.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++#include "ggml.h"
++
++#include <float.h>
++#include <limits.h>
++#include <string.h>
++
++struct ggml_paged_attn_params {
++    float scale;
++    float max_bias;
++    float logit_softcap;
++    int32_t page_tokens;
++};
++
++static inline struct ggml_paged_attn_params ggml_paged_attn_get_params(const struct ggml_tensor * dst) {
++    struct ggml_paged_attn_params params;
++    memcpy(&params, dst->op_params, sizeof(params));
++    return params;
++}
++
++static inline bool ggml_paged_attn_storage_type(enum ggml_type type) {
++    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_Q8_0;
++}
++
++static inline bool ggml_paged_attn_layout_valid(const struct ggml_tensor * tensor) {
++    if (!tensor || tensor->type < 0 || tensor->type >= GGML_TYPE_COUNT) { return false; }
++    const int64_t block = ggml_blck_size(tensor->type);
++    const size_t element = ggml_type_size(tensor->type);
++    if (block <= 0 || !element || tensor->ne[0] <= 0 || tensor->ne[0] % block) { return false; }
++    const size_t alignment = tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_F16 ? 2 :
++            tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32 ? 4 : 1;
++    if (tensor->view_offs % alignment || (tensor->data && (uintptr_t) tensor->data % alignment)) { return false; }
++    uint64_t elements = 1;
++    size_t span = element;
++    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++        if (tensor->ne[i] <= 0 || (uint64_t) tensor->ne[i] > (uint64_t) INT64_MAX / elements) { return false; }
++        if (tensor->nb[i] % alignment) { return false; }
++        elements *= (uint64_t) tensor->ne[i];
++        const uint64_t steps = (uint64_t) (tensor->ne[i] / (i == 0 ? block : 1) - 1);
++        if (steps > SIZE_MAX || (tensor->nb[i] && steps > (SIZE_MAX - span) / tensor->nb[i])) { return false; }
++        span += (size_t) steps * tensor->nb[i];
++    }
++    return tensor->view_offs <= SIZE_MAX - span;
++}
++
++// Metadata-only validation: backend capability probes have no tensor data yet.
++// Page IDs and optional lengths are validated by the cache owner before upload
++// and checked again by each compute implementation before a physical read.
++static inline bool ggml_paged_attn_valid(const struct ggml_tensor * dst) {
++    if (!dst || dst->op != GGML_OP_FLASH_ATTN_PAGED || dst->type != GGML_TYPE_F32) { return false; }
++    const struct ggml_tensor * q = dst->src[0];
++    const struct ggml_tensor * k = dst->src[1];
++    const struct ggml_tensor * v = dst->src[2];
++    const struct ggml_tensor * mask = dst->src[3];
++    const struct ggml_tensor * sinks = dst->src[4];
++    const struct ggml_tensor * table = dst->src[5];
++    const struct ggml_tensor * lengths = dst->src[6];
++    if (!q || !k || !v || !table || q->type != GGML_TYPE_F32 ||
++            !ggml_paged_attn_storage_type(k->type) || !ggml_paged_attn_storage_type(v->type)) { return false; }
++    for (int i = 0; i <= 6; ++i) {
++        if (dst->src[i] && !ggml_paged_attn_layout_valid(dst->src[i])) { return false; }
++    }
++    if (!ggml_paged_attn_layout_valid(dst)) { return false; }
++    const struct ggml_paged_attn_params params = ggml_paged_attn_get_params(dst);
++    if (params.page_tokens <= 0 || !(params.scale >= -FLT_MAX && params.scale <= FLT_MAX) ||
++            !(params.max_bias >= 0.f && params.max_bias <= FLT_MAX) ||
++            !(params.logit_softcap >= 0.f && params.logit_softcap <= FLT_MAX)) { return false; }
++    if (params.max_bias > 0.f && !mask) { return false; }
++    if (q->ne[0] <= 0 || q->ne[0] > INT32_MAX || q->ne[1] <= 0 || q->ne[2] <= 0 || q->ne[2] > INT32_MAX || q->ne[3] <= 0 || q->ne[3] > INT32_MAX ||
++            k->ne[0] != q->ne[0] || k->ne[1] <= 0 || k->ne[2] <= 0 || v->ne[0] <= 0 || v->ne[0] > INT32_MAX ||
++            v->ne[1] != k->ne[1] || v->ne[2] != k->ne[2] || v->ne[3] != k->ne[3] ||
++            (k->ne[3] != 1 && k->ne[3] != q->ne[3]) || q->ne[2] % k->ne[2] != 0 ||
++            q->nb[0] != sizeof(float) || k->nb[0] != ggml_type_size(k->type) ||
++            v->nb[0] != ggml_type_size(v->type) || k->ne[0] % ggml_blck_size(k->type) != 0 ||
++            v->ne[0] % ggml_blck_size(v->type) != 0) { return false; }
++    if (table->type != GGML_TYPE_I32 || !ggml_is_contiguous(table) || table->ne[0] <= 0 ||
++            table->ne[0] > INT32_MAX / params.page_tokens || table->ne[1] != q->ne[3] ||
++            table->ne[2] != 1 || table->ne[3] != 1) { return false; }
++    if (lengths && (lengths->type != GGML_TYPE_I32 || !ggml_is_contiguous(lengths) ||
++            lengths->ne[0] != q->ne[3] || lengths->ne[1] != 1 || lengths->ne[2] != 1 || lengths->ne[3] != 1)) { return false; }
++    const int64_t logical_capacity = table->ne[0] * params.page_tokens;
++    if (mask && ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
++            mask->ne[0] < logical_capacity || mask->ne[1] < q->ne[1] || mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
++            q->ne[2] % mask->ne[2] || q->ne[3] % mask->ne[3] ||
++            mask->nb[0] != ggml_type_size(mask->type))) { return false; }
++    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != q->ne[2] ||
++            sinks->ne[1] != 1 || sinks->ne[2] != 1 || sinks->ne[3] != 1 || sinks->nb[0] != sizeof(float))) { return false; }
++    if (dst->ne[0] != v->ne[0] || dst->ne[1] != q->ne[2] ||
++            dst->ne[2] != q->ne[1] || dst->ne[3] != q->ne[3] || !ggml_is_contiguous(dst)) { return false; }
++    for (int i = 7; i < GGML_MAX_SRC; ++i) { if (dst->src[i]) { return false; } }
++    return true;
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -8,6 +8,7 @@
+ #include "ggml-cpu.h"
+ #include "ggml.h"
+ #include "ggml-sampling.h"
++#include "ggml-paged-attn.h"
+ 
+ // FIXME: required here for quantization functions
+ #include "ggml-quants.h"
+@@ -1111,9 +1112,10 @@
+     "GLU",
+     "ATTN_MASK",
+     "TOKEN_MASK",
++    "FLASH_ATTN_PAGED",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1229,9 +1231,10 @@
+     "glu(x)",
+     "causal_mask(k,q)",
+     "token_mask(x,allowed,ids)",
++    "flash_attn_paged(q,k,v,blocks)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5614,6 +5617,36 @@
+ }
+ 
+ // ggml_flash_attn_ext
++
++struct ggml_tensor * ggml_flash_attn_paged(
++        struct ggml_context * ctx,
++        struct ggml_tensor * q,
++        struct ggml_tensor * k,
++        struct ggml_tensor * v,
++        struct ggml_tensor * mask,
++        struct ggml_tensor * sinks,
++        struct ggml_tensor * block_table,
++        struct ggml_tensor * logical_lengths,
++        int32_t page_tokens,
++        float scale,
++        float max_bias,
++        float logit_softcap) {
++    GGML_ASSERT(q && k && v && block_table);
++    const int64_t shape[] = {v->ne[0], q->ne[2], q->ne[1], q->ne[3]};
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, shape);
++    const struct ggml_paged_attn_params params = {scale, max_bias, logit_softcap, page_tokens};
++    ggml_set_op_params(result, &params, sizeof(params));
++    result->op = GGML_OP_FLASH_ATTN_PAGED;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = v;
++    result->src[3] = mask;
++    result->src[4] = sinks;
++    result->src[5] = block_table;
++    result->src[6] = logical_lengths;
++    GGML_ASSERT(ggml_paged_attn_valid(result));
++    return result;
++}
+ 
+ struct ggml_tensor * ggml_flash_attn_ext(
+         struct ggml_context * ctx,
+diff --git a/src/llama-execution-plan.h b/src/llama-execution-plan.h
+--- a/src/llama-execution-plan.h
++++ b/src/llama-execution-plan.h
+@@ -37,6 +37,10 @@
+     static bool valid(const shape & key) {
+         return key.tokens && key.tokens <= llama_graph_variant_policy::max_tokens &&
+             key.outputs <= key.tokens && key.sequences && key.sequences <= key.tokens;
++    }
++
++    static bool same_family(const shape & a, const shape & b) {
++        return a.graph_type == b.graph_type && a.input_kind == b.input_kind && a.mtp_head == b.mtp_head;
+     }
+ 
+     uint64_t value(const observation & item, size_t bytes) const {
+@@ -105,6 +109,11 @@
+     // the complete native can_reuse check still decides actual compatibility.
+     bool replace(const shape & candidate, const shape & resident, size_t resident_bytes) {
+         ++selections;
++        // Encoder, token/embedding decoder and MTP-head phases are different
++        // execution roles. Their absolute host preparation costs are not a
++        // useful eviction comparison: a cheap encoder can otherwise starve
++        // behind hot decoder plans. Keep the proven cross-role LRU behavior.
++        if (!same_family(candidate, resident)) { return true; }
+         const auto * next = find(candidate);
+         const auto * old = find(resident);
+         if (!next || !old || !old->preparation_us || old->uses < 3 || clock - old->last > 32) { return true; }
+@@ -122,6 +131,7 @@
+     // byte. Unknown measurements preserve the caller's original LRU ordering.
+     bool prefer_victim(const shape & candidate, size_t candidate_bytes,
+                        const shape & previous, size_t previous_bytes) const {
++        if (!same_family(candidate, previous)) { return false; }
+         const auto * a = find(candidate);
+         const auto * b = find(previous);
+         return a && b && a->preparation_us && b->preparation_us &&
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -575,13 +575,24 @@
+ 
+     // the mask is left unallocated when the graph only stores K/V without attending
+     // (e.g. DFlash's KV-injection pass)
+-    if (self_mask_keys && self_mask_keys->buffer && self_mask_queries->buffer) {
++    if (self_paged_table && self_paged_table->buffer) {
++        mctx->set_input_paged_table(self_paged_table);
++    }
++    if (self_dense_fallback_mask && self_dense_fallback_mask->buffer) {
++        if (!mctx->ensure_dense_backing()) {
++            throw std::runtime_error("paged KV: dense attention fallback exceeds the existing memory budget");
++        }
++        mctx->set_input_kq_mask(self_dense_fallback_mask, ubatch, cparams.causal_attn);
++    }
++    if (self_paged_table && self_kq_mask && self_kq_mask->buffer) {
++        mctx->set_input_paged_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    } else if (self_mask_keys && self_mask_keys->buffer && self_mask_queries->buffer) {
+         mctx->set_input_mask_metadata(self_mask_keys, self_mask_queries, *ubatch);
+         // This runs for actual input population, never mere graph reservation.
+         LLAMA_LOG_DEBUG("device-mask inputs: kv_rows=%lld query_rows=%lld streams=%lld dense_bytes=%zu compact_bytes=%zu\n",
+             (long long)self_kq_mask->ne[0],(long long)self_kq_mask->ne[1],(long long)self_kq_mask->ne[3],
+             ggml_nbytes(self_kq_mask),ggml_nbytes(self_mask_keys)+ggml_nbytes(self_mask_queries));
+-    } else if (self_kq_mask && self_kq_mask->buffer) {
++    } else if (self_kq_mask && self_kq_mask->buffer && self_kq_mask != self_dense_fallback_mask) {
+         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+     }
+ 
+@@ -595,16 +606,36 @@
+ }
+ 
+ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+-    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+-
+-    this->mctx = mctx;
++    mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
++    return can_reuse_impl(params);
++}
++
++bool llm_graph_input_attn_kv::can_reuse_impl(const llm_graph_params & params) {
+ 
+     bool res = true;
+ 
+     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    const bool paged = !params.cparams.training && params.cparams.flash_attn && mctx->paged_attention_supported();
++    res &= bool(self_paged_table) == paged;
++    if (self_paged_table) {
++        if (!paged) { return false; }
++        const auto nkv = mctx->get_n_kv_paged();
++        const auto ns = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
++        res &= self_paged_table->ne[0] == nkv/mctx->get_paged_page_tokens() && self_paged_table->ne[1] == ns;
++        res &= self_kq_mask->ne[0] == nkv && self_kq_mask->ne[1] == params.ubatch.n_tokens/ns &&
++            self_kq_mask->ne[2] == 1 && self_kq_mask->ne[3] == ns;
++        if (self_dense_fallback_mask) {
++            res &= can_reuse_kq_mask(self_dense_fallback_mask, mctx, params.ubatch, params.cparams);
++        }
++        if (self_paged_dense_fast) {
++            uint32_t first = 0, count = 0;
++            res &= mctx->get_paged_contiguous_span(first, count) && first == self_paged_first_row && count == nkv;
++        }
++    } else {
++        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    }
+     if (self_mask_keys) {
+         const uint32_t ns = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+         res &= mctx->can_use_device_mask(params.ubatch, params.cparams.causal_attn, ns);
+@@ -1199,27 +1230,8 @@
+ }
+ 
+ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+-
+-    // leave the mask unallocated if all attention layers have their own (e.g. qwen4exp QSA)
+-    if (inp_attn->self_mask_keys && inp_attn->self_mask_keys->buffer &&
+-            inp_attn->self_mask_queries && inp_attn->self_mask_queries->buffer) {
+-        mctx->get_attn()->set_input_mask_metadata(inp_attn->self_mask_keys,inp_attn->self_mask_queries,*ubatch);
+-        LLAMA_LOG_DEBUG("device-mask inputs: hybrid kv_rows=%lld query_rows=%lld streams=%lld dense_bytes=%zu compact_bytes=%zu\n",
+-            (long long)inp_attn->self_kq_mask->ne[0],(long long)inp_attn->self_kq_mask->ne[1],(long long)inp_attn->self_kq_mask->ne[3],
+-            ggml_nbytes(inp_attn->self_kq_mask),ggml_nbytes(inp_attn->self_mask_keys)+ggml_nbytes(inp_attn->self_mask_queries));
+-    } else if (inp_attn->self_kq_mask->buffer) {
+-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+-    }
+-
+-    if (inp_attn->self_k_rot) {
+-        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+-    }
+-
+-    if (inp_attn->self_v_rot) {
+-        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+-    }
++    inp_attn->mctx = mctx->get_attn();
++    inp_attn->set_input(ubatch);
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+@@ -1241,15 +1253,8 @@
+ 
+     bool res = true;
+ 
+-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+-  //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+-
+-    inp_attn->mctx=mctx->get_attn();
+-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+-    if (inp_attn->self_mask_keys) {
+-        const uint32_t ns=params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+-        res &= mctx->get_attn()->can_use_device_mask(params.ubatch,params.cparams.causal_attn,ns);
+-    }
++    inp_attn->mctx = mctx->get_attn();
++    res &= inp_attn->can_reuse_impl(params);
+ 
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+ 
+@@ -1718,6 +1723,9 @@
+         }
+         if (!inp || typeid(*inp)!=typeid(llm_graph_input_attn_kv) ||
+                 !inp->mctx || typeid(*inp->mctx)!=typeid(llama_kv_cache_context)) { continue; }
++        // Page-table masks use logical block order, not physical row order.
++        // The older position-only device-mask contract cannot represent it.
++        if (inp->self_paged_table || inp->self_dense_fallback_mask) { continue; }
+         auto * mask=inp->self_kq_mask;
+         if (!mask || mask->op!=GGML_OP_NONE || !(mask->flags & GGML_TENSOR_FLAG_INPUT)) { continue; }
+         const auto & batch=params.ubatch;
+@@ -3312,6 +3320,12 @@
+     return pos_bias;
+ }
+ 
++static ggml_backend_dev_t paged_kv_tensor_device(const ggml_tensor * tensor) {
++    while (tensor && tensor->view_src) { tensor = tensor->view_src; }
++    if (!tensor || !tensor->buffer || ggml_backend_buffer_is_host(tensor->buffer)) { return nullptr; }
++    return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
++}
++
+ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * q,
+          ggml_tensor * k,
+@@ -3322,7 +3336,11 @@
+          ggml_tensor * v_mla,
+              int64_t   n_kv_max,
+                float   kq_scale,
+-                 int   il) const {
++                 int   il,
++         ggml_tensor * paged_table,
++             int32_t   page_tokens,
++             int64_t   paged_first_row,
++                bool * paged_dense_fast) const {
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
+     // split the batch into streams if needed
+@@ -3340,7 +3358,46 @@
+     ggml_tensor * cur;
+ 
+     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+-    if (use_flash_attn) {
++    if (paged_table) {
++        GGML_ASSERT(!v_trans && !kq_b && !v_mla && n_kv_max == 0);
++        cur = nullptr;
++        const int64_t rows = paged_table->ne[0] * page_tokens;
++        const auto native_type = [](ggml_type type) { return type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0; };
++        if (use_flash_attn && cparams.offload_kqv && paged_first_row >= 0 && rows > 0 && rows % 256 == 0 &&
++                paged_first_row <= k->ne[1] && rows <= k->ne[1] - paged_first_row &&
++                native_type(k->type) && native_type(v->type)) {
++            const auto device = paged_kv_tensor_device(k);
++            const auto registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++            if (device && device == paged_kv_tensor_device(v) && registry &&
++                    std::strcmp(ggml_backend_reg_name(registry), "CUDA") == 0) {
++                // The existing kernel may load masked padded rows. Every row
++                // of this 256-aligned crop belongs to a mapped live page.
++                auto * cropped_k = ggml_view_4d(ctx0, k, k->ne[0], rows, k->ne[2], k->ne[3],
++                    k->nb[1], k->nb[2], k->nb[3], size_t(paged_first_row) * k->nb[1]);
++                auto * cropped_v = ggml_view_4d(ctx0, v, v->ne[0], rows, v->ne[2], v->ne[3],
++                    v->nb[1], v->nb[2], v->nb[3], size_t(paged_first_row) * v->nb[1]);
++                auto * candidate = ggml_flash_attn_ext(ctx0, q, cropped_k, cropped_v, kq_mask, kq_scale,
++                    hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++                ggml_flash_attn_ext_add_sinks(candidate, sinks);
++                ggml_prec_set_acc(candidate, GGML_PREC_F32);
++                if (ggml_backend_dev_supports_op(device, candidate) &&
++                        ggml_backend_buft_get_alloc_size(ggml_backend_dev_buffer_type(device), candidate) == ggml_nbytes(candidate)) {
++                    cur = candidate;
++                    if (paged_dense_fast) { *paged_dense_fast = true; }
++                    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
++                }
++            }
++        }
++        // Read original physical KV storage directly. In particular F32 must
++        // not take the dense F32->F16 casts below or read unmapped holes.
++        if (!cur) {
++            cur = ggml_flash_attn_paged(ctx0, q, k, v, kq_mask, sinks, paged_table, nullptr,
++                page_tokens, kq_scale, hparams.f_max_alibi_bias,
++                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++        }
++        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
++        if (!cparams.offload_kqv) { ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu); }
++    } else if (use_flash_attn) {
+         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+ 
+         if (v_trans) {
+@@ -3560,7 +3617,20 @@
+ 
+         // Keep the proven host input until all actual consumers can be
+         // inspected at the end of graph construction.
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        if (!cparams.training && cparams.flash_attn && mctx_cur->paged_attention_supported()) {
++            const auto ns = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
++            inp->self_paged_table = mctx_cur->build_input_paged_table(ctx0);
++            inp->self_kq_mask = ggml_new_tensor_4d(ctx0, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32,
++                mctx_cur->get_n_kv_paged(), ubatch.n_tokens/ns, 1, ns);
++            ggml_set_input(inp->self_kq_mask);
++            ggml_set_name(inp->self_kq_mask, "attn_inp_paged_kq_mask");
++        } else {
++            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++            if (!cparams.training && mctx_cur->paged_attention_supported()) {
++                mctx_cur->disable_paged_reclamation();
++                inp->self_dense_fallback_mask = inp->self_kq_mask;
++            }
++        }
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+@@ -3611,6 +3681,18 @@
+ 
+     const auto * mctx_cur = inp->mctx;
+ 
++    // Unsupported attention extras keep their original dense implementation.
++    // Disable sparse reclamation and commit its physical span only when inputs
++    // are actually populated, never during worst-case graph reservation.
++    ggml_tensor * paged_table = inp->self_paged_table;
++    if (paged_table && (kq_b || v_mla)) {
++        mctx_cur->disable_paged_reclamation();
++        if (!inp->self_dense_fallback_mask) {
++            inp->self_dense_fallback_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        }
++        paged_table = nullptr;
++    }
++
+     ggml_tensor * q = q_cur;
+     ggml_tensor * k;
+     ggml_tensor * v;
+@@ -3629,13 +3711,19 @@
+             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+         }
+ 
+-        k = mctx_cur->get_k(ctx0, il);
+-        v = mctx_cur->get_v(ctx0, il);
+-    }
+-
+-    ggml_tensor * kq_mask = inp->get_kq_mask();
+-
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++        k = paged_table ? mctx_cur->get_k_paged(ctx0, il) : mctx_cur->get_k(ctx0, il);
++        v = paged_table ? mctx_cur->get_v_paged(ctx0, il) : mctx_cur->get_v(ctx0, il);
++    }
++
++    ggml_tensor * kq_mask = paged_table || !inp->self_paged_table ? inp->get_kq_mask() : inp->self_dense_fallback_mask;
++
++    uint32_t first_row = 0, span_rows = 0;
++    const bool contiguous = paged_table && mctx_cur->get_paged_contiguous_span(first_row, span_rows);
++    bool dense_fast = false;
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il,
++        paged_table, paged_table ? mctx_cur->get_paged_page_tokens() : 0, contiguous ? int64_t(first_row) : -1, &dense_fast);
++    if (dense_fast) { inp->self_paged_dense_fast = true; inp->self_paged_first_row = first_row; }
++    if (paged_table) { mctx_cur->confirm_paged_layer(il); }
+     cb(cur, "kqv_out", il);
+ 
+     if (inp->self_v_rot) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -353,6 +353,9 @@
+     void set_input(const llama_ubatch * ubatch) override;
+ 
+     bool can_reuse(const llm_graph_params & params) override;
++    // Composite owners bind their attention child before this check, without
++    // casting the outer hybrid context or copying graph parameters.
++    bool can_reuse_impl(const llm_graph_params & params);
+ 
+     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
+@@ -364,6 +367,10 @@
+ 
+     ggml_tensor * self_mask_keys = nullptr;    // I32 [n_kv, 2, n_stream]
+     ggml_tensor * self_mask_queries = nullptr; // I32 [n_query, 2, n_stream]
++    ggml_tensor * self_paged_table = nullptr;  // I32 [logical_blocks, n_stream]
++    bool self_paged_dense_fast = false;
++    uint32_t self_paged_first_row = 0;
++    ggml_tensor * self_dense_fallback_mask = nullptr; // rare unsupported consumer
+     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+ 
+@@ -1302,7 +1309,11 @@
+             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                 int64_t   n_kv_max,
+                   float   kq_scale,
+-                    int   il) const;
++                    int   il,
++            ggml_tensor * paged_table = nullptr,
++                int32_t   page_tokens = 0,
++                int64_t   paged_first_row = -1,
++                   bool * paged_dense_fast = nullptr) const;
+ 
+     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -18,6 +18,7 @@
+ #include <map>
+ #include <stdexcept>
+ #include <typeinfo>
++#include <type_traits>
+ #include <unordered_map>
+ 
+ static bool ggml_is_power_of_2(int n) {
+@@ -219,7 +220,8 @@
+ std::shared_ptr<llama_memory_prefix> llama_kv_cache::retain_prefix(llama_seq_id sequence, uint32_t max_tokens) {
+     // DSA/MSA/other derived caches own extra state not represented by aliases.
+     if (typeid(*this)!=typeid(llama_kv_cache)) { return {}; }
+-    if (!max_tokens || other || (growth_initial_tokens && !growth_paging) || v_cells_impl.use_count() != 1 || n_stream != 1 || n_swa ||
++    if (!max_tokens || other || (growth_initial_tokens && !growth_paging && !paged_attention_supported()) ||
++            v_cells_impl.use_count() != 1 || n_stream != 1 || n_swa ||
+             seq_to_stream.size() != LLAMA_MAX_SEQ ||
+             sequence < 0 || uint32_t(sequence) >= n_seq_max || get_has_shift()) { return {}; }
+     auto & cells = v_cells[0];
+@@ -324,6 +326,53 @@
+     // follows the source allocation: a fitted target can be smaller than the
+     // draft default and oversized views would overflow the source tensors
+     if (other) {
++        // A shared view must never resize/reset its source's cell metadata.
++        // Validate before changing backing policy or publishing the view.
++        auto * slow = other;
++        auto * fast = other;
++        while (fast && fast->other) {
++            slow = slow->other;
++            fast = fast->other->other;
++            if (slow == fast) { throw std::invalid_argument("KV shared-view owner cycle"); }
++        }
++        if (other->n_stream != n_stream || v_cells.size() != n_stream) {
++            throw std::invalid_argument("KV shared-view stream layout mismatch");
++        }
++        for (const auto & cells : v_cells) {
++            if (cells.size() != other->get_size()) {
++                throw std::invalid_argument("KV shared-view cell capacity mismatch");
++            }
++        }
++        if (other->paged_attention_requested && other->v_cells[0].get_page_pool().enabled()) {
++            const bool virgin = !other->paged_storage_started && std::all_of(v_cells.begin(), v_cells.end(),
++                [](const llama_kv_cells & cells) { return cells.get_used() == 0; });
++            if (virgin) {
++                // Startup assistant/shared views retain the prior dense-prefix
++                // growth policy instead of committing the entire context. No
++                // sparse writes or saved history can exist on this path.
++                other->paged_attention_requested = false;
++                other->disable_paged_reclamation();
++                for (auto & cells : v_cells) {
++                    const bool disabled = cells.disable_empty_page_pool();
++                    GGML_ASSERT(disabled); GGML_UNUSED(disabled);
++                }
++                other->paged_known_committed.clear();
++                other->paged_layer_confirmed.clear();
++                LLAMA_LOG_INFO("paged attention: startup shared KV view uses conventional placement and initial-token growth\n");
++            } else {
++                // A legacy shared view has no page-table contract or independent
++                // growth owner. Recommit its source completely BEFORE publishing
++                // the view; it may otherwise read previously reclaimed interiors.
++                // A denied commit leaves the source's token/data ownership intact
++                // and unwinding removes this unpublished shared-cell reference.
++                other->growth_committed_tokens = std::min(other->growth_committed_tokens, other->growth_initial_tokens);
++                if (!other->ensure_dense_backing()) {
++                    throw std::runtime_error("paged KV: cannot admit a dense shared view within the configured CUDA quota");
++                }
++                other->disable_paged_reclamation();
++                LLAMA_LOG_INFO("paged attention: legacy shared KV view admitted with dense backing; interior reclamation disabled\n");
++            }
++        }
+         const uint32_t size_other = other->get_size();
+         if (kv_size != size_other) {
+             LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
+@@ -333,9 +382,11 @@
+ 
+     GGML_ASSERT(kv_size % n_pad == 0);
+ 
++    const char * paged = std::getenv("WILDLLAMA_PAGED_ATTENTION");
++    paged_attention_requested = paged && std::strcmp(paged, "1") == 0;
+     growth_initial_tokens=llama_kv_growth_initial();
+     growth_paging=ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING"));
+-    if (growth_initial_tokens && (v_trans || n_stream!=1 || (n_seq_max!=1 && !growth_paging) || n_swa || other)) {
++    if (growth_initial_tokens && (v_trans || n_stream!=1 || (n_seq_max!=1 && !growth_paging && !paged_attention_requested) || n_swa || other)) {
+         LLAMA_LOG_WARN("KV growth: this cache layout uses conventional fully allocated storage\n");
+         growth_initial_tokens=0;
+     }
+@@ -381,9 +432,11 @@
+         v_heads[s] = 0;
+     }
+ 
+-    v_cells.resize(n_stream);
+-    for (uint32_t s = 0; s < n_stream; ++s) {
+-        v_cells[s].resize(kv_size);
++    if (!other) {
++        v_cells.resize(n_stream);
++        for (uint32_t s = 0; s < n_stream; ++s) {
++            v_cells[s].resize(kv_size);
++        }
+     }
+ 
+     // by default, all sequence ids are mapped to the 0th stream
+@@ -643,7 +696,41 @@
+     }
+ 
+     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
++    initialize_paged_pool();
++
+     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
++}
++
++void llama_kv_cache::initialize_paged_pool() {
++    if (!v_cells.empty() && v_cells[0].get_page_pool().enabled()) { return; }
++    if (paged_layout_supported() && paged_backend_supported() && v_cells[0].enable_page_pool()) {
++        paged_layer_confirmed.resize(layers.size(), 0);
++        if (growth_initial_tokens) {
++            paged_known_committed.resize((get_size() + llama_paged_kv_pool::page_tokens - 1) /
++                llama_paged_kv_pool::page_tokens, 0);
++            const size_t initial_pages = growth_initial_tokens / llama_paged_kv_pool::page_tokens;
++            std::fill(paged_known_committed.begin(), paged_known_committed.begin() + initial_pages, 1);
++        }
++    }
++}
++
++void llama_kv_cache::report_paged_admission() const {
++    if (!paged_attention_requested || paged_admission_reported) { return; }
++    paged_admission_reported = true;
++    if (paged_attention_supported()) {
++        LLAMA_LOG_INFO("paged attention: physical P32 pool enabled; graph reads remain capability checked\n");
++    } else {
++        LLAMA_LOG_INFO("paged attention: conventional KV placement retained (layout, backend or owner capability)\n");
++    }
++}
++
++void llama_kv_cache::enable_paged_hybrid_owner() {
++    // Admission must precede the first graph reservation and all cell writes.
++    // A late caller must never reinterpret an existing dense layout.
++    for (const auto & cells : v_cells) { if (cells.get_used()) { return; } }
++    for (const auto & layer : layers) { if (hparams.is_recr(layer.il)) { return; } }
++    paged_hybrid_owner = true;
++    initialize_paged_pool();
+ }
+ 
+ void llama_kv_cache::clear(bool data) {
+@@ -667,8 +754,27 @@
+ }
+ 
+ size_t llama_kv_cache::trim_unused() {
+-    if (!growth_paging || !growth_initial_tokens || other || v_cells_impl.use_count() != 1 || hparams.no_alloc || get_has_shift() ||
++    if (!growth_initial_tokens || other || v_cells_impl.use_count() != 1 || hparams.no_alloc || get_has_shift() ||
+             typeid(*this) != typeid(llama_kv_cache)) { return 0; }
++    if (paged_attention_supported() && paged_reads_confirmed()) {
++        // The kernel reads only table-selected physical pages. Empty interior
++        // pages may now be released, unlike the legacy dense high-water path.
++        const auto & pages = get_paged_table();
++        growth_committed_tokens = growth_initial_tokens;
++        // Invalidate optional commitment hints before even a partial trim can
++        // release a mapping or a later buffer's range staging can throw.
++        std::fill(paged_known_committed.begin(), paged_known_committed.end(), 0);
++        const size_t initial_pages = growth_initial_tokens / llama_paged_kv_pool::page_tokens;
++        std::fill(paged_known_committed.begin(), paged_known_committed.begin() + initial_pages, 1);
++        for (const uint32_t page : pages) { paged_known_committed.at(page) = 1; }
++        size_t released = 0;
++        for (auto & entry : ctxs_bufs) {
++            released += llama_kv_growth_trim_pages(entry.first.get(), entry.second.get(), pages,
++                llama_paged_kv_pool::page_tokens, growth_initial_tokens);
++        }
++        return released;
++    }
++    if (!growth_paging) { return 0; }
+     uint32_t live_end = 0;
+     for (const auto & cells : v_cells) { live_end = std::max(live_end, cells.used_max_p1()); }
+     const uint32_t keep = ggml_kv_paging_keep_tokens(get_size(), growth_initial_tokens,
+@@ -681,6 +787,11 @@
+     // Lower the commitment watermark before any mapping is released, including
+     // partial failure or allocation exceptions while staging another buffer.
+     growth_committed_tokens = keep_tokens;
++    if (!paged_known_committed.empty()) {
++        std::fill(paged_known_committed.begin(), paged_known_committed.end(), 0);
++        const size_t keep_pages = keep_tokens / llama_paged_kv_pool::page_tokens;
++        std::fill(paged_known_committed.begin(), paged_known_committed.begin() + keep_pages, 1);
++    }
+     size_t released = 0;
+     for (auto & entry : ctxs_bufs) {
+         auto & ctx = entry.first;
+@@ -712,7 +823,8 @@
+ }
+ 
+ size_t llama_memory_trim_unused(llama_context * ctx) {
+-    if (!ctx || !ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING"))) { return 0; }
++    if (!ctx || (!ggml_kv_paging_enabled(std::getenv("WILDLLAMA_KV_CACHE_PAGING")) &&
++            !ggml_kv_paging_enabled(std::getenv("WILDLLAMA_PAGED_ATTENTION")))) { return 0; }
+     try {
+         if (!llama_kv_growth_initial()) { return 0; }
+         ctx->synchronize();
+@@ -1088,6 +1200,7 @@
+ }
+ 
+ llama_memory_context_ptr llama_kv_cache::init_full() {
++    report_paged_admission();
+     return std::make_unique<llama_kv_cache_context>(this);
+ }
+ 
+@@ -1336,6 +1449,13 @@
+ 
+     res.resize(n_seqs);
+ 
++    if (!cont && n_stream == 1 && paged_attention_supported()) {
++        res.s0 = res.s1 = 0;
++        res.strm[0] = 0;
++        if (!v_cells[0].get_page_pool().select(n_tokens, res.idxs[0])) { return {}; }
++        return res;
++    }
++
+     for (uint32_t s = 0; s < n_seqs; ++s) {
+         const auto seq_id = ubatch.seq_id_unq[s];
+ 
+@@ -1480,11 +1600,53 @@
+ }
+ 
+ bool llama_kv_cache::growth_needed_for(const slot_info & sinfo) const {
++    if (other) {
++        const auto * owner = other;
++        while (owner->other) { owner = owner->other; }
++        return other->growth_needed_for(sinfo) ||
++            (owner->growth_initial_tokens && get_n_kv(sinfo) > owner->growth_committed_tokens);
++    }
++    if (growth_initial_tokens && !paged_reclamation_disabled && paged_attention_supported()) {
++        for (const auto & indices : sinfo.idxs) {
++            for (const uint32_t index : indices) {
++                if (!paged_known_committed.at(index / llama_paged_kv_pool::page_tokens)) { return true; }
++            }
++        }
++        return false;
++    }
+     return growth_initial_tokens && growth_tokens_for(sinfo) > growth_committed_tokens;
+ }
+ 
+ bool llama_kv_cache::grow_for(const slot_info & sinfo) {
++    if (other) {
++        // The source covers incoming write rows; a view can require a larger
++        // padded dense read span than the source's own padding. Commit both
++        // before metadata publication, through the same bounded growth owner.
++        return other->grow_for(sinfo) && other->ensure_dense_backing(get_n_kv(sinfo));
++    }
++    if (growth_initial_tokens && !paged_reclamation_disabled && paged_attention_supported()) { return grow_paged_for(sinfo); }
+     return !growth_initial_tokens || grow_to(growth_tokens_for(sinfo));
++}
++
++bool llama_kv_cache::grow_paged_for(const slot_info & sinfo) {
++    std::vector<uint32_t> pages;
++    for (const auto & indices : sinfo.idxs) {
++        for (const uint32_t index : indices) {
++            const uint32_t page = index / llama_paged_kv_pool::page_tokens;
++            if (!paged_known_committed.at(page)) { pages.push_back(page); }
++        }
++    }
++    if (pages.empty()) { return true; }
++    std::sort(pages.begin(), pages.end());
++    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++    for (auto & entry : ctxs_bufs) {
++        if (!llama_kv_growth_commit_pages(entry.first.get(), entry.second.get(), pages,
++                llama_paged_kv_pool::page_tokens, growth_initial_tokens)) { return false; }
++    }
++    // Publish no commitment hint until every layer/buffer succeeded. A partial
++    // allocation failure can then safely retry without exposing unwritten rows.
++    for (const uint32_t page : pages) { paged_known_committed[page] = 1; }
++    return true;
+ }
+ 
+ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+@@ -1666,6 +1828,151 @@
+     }
+ 
+     return result;
++}
++
++bool llama_kv_cache::paged_layout_supported() const {
++    if (!paged_attention_requested || typeid(*this) != typeid(llama_kv_cache) || other ||
++            v_cells_impl.use_count() != 1 || n_stream != 1 || v_trans || n_swa ||
++            swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi || hparams.n_rel_attn_bkts ||
++            hparams.no_alloc || hparams.ple_n_heads || model.n_devices() > 1 ||
++            model.has_tensor_overrides() || layers.empty() || get_size() > INT32_MAX || get_size() % llama_paged_kv_pool::page_tokens) { return false; }
++    // The ordinary hybrid owner explicitly proves its attention-only child's
++    // lifetime after complete-object construction; other composites stay dense.
++    if (!paged_hybrid_owner) {
++        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) { if (hparams.is_recr(il)) { return false; } }
++    }
++    auto supported_type = [](ggml_type type) {
++        return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_Q8_0;
++    };
++    for (const auto & layer : layers) {
++        const auto dk = hparams.n_embd_head_k(layer.il), dv = hparams.n_embd_head_v(layer.il);
++        const auto heads = hparams.n_head(layer.il), kv_heads = hparams.n_head_kv(layer.il);
++        if (!layer.k || !layer.v || !supported_type(layer.k->type) || !supported_type(layer.v->type) ||
++                dk < 32 || dk > 256 || dk % 32 || dv < 32 || dv > 256 || dv % 32 ||
++                !kv_heads || heads < kv_heads || heads % kv_heads) { return false; }
++    }
++    return true;
++}
++
++bool llama_kv_cache::paged_attention_supported() const {
++    return paged_layout_supported() && v_cells[0].get_page_pool().enabled();
++}
++
++bool llama_kv_cache::paged_backend_supported() const {
++    // Probe the ACTUAL storage device for every layer before changing cell
++    // placement. Old CUDA payloads and other backends keep ordinary admission.
++    slot_info sinfo{}; sinfo.s0 = sinfo.s1 = 0; sinfo.strm = {0}; sinfo.idxs = {{0}};
++    for (const auto & layer : layers) {
++        if (!layer.k->buffer || !layer.v->buffer) { return false; }
++        const auto k_type = ggml_backend_buffer_get_type(layer.k->buffer);
++        const auto v_type = ggml_backend_buffer_get_type(layer.v->buffer);
++        auto * device = ggml_backend_buft_get_device(k_type);
++        if (k_type == ggml_backend_cpu_buffer_type() && v_type == k_type) {
++            // The canonical host buffer deliberately has no owning device;
++            // probe the actual CPU execution device rather than rejecting all
++            // CPU caches. Noncanonical host/CUDA buffers keep strict identity.
++            device = model.dev_layer(layer.il);
++            if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) { return false; }
++        } else if (!device || ggml_backend_buft_get_device(v_type) != device || model.dev_layer(layer.il) != device) {
++            return false;
++        }
++        auto * registry = ggml_backend_dev_backend_reg(device);
++        const auto device_type = ggml_backend_dev_type(device);
++        if (!registry || (device_type != GGML_BACKEND_DEVICE_TYPE_CPU &&
++                (device_type != GGML_BACKEND_DEVICE_TYPE_GPU || std::strcmp(ggml_backend_reg_name(registry), "CUDA") != 0))) { return false; }
++        ggml_context_ptr probe(ggml_init({32 * ggml_tensor_overhead(), nullptr, true}));
++        if (!probe) { return false; }
++        const auto dk = hparams.n_embd_head_k(layer.il), heads = hparams.n_head(layer.il);
++        auto * q = ggml_new_tensor_4d(probe.get(), GGML_TYPE_F32, dk, 1, heads, 1);
++        auto * k = ggml_permute(probe.get(), get_k(probe.get(), layer.il, get_size(), sinfo), 0, 2, 1, 3);
++        auto * v = ggml_permute(probe.get(), get_v(probe.get(), layer.il, get_size(), sinfo), 0, 2, 1, 3);
++        auto * table = ggml_new_tensor_2d(probe.get(), GGML_TYPE_I32, get_size() / llama_paged_kv_pool::page_tokens, 1);
++        auto * mask = ggml_new_tensor_4d(probe.get(), GGML_TYPE_F16, get_size(), 1, 1, 1);
++        auto * op = ggml_flash_attn_paged(probe.get(), q, k, v, mask, nullptr, table, nullptr,
++            llama_paged_kv_pool::page_tokens, 1.0f / std::sqrt(float(dk)), 0.0f, 0.0f);
++        if (!ggml_backend_dev_supports_op(device, op)) { return false; }
++    }
++    return true;
++}
++
++const std::vector<uint32_t> & llama_kv_cache::get_paged_table() const {
++    GGML_ASSERT(paged_attention_supported());
++    return v_cells[0].get_page_pool().table();
++}
++
++uint32_t llama_kv_cache::get_n_kv_paged() const {
++    return uint32_t(get_paged_table().size()) * llama_paged_kv_pool::page_tokens;
++}
++
++void llama_kv_cache::confirm_paged_layer(int32_t il) const {
++    if (paged_reclamation_disabled || !paged_attention_supported()) { return; }
++    const auto found = map_layer_ids.find(il);
++    if (found != map_layer_ids.end()) { paged_layer_confirmed.at(found->second) = 1; }
++}
++
++void llama_kv_cache::disable_paged_reclamation() const { paged_reclamation_disabled = true; }
++
++bool llama_kv_cache::paged_reads_confirmed() const {
++    return !paged_reclamation_disabled && paged_attention_supported() && paged_layer_confirmed.size() == layers.size() &&
++        std::all_of(paged_layer_confirmed.begin(), paged_layer_confirmed.end(), [](uint8_t value) { return value == 1; });
++}
++
++bool llama_kv_cache::ensure_dense_backing(uint32_t tokens) {
++    tokens = tokens ? std::min(tokens, get_size()) : get_size();
++    if (other) { return other->ensure_dense_backing(tokens); }
++    if (!grow_to(tokens)) { return false; }
++    if (!paged_known_committed.empty()) {
++        const size_t pages = tokens / llama_paged_kv_pool::page_tokens;
++        std::fill(paged_known_committed.begin(), paged_known_committed.begin() + pages, 1);
++    }
++    return true;
++}
++
++bool llama_kv_cache::ensure_shift_backing() {
++    if (!paged_attention_requested || !growth_initial_tokens || !v_cells[0].get_page_pool().enabled()) { return true; }
++    // The legacy RoPE update reads its dense committed prefix. Recommit only
++    // the padded high-water range it actually needs, never the whole context.
++    return grow_to(growth_tokens_for({}));
++}
++
++void llama_kv_cache::set_input_paged_table(ggml_tensor * dst) const {
++    const auto & pages = get_paged_table();
++    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == int64_t(pages.size()));
++    if (!pages.empty()) { ggml_backend_tensor_set(dst, pages.data(), 0, pages.size() * sizeof(uint32_t)); }
++}
++
++void llama_kv_cache::set_input_paged_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
++    GGML_ASSERT(paged_attention_supported() && dst && ubatch && ggml_backend_buffer_is_host(dst->buffer));
++    const auto & pages = get_paged_table();
++    const auto & cells = v_cells[0];
++    const uint32_t rows = uint32_t(pages.size()) * llama_paged_kv_pool::page_tokens;
++    GGML_ASSERT(dst->ne[0] == rows && dst->ne[1] == ubatch->n_tokens && dst->ne[2] == 1 && dst->ne[3] == 1);
++    const bool spatial = ubatch->is_pos_2d();
++    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
++        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
++    }
++    auto fill = [&](auto * data) {
++        using scalar = std::remove_pointer_t<decltype(data)>;
++        const scalar keep = llama_cast<scalar>(0.0f), drop = llama_cast<scalar>(-INFINITY);
++        for (uint32_t q = 0; q < ubatch->n_tokens; ++q) {
++            const llama_seq_id sequence = ubatch->seq_id[q][0];
++            const llama_pos position = ubatch->pos[q];
++            const llama_pos x = spatial ? ubatch->pos[2 * ubatch->n_tokens + q] : 0;
++            const llama_pos y = spatial ? ubatch->pos[ubatch->n_tokens + q] : 0;
++            for (uint32_t logical = 0; logical < rows; ++logical) {
++                const uint32_t physical = pages[logical / llama_paged_kv_pool::page_tokens] * llama_paged_kv_pool::page_tokens +
++                    logical % llama_paged_kv_pool::page_tokens;
++                bool visible = !cells.is_empty(physical) && cells.seq_has(physical, sequence);
++                if (visible && causal_attn) {
++                    const llama_pos key = cells.pos_get(physical);
++                    visible = key < position || (key == position && (!spatial || !cells.ext_get(physical).is_2d_gt(x, y)));
++                }
++                data[uint64_t(q) * rows + logical] = visible ? keep : drop;
++            }
++        }
++    };
++    if (dst->type == GGML_TYPE_F16) { fill(static_cast<ggml_fp16_t *>(dst->data)); }
++    else { GGML_ASSERT(dst->type == GGML_TYPE_F32); fill(static_cast<float *>(dst->data)); }
+ }
+ 
+ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+@@ -2669,6 +2976,7 @@
+             // Deferred readers must not first allocate physical memory in their
+             // destructor. Commit the full destination prefix before queuing I/O.
+             res = res && grow_for(sinfo);
++            if (res) { paged_storage_started = true; }
+             res = res && state_read_data(io, strm, cell_count, sinfo);
+         } catch (...) {
+             res = false;
+@@ -3281,6 +3589,7 @@
+ 
+ llama_kv_cache_context::llama_kv_cache_context(
+         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
++    full_reservation = true;
+     n_kv = kv->get_size();
+ 
+     const uint32_t n_stream = kv->get_n_stream();
+@@ -3337,6 +3646,7 @@
+ 
+     // no ubatches -> this is a KV cache update
+     if (ubatches.empty()) {
++        if (do_shift && !kv->ensure_shift_backing()) { return false; }
+         kv->update(lctx, do_shift, sc_info);
+ 
+         return true;
+@@ -3345,6 +3655,7 @@
+     // Commit before changing cells or submitting kernels. A denied expansion
+     // leaves the prior sequence metadata/data intact and returns a normal error.
+     if (!kv->grow_for(sinfos[i_cur])) { return false; }
++    kv->paged_storage_started = true;
+     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+     n_kv = kv->get_n_kv(sinfos[i_cur]);
+ 
+@@ -3365,6 +3676,67 @@
+     return n_kv;
+ }
+ 
++bool llama_kv_cache_context::paged_attention_supported() const {
++    return typeid(*this) == typeid(llama_kv_cache_context) && !llama_memory_status_is_fail(status) && kv &&
++        (full_reservation || !ubatches.empty()) && kv->paged_attention_supported();
++}
++
++uint32_t llama_kv_cache_context::get_n_kv_paged() const {
++    GGML_ASSERT(paged_attention_supported());
++    return full_reservation ? kv->get_size() : kv->get_n_kv_paged();
++}
++
++bool llama_kv_cache_context::get_paged_contiguous_span(uint32_t & first_row, uint32_t & rows) const {
++    if (!paged_attention_supported()) { return false; }
++    if (full_reservation) { first_row = 0; rows = kv->get_size(); return true; }
++    const auto & pages = kv->get_paged_table();
++    if (pages.empty() || uint64_t(pages.back()) - pages.front() + 1 != pages.size() ||
++            uint64_t(pages.back()) + 1 > kv->get_size() / llama_paged_kv_pool::page_tokens) { return false; }
++    first_row = pages.front() * llama_paged_kv_pool::page_tokens;
++    rows = uint32_t(pages.size()) * llama_paged_kv_pool::page_tokens;
++    return true;
++}
++
++ggml_tensor * llama_kv_cache_context::get_k_paged(ggml_context * ctx, int32_t il) const {
++    GGML_ASSERT(paged_attention_supported());
++    return kv->get_k(ctx, il, kv->get_size(), sinfos[i_cur]);
++}
++
++ggml_tensor * llama_kv_cache_context::get_v_paged(ggml_context * ctx, int32_t il) const {
++    GGML_ASSERT(paged_attention_supported());
++    return kv->get_v(ctx, il, kv->get_size(), sinfos[i_cur]);
++}
++
++ggml_tensor * llama_kv_cache_context::build_input_paged_table(ggml_context * ctx) const {
++    GGML_ASSERT(paged_attention_supported());
++    auto * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, get_n_kv_paged() / llama_paged_kv_pool::page_tokens, 1);
++    ggml_set_input(result);
++    ggml_set_name(result, "attn_inp_paged_block_table");
++    return result;
++}
++
++void llama_kv_cache_context::set_input_paged_table(ggml_tensor * dst) const {
++    if (!full_reservation) { kv->set_input_paged_table(dst); return; }
++    std::vector<uint32_t> pages(kv->get_size() / llama_paged_kv_pool::page_tokens);
++    for (uint32_t page = 0; page < pages.size(); ++page) { pages[page] = page; }
++    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == int64_t(pages.size()));
++    if (!pages.empty()) { ggml_backend_tensor_set(dst, pages.data(), 0, pages.size() * sizeof(uint32_t)); }
++}
++
++void llama_kv_cache_context::set_input_paged_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
++    GGML_ASSERT(paged_attention_supported());
++    if (full_reservation) { kv->set_input_kq_mask(dst, ubatch, causal_attn); return; }
++    kv->set_input_paged_mask(dst, ubatch, causal_attn);
++}
++
++void llama_kv_cache_context::confirm_paged_layer(int32_t il) const { kv->confirm_paged_layer(il); }
++
++void llama_kv_cache_context::disable_paged_reclamation() const { kv->disable_paged_reclamation(); }
++
++bool llama_kv_cache_context::ensure_dense_backing() const {
++    return full_reservation || kv->ensure_dense_backing(uint32_t(n_kv));
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -199,6 +199,19 @@
+ 
+     uint32_t get_n_kv(const slot_info & sinfo) const;
+ 
++    // Explicit physical-page indirection. Ordinary get_k/get_v and dense mask
++    // interfaces retain their original row order for unsupported graph paths.
++    bool paged_attention_supported() const;
++    uint32_t get_n_kv_paged() const;
++    const std::vector<uint32_t> & get_paged_table() const;
++    void confirm_paged_layer(int32_t il) const;
++    void disable_paged_reclamation() const;
++    LLAMA_API bool paged_reads_confirmed() const;
++    bool ensure_dense_backing(uint32_t tokens = 0);
++    bool ensure_shift_backing();
++    void set_input_paged_table(ggml_tensor * dst) const;
++    void set_input_paged_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
++
+     // get views of the current state of the cache
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+@@ -224,7 +237,7 @@
+ 
+     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
+     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+-    bool grow_for(const slot_info & sinfo);
++    LLAMA_API bool grow_for(const slot_info & sinfo);
+     bool growth_needed_for(const slot_info & sinfo) const;
+     bool allocation_preflight_safe() const { return !other && v_cells_impl.use_count() == 1; }
+ 
+@@ -312,7 +325,26 @@
+     uint32_t growth_initial_tokens = 0;
+     uint32_t growth_committed_tokens = 0;
+     bool growth_paging = false;
++    bool paged_attention_requested = false;
++    // Only the complete, exact ordinary hybrid owner can authorize its plain
++    // attention child. Indexed/SWA composites retain their original contract.
++    bool paged_hybrid_owner = false;
++    friend class llama_memory_hybrid;
++    friend class llama_kv_cache_context;
++    // Sticky across clear(): a late shared view may follow sparse live writes
++    // or a restore whose failed cleanup left the cache logically empty.
++    bool paged_storage_started = false;
++    void enable_paged_hybrid_owner();
++    void initialize_paged_pool();
++    void report_paged_admission() const;
++    mutable bool paged_admission_reported = false;
++    bool paged_layout_supported() const;
++    bool paged_backend_supported() const;
++    mutable std::vector<uint8_t> paged_layer_confirmed;
++    mutable bool paged_reclamation_disabled = false;
++    std::vector<uint8_t> paged_known_committed;
+     bool grow_to(uint32_t tokens);
++    bool grow_paged_for(const slot_info & sinfo);
+     uint32_t growth_tokens_for(const slot_info & sinfo) const;
+     size_t trim_to(uint32_t tokens, const char * proc);
+ 
+@@ -440,6 +472,19 @@
+     //
+ 
+     uint32_t get_n_kv() const;
++    bool paged_attention_supported() const;
++    uint32_t get_n_kv_paged() const;
++    uint32_t get_paged_page_tokens() const { return llama_paged_kv_pool::page_tokens; }
++    bool get_paged_contiguous_span(uint32_t & first_row, uint32_t & rows) const;
++    ggml_tensor * get_k_paged(ggml_context * ctx, int32_t il) const;
++    ggml_tensor * get_v_paged(ggml_context * ctx, int32_t il) const;
++    ggml_tensor * build_input_paged_table(ggml_context * ctx) const;
++    void set_input_paged_table(ggml_tensor * dst) const;
++    void set_input_paged_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
++    void confirm_paged_layer(int32_t il) const;
++    void disable_paged_reclamation() const;
++    bool ensure_dense_backing() const;
++    bool is_paged_full_reservation() const { return full_reservation; }
+ 
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+@@ -513,4 +558,5 @@
+     // a heuristic, to avoid attending the full cache if it is not yet utilized
+     // as the cache gets filled, the benefit from this heuristic disappears
+     int32_t n_kv;
++    bool full_reservation = false;
+ };
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -2,6 +2,7 @@
+ 
+ #include "llama.h"
+ #include "llama-cparams.h"
++#include "llama-paged-kv-pool.h"
+ 
+ #include <bitset>
+ #include <cassert>
+@@ -48,6 +49,7 @@
+         has_shift = false;
+ 
+         used.clear();
++        page_pool.clear();
+ 
+         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+             seq_pos[s].clear();
+@@ -67,6 +69,7 @@
+     }
+ 
+     void resize(uint32_t n) {
++        if (page_pool.enabled() && !page_pool.configure(n)) { page_pool = {}; }
+         pos.resize(n);
+         ext.resize(n);
+         shift.resize(n);
+@@ -75,6 +78,24 @@
+         reset();
+     }
+ 
++    bool enable_page_pool() {
++        if (page_pool.enabled()) { return true; }
++        if (!page_pool.configure(size())) { return false; }
++        for (const uint32_t cell : used) {
++            const bool added = page_pool.claim(cell);
++            assert(added); GGML_UNUSED(added);
++        }
++        return true;
++    }
++
++    const llama_paged_kv_pool & get_page_pool() const { return page_pool; }
++
++    bool disable_empty_page_pool() {
++        if (!used.empty()) { return false; }
++        page_pool = {};
++        return true;
++    }
++
+     bool is_empty(uint32_t i) const {
+         assert(i < pos.size());
+         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
+@@ -170,11 +191,11 @@
+             const auto idx = i + j;
+ 
+             if (pos[idx] == -1 && other.pos[j] != -1) {
+-                used.insert(i + j);
++                mark_used(i + j);
+             }
+ 
+             if (pos[idx] != -1 && other.pos[j] == -1) {
+-                used.erase(i + j);
++                mark_unused(i + j);
+             }
+ 
+             if (pos[idx] != -1) {
+@@ -201,11 +222,11 @@
+             const auto idx = idxs[j];
+ 
+             if (pos[idx] == -1 && other.pos[j] != -1) {
+-                used.insert(idx);
++                mark_used(idx);
+             }
+ 
+             if (pos[idx] != -1 && other.pos[j] == -1) {
+-                used.erase(idx);
++                mark_unused(idx);
+             }
+ 
+             if (pos[idx] != -1) {
+@@ -236,7 +257,7 @@
+         ext[i].reset();
+         shift[i] = 0;
+ 
+-        used.erase(i);
++        mark_unused(i);
+     }
+ 
+     // note: call only if the cell has seq_id
+@@ -255,7 +276,7 @@
+             ext[i].reset();
+             shift[i] = 0;
+ 
+-            used.erase(i);
++            mark_unused(i);
+ 
+             return true;
+         }
+@@ -285,7 +306,7 @@
+             ext[i].reset();
+             shift[i] = 0;
+ 
+-            used.erase(i);
++            mark_unused(i);
+ 
+             return true;
+         }
+@@ -434,9 +455,8 @@
+         assert(pos[i] == -1);
+         assert(seq[i].none());
+ 
++        mark_used(i);
+         pos[i] = p;
+-
+-        used.insert(i);
+     }
+ 
+     void ext_set(uint32_t i, llama_kv_cell_ext p) {
+@@ -463,7 +483,7 @@
+             pos[i] = -1;
+             shift[i] = 0;
+ 
+-            used.erase(i);
++            mark_unused(i);
+ 
+             return true;
+         }
+@@ -497,6 +517,22 @@
+ 
+     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
+     std::set<uint32_t> used;
++    llama_paged_kv_pool page_pool;
++
++    void mark_used(uint32_t index) {
++        const bool added = used.insert(index).second;
++        if (added && page_pool.enabled()) {
++            const bool claimed = page_pool.claim(index);
++            assert(claimed); GGML_UNUSED(claimed);
++        }
++    }
++
++    void mark_unused(uint32_t index) {
++        if (used.erase(index) && page_pool.enabled()) {
++            const bool released = page_pool.release(index);
++            assert(released); GGML_UNUSED(released);
++        }
++    }
+ 
+     std::vector<llama_pos> pos;
+ 
+diff --git a/src/llama-kv-growth.h b/src/llama-kv-growth.h
+--- a/src/llama-kv-growth.h
++++ b/src/llama-kv-growth.h
+@@ -5,6 +5,7 @@
+ #include "ggml-backend.h"
+ #include "ggml-cpp.h"
+ #include "llama-impl.h"
++#include "llama-kv-page-ranges.h"
+ #include <cerrno>
+ #include <cstdlib>
+ #include <cstring>
+@@ -98,3 +99,66 @@
+     }
+     llama_clear_tensor_data(tensor,offset,size);
+ }
++
++inline bool llama_kv_growth_page_ranges(ggml_context * ctx, ggml_backend_buffer_t buffer,
++        const std::vector<uint32_t> & pages, uint32_t page_tokens, uint32_t initial_tokens,
++        std::vector<ggml_kv_trim_range> & ranges) {
++    const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
++    const size_t capacity = ggml_backend_buffer_get_size(buffer);
++    const auto buft = ggml_backend_buffer_get_type(buffer);
++    std::vector<llama_kv_page_tensor> tensors;
++    for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++        if (t->view_src) { continue; }
++        const uintptr_t address = reinterpret_cast<uintptr_t>(t->data);
++        if (t->buffer != buffer || address < base || address - base > capacity ||
++            t->ne[1] <= 0 || uint64_t(t->ne[1]) > UINT32_MAX || t->ne[2] != 1 || t->ne[3] != 1) {
++            return false;
++        }
++        tensors.push_back({size_t(address - base), t->nb[1], uint32_t(t->ne[1]),
++                           ggml_backend_buft_get_alloc_size(buft, t)});
++    }
++    return !tensors.empty() && llama_kv_page_ranges(capacity, tensors, pages, page_tokens, initial_tokens, ranges);
++}
++
++// Only incoming or previously unmapped pages should be passed here. Existing
++// CUDA quotas are charged by commit(); logical virtual size is unchanged.
++inline bool llama_kv_growth_commit_pages(ggml_context * ctx, ggml_backend_buffer_t buffer,
++        const std::vector<uint32_t> & pages, uint32_t page_tokens, uint32_t initial_tokens,
++        bool * grew = nullptr) {
++    if (grew) { *grew = false; }
++    const auto buft = ggml_backend_buffer_get_type(buffer);
++    const auto * api = llama_kv_growth_api(buft);
++    if (!api) { return true; }
++    std::vector<ggml_kv_trim_range> ranges;
++    if (!llama_kv_growth_page_ranges(ctx, buffer, pages, page_tokens, initial_tokens, ranges)) { return false; }
++    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_buft_get_device(buft));
++    const auto resident = reinterpret_cast<ggml_backend_cuda_kv_range_committed_t>(
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_range_committed"));
++    for (const auto & r : ranges) {
++        if (resident && resident(buffer, r.offset, r.size)) { continue; }
++        if (!api->commit(buffer, r.offset, r.size)) { return false; }
++        if (grew) { *grew = true; }
++    }
++    return true;
++}
++
++// Caller fences all users and proves every attention consumer uses the page
++// table before reclaiming interior holes. Coarser CUDA mappings may be retained.
++inline size_t llama_kv_growth_trim_pages(ggml_context * ctx, ggml_backend_buffer_t buffer,
++        const std::vector<uint32_t> & pages, uint32_t page_tokens, uint32_t initial_tokens) {
++    const auto buft = ggml_backend_buffer_get_type(buffer);
++    const auto * api = llama_kv_growth_api(buft);
++    if (!api) { return 0; }
++    std::vector<ggml_kv_trim_range> ranges;
++    if (!llama_kv_growth_page_ranges(ctx, buffer, pages, page_tokens, initial_tokens, ranges)) { return 0; }
++    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_buft_get_device(buft));
++    const auto trim = reinterpret_cast<ggml_backend_cuda_kv_trim_unused_t>(
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_trim_unused"));
++    if (!trim) { return 0; }
++    const size_t before = api->committed(buffer);
++    // A driver error may leave a subset reclaimed. Its accounting remains
++    // authoritative; never report unreleased bytes as available capacity.
++    trim(buffer, ranges.data(), ranges.size());
++    const size_t after = api->committed(buffer);
++    return before > after ? before - after : 0;
++}
+diff --git a/src/llama-kv-page-ranges.h b/src/llama-kv-page-ranges.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-kv-page-ranges.h
+@@ -0,0 +1,65 @@
++#pragma once
++
++#include "ggml-kv-trim.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <vector>
++
++// Tensor rows are physical KV cells; logical attention pages need not be
++// adjacent in this address space. Metadata is capped independently of context.
++struct llama_kv_page_tensor {
++    size_t offset;
++    size_t row_bytes;
++    uint32_t rows;
++    size_t allocated_bytes;
++};
++
++inline bool llama_kv_page_ranges(size_t capacity,
++        const std::vector<llama_kv_page_tensor> & tensors,
++        const std::vector<uint32_t> & pages, uint32_t page_tokens,
++        uint32_t initial_tokens, std::vector<ggml_kv_trim_range> & ranges) {
++    constexpr size_t max_ranges = 65536;
++    ranges.clear();
++    if (!page_tokens || !capacity) { return false; }
++    for (size_t i = 0; i < pages.size(); ++i) {
++        if (i && pages[i] <= pages[i - 1]) { return false; }
++    }
++    auto add = [&](size_t offset, size_t size) {
++        if (!size) { return true; }
++        if (offset > capacity || size > capacity - offset || ranges.size() == max_ranges) { return false; }
++        ranges.push_back({offset, size});
++        return true;
++    };
++    for (const auto & t : tensors) {
++        if (!t.rows || !t.row_bytes || t.row_bytes > SIZE_MAX/t.rows ||
++            initial_tokens > t.rows || t.offset > capacity ||
++            t.allocated_bytes > capacity - t.offset) { return false; }
++        const size_t actual = t.row_bytes*t.rows;
++        if (actual > t.allocated_bytes || !add(t.offset, t.row_bytes*initial_tokens)) { return false; }
++        for (size_t i = 0; i < pages.size();) {
++            const uint64_t first = uint64_t(pages[i])*page_tokens;
++            size_t j = i + 1;
++            while (j < pages.size() && uint64_t(pages[j]) == uint64_t(pages[j - 1]) + 1) { ++j; }
++            const uint64_t end = std::min<uint64_t>(t.rows, (uint64_t(pages[j - 1]) + 1)*page_tokens);
++            if (first >= t.rows || !add(t.offset + size_t(first)*t.row_bytes, size_t(end - first)*t.row_bytes)) {
++                return false;
++            }
++            i = j;
++        }
++        // Quantized backends may initialize allocation padding outside ne[1].
++        if (!add(t.offset + actual, t.allocated_bytes - actual)) { return false; }
++    }
++    std::sort(ranges.begin(), ranges.end(), [](const auto & a, const auto & b) { return a.offset < b.offset; });
++    size_t count = 0;
++    for (const auto r : ranges) {
++        if (count && r.offset <= ranges[count - 1].offset + ranges[count - 1].size) {
++            auto & previous = ranges[count - 1];
++            previous.size = std::max(previous.offset + previous.size, r.offset + r.size) - previous.offset;
++        } else {
++            ranges[count++] = r;
++        }
++    }
++    ranges.resize(count);
++    return true;
++}
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -204,6 +204,7 @@
+     )) {}
+ 
+ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
++    initialize_paged_attention();
+     do {
+         balloc.split_reset();
+ 
+@@ -267,7 +268,19 @@
+ }
+ 
+ llama_memory_context_ptr llama_memory_hybrid::init_full() {
++    initialize_paged_attention();
+     return std::make_unique<llama_memory_hybrid_context>(this);
++}
++
++void llama_memory_hybrid::initialize_paged_attention() {
++    if (paged_attention_checked) { return; }
++    paged_attention_checked = true;
++    if (typeid(*this) == typeid(llama_memory_hybrid) &&
++            typeid(*mem_attn) == typeid(llama_kv_cache) &&
++            typeid(*mem_recr) == typeid(llama_memory_recurrent)) {
++        mem_attn->enable_paged_hybrid_owner();
++    }
++    mem_attn->report_paged_admission();
+ }
+ 
+ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
+@@ -416,12 +429,9 @@
+ bool llama_memory_hybrid_context::apply() {
+     assert(!llama_memory_status_is_fail(status));
+ 
+-    bool res = true;
+-
+-    res = res & ctx_attn->apply();
+-    res = res & ctx_recr->apply();
+-
+-    return res;
++    // An attention-page quota denial must not advance recurrent cell metadata.
++    // prepare() already proved the recurrent slots for the same microbatches.
++    return ctx_attn->apply() && ctx_recr->apply();
+ }
+ 
+ llama_memory_status llama_memory_hybrid_context::get_status() const {
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -91,6 +91,10 @@
+     llama_memory_recurrent * get_mem_recr() const;
+ 
+ private:
++    // Deferred until the complete dynamic type is known. A base constructor
++    // would incorrectly admit derived indexed hybrid owners.
++    void initialize_paged_attention();
++    bool paged_attention_checked = false;
+     const llama_hparams & hparams;
+ 
+     const std::unique_ptr<llama_kv_cache> mem_attn;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -500,6 +500,8 @@
+     auto org_cells = cells;
+     auto org_used = used;
+     auto org_head = head;
++    const auto org_n = n;
++    const auto org_rs_z = rs_z;
+ 
+     bool success = true;
+ 
+@@ -514,6 +516,8 @@
+     cells = std::move(org_cells);
+     used = org_used;
+     head = org_head;
++    n = org_n;
++    rs_z = org_rs_z;
+ 
+     return success;
+ }
+diff --git a/src/llama-paged-kv-pool.h b/src/llama-paged-kv-pool.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-paged-kv-pool.h
+@@ -0,0 +1,212 @@
++#pragma once
++
++#include <algorithm>
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <new>
++#include <utility>
++#include <vector>
++
++// A preallocated hierarchical bitmap. Updating a cell/page and locating a free
++// page never allocates or scans the configured token capacity.
++class llama_paged_kv_bitmap {
++public:
++    static constexpr uint32_t none = UINT32_MAX;
++
++    void reset(uint32_t count) {
++        std::vector<std::vector<uint64_t>> next;
++        for (uint64_t bits = count; bits;) {
++            const uint64_t words = (bits + 63) / 64;
++            next.emplace_back(size_t(words), 0);
++            if (words == 1) { break; }
++            bits = words;
++        }
++        levels.swap(next);
++        size = count;
++    }
++
++    void clear() {
++        for (auto & level : levels) { std::fill(level.begin(), level.end(), 0); }
++    }
++
++    bool test(uint32_t index) const {
++        return index < size && (levels[0][index / 64] & (UINT64_C(1) << (index % 64))) != 0;
++    }
++
++    void set(uint32_t index, bool value) {
++        assert(index < size);
++        size_t word = index / 64;
++        const uint64_t bit = UINT64_C(1) << (index % 64);
++        const uint64_t before = levels[0][word];
++        const uint64_t after = value ? before | bit : before & ~bit;
++        levels[0][word] = after;
++        bool old_nonempty = before != 0, new_nonempty = after != 0;
++        for (size_t level = 1; level < levels.size() && old_nonempty != new_nonempty; ++level) {
++            const size_t parent = word / 64;
++            const uint64_t parent_bit = UINT64_C(1) << (word % 64);
++            const uint64_t old_parent = levels[level][parent];
++            const uint64_t new_parent = new_nonempty ? old_parent | parent_bit : old_parent & ~parent_bit;
++            levels[level][parent] = new_parent;
++            old_nonempty = old_parent != 0; new_nonempty = new_parent != 0;
++            word = parent;
++        }
++    }
++
++    uint32_t first() const {
++        if (levels.empty() || !levels.back()[0]) { return none; }
++        size_t index = 0;
++        for (size_t level = levels.size(); level-- > 0;) {
++            const uint64_t bits = levels[level][index];
++            index = index * 64 + trailing(bits);
++        }
++        return uint32_t(index);
++    }
++
++    template<typename Visit>
++    bool each(Visit && visit) const {
++        return levels.empty() || walk(levels.size() - 1, 0, visit);
++    }
++
++    static uint32_t trailing(uint64_t bits) {
++        assert(bits);
++        uint32_t count = 0;
++        // Constant bounded work and portable C++17; compilers recognize this
++        // idiom without exposing CUDA/Windows intrinsics in the cache header.
++        while ((bits & 1) == 0) { bits >>= 1; ++count; }
++        return count;
++    }
++
++private:
++    template<typename Visit>
++    bool walk(size_t level, size_t word, Visit & visit) const {
++        uint64_t bits = levels[level][word];
++        while (bits) {
++            const size_t index = word * 64 + trailing(bits);
++            bits &= bits - 1;
++            if (level ? !walk(level - 1, index, visit) : !visit(uint32_t(index))) { return false; }
++        }
++        return true;
++    }
++
++    uint32_t size = 0;
++    std::vector<std::vector<uint64_t>> levels;
++};
++
++// Physical P32 pages are shared at cell granularity. Logical sequence/position
++// ownership remains in llama_kv_cells: removing one alias cannot release a cell
++// or page still referenced by another sequence. The attention block table maps
++// compact logical read pages directly to these noncontiguous physical pages.
++class llama_paged_kv_pool {
++public:
++    static constexpr uint32_t page_tokens = 32;
++    static constexpr uint64_t max_metadata_bytes = 16 * 1024 * 1024;
++
++    bool configure(uint32_t cells) {
++        const uint64_t pages = (uint64_t(cells) + page_tokens - 1) / page_tokens;
++        // Includes both occupied masks and worst-case cached table capacity,
++        // plus conservative bitmap/vector bookkeeping. Denial leaves the
++        // existing layout untouched and lets the caller use ordinary storage.
++        if (!cells || pages * 10 + 4096 > max_metadata_bytes) { return false; }
++        try {
++            llama_paged_kv_pool next;
++            next.capacity = cells;
++            next.occupied.resize(size_t(pages), 0);
++            next.cached_table.reserve(size_t(pages));
++            next.active.reset(uint32_t(pages));
++            next.partial.reset(uint32_t(pages));
++            next.empty.reset(uint32_t(pages));
++            for (uint32_t page = 0; page < pages; ++page) { next.empty.set(page, true); }
++            *this = std::move(next);
++            return true;
++        } catch (const std::bad_alloc &) {
++            return false;
++        }
++    }
++
++    bool enabled() const { return capacity != 0; }
++    uint32_t size() const { return capacity; }
++    uint32_t used() const { return used_cells; }
++    uint32_t free() const { return capacity - used_cells; }
++
++    void clear() {
++        if (!enabled()) { return; }
++        std::fill(occupied.begin(), occupied.end(), 0);
++        active.clear(); partial.clear(); empty.clear();
++        for (uint32_t page = 0; page < occupied.size(); ++page) { empty.set(page, true); }
++        used_cells = 0;
++        cached_table.clear();
++        table_dirty = false;
++    }
++
++    bool claim(uint32_t cell) {
++        if (cell >= capacity) { return false; }
++        const uint32_t page = cell / page_tokens, bit = UINT32_C(1) << (cell % page_tokens);
++        if (occupied[page] & bit) { return false; }
++        const bool was_empty = occupied[page] == 0;
++        occupied[page] |= bit;
++        ++used_cells;
++        empty.set(page, false);
++        partial.set(page, occupied[page] != valid_mask(page));
++        if (was_empty) { active.set(page, true); table_dirty = true; }
++        return true;
++    }
++
++    bool release(uint32_t cell) {
++        if (cell >= capacity) { return false; }
++        const uint32_t page = cell / page_tokens, bit = UINT32_C(1) << (cell % page_tokens);
++        if (!(occupied[page] & bit)) { return false; }
++        occupied[page] &= ~bit;
++        --used_cells;
++        const bool now_empty = occupied[page] == 0;
++        empty.set(page, now_empty);
++        partial.set(page, !now_empty && occupied[page] != valid_mask(page));
++        if (now_empty) { active.set(page, false); table_dirty = true; }
++        return true;
++    }
++
++    bool contains(uint32_t cell) const {
++        return cell < capacity && (occupied[cell / page_tokens] & (UINT32_C(1) << (cell % page_tokens))) != 0;
++    }
++
++    // Nonmutating reservation: prepare() can emulate the selected cells and
++    // rewind them through the normal cell transaction before real application.
++    bool select(uint32_t count, std::vector<uint32_t> & destination) const {
++        if (!enabled() || count > free()) { return false; }
++        destination.clear();
++        destination.reserve(count);
++        auto choose = [&](uint32_t page) {
++            uint32_t bits = valid_mask(page) & ~occupied[page];
++            while (bits && destination.size() < count) {
++                const uint32_t offset = llama_paged_kv_bitmap::trailing(bits);
++                bits &= bits - 1;
++                destination.push_back(page * page_tokens + offset);
++            }
++            return destination.size() < count;
++        };
++        if (count && partial.each(choose)) { empty.each(choose); }
++        return destination.size() == count;
++    }
++
++    const std::vector<uint32_t> & table() const {
++        if (table_dirty) {
++            cached_table.clear();
++            active.each([&](uint32_t page) { cached_table.push_back(page); return true; });
++            table_dirty = false;
++        }
++        return cached_table;
++    }
++
++private:
++    uint32_t valid_mask(uint32_t page) const {
++        const uint32_t remaining = capacity - page * page_tokens;
++        return remaining >= page_tokens ? UINT32_MAX : (UINT32_C(1) << remaining) - 1;
++    }
++
++    uint32_t capacity = 0, used_cells = 0;
++    std::vector<uint32_t> occupied;
++    llama_paged_kv_bitmap active, partial, empty;
++    mutable std::vector<uint32_t> cached_table;
++    mutable bool table_dirty = true;
++};
+diff --git a/tests/test-cuda-kv-growth.cpp b/tests/test-cuda-kv-growth.cpp
+--- a/tests/test-cuda-kv-growth.cpp
++++ b/tests/test-cuda-kv-growth.cpp
+@@ -24,12 +24,13 @@
+ 
+ int main(int argc,char ** argv) {
+     try {
+-        const bool paging=argc>1&&std::strcmp(argv[1],"--paging")==0;
++        const bool attention=argc>1&&std::strcmp(argv[1],"--paged-attention")==0;
++        const bool paging=attention || (argc>1&&std::strcmp(argv[1],"--paging")==0);
+         if(paging) {
+ #ifdef _WIN32
+-            require(_putenv_s("WILDLLAMA_KV_CACHE_PAGING","1")==0,"cannot opt into physical paging");
++            require(_putenv_s(attention ? "WILDLLAMA_PAGED_ATTENTION" : "WILDLLAMA_KV_CACHE_PAGING","1")==0,"cannot opt into physical paging");
+ #else
+-            require(setenv("WILDLLAMA_KV_CACHE_PAGING","1",1)==0,"cannot opt into physical paging");
++            require(setenv(attention ? "WILDLLAMA_PAGED_ATTENTION" : "WILDLLAMA_KV_CACHE_PAGING","1",1)==0,"cannot opt into physical paging");
+ #endif
+         }
+         ggml_backend_load_all();
+@@ -47,6 +48,9 @@
+         auto trim = reinterpret_cast<ggml_backend_cuda_kv_trim_t>(
+                 ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_trim_empty"));
+         require(trim != nullptr, "CUDA empty-cache trim API unavailable");
++        const auto resident = reinterpret_cast<ggml_backend_cuda_kv_range_committed_t>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_range_committed"));
++        require(resident && !resident(nullptr, 0, 0), "range residency query unavailable/invalid input accepted");
+         constexpr size_t mib = 1024*1024;
+         const size_t page = api->granularity(buft);
+         if (!page || page > 4*mib) {
+@@ -94,6 +98,8 @@
+             auto * flat=ggml_new_tensor_1d(context.get(),GGML_TYPE_I8,logical);
+             require(ggml_backend_tensor_alloc(storage.get(),flat,address)==GGML_STATUS_SUCCESS,"cannot attach paging tensor");
+             require(api->commit(storage.get(),0,filled)&&api->commit(storage.get(),logical-page,page),"cannot commit bounded paging intervals");
++            require(resident(storage.get(), 0, filled) && !resident(storage.get(), filled, page) &&
++                    resident(storage.get(), logical, 0) && !resident(storage.get(), logical, 1), "precise mapped range query");
+             std::vector<uint8_t> prefix(257,0x39), padding(17,0x87);
+             ggml_backend_tensor_set(flat,prefix.data(),13,prefix.size());
+             ggml_backend_tensor_set(flat,padding.data(),logical-page+13,padding.size());
+@@ -103,10 +109,13 @@
+             require(api->committed(storage.get())==segment+page &&
+                     before.managed_used_bytes-stats().managed_used_bytes==filled-segment,
+                     "segmented tail paging did not release exact quota");
++            require(resident(storage.get(), 0, segment) && !resident(storage.get(), segment, 1) &&
++                    resident(storage.get(), logical-page, page), "residency query after interior reclamation");
+             expect_fill(flat,13,prefix.size(),0x39);expect_fill(flat,logical-page+13,padding.size(),0x87);
+             require(trim(storage.get(),keep,2)&&api->committed(storage.get())==segment+page,"segmented trim was not idempotent");
+             require(api->commit(storage.get(),segment+13,1)&&api->committed(storage.get())==segment+2*page,
+                     "page regrowth did not use the managed quota");
++            require(resident(storage.get(), segment + 13, 1), "residency query after recommit");
+             expect_fill(flat,segment+13,257,0);
+             require(ggml_backend_buffer_get_base(storage.get())==address&&ggml_backend_buffer_get_size(storage.get())==logical,
+                     "paging changed logical address/capacity");
+diff --git a/tests/test-cuda-paged-attn.cpp b/tests/test-cuda-paged-attn.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-cuda-paged-attn.cpp
+@@ -0,0 +1,118 @@
++#define GGML_TEST_PAGED_NO_MAIN
++#define main paged_cpu_reference_entrypoint
++#include "test-paged-attn.cpp"
++#undef main
++
++#include "../ggml/include/ggml-cuda.h"
++
++#include <cstdlib>
++
++static void host_metadata_contracts() {
++    ggml_context_ptr context(ggml_init({1024 * 1024, nullptr, true}));
++    require(bool(context), "metadata fixture allocation failed");
++    auto * q = ggml_new_tensor_4d(context.get(), GGML_TYPE_F32, 32, 1, 4, 1);
++    auto * k = ggml_new_tensor_4d(context.get(), GGML_TYPE_F16, 32, 128, 2, 1);
++    auto * v = ggml_new_tensor_4d(context.get(), GGML_TYPE_Q8_0, 64, 128, 2, 1);
++    auto * table = ggml_new_tensor_2d(context.get(), GGML_TYPE_I32, 2, 1);
++    auto * mask = ggml_new_tensor_4d(context.get(), GGML_TYPE_F32, 64, 1, 1, 1);
++    auto * output = ggml_flash_attn_paged(context.get(), q, k, v, mask, nullptr, table, nullptr, 32, .25f, 0.f, 0.f);
++    require(ggml_paged_attn_valid(output), "unallocated mixed-storage metadata rejected");
++    for (auto * tensor : { q, k, v, table, mask, output }) {
++        const auto stride = tensor->nb[3];
++        const auto dimension = tensor->ne[3];
++        tensor->nb[3] = SIZE_MAX;
++        tensor->ne[3] = INT64_MAX;
++        require(!ggml_paged_attn_valid(output), "overflowing metadata span admitted");
++        tensor->nb[3] = stride;
++        tensor->ne[3] = dimension;
++    }
++    const auto columns = table->ne[0];
++    table->ne[0] = INT32_MAX;
++    require(!ggml_paged_attn_valid(output), "overflowing logical page capacity admitted");
++    table->ne[0] = columns;
++}
++
++static void cuda_capability_contracts(ggml_backend_t backend) {
++    ggml_context_ptr context(ggml_init({1024 * 1024, nullptr, true}));
++    auto * table = ggml_new_tensor_2d(context.get(), GGML_TYPE_I32, 2, 1);
++    for (const int width : { 32, 64, 128, 256, 512 }) {
++        auto * q = ggml_new_tensor_4d(context.get(), GGML_TYPE_F32, width, 65, 4, 1);
++        auto * k = ggml_new_tensor_4d(context.get(), GGML_TYPE_Q8_0, width, 128, 2, 1);
++        auto * v = ggml_new_tensor_4d(context.get(), GGML_TYPE_F16, width, 128, 2, 1);
++        auto * output = ggml_flash_attn_paged(context.get(), q, k, v, nullptr, nullptr, table, nullptr, 32, .25f, 0.f, 0.f);
++        require(ggml_backend_supports_op(backend, output) == (width <= 256),
++            "metadata-only CUDA head-width capability changed");
++        if (width == 32) {
++            const auto stride = q->nb[1];
++            q->nb[1] += 1;
++            require(!ggml_backend_supports_op(backend, output), "misaligned CUDA row stride admitted");
++            q->nb[1] = stride;
++        }
++    }
++}
++
++static void cuda_replay_contract(ggml_backend_t backend) {
++    paged_case options;
++    options.key_type = options.value_type = GGML_TYPE_Q8_0;
++    options.key_width = options.value_width = 128;
++    options.queries = 5;
++    options.blocks = 3;
++    paged_fixture fixture(backend, options);
++    for (int iteration = 0; iteration < 4; ++iteration) {
++        if (iteration) {
++            for (int stream = 0; stream < paged_fixture::streams; ++stream) {
++                auto first = fixture.block_ids.begin() + stream * options.blocks;
++                std::rotate(first, first + 1, first + options.blocks);
++            }
++            fixture.query_bytes = paged_fixture::encoded(fixture.query_storage, 3 + 17 * iteration);
++            ggml_backend_tensor_set(fixture.query_storage, fixture.query_bytes.data(), 0, fixture.query_bytes.size());
++            ggml_backend_tensor_set(fixture.table, fixture.block_ids.data(), 0, fixture.block_ids.size() * sizeof(int32_t));
++        }
++        fixture.check(backend, "CUDA graph replay with changed query data and physical block mapping");
++    }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        host_metadata_contracts();
++        if (argc < 2 || std::string(argv[1]) == "--host-only") {
++            std::puts("PASS paged CUDA metadata contracts without backend initialization");
++            return 0;
++        }
++        require(std::string(argv[1]) == "--cuda", "use --host-only or --cuda");
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++        require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++#else
++        const char * cuda_path = std::getenv("GGML_BACKEND_PATH");
++        require(cuda_path && ggml_backend_load(cuda_path), "set GGML_BACKEND_PATH to the candidate CUDA backend file");
++#endif
++        auto * registry = ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) { std::puts("SKIP no CUDA device"); return 77; }
++        auto * device = ggml_backend_reg_dev_get(registry, 0);
++        auto set_limit = reinterpret_cast<bool (*)(ggml_backend_dev_t, size_t, bool)>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_set_memory_limit"));
++        auto get_stats = reinterpret_cast<decltype(&ggml_backend_cuda_get_memory_stats)>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_get_memory_stats"));
++        auto submissions = reinterpret_cast<uint64_t (*)()>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_paged_attn_submissions"));
++        require(set_limit && get_stats && submissions, "paged CUDA quota or path counters unavailable");
++        require(set_limit(device, 128 * 1024 * 1024, true), "paged CUDA fixture quota rejected");
++        ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
++        require(bool(backend), "CUDA backend initialization failed");
++        cuda_capability_contracts(backend.get());
++        const auto before = submissions();
++        run_cases(backend.get());
++        cuda_replay_contract(backend.get());
++        require(submissions() > before, "paged CUDA kernel was not submitted");
++        ggml_backend_cuda_memory_stats memory{};
++        require(get_stats(device, &memory) && memory.enabled && memory.managed_peak_bytes <= memory.limit_bytes,
++            "paged CUDA fixture exceeded its managed memory limit");
++        std::printf("PAGED_CUDA submissions=%llu tracked_peak_bytes=%llu limit_bytes=%llu global_scratch_bytes=0 shared_bytes_per_block=4144 PASS\n",
++            (unsigned long long) (submissions() - before), (unsigned long long) memory.managed_peak_bytes,
++            (unsigned long long) memory.limit_bytes);
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL paged CUDA attention: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-execution-plan.cpp b/tests/test-execution-plan.cpp
+--- a/tests/test-execution-plan.cpp
++++ b/tests/test-execution-plan.cpp
+@@ -43,7 +43,23 @@
+         for (int i = 0; i < 1024; ++i) { plan.observe(prompt); plan.observe(decode); }
+         plan.prepared(prompt, 20000);
+         require(plan.replace(prompt, decode, 4096), "stale timing confidence never decayed");
+-        std::puts("PASS execution plans: measured cost, hot-plan protection, aging, bounded metadata, invalidation, fallback, no device allocations");
++        // Different execution roles must retain their original LRU fairness.
++        // Host timing jitter must not let a hot expensive decoder starve the
++        // cheap encoder that the same speculative request needs every round.
++        plan.clear();
++        for (int i = 0; i < 12; ++i) { plan.observe(decode); plan.prepared(decode, 100000); }
++        const shape encoder{4, 4, 0, 1, 1, 2, 0};
++        plan.observe(encoder); plan.prepared(encoder, 1);
++        require(plan.replace(encoder, decode, 4096), "decoder cost starved a different encoder role");
++        require(!plan.prefer_victim(encoder, 4096, decode, 4096) &&
++                !plan.prefer_victim(decode, 4096, encoder, 4096), "cost scoring replaced cross-role LRU");
++        for (const shape phase : {shape{1, 1, 0, 1, 0, 3, 0}, shape{1, 1, 0, 1, 0, 0, 1}}) {
++            plan.observe(phase); plan.prepared(phase, 1);
++            require(plan.replace(phase, decode, 4096) && !plan.prefer_victim(phase, 4096, decode, 4096),
++                "input kind or MTP head lost independent LRU fairness");
++        }
++        require(plan.preserved == 0, "cross-role scheduling unexpectedly protected another role");
++        std::puts("PASS execution plans: measured cost, phase fairness, hot-plan protection, aging, bounded metadata, invalidation, fallback, no device allocations");
+     } catch (const std::exception & error) {
+         std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1;
+     }
+diff --git a/tests/test-kv-page-ranges.cpp b/tests/test-kv-page-ranges.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-kv-page-ranges.cpp
+@@ -0,0 +1,47 @@
++#include "../src/llama-kv-page-ranges.h"
++
++#include <cstdio>
++#include <limits>
++
++static bool require(bool value, const char * what) {
++    if (!value) { std::fprintf(stderr, "FAIL: %s\n", what); }
++    return value;
++}
++
++int main() {
++    bool ok = true;
++    std::vector<ggml_kv_trim_range> ranges;
++    const size_t stride = 128, bytes = stride*4096;
++    const std::vector<llama_kv_page_tensor> tensors = {{0, stride, 4096, bytes + 256},
++        {bytes + 4096, stride, 4096, bytes + 256}};
++    const size_t capacity = 2*bytes + 8192;
++    const std::vector<uint32_t> pages = {1, 3, 4, 37, 127};
++    ok &= require(llama_kv_page_ranges(capacity, tensors, pages, 32, 64, ranges), "valid scattered pages");
++    for (const auto & t : tensors) {
++        for (uint32_t row = 0; row < t.rows; ++row) {
++            const bool expected = row < 64 || std::binary_search(pages.begin(), pages.end(), row/32);
++            const bool kept = ggml_kv_trim_keep(t.offset + row*stride, stride, ranges.data(), ranges.size());
++            ok &= require(kept == expected, "exact live/floor row coverage");
++            ok &= require(ggml_kv_trim_keep_sorted(t.offset + row*stride, stride, ranges.data(), ranges.size()) == kept,
++                "binary mapping protection matches full scan");
++        }
++        ok &= require(ggml_kv_trim_keep(t.offset + bytes, 256, ranges.data(), ranges.size()), "quantized tail padding");
++        ok &= require(!ggml_kv_trim_keep(t.offset + bytes + 256, 256, ranges.data(), ranges.size()), "unused alignment gap");
++    }
++    ok &= require(!llama_kv_page_ranges(capacity, tensors, {2, 2}, 32, 64, ranges), "duplicate table rejection");
++    ok &= require(!llama_kv_page_ranges(capacity, tensors, {4, 1}, 32, 64, ranges), "unsorted table rejection");
++    ok &= require(!llama_kv_page_ranges(capacity, tensors, {128}, 32, 64, ranges), "out of capacity page rejection");
++    ok &= require(!llama_kv_page_ranges(capacity, tensors, {}, 0, 64, ranges), "zero page size rejection");
++    ok &= require(!llama_kv_page_ranges(capacity, tensors, {}, 32, 4097, ranges), "invalid initial floor rejection");
++    ok &= require(!llama_kv_page_ranges(SIZE_MAX, {{1, SIZE_MAX, 2, SIZE_MAX - 1}}, {}, 32, 0, ranges), "row-byte overflow rejection");
++    ok &= require(!llama_kv_page_ranges(128, {{100, 1, 32, 32}}, {}, 32, 0, ranges), "allocation bound rejection");
++    ok &= require(llama_kv_page_ranges(257, {{0, 1, 257, 257}}, {8}, 32, 0, ranges) &&
++        ranges.size() == 1 && ranges[0].offset == 256 && ranges[0].size == 1, "partial final page clamped");
++
++    std::vector<uint32_t> fragmented;
++    for (uint32_t p = 0; p < 131074; p += 2) { fragmented.push_back(p); }
++    ok &= require(!llama_kv_page_ranges(4194368, {{0, 1, 4194368, 4194368}}, fragmented, 32, 0, ranges),
++        "bounded metadata rejects excessive fragmentation safely");
++    std::printf("KV page ranges: %s (live holes, floor, padding, bounds, metadata cap)\n", ok ? "PASS" : "FAIL");
++    return ok ? 0 : 1;
++}
+diff --git a/tests/test-kv-paged-hybrid.cpp b/tests/test-kv-paged-hybrid.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-kv-paged-hybrid.cpp
+@@ -0,0 +1,219 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++#include "../src/llama-ext.h"
++#include "../src/llama-memory-hybrid.h"
++#include "../src/llama-model.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static bool gpu = false;
++static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++static void environment(const char * name, const char * value) {
++#ifdef _WIN32
++    require(_putenv_s(name, value ? value : "") == 0, "cannot configure isolated hybrid environment");
++#else
++    require((value ? setenv(name, value, 1) : unsetenv(name)) == 0, "cannot configure isolated hybrid environment");
++#endif
++}
++
++static llama_model_ptr model() {
++    gguf_context_ptr metadata(gguf_init_empty());
++    gguf_set_val_str(metadata.get(), "general.architecture", "qwen35");
++    gguf_set_val_str(metadata.get(), "general.name", "nonzero-tiny-paged-hybrid-fixture");
++    auto u32 = [&](const char * key, uint32_t value) {
++        gguf_set_val_u32(metadata.get(), (std::string("qwen35.") + key).c_str(), value);
++    };
++    u32("context_length", 8192); u32("embedding_length", 128); u32("block_count", 2);
++    u32("feed_forward_length", 128);
++    u32("attention.head_count", gpu ? 8 : 2); u32("attention.head_count_kv", gpu ? 8 : 1);
++    u32("attention.key_length", gpu ? 256 : 64); u32("attention.value_length", gpu ? 256 : 64);
++    u32("rope.dimension_count", gpu ? 256 : 64); u32("nextn_predict_layers", 0); u32("full_attention_interval", 2);
++    u32("ssm.conv_kernel", 4); u32("ssm.inner_size", 128); u32("ssm.state_size", 128);
++    u32("ssm.time_step_rank", 1); u32("ssm.group_count", 1);
++    gguf_set_val_f32(metadata.get(), "qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
++    const uint32_t section = gpu ? 64 : 16;
++    const uint32_t sections[] = {section, section, 0, 0};
++    gguf_set_arr_data(metadata.get(), "qwen35.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
++    gguf_set_val_str(metadata.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) { char name[16]; std::snprintf(name, sizeof(name), "<0x%02X>", i); tokens.emplace_back(name); }
++    std::vector<const char *> names; for (const auto & token : tokens) { names.push_back(token.c_str()); }
++    std::vector<float> scores(259, 0); std::vector<int32_t> types(259, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(metadata.get(), "tokenizer.ggml.tokens", names.data(), names.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.eos_token_id", 2);
++    auto initialize = [](ggml_tensor * tensor, void *) {
++        require(tensor->type == GGML_TYPE_F32, "unexpected hybrid fixture weight type");
++        std::vector<float> values(size_t(ggml_nelements(tensor))); uint32_t state = 2166136261u;
++        for (const char * p = tensor->name; *p; ++p) { state = (state ^ uint8_t(*p)) * 16777619u; }
++        for (auto & value : values) {
++            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++            value = (float(state & 65535) / 65535.f - .5f) * .12f;
++        }
++        if (std::strstr(tensor->name, "norm")) { std::fill(values.begin(), values.end(), 1.f); }
++        if (std::strstr(tensor->name, "ssm_a") || std::strstr(tensor->name, "ssm_dt.bias")) { std::fill(values.begin(), values.end(), -1.f); }
++        ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
++    };
++    auto p = llama_model_default_params();
++    ggml_backend_dev_t devices[] = {gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
++    p.devices = devices; p.n_gpu_layers = gpu ? 99 : 0; p.gpu_exclusive = gpu;
++    p.load_mode = LLAMA_LOAD_MODE_NONE; p.use_extra_bufts = false; p.no_host = true;
++    if (gpu) { p.gpu_vram_limit_mib = 192; }
++    llama_model_ptr result(llama_model_init_from_user(metadata.get(), initialize, nullptr, p));
++    require(bool(result), "cannot initialize nonzero tiny Qwen hybrid model"); return result;
++}
++
++static llama_context_ptr context(llama_model * weights, bool paged, ggml_type type) {
++    environment("WILDLLAMA_PAGED_ATTENTION", paged ? "1" : "0");
++    auto p = llama_context_default_params();
++    p.n_ctx = gpu ? 1024 : 8192; p.n_batch = 512; p.n_ubatch = 128; p.n_seq_max = 2; p.n_rs_seq = 2; p.kv_unified = true;
++    p.n_threads = p.n_threads_batch = 1; p.type_k = p.type_v = type;
++    p.n_outputs_max = 2; p.n_outputs_max_per_seq = 1;
++    p.op_offload = p.offload_kqv = gpu; p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    llama_context_ptr result(llama_init_from_model(weights, p));
++    require(bool(result), "cannot initialize tiny hybrid context");
++    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(result.get()));
++    require(hybrid && hybrid->get_mem_attn()->get_cells(0).get_page_pool().enabled() == paged,
++        "ordinary hybrid paged capability was not actually selected");
++    return result;
++}
++
++static std::vector<float> decode(llama_context * ctx, int sequence, int position, int count, int salt = 0, bool allow_denial = false) {
++    auto b = llama_batch_init(count, 0, 1); b.n_tokens = count;
++    for (int i = 0; i < count; ++i) {
++        b.token[i] = 3 + ((position + i) * 13 + salt) % 256; b.pos[i] = position + i;
++        b.n_seq_id[i] = 1; b.seq_id[i][0] = sequence; b.logits[i] = i + 1 == count;
++    }
++    const int status = llama_decode(ctx, b); llama_batch_free(b);
++    if (allow_denial && status != 0) { return {}; }
++    require(status == 0, "tiny hybrid decode failed"); llama_synchronize(ctx);
++    if (gpu) {
++        llama_gpu_execution_stats stats{};
++        require(llama_gpu_execution_stats_get(ctx, &stats) && stats.gpu_heavy_ops_submitted > 0 && stats.cpu_heavy_ops_submitted == 0,
++            "tiny hybrid fixture silently used CPU heavy arithmetic");
++    }
++    const auto * values = llama_get_logits_ith(ctx, -1); require(values, "hybrid output logits unavailable");
++    return {values, values + 259};
++}
++static void equal(const std::vector<float> & a, const std::vector<float> & b, const char * stage) {
++    require(a.size() == b.size(), "hybrid output vocabulary changed"); float maximum = 0;
++    for (size_t i = 0; i < a.size(); ++i) {
++        require(std::isfinite(a[i]) && std::isfinite(b[i]), "hybrid paged attention produced nonfinite logits");
++        maximum = std::max(maximum, std::abs(a[i] - b[i]) / std::max(1.f, std::abs(a[i])));
++    }
++    require(std::max_element(a.begin(), a.end()) - a.begin() == std::max_element(b.begin(), b.end()) - b.begin(),
++        "hybrid paged attention changed the greedy token");
++    require(maximum <= 2e-4f, "hybrid paged attention exceeded numerical regression gate");
++    std::printf("PAGED_HYBRID_LOGITS stage=%s max_scaled=%.9g\n", stage, maximum);
++}
++static std::vector<uint8_t> state(llama_context * ctx, int sequence, llama_state_seq_flags flags = 0) {
++    const size_t size = llama_state_seq_get_size_ext(ctx, sequence, flags);
++    std::vector<uint8_t> bytes(size);
++    require(llama_state_seq_get_data_ext(ctx, bytes.data(), size, sequence, flags) == size, "cannot save hybrid state"); return bytes;
++}
++static void restore(llama_context * ctx, int sequence, const std::vector<uint8_t> & bytes, llama_state_seq_flags flags = 0) {
++    require(llama_state_seq_set_data_ext(ctx, bytes.data(), bytes.size(), sequence, flags) == bytes.size(), "cannot restore hybrid state");
++}
++
++static void cases(llama_model * weights, ggml_type type) {
++    auto reference = context(weights, false, type), candidate = context(weights, true, type);
++    auto compare = [&](int sequence, int position, int count, int salt, const char * stage) {
++        equal(decode(reference.get(), sequence, position, count, salt), decode(candidate.get(), sequence, position, count, salt), stage);
++    };
++    compare(0, 0, 64, 0, "shared-prefix");
++    for (auto * ctx : {reference.get(), candidate.get()}) { llama_memory_seq_cp(llama_get_memory(ctx), 0, 1, 0, -1); }
++    compare(1, 64, 64, 7, "branch-B-recurrent-copy");
++    compare(0, 64, 64, 19, "branch-A-recurrent-copy");
++    const auto survivor = state(candidate.get(), 0);
++    for (auto * ctx : {reference.get(), candidate.get()}) {
++        require(llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1), "cannot cancel hybrid branch");
++    }
++    require(state(candidate.get(), 0) == survivor, "canceling hybrid branch changed surviving attention/recurrent state");
++    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(candidate.get()));
++    auto * attention = hybrid->get_mem_attn();
++    const auto & pages = attention->get_cells(0).get_page_pool().table();
++    require(!pages.empty() && pages.back() - pages.front() + 1 != pages.size(), "hybrid fixture did not create physical page holes");
++    require(attention->paged_reads_confirmed(), "hybrid attention graph did not confirm actual paged reads");
++    const auto recurrent_before = state(candidate.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    const size_t released = llama_memory_trim_unused(candidate.get());
++    require(state(candidate.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == recurrent_before,
++        "attention reclamation changed recurrent tensors");
++    compare(0, 128, 1, 23, "noncontiguous-continuation");
++
++    auto held_ref = llama_memory_prefix_retain(reference.get(), 0, 512);
++    auto held = llama_memory_prefix_retain(candidate.get(), 0, 512);
++    require(held_ref && held && held_ref->valid() && held->valid(), "cannot retain paged hybrid prefix");
++    compare(0, 129, 1, 29, "prefix-append");
++    require(llama_memory_prefix_restore(reference.get(), held_ref, 0) && llama_memory_prefix_restore(candidate.get(), held, 0),
++        "cannot restore paged hybrid attention/recurrent prefix");
++    compare(0, 129, 1, 31, "prefix-restore-divergent-continuation");
++    held_ref.reset(); held.reset();
++    const auto saved_ref = state(reference.get(), 0), saved = state(candidate.get(), 0);
++    compare(0, 130, 1, 37, "snapshot-append");
++    restore(reference.get(), 0, saved_ref); restore(candidate.get(), 0, saved);
++    compare(0, 130, 1, 41, "snapshot-reload");
++    const auto partial_ref = state(reference.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    const auto partial = state(candidate.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    compare(0, 131, 2, 43, "rollback-span");
++    restore(reference.get(), 0, partial_ref, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    restore(candidate.get(), 0, partial, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    for (auto * ctx : {reference.get(), candidate.get()}) {
++        require(llama_memory_seq_rm(llama_get_memory(ctx), 0, 131, -1), "cannot trim hybrid speculative suffix");
++    }
++    compare(0, 131, 1, 47, "partial-recurrent-rollback");
++
++    for (auto * ctx : {reference.get(), candidate.get()}) { llama_memory_clear(llama_get_memory(ctx), true); }
++    llama_memory_trim_unused(candidate.get()); compare(0, 0, 512, 0, "clear-recommit");
++    if (gpu && type == GGML_TYPE_F32) {
++        const auto before = state(candidate.get(), 0);
++        const auto before_recurrent = state(candidate.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        llama_gpu_memory_stats memory{};
++        require(llama_model_get_gpu_memory_stats(weights, &memory) && memory.enabled && memory.limit_bytes == 192 * 1024 * 1024 &&
++            memory.limit_bytes > memory.managed_used_bytes + 4096, "bounded hybrid quota unavailable");
++        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        ggml_backend_buffer_ptr filler(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(device),
++            size_t(memory.limit_bytes - memory.managed_used_bytes - 1024)));
++        require(bool(filler), "cannot allocate bounded hybrid denial control");
++        require(decode(candidate.get(), 0, 512, 1, 0, true).empty(), "hybrid page commit unexpectedly bypassed managed quota");
++        require(state(candidate.get(), 0) == before && state(candidate.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == before_recurrent,
++            "denied attention commit advanced recurrent or attention state");
++        filler.reset(); compare(0, 512, 1, 0, "quota-release-retry");
++        require(llama_model_get_gpu_memory_stats(weights, &memory) && memory.managed_peak_bytes <= memory.limit_bytes,
++            "paged hybrid exceeded configured managed VRAM quota");
++    }
++    std::printf("PAGED_HYBRID backend=%s kv=%s context=%u initial_floor=257 branch_cancel=exact recurrent_state=preserved prefix_restore=1 snapshot_reload=1 speculative_rollback=1 reclaimed_bytes=%zu PASS\n",
++        gpu ? "CUDA" : "CPU", ggml_type_name(type), llama_n_ctx(candidate.get()), released);
++}
++
++int main(int argc, char ** argv) {
++    try {
++        std::setvbuf(stdout, nullptr, _IONBF, 0); gpu = argc == 2 && std::strcmp(argv[1], "--cuda") == 0;
++        require(argc == 1 || gpu, "use test-kv-paged-hybrid [--cuda]");
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        if (gpu) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++#else
++            std::puts("SKIP: CUDA backend not built"); return 77;
++#endif
++        }
++        environment("WILDLLAMA_KV_CACHE_PAGING", nullptr); environment("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "257");
++        environment("WILDLLAMA_GRAPH_VARIANTS_MIB", "0"); environment("WILDLLAMA_PAGED_ATTENTION", "0");
++        environment("WILDLLAMA_PREFIX_RECURRENT_MIB", "4");
++        llama_backend_init();
++        { auto weights = model(); for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) { cases(weights.get(), type); } }
++        llama_backend_free(); std::puts("PAGED_HYBRID_END_TO_END pretrained_models=0 downloads=0 PASS"); return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}
+diff --git a/tests/test-kv-paged.cpp b/tests/test-kv-paged.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-kv-paged.cpp
+@@ -0,0 +1,298 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++#include "../src/llama-kv-cache.h"
++#include "../src/llama-model.h"
++#include "../src/llama-ext.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++static bool gpu = false;
++static size_t comparisons = 0;
++
++static void environment(const char * name, const char * value) {
++#ifdef _WIN32
++    require(_putenv_s(name, value ? value : "") == 0, "cannot configure isolated test environment");
++#else
++    require((value ? setenv(name, value, 1) : unsetenv(name)) == 0, "cannot configure isolated test environment");
++#endif
++}
++
++static llama_model_ptr model() {
++    gguf_context_ptr metadata(gguf_init_empty());
++    gguf_set_val_str(metadata.get(), "general.architecture", "llama");
++    gguf_set_val_str(metadata.get(), "general.name", "nonzero-tiny-paged-kv-fixture");
++    auto u32 = [&](const char * key, uint32_t value) { gguf_set_val_u32(metadata.get(), (std::string("llama.") + key).c_str(), value); };
++    u32("context_length", 8192); u32("embedding_length", 128); u32("block_count", 2);
++    u32("feed_forward_length", 256);
++    u32("attention.head_count", gpu ? 8 : 2); u32("attention.head_count_kv", gpu ? 8 : 1);
++    u32("attention.key_length", gpu ? 256 : 64); u32("attention.value_length", gpu ? 256 : 64);
++    u32("rope.dimension_count", gpu ? 256 : 64);
++    gguf_set_val_f32(metadata.get(), "llama.attention.layer_norm_rms_epsilon", 1e-6f);
++    gguf_set_val_str(metadata.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) { char value[16]; std::snprintf(value, sizeof(value), "<0x%02X>", i); tokens.emplace_back(value); }
++    std::vector<const char *> names; for (const auto & token : tokens) { names.push_back(token.c_str()); }
++    std::vector<float> scores(259, 0); std::vector<int32_t> types(259, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(metadata.get(), "tokenizer.ggml.tokens", names.data(), names.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.eos_token_id", 2);
++    auto initialize = [](ggml_tensor * tensor, void *) {
++        require(tensor->type == GGML_TYPE_F32, "fixture unexpectedly changed weight precision");
++        std::vector<float> values(size_t(ggml_nelements(tensor)));
++        uint32_t state = 2166136261u;
++        for (const char * p = tensor->name; *p; ++p) { state = (state ^ uint8_t(*p)) * 16777619u; }
++        for (float & value : values) {
++            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++            value = (float(state & 65535) / 65535.f - .5f) * .16f;
++        }
++        if (std::strstr(tensor->name, "norm")) { std::fill(values.begin(), values.end(), 1.f); }
++        ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
++    };
++    auto p = llama_model_default_params();
++    ggml_backend_dev_t devices[] = {gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
++    p.devices = devices; p.n_gpu_layers = gpu ? 99 : 0; p.gpu_exclusive = gpu;
++    p.load_mode = LLAMA_LOAD_MODE_NONE; p.use_extra_bufts = false; p.no_host = true;
++    if (gpu) { p.gpu_vram_limit_mib = 192; }
++    llama_model_ptr result(llama_model_init_from_user(metadata.get(), initialize, nullptr, p));
++    require(bool(result), "cannot initialize tiny paged model");
++    return result;
++}
++
++static llama_context_ptr context(llama_model * weights, bool paged, ggml_type type) {
++    environment("WILDLLAMA_PAGED_ATTENTION", paged ? "1" : "0");
++    auto p = llama_context_default_params();
++    p.n_ctx = gpu ? 1024 : 8192; p.n_batch = 512; p.n_ubatch = 128; p.n_seq_max = 2; p.kv_unified = true;
++    p.n_threads = p.n_threads_batch = 1; p.type_k = p.type_v = type;
++    p.n_outputs_max = 2; p.n_outputs_max_per_seq = 1;
++    p.op_offload = p.offload_kqv = gpu; p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    llama_context_ptr value(llama_init_from_model(weights, p));
++    require(bool(value), "cannot initialize bounded test context");
++    auto * cache = dynamic_cast<llama_kv_cache *>(llama_get_memory(value.get()));
++    require(cache != nullptr && cache->get_cells(0).get_page_pool().enabled() == paged,
++        "requested supported paged capability was not actually selected");
++    return value;
++}
++
++struct row { int sequence; int position; llama_token token; };
++static std::vector<row> pattern(int sequence, int position, int count, int salt = 0) {
++    std::vector<row> rows;
++    for (int i = 0; i < count; ++i) { rows.push_back({sequence, position + i, 3 + ((position + i) * 13 + salt) % 256}); }
++    return rows;
++}
++using outputs = std::map<int, std::vector<float>>;
++
++static outputs decode(llama_context * ctx, const std::vector<row> & rows, bool allow_denial = false) {
++    auto b = llama_batch_init(int(rows.size()), 0, 1); b.n_tokens = int(rows.size());
++    std::vector<int> output_rows;
++    for (size_t i = 0; i < rows.size(); ++i) {
++        b.token[i] = rows[i].token; b.pos[i] = rows[i].position;
++        b.n_seq_id[i] = 1; b.seq_id[i][0] = rows[i].sequence;
++        b.logits[i] = i + 1 == rows.size() || rows[i + 1].sequence != rows[i].sequence;
++        if (b.logits[i]) { output_rows.push_back(int(i)); }
++    }
++    const int status = llama_decode(ctx, b); llama_batch_free(b);
++    if (allow_denial && status != 0) { return {}; }
++    require(status == 0, "paged fixture decode failed");
++    llama_synchronize(ctx);
++    outputs result;
++    for (const int index : output_rows) {
++        const auto * values = llama_get_logits_ith(ctx, index);
++        require(values != nullptr, "missing actual model logits");
++        result[rows[index].sequence] = {values, values + 259};
++    }
++    return result;
++}
++
++static void equal(const outputs & a, const outputs & b, const char * stage) {
++    require(a.size() == b.size(), "paged output sequence count changed");
++    float maximum = 0;
++    for (const auto & entry : a) {
++        const auto & before = entry.second; const auto & after = b.at(entry.first);
++        require(before.size() == after.size(), "paged vocabulary shape changed");
++        for (size_t i = 0; i < before.size(); ++i) {
++            require(std::isfinite(before[i]) && std::isfinite(after[i]), "paged attention produced nonfinite logits");
++            maximum = std::max(maximum, std::abs(before[i] - after[i]) / std::max(1.f, std::abs(before[i])));
++        }
++        require(std::max_element(before.begin(), before.end()) - before.begin() ==
++                std::max_element(after.begin(), after.end()) - after.begin(), "paged attention changed the greedy continuation token");
++    }
++    require(maximum <= 2e-4f, "paged attention exceeded the unchanged numerical regression gate");
++    std::printf("PAGED_KV_LOGITS stage=%s max_scaled=%.9g\n", stage, maximum); ++comparisons;
++}
++
++static std::vector<uint8_t> state(llama_context * ctx, int sequence) {
++    std::vector<uint8_t> bytes(llama_state_seq_get_size(ctx, sequence));
++    require(llama_state_seq_get_data(ctx, bytes.data(), bytes.size(), sequence) == bytes.size(), "cannot serialize actual KV state");
++    return bytes;
++}
++
++static void startup_shared_view_case(llama_model * weights) {
++    auto reference = context(weights, false, GGML_TYPE_F32), candidate = context(weights, true, GGML_TYPE_F32);
++    auto * cache = dynamic_cast<llama_kv_cache *>(llama_get_memory(candidate.get()));
++    const auto empty_state = state(candidate.get(), 0);
++    llama_gpu_memory_stats before{}, after{};
++    ggml_backend_buffer_ptr filler;
++    if (gpu) {
++        require(llama_model_get_gpu_memory_stats(weights, &before) && before.enabled &&
++            before.limit_bytes > before.managed_used_bytes + 4096, "startup shared-view quota unavailable");
++        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        filler.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(device),
++            size_t(before.limit_bytes - before.managed_used_bytes - 1024)));
++        require(bool(filler) && llama_model_get_gpu_memory_stats(weights, &before), "cannot bound startup shared-view budget");
++    }
++    {
++        auto filter = [](int32_t) { return true; };
++        auto share = [](int32_t layer) { return layer; };
++        llama_kv_cache view(*weights, weights->hparams, GGML_TYPE_F32, GGML_TYPE_F32, false, gpu, true,
++            llama_n_ctx(candidate.get()), 2, 1024, 0, LLAMA_SWA_TYPE_NONE, cache, filter, nullptr, share, "paged-startup-view");
++        require(&view.get_cells(0) == &cache->get_cells(0) && state(candidate.get(), 0) == empty_state &&
++            !cache->get_cells(0).get_page_pool().enabled(), "startup view changed source cells or retained sparse admission");
++        if (gpu) {
++            require(llama_model_get_gpu_memory_stats(weights, &after) && after.managed_used_bytes == before.managed_used_bytes,
++                "startup view committed full-context KV or exceeded initial physical budget");
++        }
++        llama_kv_cache::slot_info write{};
++        write.s0 = write.s1 = 0; write.strm = {0}; write.idxs = {{0}};
++        if (gpu) {
++            require(!view.grow_for(write) && state(candidate.get(), 0) == empty_state,
++                "denied padded shared-view preflight changed source cells or bypassed quota");
++        }
++        filler.reset();
++        require(view.grow_for(write) && state(candidate.get(), 0) == empty_state,
++            "shared-view padded read preflight failed or changed source cells");
++        equal(decode(reference.get(), pattern(0, 0, 64)), decode(candidate.get(), pattern(0, 0, 64)), "startup-shared-view-continuation");
++    }
++    equal(decode(reference.get(), pattern(0, 64, 1)), decode(candidate.get(), pattern(0, 64, 1)), "startup-view-retired-continuation");
++    std::puts("PAGED_KV_STARTUP_VIEW initial_physical_budget_preserved=1 source_cells_preserved=1 view_read_padding=1024 dense_continuation=1 PASS");
++}
++
++static void cases(llama_model * weights, ggml_type type) {
++    auto reference = context(weights, false, type), candidate = context(weights, true, type);
++    auto compare = [&](const std::vector<row> & rows, const char * stage) {
++        equal(decode(reference.get(), rows), decode(candidate.get(), rows), stage);
++    };
++    compare(pattern(0, 0, 96), "initial-prefill");
++    for (auto * ctx : {reference.get(), candidate.get()}) { llama_memory_seq_cp(llama_get_memory(ctx), 0, 1, 0, 96); }
++    compare(pattern(0, 96, 32, 7), "branch-A");
++    compare(pattern(1, 96, 32, 19), "branch-B");
++    for (auto * ctx : {reference.get(), candidate.get()}) {
++        require(llama_memory_seq_rm(llama_get_memory(ctx), 0, 32, 96), "cannot remove branch-A interior");
++        require(llama_memory_seq_rm(llama_get_memory(ctx), 1, 32, 96), "cannot remove last interior reference");
++    }
++    auto * cache = dynamic_cast<llama_kv_cache *>(llama_get_memory(candidate.get()));
++    const auto pages = cache->get_cells(0).get_page_pool().table();
++    require(pages.size() >= 3 && uint64_t(pages.back()) - pages.front() + 1 != pages.size(),
++        "test failed to create actual noncontiguous physical read pages");
++    require(cache->paged_reads_confirmed(), "no all-layer actual paged-attention capability was confirmed");
++    const size_t reclaimed = llama_memory_trim_unused(candidate.get());
++    auto mixed = pattern(0, 128, 1, 3); const auto other = pattern(1, 128, 1, 29); mixed.insert(mixed.end(), other.begin(), other.end());
++    compare(mixed, "noncontiguous-mixed-visibility");
++
++    for (auto * ctx : {reference.get(), candidate.get()}) {
++        const auto saved = state(ctx, 0);
++        const auto other_before = state(ctx, 1);
++        require(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1), "cannot clear one sequence");
++        require(llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0) == saved.size(), "cannot reload a fragmented sequence snapshot");
++        require(state(ctx, 1) == other_before, "one sequence restore changed another branch's state");
++    }
++    compare(pattern(0, 129, 1, 5), "state-reload-continuation");
++    for (auto * ctx : {reference.get(), candidate.get()}) {
++        llama_memory_seq_add(llama_get_memory(ctx), 0, 96, -1, -64);
++        llama_memory_seq_add(llama_get_memory(ctx), 1, 96, -1, -64);
++    }
++    compare(pattern(0, 66, 1, 11), "context-rope-shift");
++    const auto retained = state(candidate.get(), 0);
++    require(llama_memory_seq_rm(llama_get_memory(candidate.get()), 1, -1, -1), "cannot cancel independent branch");
++    require(state(candidate.get(), 0) == retained, "canceling branch changed active sequence state");
++    require(llama_memory_seq_rm(llama_get_memory(reference.get()), 1, -1, -1), "cannot clear reference branch");
++    compare(pattern(0, 67, 1, 17), "cancel-isolated-continuation");
++    for (auto * ctx : {reference.get(), candidate.get()}) { llama_memory_clear(llama_get_memory(ctx), true); }
++    const size_t cleared = llama_memory_trim_unused(candidate.get());
++    compare(pattern(0, 0, 32, 23), "clear-recommit");
++
++    if (gpu && type == GGML_TYPE_F32) {
++        llama_memory_clear(llama_get_memory(candidate.get()), true); llama_memory_trim_unused(candidate.get());
++        decode(candidate.get(), pattern(0, 0, 512));
++        const auto saved = state(candidate.get(), 0);
++        llama_gpu_memory_stats memory{};
++        require(llama_model_get_gpu_memory_stats(weights, &memory) && memory.enabled && memory.limit_bytes == 192 * 1024 * 1024,
++            "managed CUDA quota was not enforced for the tiny fixture");
++        require(memory.limit_bytes > memory.managed_used_bytes + 4096, "fixture lacks room for bounded denial control");
++        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        ggml_backend_buffer_ptr filler(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(device),
++            size_t(memory.limit_bytes - memory.managed_used_bytes - 1024)));
++        require(bool(filler), "cannot allocate bounded CUDA quota-denial control");
++        bool shared_denied = false;
++        try {
++            auto filter = [](int32_t) { return true; };
++            auto share = [](int32_t layer) { return layer; };
++            llama_kv_cache view(*weights, weights->hparams, type, type, false, gpu, true,
++                llama_n_ctx(candidate.get()), 2, 256, 0, LLAMA_SWA_TYPE_NONE, cache, filter, nullptr, share, "paged-denied-view");
++        } catch (const std::runtime_error &) { shared_denied = true; }
++        require(shared_denied && state(candidate.get(), 0) == saved && cache->paged_reads_confirmed(),
++            "denied unpublished shared view changed source state or disabled its valid page-table path");
++        const auto denied = decode(candidate.get(), pattern(0, 512, 1), true);
++        require(denied.empty() && state(candidate.get(), 0) == saved,
++            "denied physical-page commit changed the previous valid sequence");
++        filler.reset();
++        llama_memory_clear(llama_get_memory(reference.get()), true); decode(reference.get(), pattern(0, 0, 512));
++        compare(pattern(0, 512, 1), "quota-release-retry");
++        require(llama_model_get_gpu_memory_stats(weights, &memory) && memory.managed_peak_bytes <= memory.limit_bytes,
++            "paged allocation exceeded the configured managed CUDA quota");
++        std::puts("PAGED_KV_DENIAL denied_commit_preserves_state=1 retry_after_release=1 managed_peak_within_quota=1 PASS");
++    }
++    {
++        auto filter = [](int32_t) { return true; };
++        auto share = [](int32_t layer) { return layer; };
++        const auto source_state = state(candidate.get(), 0);
++        llama_kv_cache view(*weights, weights->hparams, type, type, false, gpu, true,
++            llama_n_ctx(candidate.get()), 2, 256, 0, LLAMA_SWA_TYPE_NONE, cache, filter, nullptr, share, "paged-admitted-view");
++        require(&view.get_cells(0) == &cache->get_cells(0) && !cache->paged_reads_confirmed() &&
++                state(candidate.get(), 0) == source_state,
++            "legacy shared view failed to preserve source ownership or inhibit interior reclamation");
++        compare(pattern(0, gpu && type == GGML_TYPE_F32 ? 513 : 32, 1, 31), "shared-owner-dense-fallback");
++        require(llama_memory_trim_unused(candidate.get()) == 0, "legacy shared owner allowed sparse interior reclamation");
++    }
++    std::printf("PAGED_KV_MODEL backend=%s kv=%s logical_context=%u initial_floor=257 old_tail_flag_unset=1 noncontiguous_pages=1 alias_branches=1 mixed_visibility=1 snapshot_reload=1 shift=1 cancellation=1 clear_recommit=1 reclaimed_bytes=%zu clear_reclaimed_bytes=%zu PASS\n",
++        gpu ? "CUDA" : "CPU", ggml_type_name(type), llama_n_ctx(candidate.get()), reclaimed, cleared);
++}
++
++int main(int argc, char ** argv) {
++    try {
++        std::setvbuf(stdout, nullptr, _IONBF, 0);
++        gpu = argc == 2 && std::strcmp(argv[1], "--cuda") == 0;
++        require(argc == 1 || gpu, "use test-kv-paged [--cuda]");
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        if (gpu) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++#else
++            std::puts("SKIP: CUDA backend not built"); return 77;
++#endif
++        }
++        environment("WILDLLAMA_KV_CACHE_PAGING", nullptr);
++        environment("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "257");
++        environment("WILDLLAMA_GRAPH_VARIANTS_MIB", "0");
++        environment("WILDLLAMA_PAGED_ATTENTION", "0");
++        llama_backend_init();
++        { auto weights = model(); startup_shared_view_case(weights.get());
++            for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) { cases(weights.get(), type); } }
++        llama_backend_free();
++        std::printf("PAGED_KV_END_TO_END backend=%s comparisons=%zu pretrained_models=0 downloads=0 PASS\n", gpu ? "CUDA" : "CPU", comparisons);
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}
+diff --git a/tests/test-paged-attn.cpp b/tests/test-paged-attn.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-paged-attn.cpp
+@@ -0,0 +1,278 @@
++#include "ggml.h"
++#include "ggml-cpp.h"
++#include "ggml-cpu.h"
++#include "../ggml/src/ggml-paged-attn.h"
++#include "../ggml/src/ggml-quants.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++struct paged_case {
++    ggml_type key_type = GGML_TYPE_F32;
++    ggml_type value_type = GGML_TYPE_F32;
++    ggml_type mask_type = GGML_TYPE_F16;
++    int key_width = 32;
++    int value_width = 64;
++    float softcap = 2.5f;
++    int queries = 3;
++    int blocks = 2;
++    bool mask = true;
++    bool sinks = true;
++    bool lengths = true;
++    bool shared_stream = false;
++    bool shared_mask_stream = false;
++    bool zero_length = false;
++    bool all_masked = false;
++    bool invalid_page = false;
++    bool invalid_length = false;
++};
++
++struct paged_fixture {
++    static constexpr int heads = 4, kv_heads = 2, streams = 2, page = 32;
++    paged_case options;
++    int dk, dv;
++    ggml_context_ptr context{ggml_init({1024 * 1024, nullptr, true})};
++    ggml_backend_buffer_ptr storage;
++    ggml_tensor * query_storage = nullptr;
++    ggml_tensor * key_storage = nullptr;
++    ggml_tensor * value_storage = nullptr;
++    ggml_tensor * query = nullptr;
++    ggml_tensor * key = nullptr;
++    ggml_tensor * value = nullptr;
++    ggml_tensor * mask = nullptr;
++    ggml_tensor * sinks = nullptr;
++    ggml_tensor * table = nullptr;
++    ggml_tensor * lengths = nullptr;
++    ggml_tensor * output = nullptr;
++    ggml_cgraph * graph = nullptr;
++    std::vector<uint8_t> query_bytes, key_bytes, value_bytes, mask_bytes;
++    std::vector<int32_t> block_ids, length_values;
++    std::vector<float> sink_values;
++
++    static std::vector<uint8_t> encoded(const ggml_tensor * tensor, int phase) {
++        std::vector<uint8_t> bytes(ggml_nbytes(tensor));
++        std::vector<float> row(tensor->ne[0]);
++        const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
++        for (int64_t r = 0; r < ggml_nrows(tensor); ++r) {
++            for (int64_t d = 0; d < tensor->ne[0]; ++d) {
++                row[d] = float(std::sin(double(r * tensor->ne[0] + d + phase) * .13) * .2 +
++                        std::cos(double(r * 3 + d + phase) * .07) * .03);
++            }
++            auto * destination = bytes.data() + r * row_bytes;
++            if (tensor->type == GGML_TYPE_F32) { std::memcpy(destination, row.data(), row_bytes); }
++            else if (tensor->type == GGML_TYPE_F16) { ggml_fp32_to_fp16_row(row.data(), reinterpret_cast<ggml_fp16_t *>(destination), row.size()); }
++            else { quantize_row_q8_0_ref(row.data(), reinterpret_cast<block_q8_0 *>(destination), row.size()); }
++        }
++        return bytes;
++    }
++
++    static float component(const std::vector<uint8_t> & bytes, const ggml_tensor * tensor,
++                           int64_t d, int64_t row, int64_t head, int64_t stream) {
++        const uint8_t * source = bytes.data() + row * tensor->nb[1] + head * tensor->nb[2] + stream * tensor->nb[3];
++        if (tensor->type == GGML_TYPE_F32) {
++            float result; std::memcpy(&result, source + d * sizeof(float), sizeof(result)); return result;
++        }
++        if (tensor->type == GGML_TYPE_F16) {
++            ggml_fp16_t result; std::memcpy(&result, source + d * sizeof(ggml_fp16_t), sizeof(result)); return ggml_fp16_to_fp32(result);
++        }
++        const auto * block = reinterpret_cast<const block_q8_0 *>(source) + d / QK8_0;
++        return ggml_fp16_to_fp32(block->d) * block->qs[d % QK8_0];
++    }
++
++    paged_fixture(ggml_backend_t backend, const paged_case & requested) : options(requested), dk(requested.key_width), dv(requested.value_width) {
++        require(bool(context), "paged fixture metadata allocation failed");
++        const int physical_streams = options.shared_stream ? 1 : streams;
++        const int physical_rows = (options.blocks + 2) * page;
++        const int logical_rows = options.blocks * page;
++        query_storage = ggml_new_tensor_4d(context.get(), GGML_TYPE_F32, dk, heads, options.queries, streams);
++        key_storage = ggml_new_tensor_4d(context.get(), options.key_type, dk, kv_heads, physical_rows, physical_streams);
++        value_storage = ggml_new_tensor_4d(context.get(), options.value_type, dv, kv_heads, physical_rows, physical_streams);
++        query = ggml_permute(context.get(), query_storage, 0, 2, 1, 3);
++        key = ggml_permute(context.get(), key_storage, 0, 2, 1, 3);
++        value = ggml_permute(context.get(), value_storage, 0, 2, 1, 3);
++        table = ggml_new_tensor_2d(context.get(), GGML_TYPE_I32, options.blocks, streams);
++        if (options.lengths) { lengths = ggml_new_tensor_1d(context.get(), GGML_TYPE_I32, streams); }
++        if (options.mask) { mask = ggml_new_tensor_4d(context.get(), options.mask_type, logical_rows, options.queries, 2, options.shared_mask_stream ? 1 : streams); }
++        if (options.sinks) { sinks = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, heads); }
++        output = ggml_flash_attn_paged(context.get(), query, key, value, mask, sinks, table, lengths,
++                page, .31f, options.mask ? 1.7f : 0.f, options.softcap);
++        require(ggml_paged_attn_valid(output) && ggml_backend_supports_op(backend, output), "backend rejected supported paged fixture");
++        graph = ggml_new_graph_custom(context.get(), 128, false);
++        ggml_build_forward_expand(graph, output);
++        for (auto * tensor : {query_storage, key_storage, value_storage, table, lengths, mask, sinks}) {
++            if (tensor) { ggml_set_input(tensor); }
++        }
++        storage.reset(ggml_backend_alloc_ctx_tensors(context.get(), backend));
++        require(bool(storage) && ggml_backend_buffer_get_size(storage.get()) < 4 * 1024 * 1024, "paged fixture exceeded its tiny tensor budget");
++        query_bytes = encoded(query_storage, 3); key_bytes = encoded(key_storage, 17); value_bytes = encoded(value_storage, 41);
++        block_ids.resize(options.blocks * streams);
++        length_values.resize(streams);
++        for (int s = 0; s < streams; ++s) {
++            for (int block = 0; block < options.blocks; ++block) { block_ids[s * options.blocks + block] = (2 + 3 * block + s) % (options.blocks + 2); }
++            length_values[s] = options.zero_length ? 0 : options.lengths ? logical_rows - 1 - s * 18 : logical_rows;
++        }
++        if (options.invalid_page) { block_ids[0] = -1; }
++        if (options.invalid_length) { length_values = {-1, logical_rows + 1}; }
++        if (mask) {
++            std::vector<float> values(ggml_nelements(mask));
++            for (int s = 0; s < mask->ne[3]; ++s) for (int h = 0; h < 2; ++h) for (int q = 0; q < options.queries; ++q) for (int logical = 0; logical < logical_rows; ++logical) {
++                const size_t index = logical + logical_rows * (q + options.queries * (h + 2 * s));
++                const bool hidden = options.all_masked || logical >= length_values[s] ||
++                        logical >= length_values[s] - options.queries + q + 1 || (logical + h + s) % 11 == 0;
++                values[index] = hidden ? -INFINITY : float((logical + h) % 5) * -.013f;
++            }
++            mask_bytes.resize(values.size() * ggml_type_size(mask->type));
++            if (mask->type == GGML_TYPE_F32) { std::memcpy(mask_bytes.data(), values.data(), mask_bytes.size()); }
++            else { ggml_fp32_to_fp16_row(values.data(), reinterpret_cast<ggml_fp16_t *>(mask_bytes.data()), values.size()); }
++        }
++        for (int head = 0; head < heads; ++head) { sink_values.push_back(-.3f + .17f * head); }
++        ggml_backend_tensor_set(query_storage, query_bytes.data(), 0, query_bytes.size());
++        ggml_backend_tensor_set(key_storage, key_bytes.data(), 0, key_bytes.size());
++        ggml_backend_tensor_set(value_storage, value_bytes.data(), 0, value_bytes.size());
++        ggml_backend_tensor_set(table, block_ids.data(), 0, block_ids.size() * sizeof(int32_t));
++        if (lengths) { ggml_backend_tensor_set(lengths, length_values.data(), 0, length_values.size() * sizeof(int32_t)); }
++        if (mask) { ggml_backend_tensor_set(mask, mask_bytes.data(), 0, mask_bytes.size()); }
++        if (sinks) { ggml_backend_tensor_set(sinks, sink_values.data(), 0, sink_values.size() * sizeof(float)); }
++    }
++
++    std::vector<float> reference() const {
++        const int capacity = options.blocks * page;
++        std::vector<float> result(ggml_nelements(output), 0.f);
++        std::vector<double> scores(capacity);
++        const auto params = ggml_paged_attn_get_params(output);
++        const int head_power = 1 << int(std::floor(std::log2(double(heads))));
++        const double m0 = std::pow(2., -double(params.max_bias) / head_power);
++        const double m1 = std::pow(2., -(double(params.max_bias) / 2.) / head_power);
++        for (int s = 0; s < streams; ++s) for (int q = 0; q < options.queries; ++q) for (int head = 0; head < heads; ++head) {
++            const size_t offset = dv * (head + heads * (q + options.queries * s));
++            const int length = lengths ? length_values[s] : capacity;
++            if (length < 0 || length > capacity || (options.invalid_page && s == 0)) {
++                std::fill(result.begin() + offset, result.begin() + offset + dv, NAN); continue;
++            }
++            const double slope = params.max_bias > 0.f ? head < head_power ? std::pow(m0, head + 1) : std::pow(m1, 2 * (head - head_power) + 1) : 1.;
++            double maximum = -INFINITY;
++            for (int logical = 0; logical < length; ++logical) {
++                const int physical = block_ids[s * options.blocks + logical / page] * page + logical % page;
++                double score = 0.;
++                for (int d = 0; d < dk; ++d) {
++                    score += double(component(query_bytes, query, d, q, head, s)) *
++                            component(key_bytes, key, d, physical, head / (heads / kv_heads), options.shared_stream ? 0 : s);
++                }
++                score *= double(params.scale);
++                if (params.logit_softcap != 0.f) { score = params.logit_softcap * std::tanh(score / params.logit_softcap); }
++                if (mask) { score += slope * component(mask_bytes, mask, logical, q, head % 2, s % mask->ne[3]); }
++                scores[logical] = score; maximum = std::max(maximum, score);
++            }
++            if (sinks) { maximum = std::max(maximum, double(sink_values[head])); }
++            if (maximum == -INFINITY) { continue; }
++            double sum = sinks ? std::exp(double(sink_values[head]) - maximum) : 0.;
++            for (int logical = 0; logical < length; ++logical) { sum += std::exp(scores[logical] - maximum); }
++            for (int d = 0; d < dv; ++d) {
++                double total = 0.;
++                for (int logical = 0; logical < length; ++logical) {
++                    const int physical = block_ids[s * options.blocks + logical / page] * page + logical % page;
++                    total += std::exp(scores[logical] - maximum) *
++                            component(value_bytes, value, d, physical, head / (heads / kv_heads), options.shared_stream ? 0 : s);
++                }
++                result[offset + d] = float(total / sum);
++            }
++        }
++        return result;
++    }
++
++    size_t check(ggml_backend_t backend, const char * name) {
++        const auto expected = reference();
++        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "paged attention compute failed");
++        std::vector<float> actual(expected.size());
++        ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
++        double error = 0.;
++        for (size_t i = 0; i < expected.size(); ++i) {
++            if (std::isnan(expected[i])) { require(std::isnan(actual[i]), "invalid page metadata did not fail closed"); continue; }
++            const double difference = std::abs(double(actual[i]) - expected[i]);
++            error = std::max(error, difference);
++            if (!std::isfinite(actual[i]) || difference > 2e-5 + 2e-4 * std::abs(expected[i])) {
++                std::fprintf(stderr, "PAGED_ATTN_MISMATCH case=%s index=%zu expected=%.9g actual=%.9g\n", name, i, expected[i], actual[i]);
++                require(false, "paged attention differs from independent dense double reference");
++            }
++        }
++        std::printf("PAGED_ATTN case=%s K=%s V=%s queries=%d values=%zu max_error=%.9g tensor_bytes=%zu\n",
++                name, ggml_type_name(options.key_type), ggml_type_name(options.value_type), options.queries,
++                actual.size(), error, ggml_backend_buffer_get_size(storage.get()));
++        return actual.size();
++    }
++};
++
++static void metadata_cases(ggml_backend_t backend) {
++    paged_fixture fixture(backend, {});
++    ggml_tensor invalid = *fixture.output;
++    auto options = ggml_paged_attn_get_params(&invalid); options.page_tokens = 0;
++    std::memcpy(invalid.op_params, &options, sizeof(options));
++    require(!ggml_paged_attn_valid(&invalid), "zero page size admitted");
++    invalid = *fixture.output; invalid.src[7] = fixture.query;
++    require(!ggml_paged_attn_valid(&invalid), "unknown state source admitted");
++    invalid = *fixture.output;
++    ggml_tensor wrong = *fixture.key; wrong.type = GGML_TYPE_BF16; invalid.src[1] = &wrong;
++    require(!ggml_paged_attn_valid(&invalid), "unsupported cache storage type admitted");
++    invalid = *fixture.output; wrong = *fixture.table; wrong.ne[1] = 1; invalid.src[5] = &wrong;
++    require(!ggml_paged_attn_valid(&invalid), "incomplete per-stream block table admitted");
++    invalid = *fixture.output; wrong = *fixture.mask; wrong.ne[2] = 3; invalid.src[3] = &wrong;
++    require(!ggml_paged_attn_valid(&invalid), "invalid mask head broadcasting admitted");
++    invalid = *fixture.output; wrong = *fixture.query; wrong.nb[1] = SIZE_MAX; invalid.src[0] = &wrong;
++    require(!ggml_paged_attn_valid(&invalid), "overflowing query span admitted");
++    invalid = *fixture.output; wrong = *fixture.query; wrong.nb[1] += 1; invalid.src[0] = &wrong;
++    require(!ggml_paged_attn_valid(&invalid), "unaligned query rows admitted");
++}
++
++static void run_cases(ggml_backend_t backend) {
++    size_t values = 0;
++    for (const auto key : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) for (const auto value : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
++        paged_case options; options.key_type = key; options.value_type = value;
++        paged_fixture fixture(backend, options); values += fixture.check(backend, "strided GQA, page holes, ALiBi, softcap and sinks");
++    }
++    for (int scenario = 0; scenario < 11; ++scenario) {
++        paged_case options;
++        const char * name = "";
++        if (scenario == 0) { options.queries = 65; options.blocks = 3; name = "arbitrary prefill larger than 32 queries"; }
++        if (scenario == 1) { options.shared_stream = true; name = "shared physical KV stream"; }
++        if (scenario == 2) { options.zero_length = true; name = "zero-length sink-only rows"; }
++        if (scenario == 3) { options.all_masked = true; options.sinks = false; name = "fully masked rows"; }
++        if (scenario == 4) { options.mask = options.sinks = options.lengths = false; name = "full pages without length or mask tensors"; }
++        if (scenario == 5) { options.mask = false; options.invalid_page = true; name = "invalid page IDs fail closed"; }
++        if (scenario == 6) { options.mask = false; options.invalid_length = true; name = "invalid lengths fail closed"; }
++        if (scenario == 7) { options.mask_type = GGML_TYPE_F32; options.shared_mask_stream = true; name = "F32 mask with head and stream broadcasting"; }
++        if (scenario == 8) { options.key_width = 128; options.softcap = 0.f; name = "128-dimensional keys without softcap"; }
++        if (scenario == 9) { options.key_width = options.value_width = 256; options.key_type = options.value_type = GGML_TYPE_Q8_0; name = "256-dimensional original Q8_0 keys and values"; }
++        if (scenario == 10) { options.key_width = options.value_width = 256; options.key_type = GGML_TYPE_F16; name = "256-dimensional mixed F16 keys and F32 values"; }
++        paged_fixture fixture(backend, options); values += fixture.check(backend, name);
++    }
++    metadata_cases(backend);
++    std::printf("PASS paged attention: independent dense double values=%zu, nine original-storage combinations, no dense KV gather\n", values);
++}
++
++#ifndef GGML_TEST_PAGED_NO_MAIN
++int main() {
++    try {
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        ggml_backend_ptr backend(device ? ggml_backend_dev_init(device, nullptr) : nullptr);
++        require(bool(backend), "CPU backend unavailable");
++        auto set_threads = reinterpret_cast<void (*)(ggml_backend_t, int)>(ggml_backend_reg_get_proc_address(
++                ggml_backend_dev_backend_reg(device), "ggml_backend_set_n_threads"));
++        if (set_threads) { set_threads(backend.get(), 2); }
++        run_cases(backend.get());
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL paged attention: %s\n", error.what()); return 1;
++    }
++}
++#endif
+diff --git a/tests/test-paged-kv-pool.cpp b/tests/test-paged-kv-pool.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-paged-kv-pool.cpp
+@@ -0,0 +1,117 @@
++#include "../src/llama-paged-kv-pool.h"
++#include "../src/llama-kv-cells.h"
++
++#include <cstdio>
++#include <set>
++#include <stdexcept>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void bitmap() {
++    llama_paged_kv_bitmap bits;
++    bits.reset(65537);
++    std::set<uint32_t> reference;
++    for (uint32_t index : {0u, 31u, 32u, 63u, 64u, 4095u, 4096u, 65535u, 65536u}) {
++        bits.set(index, true); reference.insert(index);
++    }
++    uint32_t state = 92134567;
++    for (int step = 0; step < 6000; ++step) {
++        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++        const auto index = state % 65537;
++        const bool enabled = (state & 1024) != 0;
++        bits.set(index, enabled);
++        if (enabled) { reference.insert(index); } else { reference.erase(index); }
++        require(bits.first() == (reference.empty() ? UINT32_MAX : *reference.begin()), "hierarchical free-page lookup disagrees with independent set");
++        require(bits.test(index) == (reference.count(index) != 0), "page membership changed");
++    }
++    std::vector<uint32_t> enumerated;
++    bits.each([&](uint32_t index) { enumerated.push_back(index); return true; });
++    require(enumerated == std::vector<uint32_t>(reference.begin(), reference.end()), "sparse page enumeration lost or duplicated a page");
++    size_t visits = 0;
++    bits.each([&](uint32_t) { return ++visits < 3; });
++    require(visits == 3, "bounded page selection ignored early completion");
++    bits.clear(); require(bits.first() == UINT32_MAX, "clear retained a live summary bit");
++}
++
++static void pool() {
++    llama_paged_kv_pool value;
++    require(value.configure(8193), "cannot initialize bounded physical pool");
++    std::vector<bool> reference(8193, false);
++    uint32_t state = 912345, count = 0;
++    for (int step = 0; step < 10000; ++step) {
++        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++        const uint32_t index = state % reference.size();
++        if (state & 256) {
++            require(value.claim(index) == !reference[index], "duplicate claim changed physical ownership");
++            if (!reference[index]) { reference[index] = true; ++count; }
++        } else {
++            require(value.release(index) == reference[index], "duplicate release changed physical ownership");
++            if (reference[index]) { reference[index] = false; --count; }
++        }
++        require(value.used() == count && value.free() == reference.size() - count, "physical cell accounting drifted");
++        if (step % 97 == 0) {
++            std::set<uint32_t> active;
++            for (uint32_t cell = 0; cell < reference.size(); ++cell) {
++                require(value.contains(cell) == reference[cell], "physical occupancy disagrees with independent bitmap");
++                if (reference[cell]) { active.insert(cell / 32); }
++            }
++            require(value.table() == std::vector<uint32_t>(active.begin(), active.end()), "compact logical-to-physical page table disagrees with occupied cells");
++            std::vector<uint32_t> selected;
++            const uint32_t requested = std::min<uint32_t>(71, value.free());
++            require(value.select(requested, selected) && selected.size() == requested, "nonmutating write reservation failed");
++            std::set<uint32_t> unique(selected.begin(), selected.end());
++            require(unique.size() == selected.size(), "one physical row was reserved twice");
++            for (const uint32_t cell : selected) { require(cell < reference.size() && !reference[cell], "reservation overwrote a live row"); }
++            require(value.used() == count, "planning published a physical allocation before apply");
++        }
++    }
++    const auto table = value.table();
++    require(!value.configure(UINT32_MAX) && value.used() == count && value.table() == table,
++        "metadata admission denial destroyed the current valid pool");
++    std::vector<uint32_t> unchanged = {42};
++    require(!value.select(value.free() + 1, unchanged) && unchanged == std::vector<uint32_t>{42}, "over-budget reservation partially published rows");
++    require(!value.claim(8193) && !value.release(8193), "out-of-range row was accepted");
++    value.clear();
++    require(value.used() == 0 && value.table().empty() && value.select(8193, unchanged) && unchanged.size() == 8193,
++        "clear leaked a physical page or the partial final page");
++}
++
++static void ownership() {
++    llama_kv_cells cells;
++    cells.resize(256);
++    cells.pos_set(65, 0); cells.seq_add(65, 0);
++    require(cells.enable_page_pool(), "cannot enable pool over an existing valid cache");
++    cells.seq_add(65, 1);
++    require(cells.get_page_pool().used() == 1 && cells.get_page_pool().table() == std::vector<uint32_t>{2},
++        "shared prefix duplicated physical storage");
++    require(!cells.seq_rm(65, 0) && cells.get_page_pool().used() == 1, "removing one branch freed another branch's page");
++    require(cells.seq_rm(65, 1) && cells.get_page_pool().table().empty(), "last branch failed to free its physical page");
++
++    cells.pos_set(0, 0); cells.seq_add(0, 0);
++    cells.pos_set(128, 32); cells.seq_add(128, 0);
++    const std::vector<uint32_t> indices = {0, 1, 128, 129};
++    const auto saved = cells.cp(indices);
++    cells.rm(0); cells.pos_set(1, 1); cells.seq_add(1, 0);
++    cells.pos_set(129, 33); cells.seq_add(129, 0);
++    cells.set(indices, saved);
++    require(cells.get_page_pool().used() == 2 && cells.get_page_pool().contains(0) &&
++            cells.get_page_pool().contains(128) && !cells.get_page_pool().contains(1) &&
++            !cells.get_page_pool().contains(129) && cells.seq_pos_get(0).size() == 2,
++        "prepare/rollback changed physical page ownership or logical token mapping");
++    require(cells.pos_add(128, -33) && cells.get_page_pool().table() == std::vector<uint32_t>{0},
++        "negative shift failed to release its now-empty page");
++    cells.reset(); require(cells.get_page_pool().table().empty(), "cache reset leaked physical pages");
++}
++
++int main() {
++    try {
++        bitmap(); pool(); ownership();
++        std::puts("PAGED_KV_POOL hierarchical_lookup=1 sparse_block_table=1 nonmutating_reservations=1 alias_refcounts=1 rollback=1 shift_release=1 bounded_metadata=1 arbitrary_physical_pages=1 PASS");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}

@@ -4,7 +4,7 @@ import "testing"
 
 func TestRuntimeFeatureRunnerEnvironment(t *testing.T) {
 	keys := []string{
-		"WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP", "WILDLLAMA_MTP_DEVICE_STATE", "WILDLLAMA_KV_CACHE_PAGING",
+		"WILDLLAMA_DRY_BACKEND", "WILDLLAMA_DECODE_OVERLAP", "WILDLLAMA_MTP_DEVICE_STATE", "WILDLLAMA_KV_CACHE_PAGING", "WILDLLAMA_PAGED_ATTENTION",
 	}
 	for _, key := range keys {
 		t.Run(key, func(t *testing.T) {

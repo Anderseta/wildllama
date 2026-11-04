@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "date": "2026-11-04",
+  "source_base": "782ac3d3793247cd3f7533e513b14bbfe07ec5c8",
+  "native_base": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+  "patch": "084-paged-kv-attention.patch",
+  "patch_sha256": "11caa88457bfba90ddb31a5ad275de8027879714d1705084c71638fd2dc67f62",
+  "patch_stack": 81,
+  "replayed_source_files": 235,
+  "platform": "Windows x64, CUDA 12.8, SM120",
+  "status": "passed",
+  "groups": {
+    "cpu": {
+      "passed": 16,
+      "targets": [
+        "test-execution-plan",
+        "test-kv-page-ranges",
+        "test-paged-kv-pool",
+        "test-paged-attn",
+        "test-kv-paged",
+        "test-kv-paged-hybrid",
+        "test-kv-trim-ranges",
+        "test-hybrid-prefix",
+        "test-mtp-state",
+        "test-mtp-device-state",
+        "test-device-verification",
+        "test-speculative-graphs",
+        "test-server-component",
+        "test-cuda-paged-attn",
+        "test-adaptive-prefill",
+        "test-graph-variants"
+      ]
+    },
+    "cuda-components": {
+      "passed": 3,
+      "targets": [
+        "test-cuda-paged-attn",
+        "test-cuda-kv-growth",
+        "test-cuda-kv-growth"
+      ]
+    },
+    "cuda-models": {
+      "passed": 3,
+      "targets": [
+        "test-kv-paged",
+        "test-kv-paged-hybrid",
+        "test-hybrid-prefix"
+      ]
+    }
+  },
+  "numerical": {
+    "cpu_dense": {
+      "comparisons": 29,
+      "max_scaled_logit_error": 2.29477882e-05,
+      "unchanged_gate": 0.0002,
+      "greedy_continuations_identical": true
+    },
+    "cpu_hybrid": {
+      "comparisons": 33,
+      "max_scaled_logit_error": 9.7900629e-06,
+      "unchanged_gate": 0.0002,
+      "greedy_continuations_identical": true
+    },
+    "cuda_dense": {
+      "comparisons": 30,
+      "max_scaled_logit_error": 2.92658806e-05,
+      "unchanged_gate": 0.0002,
+      "greedy_continuations_identical": true
+    },
+    "cuda_hybrid": {
+      "comparisons": 34,
+      "max_scaled_logit_error": 8.58306885e-06,
+      "unchanged_gate": 0.0002,
+      "greedy_continuations_identical": true
+    }
+  },
+  "operator": {
+    "double_reference_values_per_backend": 71680,
+    "kv_storage": [
+      "F32",
+      "F16",
+      "Q8_0"
+    ],
+    "mixed_storage_combinations": 9,
+    "cuda_graph_table_replay": true,
+    "cuda_managed_peak_bytes": 837504,
+    "cuda_limit_bytes": 134217728,
+    "global_kv_gather_bytes": 0
+  },
+  "resource_contracts": {
+    "model_fixture_managed_cuda_limit_mib": 192,
+    "vmm_test_limit_mib": 16,
+    "measured_vmm_granularity_bytes": 2097152,
+    "measured_vmm_reclaimed_bytes": 4194304,
+    "preserved_live_bytes_and_zero_recommit": true,
+    "shared_prefix_and_late_view_state_preserved": true,
+    "virgin_shared_view_keeps_initial_backing": true,
+    "view_padded_read_preflight": 1024,
+    "denied_growth_preserves_attention_and_recurrent_state": true,
+    "actual_model_store_used": false,
+    "pretrained_models_loaded": 0,
+    "downloads": 0
+  },
+  "execution_plans": {
+    "same_role_measured_scoring_preserved": true,
+    "cross_role_lru_fairness": true,
+    "deterministic_policy_and_actual_eagle_mtp_regression": "passed",
+    "extra_arenas": 0
+  },
+  "default": "WILDLLAMA_PAGED_ATTENTION stays off unless explicitly selected; existing profiles are not migrated",
+  "scope": "Synthetic numerical, cache/state and managed-resource regressions. No trained-model throughput, quality benchmark or SGLang performance parity claim. CPU fixtures use a small 8192-token context; GPU resource fixtures use wider KV and 1024 tokens to exercise real 2 MiB mappings without large prompts. Driver allocations and other programs are outside the managed CUDA quota."
+}
