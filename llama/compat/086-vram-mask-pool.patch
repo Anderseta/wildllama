@@ -1,0 +1,1118 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -5,6 +5,7 @@
+ #include "traits.h"
+ #include "ggml-impl.h"
+ #include "ggml-paged-attn.h"
++#include "ggml-attn-mask-compact.h"
+ #include "amx/amx.h"
+ 
+ #include <cctype>
+@@ -430,6 +431,11 @@
+     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
+         return true;
+     }
++
++    // Packed integer masks are deliberately CUDA-only. Never schedule their
++    // private representation onto a dense CPU attention/mask consumer.
++    if ((op->op==GGML_OP_ATTN_MASK && op->type==GGML_TYPE_I32) ||
++            (op->op==GGML_OP_FLASH_ATTN_EXT && op->src[3] && op->src[3]->type==GGML_TYPE_I32)) { return false; }
+ 
+     // check extra buffer types
+     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1209,6 +1209,10 @@
+     // Optional resident-policy check: unknown/non-stack pools conservatively
+     // report zero. A calibrated choice must not grow inference workspace.
+     virtual size_t available_without_growth() const { return 0; }
++    // Called only at an already synchronized backend boundary. Planning itself
++    // never frees memory or inserts a device synchronization.
++    virtual bool plan_idle_trim() { return false; }
++    virtual size_t trim_idle() { return 0; }
+ };
+ 
+ template<typename T>
+diff --git a/ggml/src/ggml-cuda/diagmask.cu b/ggml/src/ggml-cuda/diagmask.cu
+--- a/ggml/src/ggml-cuda/diagmask.cu
++++ b/ggml/src/ggml-cuda/diagmask.cu
+@@ -1,4 +1,5 @@
+ #include "diagmask.cuh"
++#include "../ggml-attn-mask-compact.h"
+ 
+ static __global__ void diag_mask_inf_f32(const float * x, float * dst, const int ncols, const int rows_per_channel, const int n_past) {
+     const int col = blockDim.y*blockIdx.y + threadIdx.y;
+@@ -56,9 +57,31 @@
+     dst[i] = T(keep ? 0.0f : -INFINITY);
+ }
+ 
++static __global__ void attn_mask_pack(const int32_t * keys, const int32_t * queries,
++        int32_t * dst, int64_t nk, int64_t nq) {
++    const int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
++    const int64_t stream=blockIdx.y;
++    if (i>=nk+nq) { return; }
++    const bool key=i<nk;
++    const int64_t row=key ? i : i-nk;
++    const int64_t n=key ? nk : nq;
++    const auto * src=(key ? keys : queries)+stream*2*n;
++    dst += stream*2*(nk+nq);
++    dst[2*i]=src[row];dst[2*i+1]=src[n+row];
++}
++
+ void ggml_cuda_op_attn_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_I32 && dst->src[1]->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(dst->src[0]) && ggml_is_contiguous(dst->src[1]));
++    if (ggml_attn_mask_is_compact(dst)) {
++        GGML_ASSERT(ggml_attn_mask_compact_valid(dst));
++        const int64_t nk=dst->src[0]->ne[0],nq=dst->src[1]->ne[0];
++        const dim3 blocks((unsigned)((nk+nq+255)/256),(unsigned)dst->ne[3]);
++        attn_mask_pack<<<blocks,256,0,ctx.stream()>>>(
++            static_cast<const int32_t *>(dst->src[0]->data),static_cast<const int32_t *>(dst->src[1]->data),
++            static_cast<int32_t *>(dst->data),nk,nq);
++        return;
++    }
+     GGML_ASSERT(dst->ne[1] * dst->ne[3] <= 65535);
+     const dim3 blocks((unsigned) ((dst->ne[0] + 255) / 256), (unsigned) (dst->ne[1] * dst->ne[3]));
+     const auto * keys = static_cast<const int32_t *>(dst->src[0]->data);
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -3,6 +3,7 @@
+ #include "common.cuh"
+ #include "convert.cuh"
+ #include "vecdotq.cuh"
++#include "../ggml-attn-mask-compact.h"
+ 
+ #include <cstdint>
+ 
+@@ -17,6 +18,16 @@
+ // Still, the value range should be shifted as much as necessary but as little as possible.
+ // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
+ #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
++
++// Negative mask stride is an internal compact-metadata contract. Ordinary
++// positive-stride masks retain their original loading and arithmetic paths.
++static __device__ __forceinline__ half fattn_mask_value(
++        const half * mask, int stride, int q, int k) {
++    if (stride<0) {
++        return half(ggml_attn_mask_compact_keep(reinterpret_cast<const int32_t *>(mask),-stride,q,k) ? 0.0f : -INFINITY);
++    }
++    return mask[int64_t(q)*stride+k];
++}
+ 
+ typedef void (* fattn_kernel_t)(
+         const char * __restrict__ Q,
+@@ -669,7 +680,8 @@
+ template <int ncols1>
+ __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+ static __global__ void flash_attn_mask_to_KV_max(
+-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
++        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33,
++        const int n_queries, const int n_mask_streams) {
+     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
+     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
+ 
+@@ -678,7 +690,11 @@
+     const int sequence = blockIdx.y;
+     const int jt       = blockIdx.x;
+ 
+-    mask += sequence*s33 + jt*ncols1*s31;
++    const bool compact=s31<0;
++    const int32_t nk=compact ? int32_t(-s31) : 0;
++    mask += (sequence%n_mask_streams)*s33;
++    const auto * pairs=reinterpret_cast<const int32_t *>(mask);
++    if (!compact) { mask += jt*ncols1*s31; }
+ 
+     __shared__ int buf_iw[WARP_SIZE];
+     if (tid < WARP_SIZE) {
+@@ -693,8 +709,18 @@
+ 
+ #pragma unroll
+         for (int j = 0; j < ncols1; ++j) {
+-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
++            const int query=jt*ncols1+j;
++            // The final query tile can be partial. Invalid output rows must
++            // not read either dense masks or compact position metadata.
++            if (query>=n_queries) { continue; }
++            if (compact) {
++                const int key=KV_max_sj+2*tid;
++                all_inf=all_inf && !ggml_attn_mask_compact_keep(pairs,nk,query,key) &&
++                    !ggml_attn_mask_compact_keep(pairs,nk,query,key+1);
++            } else {
++                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
++                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
++            }
+         }
+ 
+         all_inf = warp_reduce_all(all_inf);
+@@ -1003,7 +1029,8 @@
+     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
+     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
+ 
+-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
++    const bool compact_mask=ggml_attn_mask_is_compact(mask);
++    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || ggml_attn_mask_compact_valid(mask));
+ 
+     ggml_cuda_pool & pool = ctx.pool();
+     cudaStream_t main_stream = ctx.stream();
+@@ -1100,7 +1127,7 @@
+     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+     int32_t n_kv_max = 0;
+     if (use_sparse) {
+-        GGML_ASSERT(mask != nullptr);
++        GGML_ASSERT(mask != nullptr && !compact_mask);
+         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+         GGML_ASSERT(n_kv_max_query > 0);
+         n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+@@ -1116,7 +1143,7 @@
+     //     multiple sequences of possibly different lengths.
+     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+     if (scan_mask) {
+-        const int64_t s31 = mask->nb[1] / sizeof(half2);
++        const int64_t s31 = compact_mask ? -mask->src[0]->ne[0] : int64_t(mask->nb[1] / sizeof(half2));
+         const int64_t s33 = mask->nb[3] / sizeof(half2);
+ 
+         const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
+@@ -1128,7 +1155,7 @@
+         KV_max.alloc(ne_KV_max);
+         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
+-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
++            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, int(Q->ne[1]), int(mask->ne[3]));
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
+@@ -1260,8 +1287,10 @@
+         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
+         nb21, nb22, nb23,
+-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
++        compact_mask ? mask->src[1]->ne[0] : (mask ? mask->ne[1] : 0),
++        mask ? (compact_mask ? 1 : mask->ne[2]) : 0, mask ? mask->ne[3] : 1,
++        compact_mask ? -int32_t(2*mask->src[0]->ne[0]) : int32_t(mask ? mask->nb[1] : 0),
++        compact_mask ? 0 : int32_t(mask ? mask->nb[2] : 0), mask ? mask->nb[3] : 0
+     );
+     CUDA_CHECK(cudaGetLastError());
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -490,6 +490,19 @@
+         const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
+         const int32_t * const __restrict__ indices) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    if (stride_mask<0) {
++        // Generate just this shared-memory tile. No context x batch mask is
++        // materialized, including in the asynchronous KV-preload variants.
++        for (int j=threadIdx.y;j<ncols1;j+=nwarps) {
++            const int q=fastmodulo(j0+j,ne01);
++            for (int i=threadIdx.x;i<nbatch_fa;i+=warp_size) {
++                const int index=use_sparse ? (i<i_sup ? indices[k_VKQ_0+i] : -1) : k_VKQ_0+i;
++                tile_mask[j*(nbatch_fa+8)+i]=(oob_check && i>=i_sup) ? half(0.0f) :
++                    (index>=0 ? fattn_mask_value(mask_h,stride_mask,q,index) : half(-INFINITY));
++            }
++        }
++        return;
++    }
+     if constexpr (use_cp_async) {
+         static_assert(nbatch_fa <= 8*warp_size && nbatch_fa % 8 == 0, "bad nbatch_fa");
+         static_assert(!oob_check, "OOB check incompatible with cp_async");
+@@ -1883,7 +1896,7 @@
+     const int stride_Q1   = nb01 / sizeof(float2);
+     const int stride_Q2   = nb02 / sizeof(float2);
+     const int stride_K    = nb11 / sizeof(half2);
+-    const int stride_mask = nb31 / sizeof(half);
++    const int stride_mask = nb31 / int(sizeof(half));
+ 
+     const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -637,7 +637,7 @@
+ 
+             if (!oob_check || i_KQ < k_VKQ_sup) {
+                 KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
+-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
++                    slope*__half2float(fattn_mask_value(mask,stride_mask,j,k_VKQ_0+i_KQ)) : 0.0f;
+ 
+                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
+             }
+@@ -861,7 +861,7 @@
+ 
+     const int stride_K2   = nb11 / sizeof(half2);
+     const int stride_V2   = nb21 / sizeof(half2);
+-    const int stride_mask = nb31 / sizeof(half);
++    const int stride_mask = nb31 / int(sizeof(half));
+ 
+     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -110,7 +110,9 @@
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+     V += nb23*sequence + nb22*(head / gqa_ratio);
+ 
+-    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
++    const bool compact_mask=nb31<0;
++    const half * mask_base=mask ? (const half *)(mask+nb33*(sequence%ne33)) : nullptr;
++    const half * maskh=compact_mask ? mask_base : (mask ? (const half *)((const char *)mask_base+nb31*ic0) : nullptr);
+ 
+     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+ 
+@@ -250,10 +252,10 @@
+     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+     K     += blockIdx.y*nthreads * nb11;
+     V     += blockIdx.y*nthreads * nb21;
+-    maskh += blockIdx.y*nthreads;
++    if (!compact_mask && maskh) { maskh += blockIdx.y*nthreads; }
+     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+              // Increment pointers after each loop:
+-             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
++             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += (!compact_mask && maskh ? gridDim.y*nthreads : 0)) {
+ 
+         // Calculate KQ tile and keep track of new maximum KQ values:
+         float KQ_reg[ncols]; // KQ in registers.
+@@ -278,7 +280,8 @@
+                 }
+ 
+                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
++                    sum += slope*__half2float(compact_mask ?
++                        fattn_mask_value(mask_base,nb31/int(sizeof(half)),ic0+j,k_VKQ_0+i_KQ) : maskh[j*ne11 + i_KQ]);
+                 }
+ 
+                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -145,7 +145,7 @@
+     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
+ 
+     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
++        mask != nullptr && !ggml_attn_mask_is_compact(mask) && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -206,7 +206,7 @@
+     //     are put into the template specialization without GQA optimizations.
+     bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+-        if (t == nullptr || ggml_is_quantized(t->type)) {
++        if (t == nullptr || ggml_is_quantized(t->type) || ggml_attn_mask_is_compact(t)) {
+             continue;
+         }
+         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+@@ -549,6 +549,12 @@
+     const ggml_tensor * V     = dst->src[2];
+     const ggml_tensor * mask  = dst->src[3];
+ 
++    if (ggml_attn_mask_is_compact(mask) &&
++            (!ggml_attn_mask_compact_valid(mask) || mask->src[0]->ne[0]!=K->ne[1] ||
++             mask->src[1]->ne[0]<Q->ne[1] || Q->ne[3]%mask->ne[3]!=0)) {
++        return BEST_FATTN_KERNEL_NONE;
++    }
++
+     const int gqa_ratio = Q->ne[2] / K->ne[2];
+     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+ 
+@@ -559,7 +565,7 @@
+     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
+     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+-        if (t == nullptr || ggml_is_quantized(t->type)) {
++        if (t == nullptr || ggml_is_quantized(t->type) || ggml_attn_mask_is_compact(t)) {
+             continue;
+         }
+         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+@@ -625,7 +631,7 @@
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
+-    if (mask && mask->ne[2] != 1) {
++    if (mask && (mask->ne[2] != 1 || (mask->type != GGML_TYPE_F16 && !ggml_attn_mask_compact_valid(mask)))) {
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -34,6 +34,8 @@
+ #include "ggml-cuda/diagmask.cuh"
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
++#include "ggml-attn-mask-compact.h"
++#include "ggml-cuda/pool-trim-policy.h"
+ #include "ggml-cuda/paged-attn.cuh"
+ #include "ggml-cuda/fwht.cuh"
+ #include "ggml-cuda/getrows.cuh"
+@@ -657,6 +659,32 @@
+ 
+     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
+     size_t pool_size = 0;
++    size_t live_bytes = 0;
++    size_t trim_target = 0;
++    ggml_cuda_pool_trim_policy trim_policy;
++
++    void record_alloc(size_t size) { live_bytes += size;trim_policy.observe(live_bytes); }
++    bool plan_idle_trim() override {
++        trim_target=trim_policy.idle_target(live_bytes,pool_size,256);
++        return trim_target<pool_size;
++    }
++    size_t trim_idle() override {
++        const size_t before=pool_size;
++        ggml_cuda_set_device(device);
++        // Only returned buffers are eligible; outstanding allocations survive.
++        // Release largest cached buffers first to minimize driver calls.
++        while (pool_size>trim_target) {
++            int largest=-1;
++            for (int i=0;i<MAX_BUFFERS;++i) {
++                if (buffer_pool[i].ptr && (largest<0 || buffer_pool[i].size>buffer_pool[largest].size)) { largest=i; }
++            }
++            if (largest<0) { break; }
++            auto & b=buffer_pool[largest];
++            if (pool_size-b.size<live_bytes) { break; }
++            CUDA_CHECK(ggml_cuda_device_free(b.ptr,device));pool_size-=b.size;b={};
++        }
++        return before-pool_size;
++    }
+ 
+     ggml_cuda_pool_leg(ggml_backend_cuda_context & ctx, int device) :
+         ctx(ctx),
+@@ -719,6 +747,7 @@
+                             *actual_size = b.size;
+                             b.ptr = nullptr;
+                             b.size = 0;
++                            record_alloc(*actual_size);
+                             return ptr;
+                         }
+                     }
+@@ -731,6 +760,7 @@
+             *actual_size = b.size;
+             b.ptr = nullptr;
+             b.size = 0;
++            record_alloc(*actual_size);
+             return ptr;
+         }
+         void * ptr;
+@@ -758,10 +788,12 @@
+         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
+                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
+ #endif
++        record_alloc(*actual_size);
+         return ptr;
+     }
+ 
+     void free(void * ptr, size_t size) override {
++        GGML_ASSERT(live_bytes>=size);live_bytes-=size;
+         for (int i = 0; i < MAX_BUFFERS; ++i) {
+             ggml_cuda_buffer& b = buffer_pool[i];
+             if (b.ptr == nullptr) {
+@@ -791,9 +823,30 @@
+     size_t granularity;
+     size_t managed_bytes = 0;
+     size_t untracked_allocations = 0;
+-#if defined(GGML_USE_HIP)
+-    std::vector<std::pair<CUdeviceptr, size_t>> mappings;
+-#endif
++    struct mapping { CUdeviceptr address;size_t size;bool tracked; };
++    std::vector<mapping> mappings;
++    ggml_cuda_pool_trim_policy trim_policy;
++    size_t trim_target = 0;
++    const bool trim_enabled = ggml_cuda_env_flag("WILDLLAMA_CUDA_POOL_TRIM");
++
++    bool plan_idle_trim() override {
++        trim_target=trim_policy.idle_target(pool_used,pool_size,granularity);
++        // CUDA requires whole cuMemMap ranges to be unmapped. Never cut through
++        // a backing allocation, including one that contains a live stack frame.
++        return !mappings.empty() && mappings.back().address>=pool_addr+trim_target;
++    }
++    size_t trim_idle() override {
++        const size_t before=pool_size;
++        ggml_cuda_set_device(device);
++        while (!mappings.empty() && mappings.back().address>=pool_addr+trim_target) {
++            const auto m=mappings.back();
++            CU_CHECK(cuMemUnmap(m.address,m.size));
++            ggml_cuda_memory_release_vmm(physical_device,m.tracked ? m.size : 0,m.tracked ? 0 : 1);
++            if (m.tracked) { managed_bytes-=m.size; } else { --untracked_allocations; }
++            pool_size-=m.size;mappings.pop_back();
++        }
++        return before-pool_size;
++    }
+ 
+     explicit ggml_cuda_pool_vmm(int device) :
+         device(device),
+@@ -805,14 +858,9 @@
+ 
+     ~ggml_cuda_pool_vmm() {
+         if (pool_addr != 0) {
+-#if defined(GGML_USE_HIP)
+-            // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
+-            for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
+-                CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+-            }
+-#else
+-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+-#endif
++            for (const auto & mapping : mappings) {
++                CU_CHECK(cuMemUnmap(mapping.address,mapping.size));
++            }
+             // cuMemRelease(handle) does not release mapped physical memory. Its
+             // charge remains until the mappings above have actually been unmapped.
+             ggml_cuda_memory_release_vmm(physical_device, managed_bytes, untracked_allocations);
+@@ -827,9 +875,12 @@
+ 
+         size_t avail = pool_size - pool_used;
+ 
+-        if (size > avail) {
+-            // round up to the next multiple of the granularity
++        while (size > avail) {
++            // Optional bounded mappings make whole-mapping idle reclamation
++            // useful after a single large prefill allocation. Ordinary mode
++            // retains its original one-mapping growth policy.
+             size_t reserve_size = size - avail;
++            if (trim_enabled) { reserve_size=std::min(reserve_size,std::max(granularity,ggml_cuda_pool_trim_policy::warm_bytes)); }
+             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
+ 
+             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
+@@ -840,6 +891,8 @@
+             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+             prop.location.id = physical_device;
+             CUmemGenericAllocationHandle handle;
++            // Reserve host bookkeeping before creating/mapping device backing.
++            mappings.reserve(mappings.size()+1);
+             ggml_cuda_set_device(device);
+             ggml_cuda_memory_reservation reservation(device, reserve_size);
+             if (!reservation.valid) {
+@@ -862,9 +915,7 @@
+             // map at the end of the pool
+             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
+             CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
+-#if defined(GGML_USE_HIP)
+-            mappings.push_back({start_ptr, reserve_size});
+-#endif
++            mappings.push_back({start_ptr,reserve_size,reservation.tracked});
+ 
+             // the memory allocation handle is no longer needed after mapping
+             CU_CHECK(cuMemRelease(handle));
+@@ -922,6 +973,7 @@
+ 
+             // add to the pool
+             pool_size += reserve_size;
++            avail=pool_size-pool_used;
+ 
+             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
+             //       device, (unsigned long long) (pool_size/1024/1024),
+@@ -933,6 +985,7 @@
+         void * ptr = (void *) ((CUdeviceptr)((char *)(pool_addr) + pool_used));
+         *actual_size = size;
+         pool_used += size;
++        trim_policy.observe(pool_used);
+ 
+ #ifdef DEBUG_CUDA_MALLOC
+         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
+@@ -3486,6 +3539,31 @@
+ 
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+ 
++    if (ggml_cuda_env_flag("WILDLLAMA_CUDA_POOL_TRIM")) {
++        bool pending=false;
++        for (auto & row:cuda_ctx->pools) { for (auto & pool:row) {
++            if (pool) { pending=pool->plan_idle_trim() || pending; }
++        } }
++        if (pending) {
++            // Already outside graph execution/capture. Other streams can still
++            // reference returned scratch, and retained graph executables can
++            // retain its addresses: complete every owned stream, then destroy
++            // all captures before releasing any backing memory.
++            for (int d=0;d<GGML_CUDA_MAX_DEVICES;++d) {
++                for (auto stream:cuda_ctx->streams[d]) {
++                    if (stream) { ggml_cuda_set_device(d);CUDA_CHECK(cudaStreamSynchronize(stream)); }
++                }
++            }
++#ifdef USE_CUDA_GRAPH
++            cuda_ctx->cuda_graphs.clear();
++#endif
++            size_t released=0;
++            for (auto & row:cuda_ctx->pools) { for (auto & pool:row) { if (pool) { released+=pool->trim_idle(); } } }
++            ggml_cuda_set_device(cuda_ctx->device);
++            if (released) { GGML_LOG_DEBUG("CUDA idle scratch trim: released %.2f MiB; warm reserve %zu MiB\n",released/1048576.0,ggml_cuda_pool_trim_policy::warm_bytes/1048576); }
++        }
++    }
++
+     GGML_UNUSED(backend);
+ }
+ 
+@@ -7059,6 +7137,7 @@
+         case GGML_OP_CONT:
+             return true;
+         case GGML_OP_ATTN_MASK:
++            if (ggml_attn_mask_is_compact(op)) { return ggml_attn_mask_compact_valid(op); }
+             return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                 op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                 op->ne[1]*op->ne[3] <= 65535 &&
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-graph.h"
+ #include "../ggml/src/ggml-impl.h"
++#include "../ggml/src/ggml-attn-mask-compact.h"
+ #include <typeinfo>
+ 
+ #include "llama-impl.h"
+@@ -61,6 +62,12 @@
+     const auto n_kv     = mctx->get_n_kv();
+     const auto n_tokens = ubatch.n_tokens;
+     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
++
++    if (ggml_attn_mask_is_compact(kq_mask)) {
++        return ggml_attn_mask_compact_valid(kq_mask) &&
++            kq_mask->src[0]->ne[0] == n_kv && kq_mask->src[1]->ne[0] == n_tokens/n_stream &&
++            kq_mask->ne[3] == n_stream;
++    }
+ 
+     bool res = true;
+ 
+@@ -1673,9 +1680,12 @@
+ 
+ void llm_graph_result::prepare_device_masks(const llama_model & model,const llm_graph_params & params) {
+     try {
+-    const char * enabled=std::getenv("WILDLLAMA_DEVICE_MASK");
++    const char * compact_setting=std::getenv("WILDLLAMA_COMPACT_ATTN_MASK");
++    const bool compact_requested=compact_setting && compact_setting[0]=='1' && compact_setting[1]=='\0';
++    const char * enabled=compact_requested ? "1" : std::getenv("WILDLLAMA_DEVICE_MASK");
+     if (!llama_device_mask_enabled(enabled) || !params.sched || !params.cparams.offload_kqv ||
+-            params.cparams.training || params.cparams.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT) { return; }
++            params.cparams.training || (params.cparams.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT &&
++            !(compact_requested && params.cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP))) { return; }
+     if (!enabled) {
+         const auto & batch=params.ubatch;
+         const uint32_t streams=params.cparams.kv_unified ? 1 : batch.n_seqs_unq;
+@@ -1738,16 +1748,25 @@
+ 
+         // Inspect actual cache storage without allocating or copying any KV
+         // data. The probe context owns only a bounded set of view descriptors.
+-        const size_t views=2*size_t(model.hparams.n_layer())+4;
++        const auto cache_layers=inp->mctx->get_layer_ids();
++        if (cache_layers.empty()) { continue; }
++        if (params.cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP) {
++            bool attention_only=true;
++            for (uint32_t il:cache_layers) {
++                attention_only &= il>=model.hparams.n_layer() &&
++                    il<model.hparams.n_layer()+model.hparams.n_layer_nextn && !model.hparams.is_recr(il);
++            }
++            if (!attention_only) { continue; }
++        }
++        const size_t views=2*cache_layers.size()+4;
+         ggml_context_ptr probe(ggml_init({views*ggml_tensor_overhead(),nullptr,true}));
+         if (!probe) { continue; }
+         placement.all_kv_regular_on_device=true;
+         try {
+-            for (uint32_t il=0;il<model.hparams.n_layer();++il) {
+-                // Recurrent layers have no K/V entry. Their model placement
+-                // was still required above; the graph's attention consumers
+-                // must all pass the same CUDA check below.
+-                if (hybrid && model.hparams.is_recr(il)) { continue; }
++            for (uint32_t il:cache_layers) {
++                // Inspect the cache's actual stored layer IDs. MTP draft
++                // contexts contain only nextn layers, not the trunk's IDs.
++                // Every active attention consumer is proven below as well.
+                 if (!device_mask_regular_storage(inp->mctx->get_k(probe.get(),il),device) ||
+                         !device_mask_regular_storage(inp->mctx->get_v(probe.get(),il),device)) {
+                     placement.all_kv_regular_on_device=false;break;
+@@ -1786,13 +1805,34 @@
+         auto * queries=ggml_new_tensor_3d(get_ctx(),GGML_TYPE_I32,mask->ne[1],2,ns);
+         ggml_tensor operation=*mask;
+         operation.op=GGML_OP_ATTN_MASK;operation.src[0]=keys;operation.src[1]=queries;
++        bool compact=compact_requested && params.cparams.flash_attn;
++        for (auto * consumer:consumers) { compact &= consumer->op==GGML_OP_FLASH_ATTN_EXT; }
++        if (compact) {
++            operation.type=GGML_TYPE_I32;
++            operation.ne[0]=2*(keys->ne[0]+queries->ne[0]);
++            operation.ne[1]=operation.ne[2]=1;operation.ne[3]=ns;
++            operation.nb[0]=sizeof(int32_t);
++            for (int d=1;d<GGML_MAX_DIMS;++d) { operation.nb[d]=operation.nb[d-1]*operation.ne[d-1]; }
++            std::memcpy(operation.op_params,&GGML_ATTN_MASK_COMPACT_MAGIC,sizeof(int32_t));
++            for (auto * consumer:consumers) {
++                ggml_tensor probe_consumer=*consumer;probe_consumer.src[3]=&operation;
++                if (!ggml_backend_supports_op(backend,&probe_consumer)) { compact=false;break; }
++            }
++            if (!compact) { operation=*mask;operation.op=GGML_OP_ATTN_MASK;operation.src[0]=keys;operation.src[1]=queries; }
++        }
+         if (!ggml_backend_supports_op(backend,&operation)) { continue; }
+         ggml_set_input(keys);ggml_set_input(queries);
+         ggml_set_name(keys,"attn_inp_mask_keys");ggml_set_name(queries,"attn_inp_mask_queries");
+         mask->op=GGML_OP_ATTN_MASK;mask->src[0]=keys;mask->src[1]=queries;
++        if (compact) {
++            mask->type=operation.type;
++            std::memcpy(mask->ne,operation.ne,sizeof(mask->ne));
++            std::memcpy(mask->nb,operation.nb,sizeof(mask->nb));
++            std::memcpy(mask->op_params,operation.op_params,sizeof(mask->op_params));
++        }
+         mask->flags &= ~GGML_TENSOR_FLAG_INPUT;
+         mask->flags |= GGML_TENSOR_FLAG_COMPUTE;
+-        ggml_set_name(mask,"attn_inp_kq_mask_device");
++        ggml_set_name(mask,compact ? "attn_inp_kq_mask_implicit" : "attn_inp_kq_mask_device");
+         inp->self_mask_keys=keys;inp->self_mask_queries=queries;
+         ggml_backend_sched_set_tensor_backend(scheduler,mask,backend);
+         for (auto * consumer:consumers) { ggml_backend_sched_set_tensor_backend(scheduler,consumer,backend); }
+diff --git a/tests/test-device-attn-mask.cpp b/tests/test-device-attn-mask.cpp
+--- a/tests/test-device-attn-mask.cpp
++++ b/tests/test-device-attn-mask.cpp
+@@ -2,6 +2,7 @@
+ #include "ggml-cpp.h"
+ #include "ggml-cpu.h"
+ #include "../src/llama-device-mask.h"
++#include "../ggml/src/ggml-attn-mask-compact.h"
+ 
+ #include <algorithm>
+ #include <climits>
+@@ -19,11 +20,14 @@
+ static void require(bool value, const char * message) {
+     if (!value) { throw std::runtime_error(message); }
+ }
++static bool compact_test_mode=false;
+ static void enabled(bool value) {
+ #ifdef _WIN32
+     _putenv_s("WILDLLAMA_DEVICE_MASK", value ? "1" : "0");
++    _putenv_s("WILDLLAMA_COMPACT_ATTN_MASK", compact_test_mode && value ? "1" : "0");
+ #else
+     setenv("WILDLLAMA_DEVICE_MASK", value ? "1" : "0", 1);
++    setenv("WILDLLAMA_COMPACT_ATTN_MASK", compact_test_mode && value ? "1" : "0", 1);
+ #endif
+ }
+ static void admission() {
+@@ -176,14 +180,15 @@
+ }
+ 
+ struct mask_observation {
+-    size_t ops=0,device_ops=0,input_bytes=0,output_bytes=0;
++    size_t ops=0,device_ops=0,input_bytes=0,output_bytes=0,packed_ops=0;
+     size_t cpu_mm=0,cuda_mm=0,mask_consumers=0,host_consumers=0;
+     size_t cpu_attention=0,cuda_attention=0;
+ } observed;
+ static bool observe_mask(ggml_tensor * t,bool ask,void *) {
+     bool consumes_mask=false;
+     for(int i=0;i<GGML_MAX_SRC;++i){
+-        if(t->src[i] && std::strncmp(t->src[i]->name,"attn_inp_kq_mask_device",23)==0){consumes_mask=true;}
++        if(t->src[i] && (std::strncmp(t->src[i]->name,"attn_inp_kq_mask_device",23)==0 ||
++                std::strncmp(t->src[i]->name,"attn_inp_kq_mask_implicit",23)==0)){consumes_mask=true;}
+     }
+     const bool attention=t->op==GGML_OP_FLASH_ATTN_EXT || t->op==GGML_OP_SOFT_MAX;
+     if(t->op!=GGML_OP_ATTN_MASK && t->op!=GGML_OP_MUL_MAT && !attention && !consumes_mask)return false;
+@@ -202,6 +207,7 @@
+     if(consumes_mask){++observed.mask_consumers;if(host)++observed.host_consumers;}
+     if(t->op==GGML_OP_ATTN_MASK){
+         ++observed.ops;if(!host)++observed.device_ops;
++        if(ggml_attn_mask_is_compact(t)){++observed.packed_ops;}
+         observed.input_bytes+=ggml_nbytes(t->src[0])+ggml_nbytes(t->src[1]);
+         observed.output_bytes+=ggml_nbytes(t);
+     }
+@@ -307,7 +313,12 @@
+     require(require_op ? observed.ops>0 && observed.device_ops==observed.ops : observed.ops==0,
+         "compact-mask execution/fallback assertion failed");
+     if (require_op) {
+-        require(observed.input_bytes*4<=observed.output_bytes,"compact mask did not reduce staging by configured bound");
++        if (observed.packed_ops) {
++            require(compact_test_mode && observed.packed_ops==observed.ops && observed.output_bytes==observed.input_bytes,
++                "implicit mask materialized dense output or mixed private formats");
++        } else {
++            require(observed.input_bytes*4<=observed.output_bytes,"compact mask did not reduce staging by configured bound");
++        }
+         require(observed.mask_consumers>0 && observed.host_consumers==0,"dense GPU mask reached a CPU consumer");
+         require(observed.cuda_attention>0 && observed.cpu_attention==0,"compact mask attention did not execute entirely on CUDA");
+         std::printf("MODEL_MASK ops=%zu cuda_ops=%zu compact_bytes=%zu dense_bytes=%zu\n",
+@@ -406,8 +417,12 @@
+ int main(int argc,char ** argv) {
+     try {
+         std::setvbuf(stdout,nullptr,_IONBF,0);
+-        const bool cuda=argc>1 && std::strcmp(argv[1],"--cuda")==0;
+-        const std::string dir=argc>(cuda ? 2 : 1) ? argv[cuda ? 2 : 1] : ".";
++        bool cuda=false;std::string dir=".";
++        for(int i=1;i<argc;++i){
++            if(std::strcmp(argv[i],"--cuda")==0){cuda=true;}
++            else if(std::strcmp(argv[i],"--compact")==0){compact_test_mode=true;}
++            else{dir=argv[i];}
++        }
+         ggml_backend_load_all();
+         auto * dev=ggml_backend_dev_by_type(cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU);
+         if (!dev) { return cuda ? 77 : 1; }
+diff --git a/ggml/src/ggml-attn-mask-compact.h b/ggml/src/ggml-attn-mask-compact.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-attn-mask-compact.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include "ggml.h"
++#include <cstdint>
++#include <cstring>
++
++// Internal, CUDA-only representation of the exact ordinary causal mask.
++// Interleaved (position, sequence-membership) pairs are stored for keys then
++// queries, once per stream. It is not a lower precision attention mask.
++constexpr int32_t GGML_ATTN_MASK_COMPACT_MAGIC = 0x57414d31;
++
++inline bool ggml_attn_mask_is_compact(const ggml_tensor * t) {
++    int32_t tag = 0;
++    if (t) { std::memcpy(&tag, t->op_params, sizeof(tag)); }
++    return t && t->op == GGML_OP_ATTN_MASK && t->type == GGML_TYPE_I32 &&
++        tag == GGML_ATTN_MASK_COMPACT_MAGIC;
++}
++
++inline bool ggml_attn_mask_compact_valid(const ggml_tensor * t) {
++    if (!ggml_attn_mask_is_compact(t) || !t->src[0] || !t->src[1]) { return false; }
++    const auto * k = t->src[0];
++    const auto * q = t->src[1];
++    return k->type == GGML_TYPE_I32 && q->type == GGML_TYPE_I32 &&
++        k->ne[0] > 0 && k->ne[0] <= INT32_MAX/2 && q->ne[0] > 0 && q->ne[0] <= 65535 &&
++        k->ne[1] == 2 && q->ne[1] == 2 && k->ne[2] > 0 && k->ne[2] <= 65535 && k->ne[2] == q->ne[2] &&
++        k->ne[3] == 1 && q->ne[3] == 1 && t->ne[0] == 2*(k->ne[0] + q->ne[0]) &&
++        t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == k->ne[2] &&
++        ggml_is_contiguous(t) && ggml_is_contiguous(k) && ggml_is_contiguous(q);
++}
++
++#if defined(__CUDACC__) || defined(__HIPCC__)
++#define GGML_MASK_HD __host__ __device__
++#else
++#define GGML_MASK_HD
++#endif
++GGML_MASK_HD inline bool ggml_attn_mask_compact_keep(
++        const int32_t * pairs, int32_t nk, int32_t q, int32_t k) {
++    const auto * query = pairs + 2*int64_t(nk) + 2*int64_t(q);
++    const auto * key = pairs + 2*int64_t(k);
++    return (uint32_t(key[1]) & uint32_t(query[1])) != 0 && key[0] <= query[0];
++}
++#undef GGML_MASK_HD
+diff --git a/ggml/src/ggml-cuda/pool-trim-policy.h b/ggml/src/ggml-cuda/pool-trim-policy.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/pool-trim-policy.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <limits>
++
++// A small warm reserve and hysteresis avoid reallocating steady decode scratch.
++// A graph replay may perform no host-side pool allocations: retain the last
++// observed non-zero peak rather than mistaking that replay for an empty phase.
++struct ggml_cuda_pool_trim_policy {
++    static constexpr size_t warm_bytes = 16ull << 20;
++    static constexpr size_t minimum_release = 32ull << 20;
++    size_t peak = 0;
++    size_t last_peak = 0;
++
++    void observe(size_t used) { peak = std::max(peak, used); }
++
++    size_t idle_target(size_t used, size_t capacity, size_t granularity) {
++        if (peak) { last_peak = peak; }
++        peak = used;
++        const size_t live = std::max(used, last_peak);
++        if (!granularity || live > std::numeric_limits<size_t>::max()-warm_bytes) { return capacity; }
++        const size_t wanted = live + warm_bytes;
++        if (wanted > std::numeric_limits<size_t>::max()-(granularity-1)) { return capacity; }
++        const size_t aligned = (wanted+granularity-1)/granularity*granularity;
++        return capacity > aligned && capacity-aligned >= minimum_release ? aligned : capacity;
++    }
++};
+diff --git a/tests/test-compact-attn-mask.cpp b/tests/test-compact-attn-mask.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-compact-attn-mask.cpp
+@@ -0,0 +1,287 @@
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "ggml-cuda.h"
++#include "../ggml/src/ggml-attn-mask-compact.h"
++#include "../ggml/src/ggml-cuda/pool-trim-policy.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool ok,const char * what) { if (!ok) { throw std::runtime_error(what); } }
++
++static void make_compact(ggml_tensor * mask) {
++    const auto nk=mask->src[0]->ne[0],nq=mask->src[1]->ne[0],ns=mask->src[0]->ne[2];
++    mask->type=GGML_TYPE_I32;mask->ne[0]=2*(nk+nq);mask->ne[1]=mask->ne[2]=1;mask->ne[3]=ns;
++    mask->nb[0]=sizeof(int32_t);
++    for (int d=1;d<GGML_MAX_DIMS;++d) { mask->nb[d]=mask->nb[d-1]*mask->ne[d-1]; }
++    std::memcpy(mask->op_params,&GGML_ATTN_MASK_COMPACT_MAGIC,sizeof(int32_t));
++}
++
++static void host_contracts() {
++    ggml_context_ptr ctx(ggml_init({128*ggml_tensor_overhead(),nullptr,true}));
++    auto * k=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,768,2,2);
++    auto * q=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,65,2,2);
++    auto * mask=ggml_attn_mask(ctx.get(),k,q,GGML_TYPE_F16);
++    const auto dense_bytes=ggml_nbytes(mask);
++    make_compact(mask);
++    require(ggml_attn_mask_compact_valid(mask),"valid compact representation rejected");
++    require(ggml_nbytes(mask)<dense_bytes/16,"packed representation did not reduce mask storage");
++    auto invalid=*mask;invalid.ne[0]++;
++    require(!ggml_attn_mask_compact_valid(&invalid),"invalid compact shape accepted");
++    invalid=*mask;invalid.nb[1]++;
++    require(!ggml_attn_mask_compact_valid(&invalid),"invalid compact stride accepted");
++    invalid=*mask;invalid.op_params[0]^=1;
++    require(!ggml_attn_mask_compact_valid(&invalid),"invalid metadata version accepted");
++    size_t checks=0;
++    std::vector<int32_t> pairs(2*(768+65));
++    for (int change=0;change<5;++change) {
++        for (int i=0;i<768+65;++i) {
++            pairs[2*i]=(i%19==0) ? INT32_MIN : (i%23==0) ? INT32_MAX : (i*73+change*17)%768-8;
++            const uint32_t bits=(uint32_t(1)<<((i+change)%32)) | (i%11==0 ? 0x80000001u : 0);
++            std::memcpy(&pairs[2*i+1],&bits,4);
++        }
++        for (int qi=0;qi<65;++qi) { for (int ki=0;ki<768;++ki) {
++            const auto * key=pairs.data()+2*ki;
++            const auto * query=pairs.data()+2*(768+qi);
++            const bool expected=(uint32_t(key[1])&uint32_t(query[1])) && key[0]<=query[0];
++            require(ggml_attn_mask_compact_keep(pairs.data(),768,qi,ki)==expected,"causal/sequence predicate mismatch");++checks;
++        } }
++    }
++    constexpr size_t mib=1ull<<20;
++    ggml_cuda_pool_trim_policy policy;
++    policy.observe(128*mib);
++    require(policy.idle_target(0,128*mib,2*mib)==128*mib,"trimmed active prefill peak");
++    require(policy.idle_target(0,128*mib,2*mib)==128*mib,"mistook allocation-free graph replay for idle scratch");
++    policy.observe(4*mib);
++    require(policy.idle_target(0,128*mib,2*mib)==20*mib,"did not trim old prefill excess");
++    require(policy.idle_target(0,20*mib,2*mib)==20*mib,"discarded stable warm reserve");
++    policy.observe(48*mib);
++    require(policy.idle_target(48*mib,96*mib,2*mib)==64*mib,"trim target crossed live scratch");
++    require(policy.idle_target(48*mib,64*mib,2*mib)==64*mib,"steady decode trim churn");
++    require(policy.idle_target(48*mib,64*mib,0)==64*mib,"zero granularity accepted");
++    std::printf("PASS compact metadata: %zu exact predicates; shape/version rejection; warm-pool hysteresis\n",checks);
++}
++
++static void environment(const char * name,const char * value) {
++#ifdef _WIN32
++    _putenv_s(name,value ? value : "");
++#else
++    if (value) { setenv(name,value,1); } else { unsetenv(name); }
++#endif
++}
++
++static void cpu_rejection() {
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++    require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH),"candidate CPU backend unavailable");
++    auto * reg=ggml_backend_reg_by_name("CPU");
++    require(reg && ggml_backend_reg_dev_count(reg),"CPU device unavailable");
++    ggml_backend_ptr cpu(ggml_backend_dev_init(ggml_backend_reg_dev_get(reg,0),nullptr));
++    ggml_context_ptr ctx(ggml_init({128*ggml_tensor_overhead(),nullptr,true}));
++    auto * keys=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,256,2,1);
++    auto * queries=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,32,2,1);
++    auto * mask=ggml_attn_mask(ctx.get(),keys,queries,GGML_TYPE_F16);
++    auto * q=ggml_new_tensor_4d(ctx.get(),GGML_TYPE_F32,64,32,2,1);
++    auto * k=ggml_new_tensor_4d(ctx.get(),GGML_TYPE_F16,64,256,2,1);
++    auto * v=ggml_new_tensor_4d(ctx.get(),GGML_TYPE_F16,64,256,2,1);
++    auto * fa=ggml_flash_attn_ext(ctx.get(),q,k,v,mask,.125f,0,0);
++    make_compact(mask);
++    require(!ggml_backend_supports_op(cpu.get(),mask),"CPU accepted private CUDA packed mask");
++    require(!ggml_backend_supports_op(cpu.get(),fa),"CPU accepted CUDA packed attention consumer");
++    std::puts("PASS CPU unsupported packed mask/attention rejection");
++#endif
++}
++
++// Exercise the real scratch allocator through F16 GEMM conversion, below a
++// 248 MiB managed quota, with all graph tensor buffers remaining live during
++// the measured release. Large/small graph replays must produce identical math.
++static void cuda_pool_contract(ggml_backend_reg_t registry) {
++    auto * device=ggml_backend_reg_dev_get(registry,0);
++    const auto set_limit=reinterpret_cast<decltype(&ggml_backend_cuda_set_memory_limit)>(
++        ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_set_memory_limit"));
++    const auto get_stats=reinterpret_cast<decltype(&ggml_backend_cuda_get_memory_stats)>(
++        ggml_backend_reg_get_proc_address(registry,"ggml_backend_cuda_get_memory_stats"));
++    require(set_limit && get_stats,"CUDA memory quota diagnostics unavailable");
++    constexpr size_t mib=1ull<<20,limit=248*mib;
++    environment("WILDLLAMA_CUDA_POOL_TRIM","1");
++    environment("GGML_CUDA_CUBLAS_COMPUTE_TYPE","f16");
++    require(set_limit(device,limit,true),"cannot enable small CUDA pool quota");
++    struct release_limit { decltype(set_limit) fn;ggml_backend_dev_t device;~release_limit(){fn(device,0,false);} } owner{set_limit,device};
++    auto stats=[&]{ggml_backend_cuda_memory_stats s{};require(get_stats(device,&s),"cannot read memory quota");return s;};
++    size_t high=0,low=0;
++    {
++        ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
++        require(bool(backend),"CUDA pool test backend initialization failed");
++        ggml_context_ptr ctx(ggml_init({32*ggml_tensor_overhead()+2*ggml_graph_overhead_custom(32,false),nullptr,true}));
++        constexpr int width=4096,rows=64,large=8192,small=64;
++        auto * w=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,width,rows);
++        auto * x=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,width,large);
++        auto * xs=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,width,small);
++        auto * out=ggml_mul_mat(ctx.get(),w,x);
++        auto * outs=ggml_mul_mat(ctx.get(),w,xs);
++        auto * heavy=ggml_new_graph_custom(ctx.get(),32,false);
++        auto * light=ggml_new_graph_custom(ctx.get(),32,false);
++        ggml_build_forward_expand(heavy,out);ggml_build_forward_expand(light,outs);
++        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend.get()));
++        require(bool(buffer),"CUDA pool graph tensor allocation failed");
++        const size_t tensor_bytes=stats().managed_used_bytes;
++        std::vector<ggml_fp16_t> weights(width*rows,ggml_fp32_to_fp16(.125f));
++        std::vector<float> values(width*large,.125f),little(width*small,.125f);
++        ggml_backend_tensor_set(w,weights.data(),0,weights.size()*2);
++        ggml_backend_tensor_set(x,values.data(),0,values.size()*4);
++        ggml_backend_tensor_set(xs,little.data(),0,little.size()*4);
++        auto compute=[&](ggml_cgraph * graph,ggml_tensor * result){
++            require(ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS,"CUDA pool GEMM failed");
++            std::vector<float> output(ggml_nelements(result));
++            ggml_backend_tensor_get(result,output.data(),0,output.size()*4);
++            for (float f:output) { require(std::isfinite(f) && std::fabs(f-64.f)<1e-4f,"scratch trim changed GEMM/replay output"); }
++            const auto s=stats();require(s.managed_used_bytes<=limit && s.managed_peak_bytes<=limit,"scratch pool exceeded managed quota");
++        };
++        for (int i=0;i<5;++i) { compute(heavy,out); }
++        high=stats().managed_used_bytes;
++        require(high>tensor_bytes+32*mib,"large GEMM did not exercise temporary CUDA pool");
++        for (int i=0;i<5;++i) { compute(light,outs); }
++        low=stats().managed_used_bytes;
++        require(high>=low+32*mib,"idle scratch pool failed to return old large-phase backing");
++        const auto warm=stats().managed_used_bytes;
++        for (int i=0;i<5;++i) { compute(light,outs); }
++        require(stats().managed_used_bytes==warm,"stable small-phase replay repeatedly discarded warm reserve");
++        // Re-enter the large phase after old captured pointers were released.
++        for (int i=0;i<5;++i) { compute(heavy,out); }
++        require(stats().managed_used_bytes>=high,"large graph failed to rebuild its released scratch");
++    }
++    require(stats().managed_used_bytes==0,"CUDA pool destruction leaked managed quota accounting");
++    std::printf("PASS CUDA pool trim: high=%zu low=%zu released=%zu peak<=%zu graph_outputs_and_reentry_exact accounting_after_destroy=0\n",high,low,high-low,limit);
++    environment("WILDLLAMA_CUDA_POOL_TRIM",nullptr);
++    environment("GGML_CUDA_CUBLAS_COMPUTE_TYPE",nullptr);
++}
++
++static void cuda_case(ggml_backend_t backend,int nk,int nq,int ns,int gqa,bool effects,ggml_type kvtype) {
++    ggml_context_ptr ctx(ggml_init({128*ggml_tensor_overhead()+ggml_graph_overhead_custom(128,false),nullptr,true}));
++    const int width=effects ? 128 : 64;constexpr int heads=2;
++    auto * query=ggml_new_tensor_4d(ctx.get(),GGML_TYPE_F32,width,nq,heads*gqa,ns);
++    auto * key=ggml_new_tensor_4d(ctx.get(),kvtype,width,nk,heads,ns);
++    auto * value=ggml_new_tensor_4d(ctx.get(),kvtype,width,nk,heads,ns);
++    auto * keys=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,nk,2,ns);
++    auto * queries=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,nq,2,ns);
++    auto * dense=ggml_attn_mask(ctx.get(),keys,queries,GGML_TYPE_F16);
++    auto * compact=ggml_attn_mask(ctx.get(),keys,queries,GGML_TYPE_F16);
++    auto * reference=ggml_flash_attn_ext(ctx.get(),query,key,value,dense,0.125f,0,effects ? 3.f : 0.f);
++    auto * result=ggml_flash_attn_ext(ctx.get(),query,key,value,compact,0.125f,0,effects ? 3.f : 0.f);
++    ggml_tensor * sinks=nullptr;
++    if (effects) {
++        sinks=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,heads*gqa);
++        ggml_flash_attn_ext_add_sinks(reference,sinks);ggml_flash_attn_ext_add_sinks(result,sinks);
++    }
++    make_compact(compact);
++    require(ggml_backend_supports_op(backend,compact),"CUDA rejects valid packed mask");
++    require(ggml_backend_supports_op(backend,result),"CUDA FA rejects packed mask");
++    {
++        // Internally valid metadata is not sufficient: its bounds must also
++        // cover this particular attention consumer.
++        auto bad_keys=*keys;bad_keys.ne[0]-=32;
++        bad_keys.nb[1]=bad_keys.ne[0]*sizeof(int32_t);
++        bad_keys.nb[2]=2*bad_keys.nb[1];bad_keys.nb[3]=bad_keys.nb[2]*ns;
++        auto bad_mask=*compact;bad_mask.src[0]=&bad_keys;make_compact(&bad_mask);
++        require(ggml_attn_mask_compact_valid(&bad_mask),"cross-shape fixture is not independently valid");
++        auto bad_result=*result;bad_result.src[3]=&bad_mask;
++        require(!ggml_backend_supports_op(backend,&bad_result),"CUDA accepted insufficient key metadata");
++        if (nq>1) {
++            auto bad_queries=*queries;--bad_queries.ne[0];
++            bad_queries.nb[1]=bad_queries.ne[0]*sizeof(int32_t);
++            bad_queries.nb[2]=2*bad_queries.nb[1];bad_queries.nb[3]=bad_queries.nb[2]*ns;
++            bad_mask=*compact;bad_mask.src[1]=&bad_queries;make_compact(&bad_mask);
++            require(ggml_attn_mask_compact_valid(&bad_mask),"short-query metadata fixture is invalid");
++            bad_result=*result;bad_result.src[3]=&bad_mask;
++            require(!ggml_backend_supports_op(backend,&bad_result),"CUDA accepted insufficient query metadata");
++        }
++        bad_mask=*compact;bad_mask.op_params[0]^=1;
++        bad_result=*result;bad_result.src[3]=&bad_mask;
++        require(!ggml_backend_supports_op(backend,&bad_result),"CUDA accepted unknown packed mask version");
++    }
++    auto * graph=ggml_new_graph_custom(ctx.get(),128,false);
++    ggml_build_forward_expand(graph,reference);ggml_build_forward_expand(graph,result);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend));
++    require(bool(buffer),"small CUDA fixture allocation failed");
++    size_t total=0;
++    for (auto * tensor:{query,key,value}) { total+=ggml_nbytes(tensor); }
++    require(total<32ull*1024*1024,"fixture exceeds small-GPU test budget");
++    std::vector<float> qs(ggml_nelements(query));
++    for (size_t i=0;i<qs.size();++i) { qs[i]=std::sin(float(i%317)*.09f)*.4f; }
++    ggml_backend_tensor_set(query,qs.data(),0,qs.size()*sizeof(float));
++    // Native quantizer is used once; both paths consume identical stored bytes.
++    for (auto * tensor:{key,value}) {
++        std::vector<float> values(ggml_nelements(tensor));
++        for (size_t i=0;i<values.size();++i) { values[i]=std::cos(float((i+(tensor==value ? 7 : 0))%239)*.07f)*.3f; }
++        std::vector<unsigned char> encoded(ggml_nbytes(tensor));
++        ggml_quantize_chunk(kvtype,values.data(),encoded.data(),0,ggml_nelements(tensor)/width,width,nullptr);
++        ggml_backend_tensor_set(tensor,encoded.data(),0,encoded.size());
++    }
++    if (sinks) { std::vector<float> ss(heads*gqa,.15f);ggml_backend_tensor_set(sinks,ss.data(),0,ss.size()*4); }
++    std::vector<int32_t> kp(2*nk*ns),qp(2*nq*ns);
++    std::vector<float> expected(ggml_nelements(result)),actual(expected.size());
++    float max_error=0;
++    for (int change=0;change<5;++change) {
++        for (int s=0;s<ns;++s) {
++            for (int i=0;i<nk;++i) {
++                const int at=s*2*nk+i;
++                kp[at]=i==0 ? INT32_MIN : (i*73+change*17+s)%nk;
++                uint32_t bits=i==0 ? 0xffffffffu : i%7==0 ? 0 : uint32_t(1)<<((i+change+s)%32);
++                if (i%11==0) { bits|=0x80000001u; }
++                std::memcpy(&kp[at+nk],&bits,4);
++            }
++            for (int i=0;i<nq;++i) {
++                const int at=s*2*nq+i;
++                qp[at]=i%13==0 ? INT32_MIN : (i*59+change*7+s)%nk;
++                const uint32_t bits=uint32_t(1)<<((i+3*change+s)%32);
++                std::memcpy(&qp[at+nq],&bits,4);
++            }
++        }
++        ggml_backend_tensor_set(keys,kp.data(),0,kp.size()*4);ggml_backend_tensor_set(queries,qp.data(),0,qp.size()*4);
++        require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"CUDA attention computation failed");
++        ggml_backend_tensor_get(reference,expected.data(),0,expected.size()*4);
++        ggml_backend_tensor_get(result,actual.data(),0,actual.size()*4);
++        for (size_t i=0;i<actual.size();++i) {
++            require(std::isfinite(expected[i]) && std::isfinite(actual[i]),"non-finite compact attention result");
++            const float error=std::fabs(actual[i]-expected[i])/std::max(1.f,std::fabs(expected[i]));
++            max_error=std::max(max_error,error);require(error<2e-4f,"compact attention differs from dense mature FA");
++        }
++    }
++    std::printf("PASS CUDA compact FA: nk=%d nq=%d streams=%d GQA=%d effects=%d type=%s changed_inputs=5 max_scaled_error=%.9g dense=%zu packed=%zu\n",
++        nk,nq,ns,gqa,int(effects),ggml_type_name(kvtype),max_error,ggml_nbytes(dense),ggml_nbytes(compact));
++}
++
++int main(int argc,char ** argv) {
++    try {
++        host_contracts();
++        cpu_rejection();
++        if (argc<2 || std::string(argv[1])=="--host-only") { return 0; }
++        require(std::string(argv[1])=="--cuda","use --host-only or --cuda");
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++        require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH),"candidate CUDA backend unavailable");
++#else
++        const char * path=std::getenv("GGML_BACKEND_PATH");require(path && ggml_backend_load(path),"set GGML_BACKEND_PATH to candidate CUDA backend");
++#endif
++        auto * registry=ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) { std::puts("SKIP no CUDA device");return 77; }
++        ggml_backend_ptr backend(ggml_backend_dev_init(ggml_backend_reg_dev_get(registry,0),nullptr));
++        require(bool(backend),"CUDA backend initialization failed");
++        for (auto type:{GGML_TYPE_F16,GGML_TYPE_Q8_0}) {
++            cuda_case(backend.get(),256,1,1,1,false,type);
++            cuda_case(backend.get(),512,2,1,4,true,type);
++            cuda_case(backend.get(),768,5,2,8,true,type);
++            cuda_case(backend.get(),512,65,2,4,false,type);
++            cuda_case(backend.get(),512,1024,1,4,false,type);
++            cuda_case(backend.get(),512,1025,1,4,false,type);
++        }
++        backend.reset();
++        cuda_pool_contract(registry);
++        return 0;
++    } catch (const std::exception & e) { std::fprintf(stderr,"FAIL %s\n",e.what());return 1; }
++}

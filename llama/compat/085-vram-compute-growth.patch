@@ -1,0 +1,591 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -412,6 +412,8 @@
+         // graph rebuilds. This budget is separate from, and charged within,
+         // the native backend allocation quota.
+         graph_variant_budget = llama_graph_variant_policy::parse_budget(getenv("WILDLLAMA_GRAPH_VARIANTS_MIB"));
++        const char * growth = std::getenv("WILDLLAMA_COMPUTE_GROWTH");
++        compute_growth_requested = growth && std::strcmp(growth, "1") == 0;
+     }
+ 
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+@@ -866,6 +868,49 @@
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+ 
++llama_kv_cache * llama_context::compute_growth_cache() const {
++    if (!compute_growth_requested || !memory || cparams.training || cparams.pipeline_parallel ||
++            !cparams.causal_attn || !cparams.flash_attn || model.hparams.no_alloc ||
++            model.n_devices() > 1 || model.has_tensor_overrides()) { return nullptr; }
++    if (typeid(*memory) == typeid(llama_kv_cache)) { return static_cast<llama_kv_cache *>(memory.get()); }
++    if (typeid(*memory) == typeid(llama_memory_hybrid)) {
++        auto * hybrid = static_cast<llama_memory_hybrid *>(memory.get());
++        if (typeid(*hybrid->get_mem_attn()) == typeid(llama_kv_cache) &&
++                typeid(*hybrid->get_mem_recr()) == typeid(llama_memory_recurrent)) { return hybrid->get_mem_attn(); }
++    }
++    return nullptr;
++}
++
++bool llama_context::preflight_compute_growth(const llama_memory_context_i * mctx) {
++    auto * cache = compute_growth_cache();
++    if (!cache || !mctx) { return true; }
++    const llama_kv_cache_context * attention = nullptr;
++    if (typeid(*mctx) == typeid(llama_kv_cache_context)) {
++        attention = static_cast<const llama_kv_cache_context *>(mctx);
++    } else if (typeid(*mctx) == typeid(llama_memory_hybrid_context)) {
++        attention = static_cast<const llama_memory_hybrid_context *>(mctx)->get_attn();
++    }
++    if (!attention) { return true; }
++    const uint32_t previous = cache->get_compute_reservation();
++    if (!cache->grow_compute_reservation(attention->compute_reservation_required())) { return true; }
++    LLAMA_LOG_INFO("compute growth: reserving %u -> %u KV rows; logical context remains %u\n",
++        previous, cache->get_compute_reservation(), cparams.n_ctx);
++    // init_batch has only prepared the slots; neither attention nor recurrent
++    // apply() has run. All retained arenas/captures are synchronized and cleared
++    // by sched_reserve before attempting the larger bounded reservation.
++    sched_need_reserve = true;
++    try {
++        sched_reserve();
++        return true;
++    } catch (const std::exception & error) {
++        // A failed scheduler may have released its former arena. Retrying must
++        // reserve it again, but must not remove old KV cells or advance RNN state.
++        sched_need_reserve = true;
++        LLAMA_LOG_ERROR("compute growth: reservation denied before memory apply: %s\n", error.what());
++        return false;
++    }
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -883,6 +928,12 @@
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++    if (auto * cache = compute_growth_cache()) {
++        if (cache->enable_compute_growth(std::max(n_tokens, n_seqs))) {
++            LLAMA_LOG_INFO("compute growth: reserving %u KV rows of %u logical rows\n",
++                cache->get_compute_reservation(), cache->get_size());
++        }
++    }
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+@@ -2958,7 +3009,16 @@
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+ 
+-    sched_reserve();
++    try {
++        sched_reserve();
++    } catch (const std::exception & error) {
++        // A previous compute-growth denial can leave a pending reservation.
++        // Every retry, including repeated failures under the same pressure,
++        // must return through the C API before memory updates or apply().
++        sched_need_reserve = true;
++        LLAMA_LOG_ERROR("%s: pending compute reservation failed before memory update: %s\n", __func__, error.what());
++        return -2;
++    }
+ 
+     bool did_optimize = false;
+ 
+@@ -3009,6 +3069,8 @@
+ 
+         break;
+     }
++
++    if (!preflight_compute_growth(mctx.get())) { return -2; }
+ 
+     // reserve output buffer
+     deferred_sampler_rows.clear(); device_verify_ordered = false;
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -25,6 +25,7 @@
+ struct llama_model;
+ class llama_batch_allocr;
+ class llama_moe_cache;
++class llama_kv_cache;
+ struct llama_gpu_layer_diagnostics;
+ struct llama_device_verification_owner;
+ 
+@@ -368,6 +369,8 @@
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
+ private:
++    llama_kv_cache * compute_growth_cache() const;
++    bool preflight_compute_growth(const llama_memory_context_i * mctx);
+     llm_graph_result * get_gf_res_prev();
+ 
+     llm_graph_params graph_params(
+@@ -527,6 +530,7 @@
+     ggml_backend_sched_gpu_stats gpu_stats_previous {};
+ 
+     bool sched_need_reserve = true;
++    bool compute_growth_requested = false;
+ 
+     // whether the reserve graph has a logits tensor, set in sched_reserve()
+     // true until then, because the first output_reserve() runs before any graph is reserved
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -733,6 +733,58 @@
+     initialize_paged_pool();
+ }
+ 
++void llama_kv_cache::enable_paged_draft_owner() {
++    const char * enabled = std::getenv("WILDLLAMA_PAGED_DRAFT");
++    if (!enabled || std::strcmp(enabled, "1") != 0 || typeid(*this) != typeid(llama_kv_cache) ||
++            other || paged_storage_started || hparams.n_layer_nextn == 0 || layers.empty()) { return; }
++    for (const auto & cells : v_cells) { if (cells.get_used()) { return; } }
++    // Only the model factory may authorize a dedicated MTP attention owner.
++    // Never reinterpret trunk/recurrent/shared layers using a process flag.
++    for (const auto & layer : layers) {
++        if (uint32_t(layer.il) < hparams.n_layer() || hparams.is_recr(layer.il)) { return; }
++    }
++    paged_attention_requested = true;
++    paged_hybrid_owner = true;
++    initialize_paged_pool();
++}
++
++bool llama_kv_cache::enable_compute_growth(uint32_t minimum) {
++    if (typeid(*this) != typeid(llama_kv_cache) || other || v_cells_impl.use_count() != 1 ||
++            n_stream != 1 || v_trans || n_swa || swa_type != LLAMA_SWA_TYPE_NONE ||
++            hparams.no_alloc || hparams.use_alibi || hparams.n_rel_attn_bkts ||
++            hparams.ple_n_heads || model.has_tensor_overrides() || layers.empty()) { return false; }
++    // The initial scope is CPU/CUDA attention. Other backends keep their
++    // established full-reservation behavior until their allocator is tested.
++    for (const auto & layer : layers) {
++        auto * device = model.dev_layer(layer.il);
++        if (!device) { return false; }
++        const auto type = ggml_backend_dev_type(device);
++        auto * registry = ggml_backend_dev_backend_reg(device);
++        if (type != GGML_BACKEND_DEVICE_TYPE_CPU && (!registry || type != GGML_BACKEND_DEVICE_TYPE_GPU ||
++                std::strcmp(ggml_backend_reg_name(registry), "CUDA") != 0)) { return false; }
++    }
++    uint32_t initial = std::max(minimum, growth_initial_tokens ? growth_initial_tokens : 8192u);
++    for (const auto & cells : v_cells) { initial = std::max(initial, cells.used_max_p1()); }
++    const uint64_t padding = std::max(n_pad, 256u);
++    initial = uint32_t(std::min<uint64_t>(get_size(), (uint64_t(initial) + padding - 1) / padding * padding));
++    compute_reservation_tokens = std::max(compute_reservation_tokens, initial);
++    return true;
++}
++
++bool llama_kv_cache::grow_compute_reservation(uint32_t required) {
++    if (!compute_reservation_tokens || required <= compute_reservation_tokens) { return false; }
++    const uint32_t previous = compute_reservation_tokens;
++    const uint64_t doubled = uint64_t(previous) * 2;
++    const uint64_t padding = std::max(n_pad, 256u);
++    const uint64_t requested = std::max<uint64_t>(required, doubled);
++    compute_reservation_tokens = uint32_t(std::min<uint64_t>(get_size(), (requested + padding - 1) / padding * padding));
++    return compute_reservation_tokens > previous;
++}
++
++uint32_t llama_kv_cache::get_compute_reservation() const {
++    return compute_reservation_tokens ? compute_reservation_tokens : get_size();
++}
++
+ void llama_kv_cache::clear(bool data) {
+     invalidate_prefixes();
+     for (uint32_t s = 0; s < n_stream; ++s) {
+@@ -3590,7 +3642,7 @@
+ llama_kv_cache_context::llama_kv_cache_context(
+         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+     full_reservation = true;
+-    n_kv = kv->get_size();
++    n_kv = kv->get_compute_reservation();
+ 
+     const uint32_t n_stream = kv->get_n_stream();
+ 
+@@ -3676,6 +3728,24 @@
+     return n_kv;
+ }
+ 
++std::vector<uint32_t> llama_kv_cache_context::get_layer_ids() const { return kv->get_layer_ids(); }
++
++uint32_t llama_kv_cache_context::compute_reservation_required() const {
++    if (!kv || typeid(*this) != typeid(llama_kv_cache_context) ||
++            llama_memory_status_is_fail(status) || full_reservation || ubatches.empty()) { return 0; }
++    uint32_t required = 0;
++    // Physical indices, not token positions: restored/branched/ring caches can
++    // have live rows or upcoming writes well beyond the sequence token count.
++    for (const auto & cells : kv->v_cells) { required = std::max(required, cells.used_max_p1()); }
++    for (const auto & sinfo : sinfos) {
++        for (const auto & indices : sinfo.idxs) {
++            for (uint32_t index : indices) { required = std::max(required, index + 1); }
++        }
++    }
++    const uint64_t padding = std::max(kv->n_pad, 256u);
++    return uint32_t(std::min<uint64_t>(kv->get_size(), (uint64_t(required) + padding - 1) / padding * padding));
++}
++
+ bool llama_kv_cache_context::paged_attention_supported() const {
+     return typeid(*this) == typeid(llama_kv_cache_context) && !llama_memory_status_is_fail(status) && kv &&
+         (full_reservation || !ubatches.empty()) && kv->paged_attention_supported();
+@@ -3683,12 +3753,12 @@
+ 
+ uint32_t llama_kv_cache_context::get_n_kv_paged() const {
+     GGML_ASSERT(paged_attention_supported());
+-    return full_reservation ? kv->get_size() : kv->get_n_kv_paged();
++    return full_reservation ? uint32_t(n_kv) : kv->get_n_kv_paged();
+ }
+ 
+ bool llama_kv_cache_context::get_paged_contiguous_span(uint32_t & first_row, uint32_t & rows) const {
+     if (!paged_attention_supported()) { return false; }
+-    if (full_reservation) { first_row = 0; rows = kv->get_size(); return true; }
++    if (full_reservation) { first_row = 0; rows = uint32_t(n_kv); return true; }
+     const auto & pages = kv->get_paged_table();
+     if (pages.empty() || uint64_t(pages.back()) - pages.front() + 1 != pages.size() ||
+             uint64_t(pages.back()) + 1 > kv->get_size() / llama_paged_kv_pool::page_tokens) { return false; }
+@@ -3717,7 +3787,7 @@
+ 
+ void llama_kv_cache_context::set_input_paged_table(ggml_tensor * dst) const {
+     if (!full_reservation) { kv->set_input_paged_table(dst); return; }
+-    std::vector<uint32_t> pages(kv->get_size() / llama_paged_kv_pool::page_tokens);
++    std::vector<uint32_t> pages(uint32_t(n_kv) / llama_paged_kv_pool::page_tokens);
+     for (uint32_t page = 0; page < pages.size(); ++page) { pages[page] = page; }
+     GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == int64_t(pages.size()));
+     if (!pages.empty()) { ggml_backend_tensor_set(dst, pages.data(), 0, pages.size() * sizeof(uint32_t)); }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -166,6 +166,12 @@
+     uint32_t get_n_seq_max() const;
+     uint32_t get_n_stream() const;
+ 
++    // Optional compute-only reservation high-water mark. Logical KV capacity,
++    // storage types and sequence state are never changed by these helpers.
++    bool enable_compute_growth(uint32_t minimum);
++    bool grow_compute_reservation(uint32_t required);
++    LLAMA_API uint32_t get_compute_reservation() const;
++
+     bool get_has_shift() const;
+ 
+     ggml_type type_k() const;
+@@ -330,11 +336,13 @@
+     // attention child. Indexed/SWA composites retain their original contract.
+     bool paged_hybrid_owner = false;
+     friend class llama_memory_hybrid;
++    friend struct llama_model;
+     friend class llama_kv_cache_context;
+     // Sticky across clear(): a late shared view may follow sparse live writes
+     // or a restore whose failed cleanup left the cache logically empty.
+     bool paged_storage_started = false;
+     void enable_paged_hybrid_owner();
++    void enable_paged_draft_owner();
+     void initialize_paged_pool();
+     void report_paged_admission() const;
+     mutable bool paged_admission_reported = false;
+@@ -346,6 +354,7 @@
+     bool grow_to(uint32_t tokens);
+     bool grow_paged_for(const slot_info & sinfo);
+     uint32_t growth_tokens_for(const slot_info & sinfo) const;
++    uint32_t compute_reservation_tokens = 0;
+     size_t trim_to(uint32_t tokens, const char * proc);
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+@@ -472,6 +481,9 @@
+     //
+ 
+     uint32_t get_n_kv() const;
++    std::vector<uint32_t> get_layer_ids() const;
++    // Includes every planned microbatch, before apply() publishes any cells.
++    uint32_t compute_reservation_required() const;
+     bool paged_attention_supported() const;
+     uint32_t get_n_kv_paged() const;
+     uint32_t get_paged_page_tokens() const { return llama_paged_kv_pool::page_tokens; }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -41,6 +41,7 @@
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
++#include <typeinfo>
+ #include <vector>
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+@@ -3400,6 +3401,10 @@
+             }
+     }
+ 
++    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && res && typeid(*res) == typeid(llama_kv_cache)) {
++        static_cast<llama_kv_cache *>(res)->enable_paged_draft_owner();
++    }
++
+     return res;
+ }
+ 
+diff --git a/tests/test-compute-growth.cpp b/tests/test-compute-growth.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-compute-growth.cpp
+@@ -0,0 +1,266 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++#include "speculative.h"
++#include "../src/llama-ext.h"
++#include "../src/llama-kv-cache.h"
++#include "../src/llama-memory-hybrid.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static bool gpu = false;
++static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++static void environment(const char * name, const char * value) {
++#ifdef _WIN32
++    require(_putenv_s(name, value ? value : "") == 0, "cannot configure compute-growth environment");
++#else
++    require((value ? setenv(name, value, 1) : unsetenv(name)) == 0, "cannot configure compute-growth environment");
++#endif
++}
++
++static llama_model_ptr model(bool hybrid, bool mtp = false) {
++    gguf_context_ptr metadata(gguf_init_empty());
++    const std::string arch = hybrid ? "qwen35" : "llama";
++    gguf_set_val_str(metadata.get(), "general.architecture", arch.c_str());
++    gguf_set_val_str(metadata.get(), "general.name", "nonzero-compute-growth-fixture");
++    auto u32 = [&](const char * key, uint32_t value) { gguf_set_val_u32(metadata.get(), (arch + "." + key).c_str(), value); };
++    u32("context_length", 16384); u32("embedding_length", 128); u32("block_count", mtp ? 3 : 2);
++    u32("feed_forward_length", 128); u32("attention.head_count", 2); u32("attention.head_count_kv", 1);
++    const uint32_t head_size = gpu ? 256 : 64;
++    u32("attention.key_length", head_size); u32("attention.value_length", head_size); u32("rope.dimension_count", head_size);
++    gguf_set_val_f32(metadata.get(), (arch + ".attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
++    if (hybrid) {
++        u32("nextn_predict_layers", mtp ? 1 : 0); u32("full_attention_interval", 2);
++        u32("ssm.conv_kernel", 4); u32("ssm.inner_size", 128); u32("ssm.state_size", 128);
++        u32("ssm.time_step_rank", 1); u32("ssm.group_count", 1);
++        const uint32_t sections[] = {head_size / 4, head_size / 4, 0, 0};
++        gguf_set_arr_data(metadata.get(), "qwen35.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
++    }
++    gguf_set_val_str(metadata.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) { char name[16]; std::snprintf(name, sizeof(name), "<0x%02X>", i); tokens.emplace_back(name); }
++    std::vector<const char *> names; for (const auto & token : tokens) { names.push_back(token.c_str()); }
++    std::vector<float> scores(259, 0); std::vector<int32_t> types(259, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(metadata.get(), "tokenizer.ggml.tokens", names.data(), names.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.eos_token_id", 2);
++    auto initialize = [](ggml_tensor * tensor, void *) {
++        require(tensor->type == GGML_TYPE_F32, "unexpected compute fixture weight type");
++        std::vector<float> values(size_t(ggml_nelements(tensor))); uint32_t state = 2166136261u;
++        for (const char * p = tensor->name; *p; ++p) { state = (state ^ uint8_t(*p)) * 16777619u; }
++        for (auto & value : values) {
++            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++            value = (float(state & 65535) / 65535.f - .5f) * .12f;
++        }
++        if (std::strstr(tensor->name, "norm")) { std::fill(values.begin(), values.end(), 1.f); }
++        if (std::strstr(tensor->name, "ssm_a") || std::strstr(tensor->name, "ssm_dt.bias")) { std::fill(values.begin(), values.end(), -1.f); }
++        ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
++    };
++    auto p = llama_model_default_params();
++    ggml_backend_dev_t devices[] = {gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
++    p.devices = devices; p.n_gpu_layers = gpu ? 99 : 0; p.gpu_exclusive = gpu; p.load_mode = LLAMA_LOAD_MODE_NONE;
++    p.use_extra_bufts = false; p.no_host = true; p.load_mtp = mtp;
++    if (gpu) { p.gpu_vram_limit_mib = 192; }
++    llama_model_ptr result(llama_model_init_from_user(metadata.get(), initialize, nullptr, p));
++    require(bool(result), "cannot initialize nonzero compute-growth model"); return result;
++}
++
++static llama_context_ptr context(llama_model * weights, bool growth, bool paged, ggml_type type,
++                                 uint32_t capacity = 1536, bool mtp = false, bool flash = true, llama_context * other = nullptr) {
++    environment("WILDLLAMA_COMPUTE_GROWTH", growth ? "1" : "0");
++    environment("WILDLLAMA_PAGED_ATTENTION", paged ? "1" : "0");
++    auto p = llama_context_default_params();
++    p.n_ctx = capacity; p.n_batch = 512; p.n_ubatch = 128; p.n_seq_max = 1; p.n_rs_seq = 2;
++    p.kv_unified = true; p.n_threads = p.n_threads_batch = 1; p.type_k = p.type_v = type;
++    p.n_outputs_max = 1; p.n_outputs_max_per_seq = 1; p.op_offload = p.offload_kqv = gpu;
++    p.flash_attn_type = flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    p.ctx_type = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
++    p.ctx_other = other;
++    llama_context_ptr result(llama_init_from_model(weights, p));
++    require(bool(result), "cannot initialize compute-growth context"); return result;
++}
++
++static llama_kv_cache * cache(llama_context * ctx) {
++    auto * memory = llama_get_memory(ctx);
++    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) { return kv; }
++    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory);
++    require(hybrid, "unexpected compute-growth memory type"); return hybrid->get_mem_attn();
++}
++
++static std::vector<float> decode(llama_context * ctx, int position, int count) {
++    auto b = llama_batch_init(count, 0, 1); b.n_tokens = count;
++    for (int i = 0; i < count; ++i) {
++        b.token[i] = 3 + ((position + i) * 13) % 256; b.pos[i] = position + i;
++        b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = i + 1 == count;
++    }
++    const int status = llama_decode(ctx, b); llama_batch_free(b);
++    require(status == 0, "compute-growth decode failed"); llama_synchronize(ctx);
++    if (gpu) {
++        llama_gpu_execution_stats stats{};
++        require(llama_gpu_execution_stats_get(ctx, &stats) && stats.gpu_heavy_ops_submitted > 0 && stats.cpu_heavy_ops_submitted == 0,
++            "compute-growth fixture silently used CPU heavy arithmetic");
++    }
++    const auto * values = llama_get_logits_ith(ctx, -1); require(values, "compute-growth logits missing");
++    return {values, values + 259};
++}
++static void identical(const std::vector<float> & a, const std::vector<float> & b) {
++    require(a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
++        "compute reservation changed actual continuation logits");
++    for (float value : b) { require(std::isfinite(value), "compute-growth produced nonfinite logits"); }
++}
++static std::vector<uint8_t> state(llama_context * ctx) {
++    std::vector<uint8_t> result(llama_state_seq_get_size(ctx, 0));
++    require(llama_state_seq_get_data(ctx, result.data(), result.size(), 0) == result.size(), "cannot save compute-growth state");
++    return result;
++}
++
++static void growth_cases(bool hybrid, bool paged, ggml_type type) {
++    auto weights = model(hybrid);
++    auto reference = context(weights.get(), false, paged, type), candidate = context(weights.get(), true, paged, type);
++    require(cache(reference.get())->get_compute_reservation() == 1536, "disabled path lost full reservation");
++    require(cache(candidate.get())->get_compute_reservation() == 256, "initial compute floor was not bounded");
++    for (const auto & span : {std::pair<int, int>{0, 128}, {128, 128}, {256, 128}, {384, 128}, {512, 512}}) {
++        identical(decode(reference.get(), span.first, span.second), decode(candidate.get(), span.first, span.second));
++    }
++    require(cache(candidate.get())->get_compute_reservation() == 1024, "compute high-water mark did not grow before all planned microbatches");
++    const auto saved = state(candidate.get());
++    const auto after_restore = decode(reference.get(), 1024, 1);
++    identical(after_restore, decode(candidate.get(), 1024, 1));
++    require(cache(candidate.get())->get_compute_reservation() == 1536, "compute growth did not clamp to logical capacity");
++    auto restored = context(weights.get(), true, paged, type);
++    require(llama_state_seq_set_data(restored.get(), saved.data(), saved.size(), 0) == saved.size(), "cannot restore compute-growth history");
++    identical(after_restore, decode(restored.get(), 1024, 1));
++    identical(decode(candidate.get(), 1025, 1), decode(restored.get(), 1025, 1));
++    require(llama_n_ctx(candidate.get()) == 1536 && llama_n_ctx(restored.get()) == 1536, "compute growth changed logical context");
++    if (gpu) {
++        llama_gpu_memory_stats stats{};
++        require(llama_model_get_gpu_memory_stats(weights.get(), &stats) && stats.enabled &&
++            stats.limit_bytes == 192 * 1024 * 1024 && stats.managed_peak_bytes <= stats.limit_bytes,
++            "compute growth bypassed managed VRAM quota");
++    }
++    std::printf("COMPUTE_GROWTH model=%s paged=%d type=%s initial=256 final=1536 exact_logits=1 PASS\n",
++        hybrid ? "hybrid" : "dense", paged, ggml_type_name(type));
++}
++
++static void independent_and_fallback() {
++    auto weights = model(false);
++    environment("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "0");
++    { auto ctx = context(weights.get(), true, false, GGML_TYPE_F16, 16384);
++      require(cache(ctx.get())->get_compute_reservation() == 8192, "compute growth wrongly requires physical KV growth"); }
++    environment("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "256");
++    { auto ctx = context(weights.get(), true, false, GGML_TYPE_F16, 1536, false, false);
++      require(cache(ctx.get())->get_compute_reservation() == 1536, "unsupported non-FA layout did not retain full reservation"); }
++}
++
++static void quota_denial(bool hybrid) {
++    if (!gpu) { return; }
++    auto weights = model(hybrid);
++    auto candidate = context(weights.get(), true, false, GGML_TYPE_F16);
++    decode(candidate.get(), 0, 256);
++    require(cache(candidate.get())->get_compute_reservation() == 256, "denial fixture already crossed initial compute floor");
++    const auto before = state(candidate.get());
++    llama_gpu_memory_stats stats{};
++    require(llama_model_get_gpu_memory_stats(weights.get(), &stats) && stats.enabled &&
++        stats.limit_bytes > stats.managed_used_bytes + 4096, "bounded compute denial quota unavailable");
++    auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++    ggml_backend_buffer_ptr filler(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(device),
++        size_t(stats.limit_bytes - stats.managed_used_bytes - 1024)));
++    require(bool(filler), "cannot allocate bounded compute denial control");
++    auto b = llama_batch_init(512, 0, 1); b.n_tokens = 512;
++    for (int i = 0; i < 512; ++i) {
++        b.token[i] = 3 + ((256 + i) * 13) % 256; b.pos[i] = 256 + i;
++        b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = i == 511;
++    }
++    for (int attempt = 0; attempt < 2; ++attempt) {
++        require(llama_decode(candidate.get(), b) == -2, "compute growth unexpectedly bypassed managed quota");
++        require(state(candidate.get()) == before, "denied compute preflight changed attention/recurrent state");
++        require(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), 0) == 255, "denied compute preflight advanced sequence");
++    }
++    llama_batch_free(b);
++    filler.reset();
++    decode(candidate.get(), 256, 512);
++    require(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), 0) == 767, "compute retry failed after quota release");
++    require(llama_model_get_gpu_memory_stats(weights.get(), &stats) && stats.managed_peak_bytes <= stats.limit_bytes,
++        "compute denial/retry exceeded managed VRAM quota");
++    std::printf("COMPUTE_GROWTH_DENIAL model=%s repeated_denial=2 prior_state=exact retry_after_release=1 PASS\n", hybrid ? "hybrid" : "dense");
++}
++
++static void draft_ownership() {
++    auto weights = model(true, true);
++    environment("WILDLLAMA_PAGED_DRAFT", "0");
++    auto target = context(weights.get(), true, false, GGML_TYPE_F16);
++    auto conventional = context(weights.get(), true, false, GGML_TYPE_F16, 1536, true, true, target.get());
++    require(!cache(conventional.get())->get_cells(0).get_page_pool().enabled(), "disabled draft flag admitted a hybrid MTP cache");
++    environment("WILDLLAMA_PAGED_DRAFT", "1");
++    auto draft = context(weights.get(), true, false, GGML_TYPE_F16, 1536, true, true, target.get());
++    require(cache(draft.get())->get_cells(0).get_page_pool().enabled(), "independent MTP draft page flag did not admit its attention-only owner");
++    auto target_after_flag = context(weights.get(), true, false, GGML_TYPE_F16);
++    require(!cache(target_after_flag.get())->get_cells(0).get_page_pool().enabled(), "draft flag incorrectly enabled target paging");
++    environment("WILDLLAMA_PAGED_DRAFT", "0");
++
++    auto make_spec = [&](llama_context * head) {
++        common_params_speculative cfg;
++        cfg.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; cfg.draft.ctx_tgt = target.get(); cfg.draft.ctx_dft = head;
++        cfg.draft.n_max = 2; cfg.draft.n_min = 0; cfg.draft.p_min = 0; cfg.draft.backend_sampling = false;
++        common_speculative_ptr result(common_speculative_init(cfg, 1));
++        require(bool(result), "cannot initialize tiny MTP catch-up"); return result;
++    };
++    auto ordinary_spec = make_spec(conventional.get()), paged_spec = make_spec(draft.get());
++    for (int position = 0; position < 260; ++position) {
++        common_batch b(target.get()); b.add(3 + (position * 13) % 256, position, 0, true);
++        require(llama_process(target.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "tiny MTP target decode failed");
++        require(common_speculative_process(ordinary_spec.get(), b) && common_speculative_process(paged_spec.get(), b),
++            "tiny MTP head catch-up failed");
++    }
++    require(cache(draft.get())->get_compute_reservation() == 512, "MTP head did not grow its compute reservation");
++    require(cache(draft.get())->paged_reads_confirmed(), "MTP head graph did not prove paged reads");
++    llama_tokens ordinary_tokens, paged_tokens;
++    auto propose = [&](common_speculative * spec, llama_tokens & tokens) {
++        auto & p = common_speculative_get_draft_params(spec, 0);
++        p.drafting = true; p.n_max = 2; p.pos0 = 260; p.id_last = 7; p.result = &tokens;
++        common_speculative_draft(spec);
++    };
++    propose(ordinary_spec.get(), ordinary_tokens); propose(paged_spec.get(), paged_tokens);
++    require(ordinary_tokens.size() == 2 && ordinary_tokens == paged_tokens,
++        "paged MTP attention changed tiny greedy proposals");
++    std::puts("COMPUTE_GROWTH_MTP draft_flag_independent=1 attention_only_owner=1 actual_paged_reads=1 catchup_growth=1 greedy_proposals=identical PASS");
++}
++
++int main(int argc, char ** argv) {
++    try {
++        std::setvbuf(stdout, nullptr, _IONBF, 0); gpu = argc == 2 && std::strcmp(argv[1], "--cuda") == 0;
++        require(argc == 1 || gpu, "use test-compute-growth [--cuda]");
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "cannot load isolated CPU backend");
++#endif
++        if (gpu) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "cannot load isolated CUDA backend");
++#else
++            std::puts("SKIP: CUDA backend not built"); return 77;
++#endif
++        }
++        environment("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "256"); environment("WILDLLAMA_KV_CACHE_PAGING", "0");
++        environment("WILDLLAMA_GRAPH_VARIANTS_MIB", "0"); environment("WILDLLAMA_PAGED_DRAFT", "0");
++        llama_backend_init();
++        for (bool hybrid : {false, true}) {
++            for (bool paged : {false, true}) {
++                for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) { growth_cases(hybrid, paged, type); }
++            }
++        }
++        independent_and_fallback(); draft_ownership(); quota_denial(false); quota_denial(true);
++        llama_backend_free();
++        std::printf("COMPUTE_GROWTH backend=%s model_cases=12 pretrained_models=0 downloads=0 PASS\n", gpu ? "CUDA" : "CPU"); return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}

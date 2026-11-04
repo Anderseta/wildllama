@@ -483,3 +483,32 @@ if(TARGET ggml-cuda)
     add_test(NAME kv-paged-hybrid-cuda COMMAND test-kv-paged-hybrid --cuda)
     set_tests_properties(kv-paged-hybrid-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endif()
+
+validation_target(test-compute-growth llama-common)
+target_include_directories(test-compute-growth PRIVATE
+    "${WILDLLAMA_NATIVE}/src" "${WILDLLAMA_NATIVE}/ggml/src")
+add_dependencies(test-compute-growth ggml-cpu)
+target_compile_definitions(test-compute-growth PRIVATE
+    GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+add_test(NAME compute-growth-cpu COMMAND test-compute-growth)
+if(TARGET ggml-cuda)
+    add_dependencies(test-compute-growth ggml-cuda)
+    target_compile_definitions(test-compute-growth PRIVATE
+        GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
+    add_test(NAME compute-growth-cuda COMMAND test-compute-growth --cuda)
+    set_tests_properties(compute-growth-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()
+
+validation_target(test-compact-attn-mask ggml)
+target_include_directories(test-compact-attn-mask PRIVATE "${WILDLLAMA_NATIVE}/ggml/src")
+add_dependencies(test-compact-attn-mask ggml-cpu)
+target_compile_definitions(test-compact-attn-mask PRIVATE
+    GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+add_test(NAME compact-attn-mask-host COMMAND test-compact-attn-mask --host-only)
+if(TARGET ggml-cuda)
+    add_dependencies(test-compact-attn-mask ggml-cuda)
+    target_compile_definitions(test-compact-attn-mask PRIVATE
+        GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
+    add_test(NAME compact-attn-mask-cuda COMMAND test-compact-attn-mask --cuda)
+    set_tests_properties(compact-attn-mask-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()

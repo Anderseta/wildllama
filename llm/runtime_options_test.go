@@ -132,6 +132,57 @@ func TestPagedAttentionEnvironmentPreservesRunnerPolicies(t *testing.T) {
 	}
 }
 
+func TestVRAMSavingsAreIndependentRunnerOverrides(t *testing.T) {
+	keys := []string{"WILDLLAMA_COMPUTE_GROWTH", "WILDLLAMA_COMPACT_ATTN_MASK", "WILDLLAMA_CUDA_POOL_TRIM", "WILDLLAMA_PAGED_DRAFT"}
+	for _, key := range keys {
+		t.Setenv(key, "1")
+	}
+	policies := map[string]string{
+		"LLAMA_ARG_GPU_VRAM_LIMIT_MIB": "12288", "LLAMA_ARG_MOE_RAM_LIMIT_MIB": "10240",
+		"WILDLLAMA_KV_CACHE_INITIAL_TOKENS": "8192", "LLAMA_ARG_CTX_SIZE": "131072",
+		"LLAMA_ARG_CACHE_TYPE_K": "q8_0", "LLAMA_ARG_CACHE_TYPE_V": "q8_0",
+		"WILDLLAMA_PAGED_ATTENTION": "0", "WILDLLAMA_KV_CACHE_PAGING": "0",
+	}
+	for _, changed := range keys {
+		for _, value := range []string{"", "0", "1"} {
+			t.Run(changed+"="+value, func(t *testing.T) {
+				input := make(map[string]string)
+				for key, item := range policies {
+					input[key] = item
+				}
+				input[changed] = value
+				_, err := api.ParseRunnerEnvironment(map[string]string{changed: value})
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmd := &exec.Cmd{}
+				SetupLlamaServerCommandEnv(cmd, "llama-server", nil, input)
+				actual := make(map[string]string)
+				for _, entry := range cmd.Env {
+					key, item, _ := strings.Cut(entry, "=")
+					actual[key] = item
+				}
+				if got, present := actual[changed]; got != value || present != (value != "") {
+					t.Fatalf("explicit savings override lost: %s=%q present=%v", changed, got, present)
+				}
+				for key, item := range policies {
+					if actual[key] != item {
+						t.Fatalf("savings changed policy %s: %q", key, actual[key])
+					}
+				}
+				for _, key := range keys {
+					if key != changed && actual[key] != "1" {
+						t.Fatalf("independent option changed: %s=%q", key, actual[key])
+					}
+					if os.Getenv(key) != "1" {
+						t.Fatal("profile changed the parent process environment")
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestLogicalAndPhysicalBatchAreIndependent(t *testing.T) {
 	opts := api.DefaultOptions()
 	opts.NumBatch = 2048
