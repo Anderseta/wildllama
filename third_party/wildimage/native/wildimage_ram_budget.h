@@ -21,7 +21,20 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#pragma push_macro("WIN32_LEAN_AND_MEAN")
+#pragma push_macro("small")
+#pragma push_macro("near")
+#pragma push_macro("far")
+#pragma push_macro("interface")
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
+#pragma pop_macro("interface")
+#pragma pop_macro("far")
+#pragma pop_macro("near")
+#pragma pop_macro("small")
+#pragma pop_macro("WIN32_LEAN_AND_MEAN")
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
