@@ -290,8 +290,53 @@ index f4ea0ea..291afee 100644
  enum rng_type_t {
      STD_DEFAULT_RNG,
      CUDA_RNG,
+diff --git a/src/convert.cpp b/src/convert.cpp
+index b8a6212..932b3a6 100644
+--- a/src/convert.cpp
++++ b/src/convert.cpp
+@@ -218,6 +218,8 @@ static bool stream_tensor_data(ModelLoader& model_loader,
+     std::condition_variable memory_cv;
+     std::vector<std::thread> workers;
+     workers.reserve(n_threads);
++    wildimage_ram::ThreadFailures worker_errors;
++    wildimage_ram::JoinThreads<decltype(workers)> join_workers(workers);
+ 
+     auto reserve_memory = [&](size_t bytes) -> bool {
+         std::unique_lock<std::mutex> lock(work_mutex);
+@@ -252,6 +254,7 @@ static bool stream_tensor_data(ModelLoader& model_loader,
+ 
+     for (int worker = 0; worker < n_threads; worker++) {
+         workers.emplace_back([&]() {
++            worker_errors.run([&]() {
+             std::fstream output_file(std::filesystem::u8path(output_path), std::ios::binary | std::ios::in | std::ios::out);
+             if (!output_file.is_open()) {
+                 fail("failed to open output file '" + output_path + "' for tensor writing");
+@@ -281,6 +284,7 @@ static bool stream_tensor_data(ModelLoader& model_loader,
+                         job.success = load_tensor_for_export(model_loader, job);
+                     }
+                 } catch (const std::exception& e) {
++                    if(dynamic_cast<const wildimage_ram::Exceeded*>(&e) || dynamic_cast<const std::bad_alloc*>(&e)) wildimage_ram::budget().fail();
+                     job.error   = e.what();
+                     job.success = false;
+                 }
+@@ -314,12 +318,15 @@ static bool stream_tensor_data(ModelLoader& model_loader,
+                 }
+                 release_memory(tensor_bytes);
+             }
++            });
++            if(worker_errors.failed.load()) fail("streaming conversion worker failed");
+         });
+     }
+ 
+     for (auto& worker : workers) {
+         worker.join();
+     }
++    worker_errors.rethrow();
+     printf("\n");
+     if (failed) {
+         if (error != nullptr) {
 diff --git a/src/core/compute_workspace.cpp b/src/core/compute_workspace.cpp
-index 4e53175..132bd57 100644
+index 4e53175..9373c78 100644
 --- a/src/core/compute_workspace.cpp
 +++ b/src/core/compute_workspace.cpp
 @@ -58,6 +58,11 @@ namespace sd {
@@ -306,7 +351,7 @@ index 4e53175..132bd57 100644
          return true;
      }
  
-@@ -80,11 +85,17 @@ namespace sd {
+@@ -80,11 +85,18 @@ namespace sd {
          }
          ggml_backend_sched_reset(scheduler_);
          assign_nodes(scheduler_, graph);
@@ -315,6 +360,7 @@ index 4e53175..132bd57 100644
 +        }
          // Scheduler allocation rewrites sources. Split the execution graph only once.
          if (!ggml_backend_sched_alloc_graph(scheduler_, graph)) {
++            if(sd_backend_is_cpu(backend_)) wildimage_ram::budget().fail();
 +            if(planned_ram_==0 && !sd_backend_is_cpu(backend_)) wildimage_ram::gpu_failure();
              release();
              return false;
@@ -324,7 +370,7 @@ index 4e53175..132bd57 100644
          active_ = true;
          return true;
      }
-@@ -208,6 +219,7 @@ namespace sd {
+@@ -208,6 +220,7 @@ namespace sd {
              for (size_t i = 0; i < extra_backends_.size(); ++i) {
                  result.buffers.push_back({extra_backends_[i], sizes[i + 1]});
              }
@@ -332,7 +378,7 @@ index 4e53175..132bd57 100644
              ggml_backend_sched_free(scheduler);
          }
          for (const auto& entry : external_buffers) {
-@@ -255,6 +267,7 @@ namespace sd {
+@@ -255,6 +268,7 @@ namespace sd {
          measurement_key_.clear();
          measured_buffers_.clear();
          ggml_backend_sched_free(scheduler_);
@@ -395,6 +441,42 @@ index 5639c7e..b9d270e 100644
      std::vector<float> random_numbers = rng->randn(n);
      for (uint32_t i = 0; i < n; i++) {
          ggml_ext_im_set_f32_1d(tensor, i, random_numbers[i]);
+diff --git a/src/core/parallel.cpp b/src/core/parallel.cpp
+index a89c197..39a49a9 100644
+--- a/src/core/parallel.cpp
++++ b/src/core/parallel.cpp
+@@ -6,6 +6,7 @@
+ #include <mutex>
+ #include <thread>
+ #include <vector>
++#include "core/wildimage_ram_budget.h"
+ 
+ namespace sd {
+ 
+@@ -33,6 +34,7 @@ namespace sd {
+         int64_t count                                     = 0;
+         const std::function<void(int64_t, int64_t)>* task = nullptr;
+         std::exception_ptr error;
++        bool optional_work=false;
+ 
+         explicit Impl(ParallelExecutor* owner)
+             : owner(owner) {}
+@@ -51,6 +53,7 @@ namespace sd {
+         }
+ 
+         void execute(int index) {
++            wildimage_ram::OptionalWork optional(optional_work);
+             ParallelScope scope(owner);
+             parallel_detail::Region region;
+             const int64_t size  = count / participants;
+@@ -104,6 +107,7 @@ namespace sd {
+             pending      = n_tasks - 1;
+             task         = &callback;
+             error        = nullptr;
++            optional_work=wildimage_ram::optional_work();
+             for (int i = 0; i < pending; ++i) {
+                 workers[i]->ready = true;
+                 workers[i]->wake.notify_one();
 diff --git a/src/core/rng.hpp b/src/core/rng.hpp
 index 84e285c..f6e0526 100644
 --- a/src/core/rng.hpp
@@ -495,6 +577,36 @@ index b6fe1c7..008c209 100644
          ggml_context* context        = nullptr;
          ggml_backend_buffer_t buffer = nullptr;
          ggml_tensor* tensor          = nullptr;
+diff --git a/src/core/segment_weight_pipeline.cpp b/src/core/segment_weight_pipeline.cpp
+index 2df9a89..ad0dc78 100644
+--- a/src/core/segment_weight_pipeline.cpp
++++ b/src/core/segment_weight_pipeline.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "core/ggml_graph_cut.h"
+ #include "device_residency_manager.h"
++#include "core/wildimage_ram_budget.h"
+ 
+ namespace sd {
+     static ggml_tensor* canonical_param(
+@@ -128,6 +129,8 @@ namespace sd {
+     void SegmentWeightPipeline::enqueue_next(
+         size_t segment_index,
+         const DeviceMemoryRequest& request) {
++        wildimage_ram::OptionalWork optional;
++        try {
+         if (!enabled_ || queued_segment_ != SIZE_MAX) {
+             return;
+         }
+@@ -193,6 +196,8 @@ namespace sd {
+                 return;
+         }
+         disable();
++        } catch(const wildimage_ram::Exceeded&) {disable();}
++          catch(const std::bad_alloc&) {disable();}
+     }
+ 
+     void SegmentWeightPipeline::submit_next() {
 diff --git a/src/core/tensor.hpp b/src/core/tensor.hpp
 index a925dbf..5166869 100644
 --- a/src/core/tensor.hpp
@@ -652,7 +764,7 @@ index 76cbccb..4674169 100644
                      std::vector<ggml_tensor*> masks, ref_inputs;
                      for (const auto& mask : mask_data) {
 diff --git a/src/model_loader.cpp b/src/model_loader.cpp
-index 5576067..f57e989 100644
+index 5576067..32c8b0b 100644
 --- a/src/model_loader.cpp
 +++ b/src/model_loader.cpp
 @@ -17,6 +17,7 @@
@@ -672,6 +784,58 @@ index 5576067..f57e989 100644
          buf.resize(sizeof(float) * n);
          char* src_data_f32 = buf.data();
          qtype->to_float(src, (float*)src_data_f32, n);
+@@ -1173,13 +1174,18 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+         std::atomic<bool> failed(false);
+         std::vector<std::thread> workers;
+         std::mutex backend_tensor_set_mutex;
++        wildimage_ram::ThreadFailures worker_errors;
++        wildimage_ram::JoinThreads<decltype(workers)> join_workers(workers);
+ 
+         for (int i = 0; i < n_threads; ++i) {
+             workers.emplace_back([&, file_path, is_zip]() {
++                worker_errors.run([&]() {
+                 std::ifstream file;
+                 zip_t* zip = nullptr;
++                std::unique_ptr<zip_t,decltype(&zip_close)> zip_owner(nullptr,&zip_close);
+                 if (is_zip) {
+                     zip = zip_open(file_path.c_str(), 0, 'r');
++                    zip_owner.reset(zip);
+                     if (zip == nullptr) {
+                         LOG_ERROR("failed to open zip '%s'", file_path.c_str());
+                         failed = true;
+@@ -1194,9 +1200,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+                     }
+                 }
+ 
+-                std::vector<uint8_t> read_buffer;
+-                std::vector<uint8_t> convert_buffer;
+-                std::vector<uint8_t> zip_entry_buffer;
++                std::vector<uint8_t,wildimage_ram::Allocator<uint8_t>> read_buffer;
++                std::vector<uint8_t,wildimage_ram::Allocator<uint8_t>> convert_buffer;
++                std::vector<uint8_t,wildimage_ram::Allocator<uint8_t>> zip_entry_buffer;
+ 
+                 while (true) {
+                     int64_t t0, t1;
+@@ -1379,9 +1385,8 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+ 
+                     bytes_processed.fetch_add((uint64_t)nbytes_to_read);
+                 }
+-                if (zip != nullptr) {
+-                    zip_close(zip);
+-                }
++                });
++                if(worker_errors.failed.load()) failed=true;
+             });
+         }
+ 
+@@ -1404,6 +1409,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+         for (auto& w : workers) {
+             w.join();
+         }
++        worker_errors.rethrow();
+ 
+         if (failed) {
+             success = false;
 diff --git a/src/model_manager.cpp b/src/model_manager.cpp
 index 8b61827..5d3d317 100644
 --- a/src/model_manager.cpp
@@ -914,7 +1078,7 @@ index 81d2546..e7b5ba5 100644
      bool mmap_params(const std::vector<TensorState*>& states,
                       std::vector<ParamsStorageBlock*>& created_storage_blocks);
 diff --git a/src/model_manager_prefetch.cpp b/src/model_manager_prefetch.cpp
-index 4056b8f..6e880d9 100644
+index 4056b8f..a28ad88 100644
 --- a/src/model_manager_prefetch.cpp
 +++ b/src/model_manager_prefetch.cpp
 @@ -118,6 +118,11 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
@@ -929,6 +1093,19 @@ index 4056b8f..6e880d9 100644
          staging_block->buffer =
              ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, buffer_type);
          if (staging_block->buffer == nullptr) {
+@@ -267,9 +272,9 @@ WeightPrefetchResult ModelManager::prepare_prefetch_params(
+         return WeightPrefetchResult::Unsupported;
+     }
+     clear_prefetched_params(owner_id);
+-    if (!load_tensors_to_params_backend(states)) {
+-        return WeightPrefetchResult::Failed;
+-    }
++    try {
++        if (!load_tensors_to_params_backend(states)) {reclaim_ram(SIZE_MAX,{}); return WeightPrefetchResult::Failed;}
++    } catch(...) {reclaim_ram(SIZE_MAX,{}); throw;}
+ 
+     auto block             = std::make_unique<PrefetchBlock>();
+     block->states          = std::move(states);
 diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
 index d161d9e..d4baca3 100644
 --- a/src/pipeline/diffusion_engine.cpp

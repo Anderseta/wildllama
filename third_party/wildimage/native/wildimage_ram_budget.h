@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <exception>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -44,6 +45,16 @@ namespace wildimage_ram {
 constexpr uint64_t GiB = uint64_t(1) << 30;
 struct Memory { uint64_t total = 0, available = 0; };
 inline uint64_t saturating_add(uint64_t a,uint64_t b) {return b>UINT64_MAX-a ? UINT64_MAX : a+b;}
+inline unsigned& optional_depth() {static thread_local unsigned value=0; return value;}
+inline bool optional_work() {return optional_depth()!=0;}
+class OptionalWork {
+    bool enabled_;
+public:
+    explicit OptionalWork(bool enabled=true):enabled_(enabled) {if(enabled_) ++optional_depth();}
+    ~OptionalWork() {if(enabled_) --optional_depth();}
+    OptionalWork(const OptionalWork&)=delete;
+    OptionalWork& operator=(const OptionalWork&)=delete;
+};
 
 inline Memory system_memory() {
 #if defined(_WIN32)
@@ -131,6 +142,7 @@ public:
     }
     void release(uint64_t bytes) { if (bytes) used_.fetch_sub(bytes); }
     void fail() {
+        if(optional_work()) return;
         ram_failure = true;
         std::fprintf(stderr,"WILDIMAGE_RAM_BUDGET_EXHAUSTED: managed %.2f MiB, limit %.2f MiB\n", used()/1048576.,limit()/1048576.);
     }
@@ -166,8 +178,39 @@ inline uint64_t tensor_bytes(uint64_t elements, uint64_t size) {
     if (size && elements > UINT64_MAX/size) { budget().fail(); throw Exceeded(); }
     return elements*size;
 }
-inline void gpu_failure() { budget().gpu_failure=true; }
+inline void gpu_failure() { if(!optional_work()) budget().gpu_failure=true; }
 inline int classify_exit(int status,int memory_code) { return status && (memory_code==75 || memory_code==76) ? memory_code : status; }
+
+// Own exceptions in the actual allocation thread, then rethrow after joining.
+// Optional work cannot erase (or classify) another thread's required failure.
+class ThreadFailures {
+    const bool optional_=optional_work();
+    std::mutex mutex_;
+    std::exception_ptr error_;
+public:
+    std::atomic<bool> failed{false};
+    template<class F> void run(F&& work) noexcept {
+        OptionalWork scope(optional_);
+        try {work();}
+        catch(...) {
+            const auto error=std::current_exception();
+            try {std::rethrow_exception(error);}
+            catch(const Exceeded&) {budget().fail();}
+            catch(const std::bad_alloc&) {budget().fail();}
+            catch(...) {}
+            {std::lock_guard<std::mutex> lock(mutex_); if(!error_) error_=error;}
+            failed=true;
+        }
+    }
+    void rethrow() {std::exception_ptr error; {std::lock_guard<std::mutex> lock(mutex_); error=error_;} if(error) std::rethrow_exception(error);}
+};
+
+template<class Threads> class JoinThreads {
+    Threads& threads_;
+public:
+    explicit JoinThreads(Threads& threads):threads_(threads) {}
+    ~JoinThreads() {for(auto& thread:threads_) if(thread.joinable()) thread.join();}
+};
 
 template<class T> struct Allocator {
     using value_type=T;
@@ -207,6 +250,9 @@ inline void* raw_realloc(void* ptr,size_t bytes) noexcept {
     size_t old=0;
     { auto& registry=raw_registry(); std::lock_guard<std::mutex> lock(registry.mutex);
       auto found=registry.sizes.find(ptr); if(found==registry.sizes.end()) return nullptr; old=found->second; }
+    // Shrinking need not allocate. Retain the actual capacity and its charge
+    // until free (or a later growth), so a full budget cannot reject a shrink.
+    if(bytes<=old) return ptr;
     auto* next=raw_malloc(bytes); if(!next) return nullptr;
     std::memcpy(next,ptr,std::min(old,bytes)); raw_free(ptr); return next;
 }
