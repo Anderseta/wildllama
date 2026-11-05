@@ -291,20 +291,22 @@ index f4ea0ea..291afee 100644
      STD_DEFAULT_RNG,
      CUDA_RNG,
 diff --git a/src/convert.cpp b/src/convert.cpp
-index b8a6212..932b3a6 100644
+index b8a6212..fa12b6f 100644
 --- a/src/convert.cpp
 +++ b/src/convert.cpp
-@@ -218,6 +218,8 @@ static bool stream_tensor_data(ModelLoader& model_loader,
+@@ -218,6 +218,7 @@ static bool stream_tensor_data(ModelLoader& model_loader,
      std::condition_variable memory_cv;
      std::vector<std::thread> workers;
      workers.reserve(n_threads);
 +    wildimage_ram::ThreadFailures worker_errors;
-+    wildimage_ram::JoinThreads<decltype(workers)> join_workers(workers);
  
      auto reserve_memory = [&](size_t bytes) -> bool {
          std::unique_lock<std::mutex> lock(work_mutex);
-@@ -252,6 +254,7 @@ static bool stream_tensor_data(ModelLoader& model_loader,
+@@ -250,8 +251,10 @@ static bool stream_tensor_data(ModelLoader& model_loader,
+         memory_cv.notify_all();
+     };
  
++    wildimage_ram::JoinThreads<decltype(workers)> join_workers(workers);
      for (int worker = 0; worker < n_threads; worker++) {
          workers.emplace_back([&]() {
 +            worker_errors.run([&]() {

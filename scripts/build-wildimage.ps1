@@ -62,6 +62,19 @@ function Invoke-Checked([string]$Executable, [string[]]$Arguments, [string]$Log)
 
 function Copy-ReplacingFile([string]$Source, [string]$Target) {
     $Target = Assert-DataPath $Target
+    if (Test-Path -LiteralPath $Target -PathType Leaf) {
+        $existing = Get-Item -LiteralPath $Target -Force
+        # Keep timestamps on identical regular files: touching copied headers
+        # otherwise invalidates every dependent native compilation unit.
+        if (-not ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            $inputFile = Get-Item -LiteralPath $Source -Force
+            if ($existing.Length -eq $inputFile.Length -and
+                (Get-FileHash -LiteralPath $Target -Algorithm SHA256).Hash -eq
+                (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash) {
+                return
+            }
+        }
+    }
     $directory = Split-Path -Parent $Target
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
     $temporary = Join-Path $directory ('.' + [IO.Path]::GetFileName($Target) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
@@ -249,7 +262,7 @@ int main() {
         "-DCMAKE_CUDA_COMPILER=$($nvcc.Replace('\', '/'))", "-DCMAKE_CUDA_HOST_COMPILER=$($cl.Replace('\', '/'))", '-DCMAKE_BUILD_TYPE=Release',
         '-DCMAKE_TRY_COMPILE_CONFIGURATION=Release', '-DCMAKE_C_FLAGS_DEBUG=/MDd /Ob0 /Od /RTC1 /Z7', '-DCMAKE_CXX_FLAGS_DEBUG=/MDd /Ob0 /Od /RTC1 /Z7',
         "-DCMAKE_INSTALL_PREFIX=$((Join-Path $BuildDirectory 'install').Replace('\', '/'))", "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures",
-        '-DSD_BUILD_SHARED_LIBS=ON', '-DSD_BUILD_SHARED_GGML_LIB=OFF', '-DSD_BUILD_EXAMPLES=ON',
+        '-DSD_BUILD_SHARED_LIBS=ON', '-DSD_BUILD_SHARED_GGML_LIB=OFF', '-DSD_BUILD_EXAMPLES=ON', '-DSD_SERVER_BUILD_FRONTEND=OFF',
         '-DSD_USE_SYSTEM_GGML=ON', '-DSD_USE_UPSTREAM_GGML=OFF', "-Dggml_DIR=$($imports.Replace('\', '/'))",
         '-DSD_CUDA=ON', '-DSD_WEBP=ON', '-DSD_WEBM=ON', '-DSD_USE_SYSTEM_WEBP=OFF', '-DSD_USE_SYSTEM_WEBM=OFF')
     Invoke-Checked $CmakePath $configureArguments (Join-Path $BuildDirectory 'configure.log') | Out-Null
