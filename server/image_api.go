@@ -133,6 +133,7 @@ type imageJob struct {
 	PersistenceError    string                  `json:"persistence_error,omitempty"`
 	Result              *imageAsset             `json:"result,omitempty"`
 	Results             []imageAsset            `json:"results,omitempty"`
+	DeletedAssetIDs     []string                `json:"deleted_asset_ids,omitempty"`
 	Generation          *imageGenerationSummary `json:"generation,omitempty"`
 	ParentAssetID       string                  `json:"parent_asset_id,omitempty"`
 	TextRestoreDeferred bool                    `json:"text_restore_deferred,omitempty"`
@@ -177,6 +178,8 @@ type imageService struct {
 	sessionDeleteErr  error
 	assetOwnersDirty  bool
 	assetCatalogError error
+	assetDeletions    map[string]imageAssetRecord
+	assetDeleteErr    error
 	ownedDirectories  map[string]imageOwnedDirectory
 	newEngine         func(imagegen.Config) (imagegen.Runner, error)
 	text              imageTextBackend
@@ -268,6 +271,7 @@ func (s *Server) imageService() *imageService {
 		}
 		service.recoverImageJobStates()
 		service.loadDeletedImageSessions()
+		service.loadImageAssetDeletions()
 		s.images = service
 	})
 	return s.images
@@ -459,10 +463,11 @@ func (s *Server) registerImageRoutes(r *gin.Engine) {
 	r.POST("/api/images/jobs/:id/cancel", s.imageCancelHandler)
 	r.POST("/api/images/jobs/by-request/:request_id/cancel", s.imageCancelHandler)
 	r.GET("/api/images/assets/:id/:filename", s.imageAssetHandler)
+	r.DELETE("/api/images/assets/:id/:filename", s.imageAssetDeleteHandler)
 	r.POST("/api/images/assets", s.imageUploadHandler)
 	r.DELETE("/api/images/sessions/:session_id", s.imageSessionDeleteHandler)
 	r.GET("/api/images/capabilities", func(c *gin.Context) {
-		c.JSON(200, gin.H{"session_deletion": true})
+		c.JSON(200, gin.H{"session_deletion": true, "asset_deletion": true})
 	})
 }
 

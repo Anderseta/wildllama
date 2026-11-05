@@ -272,3 +272,12 @@ Small tests cover configuration, admission, cancellation, restore failures,
 idempotency, downloads and asset handling without loading a large image model.
 Actual image quality, peak memory and throughput must be measured with the complete
 selected pipeline on an available GPU; model-free tests do not establish them.
+
+Individual assets can be removed with `DELETE /api/images/assets/:id/:filename`,
+optionally scoped by `session_id`. The server rejects active outputs/references,
+keeps batch siblings, and collects unshared managed input copies. Only registered
+output paths are accepted; source photos, models and shared runtime caches are
+never deletion targets. An empty per-image directory and its task recovery file
+are removed after the final output disappears. Durable deletion records fence
+upload replay and sanitize recovered task/catalog state after restart; completed
+cleanup records do not repeat filesystem scans on subsequent deletions.

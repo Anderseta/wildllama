@@ -19,6 +19,7 @@ type imageAssetRecord struct {
 	Input             bool     `json:"input,omitempty"`
 	UploadFingerprint string   `json:"upload_fingerprint,omitempty"`
 	ReferenceAssetIDs []string `json:"reference_asset_ids,omitempty"`
+	DeletionCompleted bool     `json:"deletion_completed,omitempty"`
 }
 
 func (v *imageService) persistJobsLocked() error {
