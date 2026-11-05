@@ -54,7 +54,34 @@ func (v *imageService) update(job *imageJob, phase, message string, current, tot
 	defer v.mu.Unlock()
 	job.Phase = phase
 	job.Progress = imageProgress{Current: current, Total: total, Message: message, BatchIndex: job.Progress.BatchIndex, BatchCount: job.Progress.BatchCount}
+	backendChanged := false
+	if phase == "ram_offload" || phase == "cpu_fallback" {
+		backendChanged = !job.RAMOffload
+		job.RAMOffload = true
+	}
+	if phase == "cpu_fallback" && job.ComputeBackend != "cpu" {
+		job.ComputeBackend = "cpu"
+		backendChanged = true
+	}
+	if backendChanged {
+		v.persistImageJobStateLocked(job)
+	}
 	// Byte/step progress is live; persisted running/terminal states avoid disk churn.
+}
+
+func (v *imageService) setImageComputeBackend(job *imageJob, cpu bool) {
+	backend := "cuda0"
+	if cpu {
+		backend = "cpu"
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if job.ComputeBackend != backend || job.RAMOffload != cpu {
+		job.ComputeBackend = backend
+		job.RAMOffload = cpu
+		// Persist a backend transition once, rather than writing every step.
+		v.persistImageJobStateLocked(job)
+	}
 }
 
 func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
@@ -106,6 +133,8 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 	job.ID = newImageID()
 	job.Status = "queued"
 	job.Phase = "queued"
+	job.ComputeBackend = ""
+	job.RAMOffload = false
 	job.CreatedAt = time.Now().UTC()
 	job.ctx, job.cancel = context.WithCancel(v.ctx)
 	job.ctx = imagegen.WithDiskReserve(job.ctx, job.Config.MinFreeDiskMiB)
@@ -506,9 +535,11 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		}
 	}
 	v.update(job, "checking_memory", "Checking actual free CUDA memory; the fitting target is not a hard process limit", 0, 0)
-	if beforeImageFree, err = v.waitForMemory(job.ctx, profile.MaxVRAMMiB, job.Config.ReserveVRAMMiB); err != nil {
+	runtimeProfile, cpuOnly, free, err := v.admitImageMemory(job.ctx, profile)
+	if err != nil {
 		return err
 	}
+	beforeImageFree = free
 	if mode == "simultaneous" {
 		if err = v.gate.coexist(job.ID); err != nil {
 			return err
@@ -531,15 +562,21 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		v.setImageBatchProgress(job, index, generation.Count)
 		if index > 1 {
 			v.update(job, "checking_memory", "Checking free CUDA memory for the next batch image", 0, 0)
-			free, err := v.waitForMemory(job.ctx, profile.MaxVRAMMiB, job.Config.ReserveVRAMMiB)
+			var free uint64
+			runtimeProfile, cpuOnly, free, err = v.admitImageMemory(job.ctx, profile)
 			if err != nil {
 				return err
 			}
 			beforeImageFree = free
 		}
+		input.CPUOnly = cpuOnly
+		v.setImageComputeBackend(job, cpuOnly)
+		if cpuOnly {
+			v.update(job, "cpu_selection", "Sem margem de VRAM suficiente; iniciando na CPU dentro do orçamento de RAM.", 0, 0)
+		}
 		v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
 		imageStarted = true
-		result, generationErr := engine.Run(job.ctx, profile, input, func(progress imagegen.Progress) {
+		result, generationErr := engine.Run(job.ctx, runtimeProfile, input, func(progress imagegen.Progress) {
 			v.update(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total))
 		})
 		if result.Path != "" {
@@ -554,6 +591,37 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		}
 	}
 	return nil
+}
+
+func (v *imageService) admitImageMemory(ctx context.Context, profile imagegen.Profile) (imagegen.Profile, bool, uint64, error) {
+	if !profile.OffloadToCPU {
+		free, err := v.waitForMemory(ctx, profile.MaxVRAMMiB, profile.VRAMReserveMiB)
+		return profile, false, free, err
+	}
+	if err := ctx.Err(); err != nil {
+		return profile, false, 0, err
+	}
+	free, err := v.text.FreeVRAM(ctx)
+	if err != nil {
+		return profile, false, 0, err
+	}
+	// A configured GPU target is a ceiling, never a requirement to fill it.
+	// Preserve OS/other-program headroom and clamp only the runner's copy.
+	reserve := uint64(profile.VRAMReserveMiB) << 20
+	availableMiB := uint64(0)
+	if free > reserve {
+		availableMiB = (free - reserve) >> 20
+	}
+	if profile.MaxVRAMMiB > 0 && availableMiB > uint64(profile.MaxVRAMMiB) {
+		availableMiB = uint64(profile.MaxVRAMMiB)
+	}
+	if availableMiB < 64 {
+		// No GPU allocation is needed for the CPU attempt. In particular, zero
+		// must not be sent as an accidental unlimited GPU budget.
+		return profile, true, free, nil
+	}
+	profile.MaxVRAMMiB = int(min(availableMiB, uint64(1048576)))
+	return profile, false, free, nil
 }
 
 func (v *imageService) waitForMemory(ctx context.Context, target, reserve int) (uint64, error) {

@@ -59,7 +59,7 @@ func TestInspectPackedConvRotAndEmbeddedVision(t *testing.T) {
 		}
 	}
 }
-func TestRuntimeLoRAAndDiskStageArguments(t *testing.T) {
+func TestRuntimeLoRAAndRAMStageArguments(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "selected.safetensors")
 	writeSafeFixture(t, path, []fixtureTensor{
@@ -95,20 +95,29 @@ func TestRuntimeLoRAAndDiskStageArguments(t *testing.T) {
 	if err := ValidateProfile(p); err != nil {
 		t.Fatal(err)
 	}
-	args := strings.Join(buildArguments(p, Request{ReferenceImages: []string{"input.png"}}, job, "output.png", 42), "|")
-	for _, required := range []string{"--params-backend|disk", "--auto-fit|off", "--scheduler|simple", "--lora-apply-mode|at_runtime", "--lora-model-dir|", "-r|input.png"} {
+	first := strings.Join(buildArguments(p, Request{}, job, "output.png", 42), "|")
+	if !strings.Contains(first, "--params-backend|cuda0") || !strings.Contains(first, "--disable-segmented-compute") || strings.Contains(first, "--offload-to-cpu") {
+		t.Fatal("RAM offload was forced before checking GPU fit", first)
+	}
+	args := strings.Join(buildArgumentsForMode(p, Request{ReferenceImages: []string{"input.png"}}, job, "output.png", 42, imageRAMGPU), "|")
+	for _, required := range []string{"--params-backend|cpu", "--offload-to-cpu", "--auto-fit|off", "--stage-components|on", "--max-ram|0", "--scheduler|simple", "--lora-apply-mode|at_runtime", "--lora-model-dir|", "-r|input.png"} {
 		if !strings.Contains(args, required) {
 			t.Fatalf("missing %s: %s", required, args)
 		}
 	}
-	for _, forbidden := range []string{"--mmap", "--eager-load", "--llm_vision", "--offload-to-cpu", "--type", "--sigmas"} {
+	for _, forbidden := range []string{"--mmap", "--eager-load", "--llm_vision", "--type", "--sigmas", "--disable-segmented-compute"} {
 		if strings.Contains(args, forbidden) {
 			t.Fatalf("unrequested flag %s", forbidden)
 		}
 	}
 	p.StageComponents = false
-	legacy := strings.Join(buildArguments(p, Request{}, job, "output.png", 42), "|")
-	if !strings.Contains(legacy, "--mmap") || !strings.Contains(legacy, "--offload-to-cpu") {
-		t.Fatal("legacy opt-in changed")
+	resident := strings.Join(buildArgumentsForMode(p, Request{}, job, "output.png", 42, imageRAMGPU), "|")
+	if strings.Contains(resident, "--mmap") || !strings.Contains(resident, "--offload-to-cpu") || !strings.Contains(resident, "--stage-components|off") {
+		t.Fatal("RAM offload was disabled with phase staging", resident)
+	}
+	p.StageComponents, p.OffloadToCPU = true, false
+	disk := strings.Join(buildArguments(p, Request{}, job, "output.png", 42), "|")
+	if !strings.Contains(disk, "--params-backend|disk") || strings.Contains(disk, "--offload-to-cpu") {
+		t.Fatal("explicit disk-only mode changed", disk)
 	}
 }

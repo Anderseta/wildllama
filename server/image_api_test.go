@@ -41,6 +41,7 @@ func (e *imageTestEvents) snapshot() []string {
 type imageTestRunner struct {
 	events    *imageTestEvents
 	request   imagegen.Request
+	profile   imagegen.Profile
 	entered   chan struct{}
 	wait      bool
 	release   <-chan struct{}
@@ -53,11 +54,12 @@ func (e *imageTestRunner) Status() imagegen.RunnerStatus {
 	if e.status != nil {
 		return *e.status
 	}
-	return imagegen.RunnerStatus{Ready: true, Revision: "test"}
+	return imagegen.RunnerStatus{Ready: true, Revision: "test", RAMBudgetSupported: true}
 }
 func (e *imageTestRunner) Close() error { e.events.add("close_image"); return nil }
-func (e *imageTestRunner) Run(ctx context.Context, _ imagegen.Profile, request imagegen.Request, progress func(imagegen.Progress)) (imagegen.Result, error) {
+func (e *imageTestRunner) Run(ctx context.Context, profile imagegen.Profile, request imagegen.Request, progress func(imagegen.Progress)) (imagegen.Result, error) {
 	e.request = request
+	e.profile = profile
 	e.events.add("run_image")
 	if e.entered != nil {
 		close(e.entered)

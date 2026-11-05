@@ -39,6 +39,14 @@ type Engine struct {
 	runtimeRevision  string
 }
 
+type imageMemoryMode int
+
+const (
+	imageGPUResident imageMemoryMode = iota
+	imageRAMGPU
+	imageRAMCPU
+)
+
 // NewEngine is read-only: status/configuration requests never create a cache,
 // start a process, or download weights. Write directories are created by Run.
 func NewEngine(config Config) (*Engine, error) {
@@ -81,6 +89,7 @@ func (e *Engine) Status() RunnerStatus {
 			Revision string `json:"revision"`
 			Features struct {
 				ConditioningCache bool `json:"conditioning_cache"`
+				RAMBudget         bool `json:"ram_budget"`
 			} `json:"features"`
 			Files []struct {
 				Name   string `json:"name"`
@@ -138,6 +147,11 @@ func (e *Engine) Status() RunnerStatus {
 		}
 		status.Revision = e.runtimeRevision
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
+		status.RAMBudgetSupported = manifest.Features.RAMBudget
+	}
+	if !status.RAMBudgetSupported {
+		status.Error = "image runtime does not support bounded RAM offload; update the isolated image runtime"
+		return status
 	}
 	status.Ready = true
 	return status
@@ -187,6 +201,12 @@ func ValidateProfile(p Profile) error {
 	if p.MaxVRAMMiB < 0 || p.MaxVRAMMiB > 1048576 {
 		return errors.New("image VRAM fitting target must be between 0 and 1048576 MiB")
 	}
+	if p.MaxRAMMiB < 0 || p.MaxRAMMiB > 1048576 {
+		return errors.New("image RAM budget must be between 0 (bounded Auto) and 1048576 MiB")
+	}
+	if p.VRAMReserveMiB < 0 || p.VRAMReserveMiB > 1048576 {
+		return errors.New("image free VRAM margin must be between 0 and 1048576 MiB")
+	}
 	if p.CPUThreads < 0 || p.CPUThreads > 1024 {
 		return errors.New("image CPU threads must be between 0 and 1024")
 	}
@@ -211,6 +231,9 @@ func ValidateProfile(p Profile) error {
 }
 
 func ValidateRequest(p Profile, r Request) error {
+	if r.CPUOnly && !p.OffloadToCPU {
+		return errors.New("CPU image admission requires enabled RAM offload")
+	}
 	var err error
 	p, err = ResolveProfileDimensions(p, r)
 	if err != nil {
@@ -442,73 +465,46 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		}
 		seed = int64(binary.LittleEndian.Uint64(data[:]) & math.MaxInt64)
 	}
-	args := buildArguments(p, r, jobDir, output, seed)
-	cmd := exec.CommandContext(ctx, e.config.RunnerPath, args...)
-	cmd.Dir = jobDir
-	cmd.Env = isolatedEnvironment(e.config, jobDir)
-	if runnerStatus.ConditioningCacheSupported && e.config.ConditioningCacheMiB > 0 {
-		cacheEnv, cacheErr := conditioningCacheEnvironment(ctx, e.config, p, r, runnerStatus.Revision, progress)
-		if ctx.Err() != nil {
-			return Result{}, ctx.Err()
-		}
-		if cacheErr == nil {
-			cmd.Env = append(cmd.Env, cacheEnv...)
-		}
-		// Cache preparation is optional; filesystem failures never prevent an
-		// otherwise valid image request from using the normal encoder path.
-	}
-	prepareCommand(cmd)
 	start := time.Now()
 	log := &progressLog{callback: progress, start: start}
-	cmd.Stdout = log
-	cmd.Stderr = log
-	var guardMu sync.Mutex
-	var guard io.Closer
-	cmd.Cancel = func() error {
-		guardMu.Lock()
-		defer guardMu.Unlock()
-		if guard != nil {
-			_ = guard.Close()
-		}
-		if cmd.Process != nil {
-			return cmd.Process.Kill()
-		}
-		return nil
+	mode := imageGPUResident
+	if r.CPUOnly {
+		mode = imageRAMCPU
 	}
-	cmd.WaitDelay = 5 * time.Second
-	log.emit(Progress{Phase: "starting", Message: "Starting the isolated CUDA image runner"}, true)
-	if err := cmd.Start(); err != nil {
-		return Result{}, fmt.Errorf("start image runner: %w", err)
-	}
-	e.mu.Lock()
-	e.pid = cmd.Process.Pid
-	e.mu.Unlock()
-	log.mu.Lock()
-	log.pid = cmd.Process.Pid
-	log.mu.Unlock()
-	guardMu.Lock()
-	guard, err = attachChild(cmd)
-	guardMu.Unlock()
-	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return Result{}, fmt.Errorf("isolate image process: %w", err)
-	}
-	defer func() { guardMu.Lock(); _ = guard.Close(); guardMu.Unlock() }()
-	err = cmd.Wait()
-	log.flush()
 	var runErr error
-	select {
-	case diskErr := <-diskGuard:
-		runErr = diskErr
-	default:
+	for {
+		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, runnerStatus, log)
+		select {
+		case diskErr := <-diskGuard:
+			runErr = diskErr
+		default:
+		}
+		var exit *exec.ExitError
+		if runErr != nil || ctx.Err() != nil || !p.OffloadToCPU || mode == imageRAMCPU || !errors.As(err, &exit) ||
+			exit.ExitCode() != GPUOutOfMemoryExitCode || validateOutputPNG(output, p.Width, p.Height) == nil {
+			break
+		}
+		// The failed process and its CPU/GPU resources have been fully closed.
+		// Retry only the native protocol's classified GPU allocation failure;
+		// invalid models, host-budget failures, cancellation and saved PNGs must
+		// never trigger a second generation or silently change image quality.
+		if removeErr := os.Remove(output); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return Result{}, fmt.Errorf("remove incomplete GPU attempt: %w", removeErr)
+		}
+		if mode == imageGPUResident {
+			mode = imageRAMGPU
+			log.emit(Progress{Phase: "ram_offload", Message: "Os pesos não couberam na GPU; usando RAM dentro do orçamento e mantendo o cálculo na GPU."}, true)
+		} else {
+			mode = imageRAMCPU
+			log.emit(Progress{Phase: "cpu_fallback", Message: "A GPU não comportou o cálculo com offload; tentando na CPU dentro do orçamento de RAM."}, true)
+		}
 	}
 	if runErr != nil {
 		// Keep the actionable disk reason instead of reporting a generic cancel.
 	} else if ctx.Err() != nil {
 		runErr = ctx.Err()
 	} else if err != nil {
-		runErr = fmt.Errorf("image runner failed: %w: %s", err, log.tail())
+		runErr = err
 	}
 	if err := validateOutputPNG(output, p.Width, p.Height); err != nil {
 		_ = os.Remove(output)
@@ -528,22 +524,113 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	return result, nil
 }
 
+func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode, status RunnerStatus, log *progressLog) error {
+	args := buildArgumentsForMode(p, r, jobDir, output, seed, mode)
+	if mode == imageRAMCPU {
+		// CPU conditioning gets a separate exact cache namespace. The saved
+		// profile, generation summary and user-selected resource caps stay intact.
+		p.EncoderOnCPU, p.VAEOnCPU = true, true
+	}
+	cmd := exec.CommandContext(ctx, e.config.RunnerPath, args...)
+	cmd.Dir = jobDir
+	cmd.Env = isolatedEnvironment(e.config, jobDir)
+	if status.ConditioningCacheSupported && e.config.ConditioningCacheMiB > 0 {
+		cacheEnv, cacheErr := conditioningCacheEnvironment(ctx, e.config, p, r, status.Revision, log.callback)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if cacheErr == nil {
+			cmd.Env = append(cmd.Env, cacheEnv...)
+		}
+	}
+	prepareCommand(cmd)
+	cmd.Stdout, cmd.Stderr = log, log
+	var guardMu sync.Mutex
+	var guard io.Closer
+	cmd.Cancel = func() error {
+		guardMu.Lock()
+		defer guardMu.Unlock()
+		if guard != nil {
+			_ = guard.Close()
+		}
+		if cmd.Process != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = 5 * time.Second
+	message := "Starting the isolated CUDA image runner"
+	if mode == imageRAMCPU {
+		message = "Iniciando a tentativa na CPU com os mesmos parâmetros de imagem e orçamento de RAM."
+	}
+	log.emit(Progress{Phase: "starting", Message: message}, true)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start image runner: %w", err)
+	}
+	e.mu.Lock()
+	e.pid = cmd.Process.Pid
+	e.mu.Unlock()
+	log.mu.Lock()
+	log.pid = cmd.Process.Pid
+	log.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.pid = 0
+		e.mu.Unlock()
+		log.mu.Lock()
+		log.pid = 0
+		log.mu.Unlock()
+	}()
+	guardMu.Lock()
+	guard, err := attachChild(cmd)
+	guardMu.Unlock()
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("isolate image process: %w", err)
+	}
+	defer func() { guardMu.Lock(); _ = guard.Close(); guardMu.Unlock() }()
+	err = cmd.Wait()
+	log.flush()
+	if err != nil {
+		return fmt.Errorf("image runner failed: %w: %s", err, log.tail())
+	}
+	return nil
+}
+
 func buildArguments(p Profile, r Request, jobDir, output string, seed int64) []string {
+	return buildArgumentsForMode(p, r, jobDir, output, seed, imageGPUResident)
+}
+
+func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode) []string {
 	args := []string{"--diffusion-model", p.DiffusionModel, "--llm", p.TextEncoder, "--vae", p.VAE,
 		"--prompt-file", filepath.Join(jobDir, "prompt.txt"), "--negative-prompt-file", filepath.Join(jobDir, "negative.txt"),
 		"--width", strconv.Itoa(p.Width), "--height", strconv.Itoa(p.Height), "--steps", strconv.Itoa(p.Steps),
 		"--cfg-scale", strconv.FormatFloat(p.CFGScale, 'g', -1, 64), "--sampling-method", p.Sampler, "--seed", strconv.FormatInt(seed, 10), "--output", output}
+	stage := "off"
 	if p.StageComponents {
-		args = append(args, "--params-backend", "disk", "--auto-fit", "off")
-	} else {
-		args = append(args, "--auto-fit", "on")
+		stage = "on"
 	}
+	args = append(args, "--stage-components", stage, "--max-ram", strconv.FormatFloat(float64(p.MaxRAMMiB)/1024, 'f', -1, 64),
+		"--vram-reserve", strconv.FormatFloat(float64(p.VRAMReserveMiB)/1024, 'f', -1, 64))
 	backend := "cuda0"
 	if p.VAEOnCPU {
 		backend += ",vae=cpu"
 	}
 	if p.EncoderOnCPU {
 		backend += ",te=cpu"
+	}
+	if mode == imageRAMCPU {
+		backend = "cpu"
+	}
+	if mode != imageGPUResident {
+		args = append(args, "--params-backend", "cpu", "--offload-to-cpu", "--auto-fit", "off")
+	} else if p.OffloadToCPU {
+		args = append(args, "--params-backend", backend, "--auto-fit", "off", "--disable-segmented-compute")
+	} else if p.StageComponents {
+		args = append(args, "--params-backend", "disk", "--auto-fit", "off")
+	} else {
+		args = append(args, "--auto-fit", "on")
 	}
 	args = append(args, "--backend", backend)
 	if p.Sigmas != "" {
@@ -553,13 +640,10 @@ func buildArguments(p Profile, r Request, jobDir, output string, seed int64) []s
 		args = append(args, "--scheduler", p.Scheduler)
 	}
 	if p.MaxVRAMMiB > 0 {
-		args = append(args, "--max-vram", strconv.FormatFloat(float64(p.MaxVRAMMiB)/1024, 'f', 4, 64))
+		args = append(args, "--max-vram", strconv.FormatFloat(float64(p.MaxVRAMMiB)/1024, 'f', -1, 64))
 	}
 	if p.CPUThreads > 0 {
 		args = append(args, "--threads", strconv.Itoa(p.CPUThreads))
-	}
-	if p.OffloadToCPU && !p.StageComponents {
-		args = append(args, "--offload-to-cpu", "--mmap")
 	}
 	if p.FlashAttention {
 		args = append(args, "--flash-attn", "on")

@@ -31,6 +31,28 @@ type imageProfile struct {
 	Seed           *int64 `json:"seed,omitempty"`
 }
 
+// Profile has its own missing-field defaults. Decode the outer fields
+// explicitly so the embedded decoder cannot swallow names, prompts or seeds.
+func (p *imageProfile) UnmarshalJSON(data []byte) error {
+	var base imagegen.Profile
+	if err := json.Unmarshal(data, &base); err != nil {
+		return err
+	}
+	var extra struct {
+		Name           string `json:"name"`
+		PromptPrefix   string `json:"prompt_prefix"`
+		NegativePrompt string `json:"negative_prompt"`
+		ExecutionMode  string `json:"execution_mode"`
+		Seed           *int64 `json:"seed"`
+	}
+	if err := json.Unmarshal(data, &extra); err != nil {
+		return err
+	}
+	*p = imageProfile{Profile: base, Name: extra.Name, PromptPrefix: extra.PromptPrefix,
+		NegativePrompt: extra.NegativePrompt, ExecutionMode: extra.ExecutionMode, Seed: extra.Seed}
+	return nil
+}
+
 type imageConfig struct {
 	Version           int    `json:"version"`
 	Revision          uint64 `json:"revision"`
@@ -101,6 +123,8 @@ type imageJob struct {
 	Status              string                  `json:"status"`
 	Phase               string                  `json:"phase"`
 	EffectiveMode       string                  `json:"effective_mode,omitempty"`
+	ComputeBackend      string                  `json:"compute_backend,omitempty"`
+	RAMOffload          bool                    `json:"ram_offload,omitempty"`
 	Progress            imageProgress           `json:"progress"`
 	CreatedAt           time.Time               `json:"created_at"`
 	StartedAt           *time.Time              `json:"started_at,omitempty"`
@@ -172,7 +196,7 @@ func defaultImageConfig(root string) imageConfig {
 	}
 	profile := imagegen.DefaultProfile(imagegen.DefaultRecipeID)
 	return imageConfig{Version: 1, Revision: 1, DefaultProfileID: profile.ID, ExecutionMode: "exclusive", RestoreTextModels: true,
-		ReserveVRAMMiB: 1024, Config: imagegen.Config{ConditioningCacheMiB: 256, MinFreeDiskMiB: 1024, RunnerPath: filepath.Join(filepath.Dir(root), "lib", "wildimage", executable),
+		ReserveVRAMMiB: imagegen.DefaultVRAMReserveMiB, Config: imagegen.Config{ConditioningCacheMiB: 256, MinFreeDiskMiB: 1024, RunnerPath: filepath.Join(filepath.Dir(root), "lib", "wildimage", executable),
 			WorkDir: filepath.Join(root, "work"), ModelsDir: filepath.Join(root, "models"), OutputDir: filepath.Join(root, "outputs")},
 		Profiles: []imageProfile{{Profile: profile, Name: "Qwen Image 2.1 Turbo"}}}
 }

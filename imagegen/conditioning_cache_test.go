@@ -62,6 +62,8 @@ func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesIn
 		"staging":           func(p *Profile) { p.StageComponents = !p.StageComponents },
 		"offload":           func(p *Profile) { p.OffloadToCPU = !p.OffloadToCPU },
 		"vram":              func(p *Profile) { p.MaxVRAMMiB++ },
+		"ram":               func(p *Profile) { p.MaxRAMMiB++ },
+		"vram-margin":       func(p *Profile) { p.VRAMReserveMiB++ },
 	} {
 		t.Run("conditioning-"+name, func(t *testing.T) {
 			next := profile

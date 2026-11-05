@@ -168,7 +168,7 @@ unexpectedly consuming the memory admitted for the image.
 | Image setting | Scope |
 | --- | --- |
 | `max_vram_mib` | Diffusion runner fitting/streaming target. It is **not** a hard driver-wide CUDA allocation quota. |
-| `reserve_vram_mib` | Preventive free-memory margin for admission; other programs can still allocate memory afterward. |
+| `vram_reserve_mib` | Active image profile's free-GPU margin, default 256 MiB, checked by admission and native allocations. Explicit zero stays zero; other programs can still allocate memory afterward. |
 | `max_ram_mib` | Active image profile's managed host allocation ceiling; 0 uses bounded Auto with a physical-memory reserve. |
 | `offload_to_cpu` | Permit RAM-backed weights with GPU staging, then CPU computation only after classified GPU memory failures. The initial attempt prefers GPU residency. Defaults to true for new profiles. |
 | `encoder_on_cpu`, `vae_on_cpu` | Explicit CPU computation for those components. |

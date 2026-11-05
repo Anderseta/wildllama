@@ -39,7 +39,29 @@ func TestMain(m *testing.M) {
 	for _, name := range []string{"TEMP", "TMP", "TMPDIR"} {
 		os.Setenv(name, dir)
 	}
+	// The fixture child implements the managed-budget protocol; production
+	// runners advertise the same contract in their verified runtime manifest.
+	exe, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		panic(err)
+	}
+	manifest, err := json.Marshal(map[string]any{
+		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true},
+		"files": []map[string]any{{"name": filepath.Base(exe), "size": len(data), "sha256": digest(data)}},
+	})
+	if err != nil {
+		panic(err)
+	}
+	manifestPath := filepath.Join(filepath.Dir(exe), "wildimage-runtime.json")
+	if err := os.WriteFile(manifestPath, manifest, 0600); err != nil {
+		panic(err)
+	}
 	code := m.Run()
+	os.Remove(manifestPath)
 	os.RemoveAll(dir)
 	os.Exit(code)
 }
@@ -89,6 +111,18 @@ func fakeChild(mode string) {
 			values[os.Args[i]] = os.Args[i+1]
 		}
 	}
+	if path := os.Getenv("WILDIMAGE_FAKE_ATTEMPTS"); path != "" {
+		encoded, _ := json.Marshal(os.Args[1:])
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			os.Exit(8)
+		}
+		_, err = file.Write(append(encoded, '\n'))
+		file.Close()
+		if err != nil {
+			os.Exit(8)
+		}
+	}
 	time.Sleep(25 * time.Millisecond)
 	fmt.Fprintln(os.Stderr, "loading model components")
 	if mode == "wait" {
@@ -98,6 +132,24 @@ func fakeChild(mode string) {
 	prompt, err := os.ReadFile(values["--prompt-file"])
 	if err != nil || !strings.Contains(string(prompt), "literal --prompt ; &") {
 		os.Exit(3)
+	}
+	if mode == "ram-budget" {
+		fmt.Fprintln(os.Stderr, "managed RAM budget exhausted")
+		os.Exit(RAMBudgetExitCode)
+	}
+	if mode == "invalid-model" {
+		fmt.Fprintln(os.Stderr, "invalid model metadata")
+		os.Exit(7)
+	}
+	if mode == "gpu-oom-always" || mode == "gpu-oom-then-cpu" && values["--backend"] != "cpu" {
+		fmt.Fprintln(os.Stderr, "classified GPU allocation failure")
+		os.Exit(GPUOutOfMemoryExitCode)
+	}
+	if (mode == "gpu-oom-then-ram" || mode == "gpu-oom-then-ram-budget") && values["--params-backend"] != "cpu" {
+		os.Exit(GPUOutOfMemoryExitCode)
+	}
+	if mode == "gpu-oom-then-ram-budget" {
+		os.Exit(RAMBudgetExitCode)
 	}
 	for step := 1; step <= 8; step++ {
 		fmt.Fprintf(os.Stderr, "%d/8 - 12.5 it/s\r", step)
@@ -120,6 +172,9 @@ func fakeChild(mode string) {
 	fmt.Fprintln(os.Stderr, "1/1 images saved")
 	if mode == "late-failure" {
 		os.Exit(7)
+	}
+	if mode == "saved-gpu-oom" {
+		os.Exit(GPUOutOfMemoryExitCode)
 	}
 	if mode == "saved-wait" {
 		time.Sleep(30 * time.Second)
@@ -146,6 +201,7 @@ func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeT
 func testProfile(t *testing.T, dir string) Profile {
 	t.Helper()
 	p := DefaultProfile(DefaultRecipeID)
+	p.MaxVRAMMiB = 12288
 	p.Width = 64
 	p.Height = 64
 	p.DiffusionModel = filepath.Join(dir, "diffusion.gguf")
@@ -178,13 +234,14 @@ func TestRecipesAndArguments(t *testing.T) {
 	}
 	p := DefaultProfile(DefaultRecipeID)
 	p.DiffusionModel = "diff.gguf"
+	p.MaxVRAMMiB = 12288 // explicit existing-profile cap is preserved despite new Auto defaults
 	p.TextEncoder = "encoder.gguf"
 	p.VAE = "vae.safetensors"
 	if err := ValidateProfile(p); err != nil {
 		t.Fatal(err)
 	}
 	args := strings.Join(buildArguments(p, Request{}, "job", "out.png", 42), "|")
-	for _, required := range []string{"--sigmas|" + TurboSigmas, "--steps|8", "--cfg-scale|1", "--sampling-method|euler", "--max-vram|12.0000", "--backend|cuda0", "--prompt-file|"} {
+	for _, required := range []string{"--sigmas|" + TurboSigmas, "--steps|8", "--cfg-scale|1", "--sampling-method|euler", "--max-vram|12", "--backend|cuda0", "--prompt-file|"} {
 		if !strings.Contains(args, required) {
 			t.Fatalf("missing %s", required)
 		}

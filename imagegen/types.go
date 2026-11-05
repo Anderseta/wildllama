@@ -2,7 +2,10 @@
 // loads image ggml libraries into the text inference process.
 package imagegen
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 const (
 	RunnerRevision  = "3be2378"
@@ -10,6 +13,10 @@ const (
 	DefaultRecipeID = "qwen-image-2.1-turbo-uncensored-q5"
 	ManifestName    = "wildimage-model.json"
 	TurboSigmas     = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
+	// Only the managed native runner emits this code for a retryable GPU failure.
+	GPUOutOfMemoryExitCode = 75
+	RAMBudgetExitCode      = 76
+	DefaultVRAMReserveMiB  = 256
 )
 
 type Config struct {
@@ -40,13 +47,29 @@ type Profile struct {
 	// PreserveReferenceSize prefers a supported canvas from the first reference.
 	PreserveReferenceSize bool `json:"preserve_reference_size"`
 	// MaxVRAMMiB is the runner's streaming/fitting target, not a process hard cap.
-	MaxVRAMMiB     int  `json:"max_vram_mib"`
+	MaxVRAMMiB int `json:"max_vram_mib"`
+	// MaxRAMMiB bounds managed image CPU allocations; zero selects bounded Auto.
+	// Text MoE/prompt-cache budgets are independent of this image process.
+	MaxRAMMiB      int  `json:"max_ram_mib"`
+	VRAMReserveMiB int  `json:"vram_reserve_mib"`
 	CPUThreads     int  `json:"cpu_threads"`
 	OffloadToCPU   bool `json:"offload_to_cpu"`
 	FlashAttention bool `json:"flash_attention"`
 	VAETiling      bool `json:"vae_tiling"`
 	VAEOnCPU       bool `json:"vae_on_cpu"`
 	EncoderOnCPU   bool `json:"encoder_on_cpu"`
+}
+
+// A missing margin in an old profile adopts the image-specific default. An
+// explicit zero remains zero; it must never become an increased hidden budget.
+func (p *Profile) UnmarshalJSON(data []byte) error {
+	type plain Profile
+	value := plain{VRAMReserveMiB: DefaultVRAMReserveMiB}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*p = Profile(value)
+	return nil
 }
 
 type LoRA struct {
@@ -73,6 +96,8 @@ type Request struct {
 	Seed            int64    `json:"seed"`
 	ReferenceImages []string `json:"reference_images,omitempty"`
 	OutputPath      string   `json:"output_path"`
+	// CPUOnly is an internal admission decision, never a client override.
+	CPUOnly bool `json:"-"`
 }
 
 type Progress struct {
@@ -102,6 +127,7 @@ type RunnerStatus struct {
 	Revision                   string `json:"revision"`
 	Error                      string `json:"error,omitempty"`
 	ConditioningCacheSupported bool   `json:"conditioning_cache_supported"`
+	RAMBudgetSupported         bool   `json:"ram_budget_supported"`
 }
 
 type Component struct {
@@ -159,6 +185,6 @@ type Runner interface {
 
 func DefaultProfile(modelID string) Profile {
 	return Profile{ID: "qwen-image-2.1-turbo", ModelID: modelID, Width: 1024, Height: 1024,
-		Steps: 8, CFGScale: 1, Sampler: "euler", Sigmas: TurboSigmas, MaxVRAMMiB: 12288,
+		Steps: 8, CFGScale: 1, Sampler: "euler", Sigmas: TurboSigmas, MaxVRAMMiB: 0, VRAMReserveMiB: DefaultVRAMReserveMiB,
 		StageComponents: true, OffloadToCPU: true, FlashAttention: true, VAETiling: true}
 }
