@@ -13,6 +13,7 @@
 #include <mutex>
 #include <new>
 #include <cstring>
+#include <cerrno>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -29,6 +30,7 @@
 namespace wildimage_ram {
 constexpr uint64_t GiB = uint64_t(1) << 30;
 struct Memory { uint64_t total = 0, available = 0; };
+inline uint64_t saturating_add(uint64_t a,uint64_t b) {return b>UINT64_MAX-a ? UINT64_MAX : a+b;}
 
 inline Memory system_memory() {
 #if defined(_WIN32)
@@ -64,6 +66,17 @@ inline uint64_t effective_limit(uint64_t requested, Memory memory) {
     return requested ? std::min(requested, automatic) : automatic;
 }
 
+inline bool parse_gib(const char* amount,uint64_t& bytes) {
+    if(!amount || !*amount) return false;
+    errno=0; char* end=nullptr; const double value=std::strtod(amount,&end);
+    // 2^34 GiB is 2^64 bytes, which cannot be represented even where
+    // long double has only double precision (MSVC).
+    if(errno==ERANGE || end==amount || !end || *end || !std::isfinite(value) || value<0 || value>=17179869184.0) return false;
+    const double scaled=value*GiB;
+    if(value>0 && scaled<1) return false;
+    bytes=static_cast<uint64_t>(scaled); return true;
+}
+
 class Exceeded : public std::runtime_error {
 public: Exceeded() : std::runtime_error("Wildimage managed RAM budget exhausted") {}
 };
@@ -75,12 +88,14 @@ class Budget {
     std::mutex configure_mutex_;
 public:
     std::atomic<bool> ram_failure{false}, gpu_failure{false};
+    std::atomic<uint64_t> gpu_reserve_bytes{GiB/4};
     std::atomic<bool> stage_components{false};
-    bool configure(uint64_t requested, Memory memory, bool stage) {
+    bool configure(uint64_t requested, Memory memory, bool stage,uint64_t gpu_reserve=GiB/4) {
         std::lock_guard<std::mutex> lock(configure_mutex_);
         if (used_.load()) return false;
         limit_ = effective_limit(requested, memory);
         configured_ = true; stage_components = stage;
+        gpu_reserve_bytes=gpu_reserve;
         ram_failure = false; gpu_failure = false; peak_ = 0;
         return limit_.load() > 0;
     }

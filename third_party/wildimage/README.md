@@ -50,7 +50,10 @@ The RAM overlay exports configuration and managed host-allocation functions with
 changing the existing C parameter struct layout. CLI decoding, model/weight storage,
 CPU workspaces, tensors and exact conditioning payloads share the DLL's budget.
 `--max-ram 0` selects bounded physical-memory Auto; explicit ceilings are never
-increased. `--stage-components on` permits sequential phase eviction of host weights.
+increased. `--vram-reserve` supplies the active image profile's free GPU headroom
+in GiB (default 0.25, exactly 256 MiB); explicit zero remains zero. The native
+capacity check applies it after device initialization. `--stage-components on`
+permits sequential phase eviction of host weights.
 Failed jobs classify GPU-memory exhaustion as exit 75 and RAM exhaustion as 76;
 successful jobs remain exit 0 after recovered allocation probes. The caller may
 retry only GPU failures with RAM-backed GPU computation, then CPU computation.

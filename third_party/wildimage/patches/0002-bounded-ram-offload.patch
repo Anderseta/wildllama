@@ -37,18 +37,19 @@ index 591a151..12d8438 100644
 +    }
 +}
 diff --git a/examples/common/common.cpp b/examples/common/common.cpp
-index 637bbb6..b242e06 100644
+index 637bbb6..a529294 100644
 --- a/examples/common/common.cpp
 +++ b/examples/common/common.cpp
-@@ -581,6 +581,7 @@ ArgOptions SDContextParams::get_options() {
+@@ -581,6 +581,8 @@ ArgOptions SDContextParams::get_options() {
           "optional per-device budget in GiB for managed weights and runner buffers during automatic graph-cut execution. Accepts a single value or assignments by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without an explicit budget; a negative value reserves that much free VRAM",
           0,
           &max_vram},
 +        {"", "--max-ram", "managed RAM limit in GiB; 0 selects bounded available RAM with a physical-memory reserve", 0, &max_ram},
++        {"", "--vram-reserve", "minimum free GPU headroom in GiB (default: 0.25 = 256 MiB); explicit 0 keeps zero", 0, &vram_reserve},
      };
  
      options.int_options = {
-@@ -607,7 +608,7 @@ ArgOptions SDContextParams::get_options() {
+@@ -607,7 +609,7 @@ ArgOptions SDContextParams::get_options() {
           true, &disable_prefetch},
          {"",
           "--disable-segmented-compute",
@@ -57,7 +58,7 @@ index 637bbb6..b242e06 100644
           true, &disable_segmented_compute},
          {"",
           "--eager-load",
-@@ -789,6 +790,7 @@ ArgOptions SDContextParams::get_options() {
+@@ -789,6 +791,7 @@ ArgOptions SDContextParams::get_options() {
               flash_attn_mode = "off,diffusion=on";
               return 0;
           }},
@@ -65,11 +66,11 @@ index 637bbb6..b242e06 100644
          {"",
           "--auto-fit",
           "on|off (default: on). Preserve --backend (otherwise select one GPU) and place weights on the compute GPU, "
-@@ -877,6 +879,10 @@ void SDContextParams::build_embedding_map() {
+@@ -877,6 +880,10 @@ void SDContextParams::build_embedding_map() {
  }
  
  bool SDContextParams::resolve(SDMode mode) {
-+    if(!sd_set_memory_budget(max_ram.c_str(),stage_components)) {
++    if(!sd_set_memory_budget(max_ram.c_str(),stage_components,vram_reserve.c_str())) {
 +        LOG_ERROR("Unable to configure a bounded managed RAM budget");
 +        return false;
 +    }
@@ -77,14 +78,15 @@ index 637bbb6..b242e06 100644
          n_threads = sd_get_num_physical_cores();
      }
 diff --git a/examples/common/common.h b/examples/common/common.h
-index 39d6011..e9302ad 100644
+index 39d6011..310542f 100644
 --- a/examples/common/common.h
 +++ b/examples/common/common.h
-@@ -160,6 +160,8 @@ struct SDContextParams {
+@@ -160,6 +160,9 @@ struct SDContextParams {
      rng_type_t sampler_rng_type    = RNG_TYPE_COUNT;
      bool offload_params_to_cpu     = false;
      std::string max_vram           = "0";
 +    std::string max_ram            = "0";
++    std::string vram_reserve       = "0.25";
 +    bool stage_components         = false;
      bool disable_prefetch          = false;
      bool disable_segmented_compute = false;
@@ -269,7 +271,7 @@ index 8a8f843..bf2dd14 100644
          image_ = image;
      }
 diff --git a/include/stable-diffusion.h b/include/stable-diffusion.h
-index f4ea0ea..01ae05d 100644
+index f4ea0ea..291afee 100644
 --- a/include/stable-diffusion.h
 +++ b/include/stable-diffusion.h
 @@ -28,6 +28,15 @@ extern "C" {
@@ -277,7 +279,7 @@ index f4ea0ea..01ae05d 100644
  #include <string.h>
  
 +// Managed host tensors/weights/workspaces. Zero GiB selects bounded automatic RAM.
-+SD_API bool sd_set_memory_budget(const char* max_ram_gib, bool stage_components);
++SD_API bool sd_set_memory_budget(const char* max_ram_gib, bool stage_components,const char* vram_reserve_gib);
 +SD_API int sd_get_memory_failure_code(void); // 75 GPU allocation/budget, 76 RAM budget
 +SD_API bool sd_host_reserve(size_t bytes);
 +SD_API void sd_host_release(size_t bytes);
@@ -671,7 +673,7 @@ index 5576067..f57e989 100644
          char* src_data_f32 = buf.data();
          qtype->to_float(src, (float*)src_data_f32, n);
 diff --git a/src/model_manager.cpp b/src/model_manager.cpp
-index 8b61827..0e3e7a7 100644
+index 8b61827..5d3d317 100644
 --- a/src/model_manager.cpp
 +++ b/src/model_manager.cpp
 @@ -566,9 +566,16 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
@@ -790,7 +792,7 @@ index 8b61827..0e3e7a7 100644
      release_params_storage_blocks(false, &target_states);
  }
  WeightResidencyInfo ModelManager::inspect_compute_backend_params(
-@@ -1763,7 +1793,13 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
+@@ -1763,19 +1793,19 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
      const std::vector<TensorState*>& states,
      bool log_details) const {
      CapacityCheck result;
@@ -804,8 +806,22 @@ index 8b61827..0e3e7a7 100644
 +        result.available_budget_bytes=static_cast<size_t>(wildimage_ram::budget().remaining());
          return result;
      }
-     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
-@@ -1857,6 +1893,16 @@ bool ModelManager::fits_compute_backend_capacity(
+-    auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
++    auto add             = wildimage_ram::saturating_add;
+     const size_t missing = compute_backend_alloc_size(states, true);
+     // Backend scratch buffers and pipelines are not included in graph measurements.
+-    size_t safety_margin = 512ULL * 1024ULL * 1024ULL;
+-#ifdef _WIN32
+-    if (sd_backend_is(request.compute_backend, "CUDA")) {
+-        // Avoid WDDM allocation churn when transient buffers compete with reusable staging buffers.
+-        safety_margin = 1024ULL * 1024ULL * 1024ULL;
+-    }
+-#endif
++    const size_t safety_margin=static_cast<size_t>(wildimage_ram::budget().gpu_reserve_bytes.load());
+     result.required_device_bytes = add(add(request.pending_allocation_bytes, missing), safety_margin);
+     result.required_budget_bytes = add(request.runtime_peak_bytes(), missing);
+     auto available_device_bytes  = [&](ggml_backend_t backend) {
+@@ -1857,6 +1887,16 @@ bool ModelManager::fits_compute_backend_capacity(
          return false;
      }
      const auto capacity = check_capacity(request, states);
@@ -822,7 +838,7 @@ index 8b61827..0e3e7a7 100644
      return !capacity.requires_reclamation && capacity.fits();
  }
  
-@@ -1876,7 +1922,11 @@ bool ModelManager::ensure_compute_backend_capacity(
+@@ -1876,7 +1916,11 @@ bool ModelManager::ensure_compute_backend_capacity(
          return false;
      }
      if (sd_backend_is_cpu(compute_backend)) {
@@ -835,7 +851,7 @@ index 8b61827..0e3e7a7 100644
      }
  
      auto fits = [&]() {
-@@ -2044,5 +2094,26 @@ bool ModelManager::ensure_compute_backend_capacity(
+@@ -2044,5 +2088,26 @@ bool ModelManager::ensure_compute_backend_capacity(
               capacity.required_budget_bytes / (1024.0 * 1024.0),
               available_device.c_str(),
               available_budget.c_str());
@@ -945,22 +961,23 @@ index d161d9e..d4baca3 100644
          free(images);
          return;
 diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
-index bca4b79..f9155bf 100644
+index bca4b79..c8141aa 100644
 --- a/src/stable-diffusion.cpp
 +++ b/src/stable-diffusion.cpp
-@@ -11,6 +11,23 @@
+@@ -11,6 +11,24 @@
  #include "pipeline/diffusion_engine.h"
  #include "pipeline/generation.h"
  #include "pipeline/request.h"
 +#include "core/wildimage_ram_budget.h"
 +
-+SD_API bool sd_set_memory_budget(const char* amount, bool stage) {
-+    if(!amount || !*amount) return false;
-+    char* end=nullptr; const double gib=std::strtod(amount,&end);
-+    if(!end || *end || !std::isfinite(gib) || gib<0 || gib>double(UINT64_MAX)/wildimage_ram::GiB) return false;
-+    const bool ok=wildimage_ram::budget().configure(static_cast<uint64_t>(gib*wildimage_ram::GiB),wildimage_ram::system_memory(),stage);
++SD_API bool sd_set_memory_budget(const char* amount, bool stage,const char* reserve) {
++    uint64_t bytes=0,headroom=0;
++    if(!wildimage_ram::parse_gib(amount,bytes) || !wildimage_ram::parse_gib(reserve,headroom)) return false;
++    const double gib=static_cast<double>(bytes)/wildimage_ram::GiB;
++    const bool ok=wildimage_ram::budget().configure(bytes,wildimage_ram::system_memory(),stage,headroom);
 +    if(!ok) { wildimage_ram::budget().fail(); return false; }
 +    LOG_INFO("Managed RAM budget: %.2f MiB (requested %.2f GiB%s)",wildimage_ram::budget().limit()/1048576.,gib,gib==0 ? ", bounded auto" : "");
++    LOG_INFO("GPU free-memory headroom: %.2f MiB",headroom/1048576.);
 +    return true;
 +}
 +SD_API int sd_get_memory_failure_code(void) { return wildimage_ram::budget().failure_code(); }
@@ -972,7 +989,7 @@ index bca4b79..f9155bf 100644
  
  #define NONE_STR "NONE"
  
-@@ -646,11 +663,15 @@ struct sd_ctx_t {
+@@ -646,11 +664,15 @@ struct sd_ctx_t {
  };
  
  sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
@@ -988,7 +1005,7 @@ index bca4b79..f9155bf 100644
      sd_ctx->sd = new StableDiffusionGGML();
      if (sd_ctx->sd == nullptr) {
          free(sd_ctx);
-@@ -664,6 +685,11 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+@@ -664,6 +686,11 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
          return nullptr;
      }
      return sd_ctx;
@@ -1000,7 +1017,7 @@ index bca4b79..f9155bf 100644
  }
  
  void free_sd_ctx(sd_ctx_t* sd_ctx) {
-@@ -770,6 +796,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
+@@ -770,6 +797,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
              return false;
          }
      } catch (const std::exception& e) {
@@ -1008,7 +1025,7 @@ index bca4b79..f9155bf 100644
          LOG_ERROR("image generation failed: %s", e.what());
          free_sd_images(images, count);
          return false;
-@@ -818,7 +845,7 @@ SD_API void free_sd_images(sd_image_t* result_images, int num_images) {
+@@ -818,7 +846,7 @@ SD_API void free_sd_images(sd_image_t* result_images, int num_images) {
  
      for (int i = 0; i < num_images; ++i) {
          if (result_images[i].data != nullptr) {
