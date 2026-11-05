@@ -1,0 +1,1019 @@
+diff --git a/examples/cli/main.cpp b/examples/cli/main.cpp
+index 591a151..12d8438 100644
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -20,6 +20,7 @@
+ #include "common/media_io.h"
+ #include "common/resource_owners.hpp"
+ #include "image_metadata.h"
++#include "core/wildimage_ram_budget.h"
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -633,7 +634,7 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
+     return true;
+ }
+ 
+-int main(int argc, const char* argv[]) {
++static int wildimage_main(int argc, const char* argv[]) {
+     if (argc > 1 && std::string(argv[1]) == "--version") {
+         std::cout << version_string() << "\n";
+         return EXIT_SUCCESS;
+@@ -996,3 +997,16 @@ int main(int argc, const char* argv[]) {
+ 
+     return 0;
+ }
++
++int main(int argc,const char* argv[]) {
++    try {
++        const int result=wildimage_main(argc,argv);
++        const int memory=sd_get_memory_failure_code();
++        return wildimage_ram::classify_exit(result,memory);
++    } catch(const std::exception& error) {
++        std::fprintf(stderr,"Wildimage failed: %s\n",error.what());
++        if(dynamic_cast<const wildimage_ram::Exceeded*>(&error) || dynamic_cast<const std::bad_alloc*>(&error)) return 76;
++        const int memory=sd_get_memory_failure_code();
++        return memory ? memory : 1;
++    }
++}
+diff --git a/examples/common/common.cpp b/examples/common/common.cpp
+index 637bbb6..b242e06 100644
+--- a/examples/common/common.cpp
++++ b/examples/common/common.cpp
+@@ -581,6 +581,7 @@ ArgOptions SDContextParams::get_options() {
+          "optional per-device budget in GiB for managed weights and runner buffers during automatic graph-cut execution. Accepts a single value or assignments by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without an explicit budget; a negative value reserves that much free VRAM",
+          0,
+          &max_vram},
++        {"", "--max-ram", "managed RAM limit in GiB; 0 selects bounded available RAM with a physical-memory reserve", 0, &max_ram},
+     };
+ 
+     options.int_options = {
+@@ -607,7 +608,7 @@ ArgOptions SDContextParams::get_options() {
+          true, &disable_prefetch},
+         {"",
+          "--disable-segmented-compute",
+-         "force monolithic graph execution even when automatic graph cutting is needed (defaults to false)",
++         "force monolithic GPU graph execution (defaults to false); bounded CPU graphs may still be segmented",
+          true, &disable_segmented_compute},
+         {"",
+          "--eager-load",
+@@ -789,6 +790,7 @@ ArgOptions SDContextParams::get_options() {
+              flash_attn_mode = "off,diffusion=on";
+              return 0;
+          }},
++        {"", "--stage-components", "on|off: release inactive RAM-backed component weights between phases", [this](int argc,const char** argv,int index) { return parse_on_off_arg(argc,argv,index,"--stage-components",stage_components); }},
+         {"",
+          "--auto-fit",
+          "on|off (default: on). Preserve --backend (otherwise select one GPU) and place weights on the compute GPU, "
+@@ -877,6 +879,10 @@ void SDContextParams::build_embedding_map() {
+ }
+ 
+ bool SDContextParams::resolve(SDMode mode) {
++    if(!sd_set_memory_budget(max_ram.c_str(),stage_components)) {
++        LOG_ERROR("Unable to configure a bounded managed RAM budget");
++        return false;
++    }
+     if (n_threads <= 0) {
+         n_threads = sd_get_num_physical_cores();
+     }
+diff --git a/examples/common/common.h b/examples/common/common.h
+index 39d6011..e9302ad 100644
+--- a/examples/common/common.h
++++ b/examples/common/common.h
+@@ -160,6 +160,8 @@ struct SDContextParams {
+     rng_type_t sampler_rng_type    = RNG_TYPE_COUNT;
+     bool offload_params_to_cpu     = false;
+     std::string max_vram           = "0";
++    std::string max_ram            = "0";
++    bool stage_components         = false;
+     bool disable_prefetch          = false;
+     bool disable_segmented_compute = false;
+     bool eager_load                = false;
+diff --git a/examples/common/media_io.cpp b/examples/common/media_io.cpp
+index e878c88..aa52023 100644
+--- a/examples/common/media_io.cpp
++++ b/examples/common/media_io.cpp
+@@ -16,11 +16,17 @@
+ #include <vector>
+ 
+ #define STB_IMAGE_IMPLEMENTATION
++#define STBI_MALLOC(bytes) sd_host_malloc(bytes)
++#define STBI_REALLOC(ptr,bytes) sd_host_realloc(ptr,bytes)
++#define STBI_FREE(ptr) sd_host_free(ptr)
+ #define STB_IMAGE_STATIC
+ #define STBI_WINDOWS_UTF8
+ #include "stb_image.h"
+ 
+ #define STB_IMAGE_WRITE_IMPLEMENTATION
++#define STBIW_MALLOC(bytes) sd_host_malloc(bytes)
++#define STBIW_REALLOC(ptr,bytes) sd_host_realloc(ptr,bytes)
++#define STBIW_FREE(ptr) sd_host_free(ptr)
+ #define STB_IMAGE_WRITE_STATIC
+ #define STBIW_WINDOWS_UTF8
+ #include "stb_image_write.h"
+@@ -270,23 +276,25 @@ uint8_t* decode_webp_image_to_buffer(const uint8_t* data,
+     }
+ 
+     const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
++    if(width<=0 || height<=0 || pixel_count>SIZE_MAX/20) return nullptr;
++    SDHostReservation decoder_scratch;
++    if(!decoder_scratch.acquire(pixel_count*16)) return nullptr;
+ 
+     if (expected_channel == 1) {
+         int decoded_width  = width;
+         int decoded_height = height;
+-        WebPBufferPtr decoded(features.has_alpha
+-                                  ? WebPDecodeRGBA(data, size, &decoded_width, &decoded_height)
+-                                  : WebPDecodeRGB(data, size, &decoded_width, &decoded_height));
++        FreeUniquePtr<uint8_t> decoded(static_cast<uint8_t*>(sd_host_malloc(pixel_count*4)));
++        if(decoded && !WebPDecodeRGBAInto(data,size,decoded.get(),pixel_count*4,width*4)) return nullptr;
+         if (decoded == nullptr) {
+             return nullptr;
+         }
+ 
+-        FreeUniquePtr<uint8_t> grayscale((uint8_t*)malloc(pixel_count));
++        FreeUniquePtr<uint8_t> grayscale((uint8_t*)sd_host_malloc(pixel_count));
+         if (grayscale == nullptr) {
+             return nullptr;
+         }
+ 
+-        const int decoded_channels = features.has_alpha ? 4 : 3;
++        const int decoded_channels = 4;
+         for (size_t i = 0; i < pixel_count; ++i) {
+             const uint8_t* src = decoded.get() + i * decoded_channels;
+             grayscale.get()[i] = static_cast<uint8_t>((77 * src[0] + 150 * src[1] + 29 * src[2] + 128) >> 8);
+@@ -301,20 +309,15 @@ uint8_t* decode_webp_image_to_buffer(const uint8_t* data,
+ 
+     int decoded_width  = width;
+     int decoded_height = height;
+-    WebPBufferPtr decoded((expected_channel == 4)
+-                              ? WebPDecodeRGBA(data, size, &decoded_width, &decoded_height)
+-                              : WebPDecodeRGB(data, size, &decoded_width, &decoded_height));
+-    if (decoded == nullptr) {
+-        return nullptr;
+-    }
+-
+     const size_t out_size = pixel_count * static_cast<size_t>(expected_channel);
+-    FreeUniquePtr<uint8_t> output((uint8_t*)malloc(out_size));
++    FreeUniquePtr<uint8_t> output((uint8_t*)sd_host_malloc(out_size));
+     if (output == nullptr) {
+         return nullptr;
+     }
+ 
+-    memcpy(output.get(), decoded.get(), out_size);
++    const auto* decoded=expected_channel==4 ? WebPDecodeRGBAInto(data,size,output.get(),out_size,width*4)
++                                          : WebPDecodeRGBInto(data,size,output.get(),out_size,width*3);
++    if(!decoded) return nullptr;
+     return output.release();
+ }
+ 
+@@ -478,6 +481,10 @@ uint8_t* load_image_common(bool from_memory,
+     } else {
+         image_path = image_path_or_bytes;
+         if (encoded_image_format_from_path(image_path_or_bytes) == EncodedImageFormat::WEBP) {
++            std::error_code size_error;
++            const auto encoded_size=std::filesystem::file_size(image_path_or_bytes,size_error);
++            SDHostReservation encoded_memory;
++            if(size_error || encoded_size>SIZE_MAX || !encoded_memory.acquire(static_cast<size_t>(encoded_size))) return nullptr;
+             std::vector<uint8_t> file_bytes;
+             if (!read_binary_file_bytes(image_path_or_bytes, file_bytes)) {
+                 LOG_ERROR("load image from '%s' failed", image_path_or_bytes);
+@@ -519,7 +526,7 @@ uint8_t* load_image_common(bool from_memory,
+     if (expected_channel == 0) {
+         expected_channel = source_channel_count == 2 ? 4 : (source_channel_count == 1 ? 3 : source_channel_count);
+         if (expected_channel != source_channel_count) {
+-            FreeUniquePtr<uint8_t> promoted((uint8_t*)malloc((size_t)width * height * expected_channel));
++            FreeUniquePtr<uint8_t> promoted((uint8_t*)sd_host_malloc((size_t)width * height * expected_channel));
+             if (promoted == nullptr) {
+                 LOG_ERROR("error: allocate memory for channel promotion, image_path = %s", image_path);
+                 return nullptr;
+@@ -577,7 +584,7 @@ uint8_t* load_image_common(bool from_memory,
+ 
+         if (crop_x != 0 || crop_y != 0) {
+             LOG_INFO("crop input image from %dx%d to %dx%d, image_path = %s", width, height, crop_w, crop_h, image_path);
+-            FreeUniquePtr<uint8_t> cropped_image_buffer((uint8_t*)malloc(crop_w * crop_h * expected_channel));
++            FreeUniquePtr<uint8_t> cropped_image_buffer((uint8_t*)sd_host_malloc(crop_w * crop_h * expected_channel));
+             if (cropped_image_buffer == nullptr) {
+                 LOG_ERROR("error: allocate memory for crop\n");
+                 return nullptr;
+@@ -594,7 +601,7 @@ uint8_t* load_image_common(bool from_memory,
+         }
+ 
+         LOG_INFO("resize input image from %dx%d to %dx%d", width, height, expected_width, expected_height);
+-        FreeUniquePtr<uint8_t> resized_image_buffer((uint8_t*)malloc(expected_height * expected_width * expected_channel));
++        FreeUniquePtr<uint8_t> resized_image_buffer((uint8_t*)sd_host_malloc(expected_height * expected_width * expected_channel));
+         if (resized_image_buffer == nullptr) {
+             LOG_ERROR("error: allocate memory for resize input image\n");
+             return nullptr;
+@@ -768,6 +775,9 @@ bool write_image_to_file(const std::string& path,
+                          const std::string& parameters,
+                          int quality) {
+     const EncodedImageFormat format = encoded_image_format_from_path(path);
++    if(width<=0 || height<=0 || channels<=0 || static_cast<uint64_t>(width)*height>SIZE_MAX/(static_cast<size_t>(channels)*2)) return false;
++    SDHostReservation encoded_memory;
++    if(!encoded_memory.acquire(static_cast<size_t>(width)*height*channels*2)) return false;
+ 
+     const auto encoded = encode_image_to_vector(format, image, width, height, channels, parameters, quality);
+     return !encoded.empty() && write_binary_file_bytes(path, encoded);
+diff --git a/examples/common/resource_owners.hpp b/examples/common/resource_owners.hpp
+index 8a8f843..bf2dd14 100644
+--- a/examples/common/resource_owners.hpp
++++ b/examples/common/resource_owners.hpp
+@@ -13,10 +13,20 @@
+ 
+ struct FreeDeleter {
+     void operator()(void* ptr) const {
+-        free(ptr);
++        sd_host_free(ptr);
+     }
+ };
+ 
++class SDHostReservation {
++    size_t bytes_=0;
++public:
++    SDHostReservation()=default;
++    SDHostReservation(const SDHostReservation&)=delete;
++    SDHostReservation& operator=(const SDHostReservation&)=delete;
++    ~SDHostReservation() {sd_host_release(bytes_);}
++    bool acquire(size_t bytes) {if(!sd_host_reserve(bytes)) return false; bytes_+=bytes; return true;}
++};
++
+ struct FileCloser {
+     void operator()(FILE* file) const {
+         if (file != nullptr) {
+@@ -65,7 +75,7 @@ private:
+         }
+ 
+         const size_t byte_count = static_cast<size_t>(image.width) * image.height * image.channel;
+-        uint8_t* raw_copy       = static_cast<uint8_t*>(malloc(byte_count));
++        uint8_t* raw_copy       = static_cast<uint8_t*>(sd_host_malloc(byte_count));
+         if (raw_copy == nullptr) {
+             return {0, 0, 0, nullptr};
+         }
+@@ -111,7 +121,7 @@ public:
+ 
+     sd_image_t* put() {
+         if (image_.data != nullptr) {
+-            free(image_.data);
++            sd_host_free(image_.data);
+             image_.data = nullptr;
+         }
+         image_.width   = 0;
+@@ -136,7 +146,7 @@ public:
+ 
+     void reset(sd_image_t image = {0, 0, 0, nullptr}) {
+         if (image_.data != nullptr) {
+-            free(image_.data);
++            sd_host_free(image_.data);
+         }
+         image_ = image;
+     }
+diff --git a/include/stable-diffusion.h b/include/stable-diffusion.h
+index f4ea0ea..01ae05d 100644
+--- a/include/stable-diffusion.h
++++ b/include/stable-diffusion.h
+@@ -28,6 +28,15 @@ extern "C" {
+ #include <stdint.h>
+ #include <string.h>
+ 
++// Managed host tensors/weights/workspaces. Zero GiB selects bounded automatic RAM.
++SD_API bool sd_set_memory_budget(const char* max_ram_gib, bool stage_components);
++SD_API int sd_get_memory_failure_code(void); // 75 GPU allocation/budget, 76 RAM budget
++SD_API bool sd_host_reserve(size_t bytes);
++SD_API void sd_host_release(size_t bytes);
++SD_API void* sd_host_malloc(size_t bytes);
++SD_API void* sd_host_realloc(void* ptr, size_t bytes);
++SD_API void sd_host_free(void* ptr);
++
+ enum rng_type_t {
+     STD_DEFAULT_RNG,
+     CUDA_RNG,
+diff --git a/src/core/compute_workspace.cpp b/src/core/compute_workspace.cpp
+index 4e53175..132bd57 100644
+--- a/src/core/compute_workspace.cpp
++++ b/src/core/compute_workspace.cpp
+@@ -58,6 +58,11 @@ namespace sd {
+         if (grows) {
+             release();
+         }
++        planned_ram_=0;
++        for(const auto& size:measurement.buffers) if(sd_backend_is_cpu(size.backend)) {
++            if(size.bytes>SIZE_MAX-planned_ram_) { wildimage_ram::budget().fail(); return false; }
++            planned_ram_+=size.bytes;
++        }
+         return true;
+     }
+ 
+@@ -80,11 +85,17 @@ namespace sd {
+         }
+         ggml_backend_sched_reset(scheduler_);
+         assign_nodes(scheduler_, graph);
++        if(!ram_.try_reset(std::max<uint64_t>(planned_ram_,ram_.bytes()))) {
++            wildimage_ram::budget().fail(); release(); return false;
++        }
+         // Scheduler allocation rewrites sources. Split the execution graph only once.
+         if (!ggml_backend_sched_alloc_graph(scheduler_, graph)) {
++            if(planned_ram_==0 && !sd_backend_is_cpu(backend_)) wildimage_ram::gpu_failure();
+             release();
+             return false;
+         }
++        const auto actual_ram=sd_backend_is_cpu(backend_) ? bytes(backend_) : bytes(cpu_backend_);
++        if(!ram_.try_reset(actual_ram)) { wildimage_ram::budget().fail(); release(); return false; }
+         active_ = true;
+         return true;
+     }
+@@ -208,6 +219,7 @@ namespace sd {
+             for (size_t i = 0; i < extra_backends_.size(); ++i) {
+                 result.buffers.push_back({extra_backends_[i], sizes[i + 1]});
+             }
++            if(!sd_backend_is_cpu(backend_) && cpu_backend_!=nullptr) result.buffers.push_back({cpu_backend_,sizes[extra_backends_.size()+1]});
+             ggml_backend_sched_free(scheduler);
+         }
+         for (const auto& entry : external_buffers) {
+@@ -255,6 +267,7 @@ namespace sd {
+         measurement_key_.clear();
+         measured_buffers_.clear();
+         ggml_backend_sched_free(scheduler_);
++        ram_.reset();
+         scheduler_          = nullptr;
+         scheduler_capacity_ = 0;
+         return true;
+diff --git a/src/core/compute_workspace.h b/src/core/compute_workspace.h
+index 8dee5da..b60d889 100644
+--- a/src/core/compute_workspace.h
++++ b/src/core/compute_workspace.h
+@@ -5,6 +5,7 @@
+ #include <vector>
+ 
+ #include "ggml-backend.h"
++#include "core/wildimage_ram_budget.h"
+ 
+ namespace sd {
+     struct BackendBufferSize {
+@@ -19,6 +20,8 @@ namespace sd {
+         ggml_backend_sched_t scheduler_ = nullptr;
+         size_t scheduler_capacity_      = 0;
+         bool active_                    = false;
++        wildimage_ram::Reservation ram_;
++        size_t planned_ram_ = 0;
+         std::vector<uint8_t> measurement_key_;
+         std::vector<BackendBufferSize> measured_buffers_;
+ 
+diff --git a/src/core/ggml_runner.cpp b/src/core/ggml_runner.cpp
+index 8c2c5ba..d93c0bd 100644
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -857,14 +857,15 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads, const std::f
+ }
+ 
+ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs) {
++    wildimage_ram::budget().gpu_failure=false;
+     if (!assign_graph_cut_layer_split_backends(graph)) {
+         return std::nullopt;
+     }
+     const auto params       = collect_used_param_tensors(graph);
+     const auto& cached_plan = resolve_graph_cut_plan(graph);
+     auto manager            = residency_manager.lock();
+-    const bool can_segment  = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
+-                              manager != nullptr && manager->segmented_compute_enabled() &&
++    const bool can_segment  = !is_multi_device() &&
++                              manager != nullptr && (sd_backend_is_cpu(runtime_backend) || manager->segmented_compute_enabled()) &&
+                               cached_plan.valid && cached_plan.has_cuts && cached_plan.segments.size() > 1;
+     // An empty workspace request is a lower bound on the full graph's memory demand.
+     bool segmented = can_segment && !fits(memory_requests({{runtime_backend, 0}}, 0), params);
+diff --git a/src/core/ggml_tensor_utils.cpp b/src/core/ggml_tensor_utils.cpp
+index 5639c7e..b9d270e 100644
+--- a/src/core/ggml_tensor_utils.cpp
++++ b/src/core/ggml_tensor_utils.cpp
+@@ -11,6 +11,7 @@
+ 
+ void ggml_ext_im_set_randn_f32(ggml_tensor* tensor, std::shared_ptr<RNG> rng) {
+     uint32_t n                        = (uint32_t)ggml_nelements(tensor);
++    wildimage_ram::Reservation memory(wildimage_ram::tensor_bytes(n,sizeof(float)));
+     std::vector<float> random_numbers = rng->randn(n);
+     for (uint32_t i = 0; i < n; i++) {
+         ggml_ext_im_set_f32_1d(tensor, i, random_numbers[i]);
+diff --git a/src/core/rng.hpp b/src/core/rng.hpp
+index 84e285c..f6e0526 100644
+--- a/src/core/rng.hpp
++++ b/src/core/rng.hpp
+@@ -5,6 +5,7 @@
+ #include <memory>
+ #include <random>
+ #include <vector>
++#include "core/wildimage_ram_budget.h"
+ 
+ class RNG {
+ public:
+@@ -28,6 +29,7 @@ public:
+ 
+     std::vector<float> randn(uint32_t n) override {
+         std::vector<float> result;
++        result.reserve(n);
+         float mean   = 0.0;
+         float stddev = 1.0;
+         std::normal_distribution<float> distribution(mean, stddev);
+@@ -39,4 +41,4 @@ public:
+     }
+ };
+ 
+-#endif  // __SD_CORE_RNG_HPP__
+\ No newline at end of file
++#endif  // __SD_CORE_RNG_HPP__
+diff --git a/src/core/rng_philox.hpp b/src/core/rng_philox.hpp
+index 9799a87..b7d7e66 100644
+--- a/src/core/rng_philox.hpp
++++ b/src/core/rng_philox.hpp
+@@ -72,6 +72,7 @@ public:
+     }
+ 
+     std::vector<float> randn(uint32_t n) override {
++        wildimage_ram::Reservation counters(wildimage_ram::tensor_bytes(n,4*sizeof(uint32_t)));
+         Counter counter;
+         counter[0].resize(n, this->offset);
+         counter[1].resize(n);
+diff --git a/src/core/runner_cache.cpp b/src/core/runner_cache.cpp
+index 9bbcae0..cbcf491 100644
+--- a/src/core/runner_cache.cpp
++++ b/src/core/runner_cache.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "core/ggml_graph_cut.h"
+ #include "core/util.h"
++#include "core/ggml_extend_backend.h"
+ 
+ namespace sd {
+     static std::unordered_set<const ggml_tensor*> cache_graph_tensors(ggml_cgraph* graph) {
+@@ -34,10 +35,19 @@ namespace sd {
+         // Cut views are rebound with their original strides and offsets.
+         std::copy(std::begin(source->nb), std::end(source->nb), std::begin(entry->tensor->nb));
+         ggml_set_name(entry->tensor, name.c_str());
++        if(sd_backend_is_cpu(backend)) {
++            const auto buft=ggml_backend_get_default_buffer_type(backend);
++            const auto bytes=GGML_PAD(ggml_backend_buft_get_alloc_size(buft,entry->tensor),ggml_backend_buft_get_alignment(buft));
++            if(!entry->ram.try_reset(bytes)) { wildimage_ram::budget().fail(); return nullptr; }
++        }
+         entry->buffer = ggml_backend_alloc_ctx_tensors(entry->context, backend);
+         if (entry->buffer == nullptr) {
++            if(sd_backend_is_cpu(backend)) wildimage_ram::budget().fail(); else wildimage_ram::gpu_failure();
+             return nullptr;
+         }
++        if(sd_backend_is_cpu(backend) && !entry->ram.try_reset(ggml_backend_buffer_get_size(entry->buffer))) {
++            wildimage_ram::budget().fail(); return nullptr;
++        }
+         return entry;
+     }
+ 
+@@ -55,7 +65,7 @@ namespace sd {
+             return nullptr;
+         }
+         if (source->view_src != nullptr || !ggml_is_contiguous(source) || source->buffer == nullptr) {
+-            std::vector<uint8_t> data(ggml_nbytes(source));
++            std::vector<uint8_t,wildimage_ram::Allocator<uint8_t>> data(ggml_nbytes(source));
+             ggml_backend_tensor_get(source, data.data(), 0, data.size());
+             ggml_backend_tensor_set(entry->tensor, data.data(), 0, data.size());
+         } else {
+diff --git a/src/core/runner_cache.h b/src/core/runner_cache.h
+index b6fe1c7..008c209 100644
+--- a/src/core/runner_cache.h
++++ b/src/core/runner_cache.h
+@@ -7,6 +7,7 @@
+ #include <unordered_set>
+ 
+ #include "ggml-backend.h"
++#include "core/wildimage_ram_budget.h"
+ 
+ namespace sd::ggml_graph_cut {
+     struct Segment;
+@@ -14,6 +15,7 @@ namespace sd::ggml_graph_cut {
+ 
+ namespace sd {
+     struct CachedTensor {
++        wildimage_ram::Reservation ram;
+         ggml_context* context        = nullptr;
+         ggml_backend_buffer_t buffer = nullptr;
+         ggml_tensor* tensor          = nullptr;
+diff --git a/src/core/tensor.hpp b/src/core/tensor.hpp
+index a925dbf..5166869 100644
+--- a/src/core/tensor.hpp
++++ b/src/core/tensor.hpp
+@@ -18,6 +18,7 @@
+ 
+ #include "core/parallel.h"
+ #include "core/rng.hpp"
++#include "core/wildimage_ram_budget.h"
+ 
+ namespace sd {
+ 
+@@ -73,13 +74,26 @@ namespace sd {
+     class Tensor {
+     public:
+         Tensor() = default;
++        Tensor(const Tensor& other)
++            : ram_(wildimage_ram::tensor_bytes(other.data_.size(),sizeof(T))), data_(other.data_), shape_(other.shape_) {}
++        Tensor(Tensor&& other) noexcept { swap(other); }
++        Tensor& operator=(const Tensor& other) { if(this!=&other) {Tensor copy(other); swap(copy);} return *this; }
++        Tensor& operator=(Tensor&& other) noexcept { if(this!=&other) {Tensor moved(std::move(other)); swap(moved);} return *this; }
++        void swap(Tensor& other) noexcept { data_.swap(other.data_); shape_.swap(other.shape_); ram_.swap(other.ram_); }
+ 
+         explicit Tensor(std::vector<int64_t> shape)
+-            : data_(static_cast<size_t>(tensor_numel(shape))), shape_(std::move(shape)) {
++            : ram_(wildimage_ram::tensor_bytes(static_cast<uint64_t>(tensor_numel(shape)),sizeof(T))),
++              data_(static_cast<size_t>(tensor_numel(shape))), shape_(std::move(shape)) {
+         }
+ 
+-        Tensor(std::vector<int64_t> shape, std::vector<T> data)
+-            : data_(std::move(data)), shape_(std::move(shape)) {
++        Tensor(std::vector<int64_t> shape, const std::vector<T>& data)
++            : Tensor(std::move(shape)) {
++            if(data.size()!=data_.size()) tensor_throw_invalid_argument("Tensor data size does not match shape");
++            std::copy(data.begin(),data.end(),data_.begin());
++        }
++        Tensor(std::vector<int64_t> shape, std::vector<T>&& data)
++            : ram_(wildimage_ram::tensor_bytes(data.capacity(),sizeof(T))),
++              data_(std::move(data)), shape_(std::move(shape)) {
+             if (static_cast<int64_t>(data_.size()) != tensor_numel(shape_)) {
+                 tensor_throw_invalid_argument("Tensor data size does not match shape: data.size()=" +
+                                               std::to_string(data_.size()) + ", shape=" +
+@@ -88,6 +102,13 @@ namespace sd {
+             }
+         }
+ 
++        Tensor(std::vector<int64_t> shape, std::vector<T>&& data, wildimage_ram::Reservation memory)
++            : ram_(std::move(memory)), data_(), shape_(std::move(shape)) {
++            ram_.reset(wildimage_ram::tensor_bytes(data.capacity(),sizeof(T)));
++            data_=std::move(data);
++            if(static_cast<int64_t>(data_.size())!=tensor_numel(shape_)) tensor_throw_invalid_argument("Tensor data size does not match shape");
++        }
++
+         const std::vector<int64_t>& shape() const {
+             return shape_;
+         }
+@@ -121,8 +142,17 @@ namespace sd {
+         }
+ 
+         void resize(std::vector<int64_t> shape) {
++            const auto size = static_cast<size_t>(tensor_numel(shape));
++            if (size > data_.capacity()) {
++                wildimage_ram::Reservation memory(wildimage_ram::tensor_bytes(size,sizeof(T)));
++                std::vector<T> replacement(size);
++                std::copy_n(data_.begin(),std::min(size,data_.size()),replacement.begin());
++                data_.swap(replacement);
++                ram_.swap(memory);
++            } else {
++                data_.resize(size);
++            }
+             shape_ = std::move(shape);
+-            data_.resize(static_cast<size_t>(tensor_numel(shape_)));
+         }
+ 
+         Tensor& reshape_(std::vector<int64_t> shape) {
+@@ -279,14 +309,18 @@ namespace sd {
+                 tensor_throw_invalid_argument("Tensor randn requires a valid RNG");
+             }
+             const uint32_t size = static_cast<uint32_t>(tensor_numel(shape));
+-            return Tensor(std::move(shape), rng->randn(size));
++            wildimage_ram::Reservation memory(wildimage_ram::tensor_bytes(size,sizeof(T)));
++            return Tensor(std::move(shape), rng->randn(size),std::move(memory));
+         }
+ 
+         static Tensor randn_like(const Tensor& other, const std::shared_ptr<RNG>& rng) {
+             return randn(other.shape(), rng);
+         }
+ 
+-        static Tensor from_vector(std::vector<T> data) {
++        static Tensor from_vector(const std::vector<T>& data) {
++            return Tensor({static_cast<int64_t>(data.size())},data);
++        }
++        static Tensor from_vector(std::vector<T>&& data) {
+             const int64_t size = static_cast<int64_t>(data.size());
+             return Tensor({size}, std::move(data));
+         }
+@@ -337,6 +371,7 @@ namespace sd {
+             return offset;
+         }
+ 
++        wildimage_ram::Reservation ram_;
+         std::vector<T> data_;
+         std::vector<int64_t> shape_;
+     };
+diff --git a/src/core/tensor_ggml.hpp b/src/core/tensor_ggml.hpp
+index 5082ce2..b155739 100644
+--- a/src/core/tensor_ggml.hpp
++++ b/src/core/tensor_ggml.hpp
+@@ -56,7 +56,7 @@ namespace sd {
+             GGML_ABORT("ggml tensor type does not match sd::Tensor type");
+         }
+         Tensor<T> result(shape_from_ggml(tensor));
+-        std::vector<uint8_t> strided_data;
++        std::vector<uint8_t,wildimage_ram::Allocator<uint8_t>> strided_data;
+         void* destination = result.data();
+         if (!ggml_is_contiguous(tensor)) {
+             strided_data.resize(ggml_nbytes(tensor));
+diff --git a/src/core/util.cpp b/src/core/util.cpp
+index a691b42..a294ffe 100644
+--- a/src/core/util.cpp
++++ b/src/core/util.cpp
+@@ -788,8 +788,8 @@ sd_image_t tensor_to_sd_image(const sd::Tensor<float>& tensor, int frame_index)
+     int width     = static_cast<int>(shape[0]);
+     int height    = static_cast<int>(shape[1]);
+     int channel   = static_cast<int>(shape[shape.size() == 5 ? 3 : 2]);
+-    uint8_t* data = (uint8_t*)malloc(static_cast<size_t>(width * height * channel));
+-    GGML_ASSERT(data != nullptr);
++    uint8_t* data = static_cast<uint8_t*>(wildimage_ram::raw_malloc(static_cast<size_t>(width)*height*channel));
++    if(!data) throw wildimage_ram::Exceeded();
+     preprocessing_tensor_frame_to_sd_image(tensor, frame_index, data);
+     return {
+         static_cast<uint32_t>(width),
+diff --git a/src/model/diffusion/qwen_image_2_1.hpp b/src/model/diffusion/qwen_image_2_1.hpp
+index 76cbccb..4674169 100644
+--- a/src/model/diffusion/qwen_image_2_1.hpp
++++ b/src/model/diffusion/qwen_image_2_1.hpp
+@@ -530,6 +530,9 @@ namespace Qwen {
+                         pe_key.add(region.height_axis).add(region.width_axis);
+                     }
+                     auto pe = make_input(pe_cache_.get_or_create(pe_key, [&]() {
++                        const int64_t tokens=static_cast<int64_t>(layout.positions.size())-(cached ? layout.prefix_length : 0);
++                        const auto pe_bytes=wildimage_ram::tensor_bytes(static_cast<uint64_t>(tokens),sizeof(float)*2*config.head_dim);
++                        wildimage_ram::Reservation pe_memory(pe_bytes), pe_scratch(wildimage_ram::tensor_bytes(pe_bytes,2));
+                         const auto first_position = layout.positions.begin() + (cached ? layout.prefix_length : 0);
+                         Rope::Embedding embedding;
+                         embedding.ids.assign(first_position, layout.positions.end());
+@@ -543,8 +546,7 @@ namespace Qwen {
+                         }
+                         embedding.values     = Rope::embed_nd(embedding.ids, 1, 10000.f, config.axes_dim, embedding.layout, &embedding.frequencies);
+                         auto values          = finish_rope_pe(std::move(embedding));
+-                        const int64_t tokens = static_cast<int64_t>(layout.positions.size()) - (cached ? layout.prefix_length : 0);
+-                        return sd::Tensor<float>({2, 2, config.head_dim / 2, tokens}, std::move(values));
++                        return sd::Tensor<float>({2, 2, config.head_dim / 2, tokens}, std::move(values),std::move(pe_memory));
+                     }));
+                     std::vector<ggml_tensor*> masks, ref_inputs;
+                     for (const auto& mask : mask_data) {
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+index 5576067..f57e989 100644
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -17,6 +17,7 @@
+ #include <vector>
+ 
+ #include "core/util.h"
++#include "core/wildimage_ram_budget.h"
+ #include "model_io/gguf_io.h"
+ #include "model_io/safetensors_io.h"
+ #include "model_io/torch_legacy_io.h"
+@@ -152,7 +153,7 @@ void convert_tensor(void* src,
+             throw std::runtime_error(sd_format("type %s unsupported for integer quantization: no dequantization available",
+                                                ggml_type_name(src_type)));
+         }
+-        std::vector<char> buf;
++        std::vector<char,wildimage_ram::Allocator<char>> buf;
+         buf.resize(sizeof(float) * n);
+         char* src_data_f32 = buf.data();
+         qtype->to_float(src, (float*)src_data_f32, n);
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+index 8b61827..0e3e7a7 100644
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -566,9 +566,16 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
+                 staged_tensors.push_back({state, staging_tensor});
+             }
+ 
++            wildimage_ram::Reservation ram;
++            if(ggml_backend_buft_is_host(staging_buft)) {
++                size_t bytes=0;
++                for(const auto& tensor:staged_tensors) bytes+=GGML_PAD(ggml_backend_buft_get_alloc_size(staging_buft,tensor.second),ggml_backend_buft_get_alignment(staging_buft));
++                if(!ram.try_reset(bytes)) { wildimage_ram::budget().fail(); ggml_free(staging_ctx); return false; }
++            }
+             ggml_backend_buffer_t compute_buffer =
+                 ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, staging_buft);
+             if (compute_buffer == nullptr) {
++                if(ggml_backend_buft_is_host(staging_buft)) wildimage_ram::budget().fail(); else wildimage_ram::gpu_failure();
+                 LOG_ERROR("model manager alloc compute params backend buffer failed, num_tensors = %zu",
+                           staged_tensors.size());
+                 ggml_free(staging_ctx);
+@@ -588,6 +595,7 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
+             ggml_backend_synchronize(compute_backend);
+ 
+             auto block             = std::make_unique<ComputeStagingBlock>();
++            block->ram.swap(ram);
+             block->compute_backend = compute_backend;
+             block->buffer          = compute_buffer;
+             block->staging_ctx     = staging_ctx;
+@@ -881,13 +889,13 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
+         states_by_buffer_type[{params_buft, static_cast<int>(state->residency_mode)}].push_back(state);
+     }
+ 
++    const auto protected_params=states;
+     for (const auto& pair : states_by_buffer_type) {
+         ggml_backend_buffer_type_t params_buft  = pair.first.first;
+         const std::vector<TensorState*>& states = pair.second;
+         size_t alignment                        = ggml_backend_buft_get_alignment(params_buft);
+         size_t max_size                         = ggml_backend_buft_get_max_size(params_buft);
+-        if (!ggml_backend_buft_is_host(params_buft) &&
+-            (max_size == 0 || max_size > MAX_RESIDENCY_BLOCK_BYTES)) {
++        if (max_size == 0 || max_size > MAX_RESIDENCY_BLOCK_BYTES) {
+             max_size = MAX_RESIDENCY_BLOCK_BYTES;
+         }
+ 
+@@ -896,8 +904,17 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
+                 return true;
+             }
+ 
++            wildimage_ram::Reservation ram;
++            if (ggml_backend_buft_is_host(params_buft)) {
++                if (!reclaim_ram(chunk_size, protected_params) || !ram.try_reset(chunk_size)) {
++                    wildimage_ram::budget().fail();
++                    return false;
++                }
++            }
+             ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(params_buft, chunk_size);
+             if (buffer == nullptr) {
++                if (ggml_backend_buft_is_host(params_buft)) wildimage_ram::budget().fail();
++                else wildimage_ram::gpu_failure();
+                 LOG_ERROR("model manager alloc params backend buffer failed, size = %.2fMB",
+                           chunk_size / (1024.0 * 1024.0));
+                 return false;
+@@ -931,6 +948,7 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
+             }
+ 
+             auto block              = std::make_unique<ParamsStorageBlock>();
++            block->ram.swap(ram);
+             block->buffer           = buffer;
+             block->states           = chunk;
+             ParamsStorageBlock* raw = block.get();
+@@ -973,7 +991,7 @@ bool ModelManager::load_tensor_parts(TensorState& state) {
+         return false;
+     }
+     const size_t size = ggml_nbytes(state.tensor);
+-    std::vector<uint8_t> buffer;
++    std::vector<uint8_t,wildimage_ram::Allocator<uint8_t>> buffer;
+     void* data = state.tensor->data;
+     if (!ggml_backend_buffer_is_host(state.tensor->buffer)) {
+         buffer.resize(size);
+@@ -1176,6 +1194,7 @@ void ModelManager::free_compute_staging_block(ComputeStagingBlock& block) {
+         ggml_backend_buffer_free(block.buffer);
+         block.buffer = nullptr;
+     }
++    block.ram.reset();
+     if (block.staging_ctx != nullptr) {
+         ggml_free(block.staging_ctx);
+         block.staging_ctx = nullptr;
+@@ -1237,6 +1256,7 @@ void ModelManager::free_params_storage_block(ParamsStorageBlock& block) {
+         block.buffer = nullptr;
+     }
+     block.mmap_tensor_stores.clear();
++    block.ram.reset();
+ 
+     for (TensorState* state : block.states) {
+         if (state == nullptr || state->tensor == nullptr) {
+@@ -1685,12 +1705,22 @@ void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>&
+             [](TensorState* state) {
+                 return state == nullptr ||
+                        (state->pin_count == 0 && !state->staged_to_compute_backend &&
+-                        state->residency_mode == ResidencyMode::Disk);
++                        (state->residency_mode == ResidencyMode::Disk ||
++                         (wildimage_ram::budget().stage_components && sd_backend_is_cpu(state->params_backend))));
+             });
+         if (intersects && fully_evictable) {
+             target_states.insert(block->states.begin(), block->states.end());
+         }
+     }
++    for (auto it=params_storage_blocks_.begin(); it!=params_storage_blocks_.end();) {
++        auto& block=**it;
++        const bool release=wildimage_ram::budget().stage_components && block.buffer && ggml_backend_buffer_is_host(block.buffer) &&
++            std::all_of(block.states.begin(),block.states.end(),[&](TensorState* state) {
++                return state && target_states.count(state) && state->pin_count==0 && !state->staged_to_compute_backend;
++            });
++        if(release) { free_params_storage_block(block); it=params_storage_blocks_.erase(it); }
++        else ++it;
++    }
+     release_params_storage_blocks(false, &target_states);
+ }
+ WeightResidencyInfo ModelManager::inspect_compute_backend_params(
+@@ -1763,7 +1793,13 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
+     const std::vector<TensorState*>& states,
+     bool log_details) const {
+     CapacityCheck result;
+-    if (request.compute_backend == nullptr || sd_backend_is_cpu(request.compute_backend)) {
++    if (request.compute_backend == nullptr) {
++        return result;
++    }
++    if (sd_backend_is_cpu(request.compute_backend)) {
++        const auto missing=compute_backend_alloc_size(states,true);
++        result.required_budget_bytes=missing > SIZE_MAX-request.pending_allocation_bytes ? SIZE_MAX : missing+request.pending_allocation_bytes;
++        result.available_budget_bytes=static_cast<size_t>(wildimage_ram::budget().remaining());
+         return result;
+     }
+     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
+@@ -1857,6 +1893,16 @@ bool ModelManager::fits_compute_backend_capacity(
+         return false;
+     }
+     const auto capacity = check_capacity(request, states);
++    if(!sd_backend_is_cpu(request.compute_backend)) {
++        size_t missing_host=0;
++        for(const auto* state:states) if(state && !state->loaded_to_params_backend && sd_backend_is_cpu(state->params_backend)) {
++            const auto buft=params_buffer_type_for(*state);
++            const auto bytes=GGML_PAD(ggml_backend_buft_get_alloc_size(buft,state->tensor),ggml_backend_buft_get_alignment(buft));
++            if(bytes>SIZE_MAX-missing_host) return false;
++            missing_host+=bytes;
++        }
++        if(missing_host>wildimage_ram::budget().remaining()) return false;
++    }
+     return !capacity.requires_reclamation && capacity.fits();
+ }
+ 
+@@ -1876,7 +1922,11 @@ bool ModelManager::ensure_compute_backend_capacity(
+         return false;
+     }
+     if (sd_backend_is_cpu(compute_backend)) {
+-        return true;
++        auto capacity=check_capacity(request,required_states);
++        if(capacity.fits()) return true;
++        if(reclaim_ram(capacity.required_budget_bytes,required_states) && check_capacity(request,required_states).fits()) return true;
++        wildimage_ram::budget().fail();
++        return false;
+     }
+ 
+     auto fits = [&]() {
+@@ -2044,5 +2094,26 @@ bool ModelManager::ensure_compute_backend_capacity(
+              capacity.required_budget_bytes / (1024.0 * 1024.0),
+              available_device.c_str(),
+              available_budget.c_str());
++    wildimage_ram::gpu_failure();
+     return false;
+ }
++
++bool ModelManager::reclaim_ram(size_t pending, const std::vector<TensorState*>& protected_states) {
++    if(pending<=wildimage_ram::budget().remaining()) return true;
++    std::unordered_set<TensorState*> protected_set(protected_states.begin(),protected_states.end());
++    clear_all_prefetched_params();
++    std::unordered_set<TensorState*> candidates;
++    for(const auto& state:tensor_states_) if(state && state->pin_count==0 && !protected_set.count(state.get())) candidates.insert(state.get());
++    release_compute_staging_blocks(false,&candidates);
++    for(auto it=params_storage_blocks_.begin(); it!=params_storage_blocks_.end();) {
++        auto& block=**it;
++        const bool evict=block.buffer && ggml_backend_buffer_is_host(block.buffer) && block.mmap_tensor_stores.empty() &&
++            std::all_of(block.states.begin(),block.states.end(),[&](TensorState* state) {
++                return state && state->pin_count==0 && !state->staged_to_compute_backend && !protected_set.count(state);
++            });
++        if(evict) { free_params_storage_block(block); it=params_storage_blocks_.erase(it); }
++        else ++it;
++        if(pending<=wildimage_ram::budget().remaining()) return true;
++    }
++    return pending<=wildimage_ram::budget().remaining();
++}
+diff --git a/src/model_manager.h b/src/model_manager.h
+index 81d2546..e7b5ba5 100644
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -13,6 +13,7 @@
+ #include "device_residency_manager.h"
+ #include "model_component.h"
+ #include "model_loader.h"
++#include "core/wildimage_ram_budget.h"
+ 
+ class ModelManager : public DeviceResidencyManager {
+ public:
+@@ -59,12 +60,14 @@ private:
+     };
+ 
+     struct ParamsStorageBlock {
++        wildimage_ram::Reservation ram;
+         ggml_backend_buffer_t buffer = nullptr;
+         std::vector<MmapTensorStore> mmap_tensor_stores;
+         std::vector<TensorState*> states;
+     };
+ 
+     struct ComputeStagingBlock {
++        wildimage_ram::Reservation ram;
+         ggml_backend_t compute_backend = nullptr;
+         ggml_backend_buffer_t buffer   = nullptr;
+         ggml_context* staging_ctx      = nullptr;
+@@ -135,6 +138,7 @@ private:
+     bool validate_tensor(const TensorState& state) const;
+ 
+     bool load_tensors_to_params_backend(const std::vector<TensorState*>& states);
++    bool reclaim_ram(size_t pending, const std::vector<TensorState*>& protected_states);
+     bool apply_loras_to_params(const std::vector<TensorState*>& states);
+     bool mmap_params(const std::vector<TensorState*>& states,
+                      std::vector<ParamsStorageBlock*>& created_storage_blocks);
+diff --git a/src/model_manager_prefetch.cpp b/src/model_manager_prefetch.cpp
+index 4056b8f..6e880d9 100644
+--- a/src/model_manager_prefetch.cpp
++++ b/src/model_manager_prefetch.cpp
+@@ -118,6 +118,11 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
+             }
+             staging_block->staged_tensors.push_back({state, staging_tensor});
+         }
++        if(ggml_backend_buft_is_host(buffer_type)) {
++            size_t bytes=0;
++            for(const auto& tensor:staging_block->staged_tensors) bytes+=GGML_PAD(ggml_backend_buft_get_alloc_size(buffer_type,tensor.second),ggml_backend_buft_get_alignment(buffer_type));
++            if(!staging_block->ram.try_reset(bytes)) {ggml_free(staging_ctx); staging_block->staging_ctx=nullptr; return false;}
++        }
+         staging_block->buffer =
+             ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, buffer_type);
+         if (staging_block->buffer == nullptr) {
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+index d161d9e..d4baca3 100644
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -2129,7 +2129,7 @@ void StableDiffusionGGML::preview_image(int step,
+         uint32_t img_height = static_cast<uint32_t>(_latents.shape()[1]) * patch_sz;
+ 
+         uint32_t img_channels = latent_alpha_proj != nullptr ? 4 : 3;
+-        uint8_t* data         = (uint8_t*)malloc(frames * img_width * img_height * img_channels * sizeof(uint8_t));
++        uint8_t* data         = static_cast<uint8_t*>(wildimage_ram::raw_malloc(static_cast<size_t>(frames)*img_width*img_height*img_channels));
+         GGML_ASSERT(data != nullptr);
+         preview_latent_video(data, _latents, latent_rgb_proj, latent_rgb_bias, patch_sz, latent_alpha_proj, latent_alpha_bias);
+         sd_image_t* images = (sd_image_t*)malloc(frames * sizeof(sd_image_t));
+@@ -2138,7 +2138,7 @@ void StableDiffusionGGML::preview_image(int step,
+             images[i] = {img_width, img_height, img_channels, data + i * img_width * img_height * img_channels};
+         }
+         step_callback(step, frames, images, is_noisy, step_callback_data);
+-        free(data);
++        wildimage_ram::raw_free(data);
+         free(images);
+         return;
+     }
+@@ -2168,7 +2168,7 @@ void StableDiffusionGGML::preview_image(int step,
+ 
+         step_callback(step, frames, images, is_noisy, step_callback_data);
+         for (uint32_t i = 0; i < frames; ++i) {
+-            free(images[i].data);
++            wildimage_ram::raw_free(images[i].data);
+         }
+         free(images);
+         return;
+diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
+index bca4b79..f9155bf 100644
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -11,6 +11,23 @@
+ #include "pipeline/diffusion_engine.h"
+ #include "pipeline/generation.h"
+ #include "pipeline/request.h"
++#include "core/wildimage_ram_budget.h"
++
++SD_API bool sd_set_memory_budget(const char* amount, bool stage) {
++    if(!amount || !*amount) return false;
++    char* end=nullptr; const double gib=std::strtod(amount,&end);
++    if(!end || *end || !std::isfinite(gib) || gib<0 || gib>double(UINT64_MAX)/wildimage_ram::GiB) return false;
++    const bool ok=wildimage_ram::budget().configure(static_cast<uint64_t>(gib*wildimage_ram::GiB),wildimage_ram::system_memory(),stage);
++    if(!ok) { wildimage_ram::budget().fail(); return false; }
++    LOG_INFO("Managed RAM budget: %.2f MiB (requested %.2f GiB%s)",wildimage_ram::budget().limit()/1048576.,gib,gib==0 ? ", bounded auto" : "");
++    return true;
++}
++SD_API int sd_get_memory_failure_code(void) { return wildimage_ram::budget().failure_code(); }
++SD_API bool sd_host_reserve(size_t bytes) { if(wildimage_ram::budget().try_acquire(bytes)) return true; wildimage_ram::budget().fail(); return false; }
++SD_API void sd_host_release(size_t bytes) { wildimage_ram::budget().release(bytes); }
++SD_API void* sd_host_malloc(size_t bytes) { return wildimage_ram::raw_malloc(bytes); }
++SD_API void* sd_host_realloc(void* ptr,size_t bytes) { return wildimage_ram::raw_realloc(ptr,bytes); }
++SD_API void sd_host_free(void* ptr) { wildimage_ram::raw_free(ptr); }
+ 
+ #define NONE_STR "NONE"
+ 
+@@ -646,11 +663,15 @@ struct sd_ctx_t {
+ };
+ 
+ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
++    if(wildimage_ram::budget().limit()==0) { wildimage_ram::budget().fail(); return nullptr; }
++    wildimage_ram::budget().gpu_failure=false;
+     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
+     if (sd_ctx == nullptr) {
+         return nullptr;
+     }
++    sd_ctx->sd=nullptr;
+ 
++    try {
+     sd_ctx->sd = new StableDiffusionGGML();
+     if (sd_ctx->sd == nullptr) {
+         free(sd_ctx);
+@@ -664,6 +685,11 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+         return nullptr;
+     }
+     return sd_ctx;
++    } catch(const std::exception& error) {
++        if(dynamic_cast<const wildimage_ram::Exceeded*>(&error) || dynamic_cast<const std::bad_alloc*>(&error)) wildimage_ram::budget().fail();
++        LOG_ERROR("model initialization failed: %s",error.what());
++        delete sd_ctx->sd; free(sd_ctx); return nullptr;
++    }
+ }
+ 
+ void free_sd_ctx(sd_ctx_t* sd_ctx) {
+@@ -770,6 +796,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
+             return false;
+         }
+     } catch (const std::exception& e) {
++        if(dynamic_cast<const wildimage_ram::Exceeded*>(&e) || dynamic_cast<const std::bad_alloc*>(&e)) wildimage_ram::budget().fail();
+         LOG_ERROR("image generation failed: %s", e.what());
+         free_sd_images(images, count);
+         return false;
+@@ -818,7 +845,7 @@ SD_API void free_sd_images(sd_image_t* result_images, int num_images) {
+ 
+     for (int i = 0; i < num_images; ++i) {
+         if (result_images[i].data != nullptr) {
+-            free(result_images[i].data);
++            sd_host_free(result_images[i].data);
+             result_images[i].data = nullptr;
+         }
+     }

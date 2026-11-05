@@ -11,6 +11,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include "wildimage_ram_budget.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -25,7 +26,7 @@
 
 namespace wildimage_conditioning {
 namespace fs = std::filesystem;
-using Bytes = std::vector<uint8_t>;
+using Bytes = std::vector<uint8_t,wildimage_ram::Allocator<uint8_t>>;
 using Digest = std::array<uint8_t, 32>;
 constexpr uint64_t entry_max_bytes = UINT64_C(256) << 20;
 constexpr uint64_t store_max_bytes = UINT64_C(8192) << 20;

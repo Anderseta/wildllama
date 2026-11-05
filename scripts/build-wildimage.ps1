@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = '3be23788fc0c9f35a2c24b1211caae11d4a54dbc'
-$runtimeRevision = '3be2378-wildllama-conditioning1'
+$runtimeRevision = '3be2378-wildllama-ram1'
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
 
@@ -222,24 +222,27 @@ int main() {
     $configuration | Set-Content -LiteralPath (Join-Path $imports 'ggml-config.cmake') -Encoding utf8
 
     $nativeDirectory = Join-Path $repository 'third_party/wildimage/native'
-    $patch = Join-Path $repository 'third_party/wildimage/patches/0001-conditioning-disk-cache.patch'
-    if (-not (Test-Path -LiteralPath $patch)) { throw "Conditioning-cache patch is not frozen yet: $patch. Import libraries and ABI probe are ready." }
     $conditioningDirectory = Join-Path $SourceDirectory 'src/conditioning'
     New-Item -ItemType Directory -Force -Path $conditioningDirectory | Out-Null
     $sourceInputs = @()
-    foreach ($name in @('wildimage_conditioning_cache.h', 'wildimage_conditioning_store.h')) {
+    foreach ($name in @('wildimage_conditioning_cache.h', 'wildimage_conditioning_store.h', 'wildimage_ram_budget.h')) {
         $header = Join-Path $nativeDirectory $name
         Copy-ReplacingFile $header (Join-Path $conditioningDirectory $name)
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
-    & git -C $SourceDirectory apply --check $patch 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        Invoke-Checked 'git' @('-C', $SourceDirectory, 'apply', $patch) (Join-Path $BuildDirectory 'apply-patch.log') | Out-Null
-    } else {
-        & git -C $SourceDirectory apply --reverse --check $patch 2>$null
-        if ($LASTEXITCODE -ne 0) { throw 'Native conditioning patch cannot be applied or verified as already applied.' }
+    Copy-ReplacingFile (Join-Path $nativeDirectory 'wildimage_ram_budget.h') (Join-Path $SourceDirectory 'src/core/wildimage_ram_budget.h')
+    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch')) {
+        $patch = Join-Path $repository "third_party/wildimage/patches/$patchName"
+        if(-not (Test-Path -LiteralPath $patch)) {throw "Native patch is absent: $patch"}
+        & git -C $SourceDirectory apply --check $patch 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Invoke-Checked 'git' @('-C', $SourceDirectory, 'apply', $patch) (Join-Path $BuildDirectory ($patchName+'.log')) | Out-Null
+        } else {
+            & git -C $SourceDirectory apply --reverse --check $patch 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "Native patch cannot be applied or verified as already applied: $patchName" }
+        }
+        $sourceInputs += File-Record $patch "third_party/wildimage/patches/$patchName"
     }
-    $sourceInputs += File-Record $patch 'third_party/wildimage/patches/0001-conditioning-disk-cache.patch'
     $sourceInputs += File-Record $PSCommandPath 'scripts/build-wildimage.ps1'
     $configureArguments = @('-S', $SourceDirectory, '-B', $cmakeDirectory, '-G', 'Ninja',
         "-DCMAKE_MAKE_PROGRAM=$($ninja.Replace('\', '/'))", "-DCMAKE_C_COMPILER=$($cl.Replace('\', '/'))", "-DCMAKE_CXX_COMPILER=$($cl.Replace('\', '/'))",
@@ -257,9 +260,9 @@ int main() {
         return
     }
 
-    Invoke-Checked $CmakePath @('--build', $cmakeDirectory, '--target', 'sd-cli', '--parallel', "$Parallel") (Join-Path $BuildDirectory 'compile.log') | Out-Null
+    Invoke-Checked $CmakePath @('--build', $cmakeDirectory, '--target', 'sd-cli', 'sd-server', '--parallel', "$Parallel") (Join-Path $BuildDirectory 'compile.log') | Out-Null
     $binaryDirectory = Join-Path $cmakeDirectory 'bin'
-    foreach ($name in @('sd-cli.exe', 'stable-diffusion.dll')) {
+    foreach ($name in @('sd-cli.exe', 'sd-server.exe', 'stable-diffusion.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $binaryDirectory $name))) { throw "Expected compiled output is absent: $name" }
     }
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
@@ -267,7 +270,7 @@ int main() {
         if ($file.Name -eq 'wildimage-runtime.json') { continue }
         Copy-ReplacingFile $file.FullName (Join-Path $Destination $file.Name)
     }
-    foreach ($name in @('sd-cli.exe', 'stable-diffusion.dll')) {
+    foreach ($name in @('sd-cli.exe', 'sd-server.exe', 'stable-diffusion.dll')) {
         Copy-ReplacingFile (Join-Path $binaryDirectory $name) (Join-Path $Destination $name)
     }
     $licenses = @{
@@ -281,7 +284,7 @@ int main() {
     foreach ($relative in $licenses.Keys) { Copy-ReplacingFile (Join-Path $SourceDirectory $relative) (Join-Path $Destination $licenses[$relative]) }
     Invoke-Checked (Join-Path $Destination 'sd-cli.exe') @('--help') (Join-Path $BuildDirectory 'help.log') | Out-Null
     $files = @(Get-ChildItem -LiteralPath $Destination -File | Where-Object { $_.Name -ne 'wildimage-runtime.json' } | ForEach-Object { File-Record $_.FullName $_.Name })
-    $manifest = @{ provider = 'stable-diffusion.cpp'; source = 'https://github.com/leejet/stable-diffusion.cpp'; revision = $runtimeRevision; upstream_revision = $sourceRevision; base_release = $baseManifest.release; base_archive_sha256 = $baseManifest.archive_sha256; features = @{ conditioning_cache = $true }; build = $preparation; files = $files }
+    $manifest = @{ provider = 'stable-diffusion.cpp'; source = 'https://github.com/leejet/stable-diffusion.cpp'; revision = $runtimeRevision; upstream_revision = $sourceRevision; base_release = $baseManifest.release; base_archive_sha256 = $baseManifest.archive_sha256; features = @{ conditioning_cache = $true; ram_budget = $true; gpu_memory_retry_exit = 75; ram_budget_exit = 76 }; build = $preparation; files = $files }
     $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Destination 'wildimage-runtime.json') -Encoding utf8
     Write-Output "WildImage custom runtime prepared: $Destination"
     Write-Output 'Released GGML/CUDA DLLs were reused unchanged. No model was downloaded or loaded.'

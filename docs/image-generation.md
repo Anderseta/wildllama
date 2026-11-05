@@ -27,20 +27,42 @@ model adapters apply at runtime rather than expanding and rewriting the base
 weights. Model quantization, base/Turbo training and LoRA strength are independent
 choices.
 
-## Sequential component storage
+## RAM backing and sequential components
 
-`stage_components` uses the image runner's disk parameter backend with lazy
-loading, without whole-file mmap or eager model materialization. GPU computation
-remains enabled. At a component's phase boundary, the runner evicts its GPU weight
-staging and releases eligible CPU parameter blocks before the next component.
-Conditioning and latent results needed by later phases remain available.
-The operating system may retain reclaimable filesystem cache; this mode is not a
-hard whole-process RAM limit or a system-wide no-swap guarantee.
+New image profiles enable `offload_to_cpu` as a fallback policy. A GPU-resident
+attempt runs first. Only a classified GPU memory failure moves weights to RAM
+backing while retaining GPU computation. Inactive host weights can be evicted and
+loaded again from their original files under pressure. `stage_components` also
+releases an inactive component's weights at the phase boundary; it can remain
+enabled together with RAM backing. Conditioning, references and latents required
+by the next phase remain available. Explicit `encoder_on_cpu` and `vae_on_cpu`
+choose CPU computation independently. With RAM offload disabled, sequential mode
+retains its previous lazy disk-backed behavior.
 
-The encoder can compute on CUDA and release its weights before diffusion; forcing
-the encoder to CPU is a separate placement choice. The existing per-device fitting
-target and graph segmentation still bound managed image work. The image engine's
-storage/cache implementation is isolated from text inference.
+The active image profile supplies both memory settings. `max_ram_mib=0` selects
+bounded Auto: available physical RAM minus the larger of 1 GiB or 5% of total
+physical RAM. An explicit RAM value is a ceiling and is only reduced if that
+available allowance is smaller. Explicit RAM/VRAM values are never increased or
+borrowed from a text profile. Admission may reduce the job's temporary GPU target
+without changing the saved profile.
+
+The native RAM ledger admits managed tensor storage, reference decoding, host
+weights, CPU workspaces/cache and conditioning payloads before allocation. Copy,
+growth and scratch buffers reserve their overlapping lifetimes. Graph cuts run
+within either GPU or CPU capacity; inactive reloadable weights are reclaimed first.
+This is a managed allocation budget, not an operating-system process RSS quota:
+library/driver overhead, small metadata and reclaimable filesystem cache remain
+outside its scope. Unknown/insufficient automatic RAM never becomes unlimited.
+
+The image profile's free-VRAM headroom defaults to 256 MiB. This is a free-memory
+margin, not a 256 MiB allocation ceiling. When RAM fallback is enabled, an
+unavailable GPU can select CPU initially. A classified GPU memory failure can
+advance through clean contexts: GPU-resident weights, RAM-backed weights with GPU
+computation, then CPU computation if GPU working data still cannot fit. Every
+attempt preserves references/order, seed, model precision and sampling settings. A completed PNG,
+cancellation, RAM-budget failure or unrelated error never triggers that retry.
+CPU execution can be much slower. If the working data cannot fit either allowance,
+the job reports a memory error instead of exceeding its managed budget.
 
 ### Exact conditioning cache on SSD
 
@@ -147,13 +169,15 @@ unexpectedly consuming the memory admitted for the image.
 | --- | --- |
 | `max_vram_mib` | Diffusion runner fitting/streaming target. It is **not** a hard driver-wide CUDA allocation quota. |
 | `reserve_vram_mib` | Preventive free-memory margin for admission; other programs can still allocate memory afterward. |
-| `offload_to_cpu`, `encoder_on_cpu`, `vae_on_cpu` | Placement of pipeline work; may reduce GPU demand at the cost of transfer or CPU time. |
-| `stage_components` | Lazy disk-backed component weights with CPU/GPU release at phase boundaries, instead of retaining all component weights in host memory. |
+| `max_ram_mib` | Active image profile's managed host allocation ceiling; 0 uses bounded Auto with a physical-memory reserve. |
+| `offload_to_cpu` | Permit RAM-backed weights with GPU staging, then CPU computation only after classified GPU memory failures. The initial attempt prefers GPU residency. Defaults to true for new profiles. |
+| `encoder_on_cpu`, `vae_on_cpu` | Explicit CPU computation for those components. |
+| `stage_components` | Release inactive component weights between phases. Works with RAM backing; without RAM offload, preserves lazy disk-backed execution. |
 | `vae_tiling` | Optional VAE memory reduction, separate from diffusion sampling. |
 | `preserve_reference_size` | Choose the nearest supported canvas from the first reference's pixel dimensions; defaults to `false` and leaves original files unchanged. |
 | Text `moe_ram_limit_mib` / `gpu_vram_limit_mib` | Continue to apply to their documented text-runner scopes; they do not become diffusion-process limits. |
 
-There is no claim of a process-wide image RAM cap, system-wide swap prevention or
+There is no claim of a process-wide RSS cap, system-wide swap prevention or
 guaranteed fit from GGUF file sizes. Resolution, workspaces, VAE, conditioning,
 projector, CPU placement and other applications all affect the actual footprint.
 

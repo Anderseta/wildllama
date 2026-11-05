@@ -24,7 +24,7 @@ publisher's model cards. Recipe entries pin each repository revision, expected
 size and SHA256. No weights are committed or downloaded by a read-only status
 request. Model installation is an explicit resumable API action.
 
-The optional Windows conditioning-cache build uses `scripts/build-wildimage.ps1`.
+The Windows conditioning-cache/RAM-budget build uses `scripts/build-wildimage.ps1`.
 It requires an existing PowerShell 7.2+, MSVC 14.39, CUDA 12.8 and CMake installation;
 it does not install tools or fetch source, dependencies or weights. Supply a checkout
 at the pinned source revision with its pinned submodules already present:
@@ -43,8 +43,20 @@ their recorded hashes, and runs a small CPU-only ABI probe. The imported CMake
 targets propagate `GGML_MAX_NAME=160`, matching this release rather than the GGML
 header's default of 64. The probe verifies the tensor structure overhead, a
 130-character tensor name and one CPU tensor value before configuring the build.
-The tracked conditioning patch and two headers are applied to the external source
+The tracked conditioning and bounded-RAM patches/headers are applied to the external source
 checkout; the full vendored tree remains outside Git.
+
+The RAM overlay exports configuration and managed host-allocation functions without
+changing the existing C parameter struct layout. CLI decoding, model/weight storage,
+CPU workspaces, tensors and exact conditioning payloads share the DLL's budget.
+`--max-ram 0` selects bounded physical-memory Auto; explicit ceilings are never
+increased. `--stage-components on` permits sequential phase eviction of host weights.
+Failed jobs classify GPU-memory exhaustion as exit 75 and RAM exhaustion as 76;
+successful jobs remain exit 0 after recovered allocation probes. The caller may
+retry only GPU failures with RAM-backed GPU computation, then CPU computation.
+`--disable-segmented-compute` keeps the first GPU-resident attempt monolithic;
+CPU graphs retain bounded segmentation. The build replaces both native clients
+and the image DLL together and advertises `features.ram_budget` only in that payload.
 
 Remove `-PrepareOnly` to compile the CLI, image core and its existing custom CUDA
 operations. The large GGML CUDA backend is reused unchanged, including FP8/INT8
