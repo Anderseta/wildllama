@@ -8,6 +8,7 @@ import (
 
 	"github.com/ollama/ollama/internal/cloud"
 	"github.com/ollama/ollama/model/renderers"
+	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/types/model"
 )
 
@@ -80,11 +81,10 @@ func (m *Model) Thinking() *model.Thinking {
 		if thinking.Default == false && thinking.Supports(true) {
 			thinking.Default = true
 		}
-		// true currently reaches Qwen3.8 as medium via ThinkValue.String().
-		if name == "qwen3.8" {
-			thinking.Default = "medium"
-		}
 		return thinking
+	}
+	if m.HasChatTemplate && !usesOllamaRenderedChat(m) {
+		return thinking.TemplateControls(m.metadata.String("tokenizer.chat_template"))
 	}
 	if shouldUseGoTemplate(m) {
 		if thinking, ok := legacyThinking[m.templateDigest]; ok {
@@ -94,16 +94,18 @@ func (m *Model) Thinking() *model.Thinking {
 	return nil
 }
 
-// genericThinking excludes Harmony and template-only paths from new fallback rules.
+// genericThinking excludes Harmony and legacy Go-template paths from new fallback
+// rules. Native Jinja templates can declare their own exact named controls.
 func (m *Model) genericThinking() *model.Thinking {
-	if m == nil || m.Config.Renderer == "" || shouldUseHarmony(m) {
+	if m == nil || shouldUseHarmony(m) || (m.Config.Renderer == "" && usesOllamaRenderedChat(m)) {
 		return nil
 	}
 	return m.Thinking()
 }
 
 // lookupThinking lets compatibility middleware preserve named efforts only for
-// local generic renderers. Other models keep the existing protocol conversions.
+// local renderers or declared native-template controls. Other models retain the
+// existing protocol conversions.
 func lookupThinking(name string) *model.Thinking {
 	ref, err := parseAndValidateModelRef(name)
 	if err != nil || ref.Source == modelSourceCloud {

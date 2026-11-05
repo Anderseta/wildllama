@@ -100,7 +100,7 @@ func TestModelThinking(t *testing.T) {
 		want *model.Thinking
 	}{
 		{"local gemma default on", Model{Config: model.ConfigV2{Renderer: "gemma4", Parser: "gemma4"}}, &model.Thinking{Values: []any{false, true}, Default: true}},
-		{"local qwen38 default medium", Model{Config: model.ConfigV2{Renderer: "qwen3.8", Parser: "qwen3.5"}}, &model.Thinking{Values: []any{false, "low", "medium", "xhigh"}, Default: "medium"}},
+		{"local qwen38 default xhigh", Model{Config: model.ConfigV2{Renderer: "qwen3.8", Parser: "qwen3.5"}}, &model.Thinking{Values: []any{false, "low", "medium", "xhigh"}, Default: "xhigh"}},
 		{"renderer without thinking capability", Model{Config: model.ConfigV2{Renderer: "gemma4"}}, &model.Thinking{Values: []any{false}, Default: false}},
 		{"unknown renderer", Model{Config: model.ConfigV2{Renderer: "unknown"}}, nil},
 		{"nonthinking", Model{Config: model.ConfigV2{Renderer: "qwen3-coder"}}, &model.Thinking{Values: []any{false}, Default: false}},
@@ -149,8 +149,8 @@ func TestThinkingShowFollowsRendererChanges(t *testing.T) {
 		name, from, renderer, parser string
 		want                         *model.Thinking
 	}{
-		{"thinking-generic", "thinking-base", "qwen3.8", "qwen3.5", &model.Thinking{Values: []any{false, "low", "medium", "xhigh"}, Default: "medium"}},
-		{"thinking-inherited", "thinking-generic", "", "", &model.Thinking{Values: []any{false, "low", "medium", "xhigh"}, Default: "medium"}},
+		{"thinking-generic", "thinking-base", "qwen3.8", "qwen3.5", &model.Thinking{Values: []any{false, "low", "medium", "xhigh"}, Default: "xhigh"}},
+		{"thinking-inherited", "thinking-generic", "", "", &model.Thinking{Values: []any{false, "low", "medium", "xhigh"}, Default: "xhigh"}},
 		{"thinking-changed", "thinking-generic", "qwen3-coder", "qwen3-coder", &model.Thinking{Values: []any{false}, Default: false}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -224,7 +224,8 @@ func TestThinkingResolvedBeforeRenderAndParse(t *testing.T) {
 					t.Fatalf("status %d: %s", w.Code, w.Body.String())
 				}
 				prompt := mock.CompletionRequest.Prompt
-				if strings.Contains(prompt, "Reasoning effort is set to xhigh") != (requested == "xhigh") {
+				wantXhigh := requested == nil || requested == "xhigh" || requested == "high" || requested == "max" || requested == "minimal" || requested == "future"
+				if strings.Contains(prompt, "Reasoning effort is set to xhigh") != wantXhigh {
 					t.Fatalf("xhigh mismatch for %#v: %s", requested, prompt)
 				}
 				if strings.Contains(prompt, "Reasoning effort is set to low") != (requested == "low") {

@@ -34,6 +34,14 @@ The response includes a top-level `thinking` object:
 - `values: [false]` means the model does not support thinking.
 - If `thinking` is omitted, the model has no thinking metadata. The model might conduct thinking based on its existing behavior.
 
+WildLlama also discovers explicit controls in imported GGUF Jinja templates,
+using cached model metadata without loading the weights. For example, Qwen3.8
+templates advertise `false`, `low`, `medium`, and `xhigh`, defaulting to `xhigh`;
+Qwen3.5 templates advertise only `false` and `true`. Custom templates with no
+recognizable control contract remain unspecified. Renaming a model does not
+change its supported levels. These levels guide the model's reasoning rather
+than impose a fixed reasoning-token budget.
+
 ## Enable thinking in API calls
 
 Set the `think` field on a chat or generate request:

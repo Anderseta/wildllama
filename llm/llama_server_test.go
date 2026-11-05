@@ -3826,6 +3826,14 @@ func TestLlamaServerChatTemplateKwargs(t *testing.T) {
 				"reasoning_effort": "high",
 			},
 		},
+		{
+			name:  "native qwen xhigh is not downgraded",
+			think: &api.ThinkValue{Value: "xhigh"},
+			want: map[string]any{
+				"enable_thinking":  true,
+				"reasoning_effort": "xhigh",
+			},
+		},
 	}
 
 	for _, tt := range tests {
