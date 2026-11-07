@@ -48,6 +48,15 @@ func huggingFaceFileGroup(filename string) string {
 	return filename
 }
 
+var huggingFaceProjectorMarker = regexp.MustCompile(`(?i)(?:^|[-_. ])mmproj(?:[-_. ]|$)`)
+
+func isHuggingFaceProjector(filename string) bool {
+	name := path.Base(filename)
+	// Retain existing prefix names and recognize a separated marker after the
+	// model name. Inspect only the basename, never a parent directory.
+	return strings.HasPrefix(strings.ToLower(name), "mmproj") || huggingFaceProjectorMarker.MatchString(name)
+}
+
 func validateHuggingFaceProjector(files []huggingFaceFile) error {
 	for _, file := range files {
 		if err := validateHuggingFaceFile(file); err != nil {
@@ -78,7 +87,7 @@ func selectHuggingFaceGGUF(files []huggingFaceFile, tag string, choices ...huggi
 		if err := validateCreateFilePath(file.Filename); err != nil || strings.Contains(file.Filename, "\\") {
 			return nil, fmt.Errorf("invalid Hugging Face GGUF path: %q", file.Filename)
 		}
-		if strings.HasPrefix(strings.ToLower(path.Base(file.Filename)), "mmproj") {
+		if isHuggingFaceProjector(file.Filename) {
 			key := huggingFaceFileGroup(file.Filename)
 			projectorGroups[key] = append(projectorGroups[key], file)
 			continue

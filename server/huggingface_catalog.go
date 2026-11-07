@@ -140,7 +140,7 @@ func huggingFaceVariants(repository string, source huggingFaceRepository) huggin
 		if err := validateCreateFilePath(file.Filename); err != nil || strings.Contains(file.Filename, "\\") {
 			continue
 		}
-		if strings.HasPrefix(strings.ToLower(path.Base(file.Filename)), "mmproj") {
+		if isHuggingFaceProjector(file.Filename) {
 			key := huggingFaceFileGroup(file.Filename)
 			projectorGroups[key] = append(projectorGroups[key], file)
 			continue

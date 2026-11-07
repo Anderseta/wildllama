@@ -27,6 +27,26 @@ func huggingFaceTestFile(name string) huggingFaceFile {
 	return file
 }
 
+func TestHuggingFaceProjectorNameBoundaries(t *testing.T) {
+	for _, filename := range []string{
+		"mmproj-F16.gguf", "MMProjModel.gguf", "sub/model.mmproj-Q8_0.gguf",
+		"model_MMProJ_f16.GGUF", "model-F16-mmproj.gguf", "model mmproj F16.gguf",
+		"sub/model-mmproj-F16-00001-of-00002.gguf",
+	} {
+		if !isHuggingFaceProjector(filename) {
+			t.Errorf("projector not recognized: %q", filename)
+		}
+	}
+	for _, filename := range []string{
+		"model-Q8_0.gguf", "mmproj-assets/model-Q8_0.gguf", "model-notmmproj-Q8_0.gguf",
+		"model-mmprojection-Q8_0.gguf", "model-ammproj-Q8_0.gguf",
+	} {
+		if isHuggingFaceProjector(filename) {
+			t.Errorf("ordinary model mistaken for projector: %q", filename)
+		}
+	}
+}
+
 func TestHuggingFaceSelectShardsAndVision(t *testing.T) {
 	files := []huggingFaceFile{
 		huggingFaceTestFile("model-IQ3_S-00002-of-00002.gguf"),

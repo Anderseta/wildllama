@@ -87,6 +87,41 @@ func TestHuggingFaceCatalogProjectorValidationAndLFSSizeFallback(t *testing.T) {
 	}
 }
 
+func TestHuggingFaceProjectorsAfterModelNameStaySeparateFromWeights(t *testing.T) {
+	const base = "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic"
+	weights := base + ".Q8_0.gguf"
+	projector := base + ".mmproj-Q8_0.gguf"
+	files := []huggingFaceFile{
+		huggingFaceTestFile(weights),
+		huggingFaceTestFile(projector),
+		huggingFaceTestFile(base + ".mmproj-f16.gguf"),
+	}
+	catalog := huggingFaceVariants("owner/model", huggingFaceRepository{Files: files})
+	if len(catalog.Variants) != 1 || catalog.Variants[0].Filename != weights || len(catalog.Projectors) != 2 {
+		t.Fatalf("projectors mixed with weight variants: %+v", catalog)
+	}
+	for _, item := range catalog.Projectors {
+		if item.Complete == nil || !*item.Complete || item.Size != 100 {
+			t.Fatalf("valid projector unavailable: %+v", item)
+		}
+	}
+	selected, err := selectHuggingFaceGGUF(files, "Q8_0", huggingFaceSelection{Projector: &projector})
+	if err != nil || len(selected) != 2 || selected[0].Filename != weights || selected[1].Filename != projector {
+		t.Fatalf("Q8 weights/projector selection: %+v, %v", selected, err)
+	}
+	none := "none"
+	selected, err = selectHuggingFaceGGUF(files, "Q8_0", huggingFaceSelection{Projector: &none})
+	if err != nil || len(selected) != 1 || selected[0].Filename != weights {
+		t.Fatalf("text-only selection: %+v, %v", selected, err)
+	}
+	if _, err := selectHuggingFaceGGUF(files, "Q8_0"); err == nil || !strings.Contains(err.Error(), "multiple Hugging Face vision projectors") {
+		t.Fatalf("ambiguous projector silently selected: %v", err)
+	}
+	if _, err := selectHuggingFaceGGUF(files, "", huggingFaceSelection{File: projector, Projector: &none}); err == nil {
+		t.Fatal("a projector was accepted as the text model")
+	}
+}
+
 type huggingFaceRoundTrip func(*http.Request) (*http.Response, error)
 
 func (fn huggingFaceRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return fn(r) }
