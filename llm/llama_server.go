@@ -142,22 +142,23 @@ func boundedNumPredict(numPredict, numCtx int) int {
 // llamaServerRunner wraps an upstream llama-server process and implements the LlamaServer interface.
 // It communicates with llama-server over HTTP.
 type llamaServerRunner struct {
-	port               int
-	cmd                *exec.Cmd
-	done               chan struct{}
-	doneErr            error
-	client             *http.Client
-	memoryMu           sync.RWMutex
-	memTotal           uint64 // actual total buffer size parsed from llama-server logs (bytes)
-	memGPU             uint64 // actual GPU buffer size parsed from llama-server logs (bytes)
-	memModelFileBacked uint64 // model weight bytes whose buffers mirror the on-disk file (mmap views + direct device copies); excludes repacked copies like CPU_REPACK
-	memCPUMappedModel  uint64 // model weight bytes in mmap-backed CPU buffers (e.g. CPU_Mapped), parsed from llama-server logs
-	moeRAMWeightLimit  uint64 // bounded locked host-weight cache; zero preserves normal mmap accounting
-	gpuLayers          uint64 // model layers loaded on GPU, parsed from llama-server logs
-	gpuLayerOverflow   int    // number of GPU-selected layers partially overflowed to CPU
-	status             *StatusWriter
-	options            api.Options
-	modelPath          string
+	port                   int
+	cmd                    *exec.Cmd
+	done                   chan struct{}
+	doneErr                error
+	client                 *http.Client
+	memoryMu               sync.RWMutex
+	memTotal               uint64 // actual total buffer size parsed from llama-server logs (bytes)
+	memGPU                 uint64 // actual GPU buffer size parsed from llama-server logs (bytes)
+	memModelFileBacked     uint64 // model weight bytes whose buffers mirror the on-disk file (mmap views + direct device copies); excludes repacked copies like CPU_REPACK
+	memCPUMappedModel      uint64 // model weight bytes in mmap-backed CPU buffers (e.g. CPU_Mapped), parsed from llama-server logs
+	moeRAMWeightLimit      uint64 // bounded locked host-weight cache; zero preserves normal mmap accounting
+	gpuLayers              uint64 // model layers loaded on GPU, parsed from llama-server logs
+	layerPlacementObserved bool   // only a final native offload line confirms placement
+	gpuLayerOverflow       int    // number of GPU-selected layers partially overflowed to CPU
+	status                 *StatusWriter
+	options                api.Options
+	modelPath              string
 	// mediaMarker must match the LLAMA_MEDIA_MARKER value passed to llama-server.
 	// llama.cpp randomizes this by default; Ollama renders stable [img-N] markers
 	// and rewrites them before forwarding the request.
@@ -1314,6 +1315,7 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	s.memCPUMappedModel = 0
 	s.moeRAMWeightLimit = 0
 	s.gpuLayers = 0
+	s.layerPlacementObserved = false
 	s.gpuLayerOverflow = 0
 	for k := range s.vramByDevice {
 		delete(s.vramByDevice, k)
@@ -1326,6 +1328,7 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	// may become an observation of the replacement process.
 	if s.output != nil {
 		s.output.buffers = nil
+		s.output.lastKVBuffer = nil
 		s.output.tail = nil
 		s.output.discardingLine = false
 		s.output.kvCacheGroup = ""
@@ -3181,6 +3184,7 @@ type memoryParsingWriter struct {
 	kvCacheGroup       string
 	hasContextBuffers  bool
 	boundedExpertCache uint64
+	lastKVBuffer       *memoryBufferKey
 }
 
 type memoryBufferKey struct {
@@ -3191,7 +3195,9 @@ type memoryBufferKey struct {
 }
 
 type memoryBuffer struct {
-	bytes uint64
+	bytes         uint64
+	capacityBytes uint64 // virtual KV capacity reported by native growth logs
+	growing       bool
 }
 
 // deviceFreeRegex matches per-device free VRAM reported at model load time:
@@ -3209,6 +3215,7 @@ var boundedExpertCacheRegex = regexp.MustCompile(`gpu-exclusive:\s+([\d.]+)\s+Mi
 var (
 	offloadedLayersRegex      = regexp.MustCompile(`offloaded\s+(\d+)/(\d+)\s+layers to GPU`)
 	fitOverflowingLayersRegex = regexp.MustCompile(`common_params_fit_impl:\s+-\s+.+:\s+\d+\s+layers\s+\(\s*(\d+)\s+overflowing\)`)
+	kvGrowthCapacityRegex     = regexp.MustCompile(`KV growth:\s+\d+ initial cells,\s+\d+ logical cells,\s+([\d.]+) MiB virtual capacity`)
 )
 
 // isGPUBuffer returns true if the backend buffer name represents GPU memory.
@@ -3272,11 +3279,12 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 
 func (w *memoryParsingWriter) resetContextMemoryLocked() {
 	for key := range w.buffers {
-		if key.kind == "KV" {
+		if key.kind == "KV" || key.kind == "RS" {
 			delete(w.buffers, key)
 		}
 	}
 	w.kvCacheGroup, w.hasContextBuffers, w.boundedExpertCache = "", false, 0
+	w.lastKVBuffer = nil
 	w.updateRunnerMemoryLocked()
 }
 
@@ -3309,6 +3317,7 @@ func (w *memoryParsingWriter) observeMemoryLineLocked(b []byte) {
 		if loadedErr == nil && totalErr == nil {
 			w.runner.gpuLayers = loaded
 			w.runner.totalLayers = total
+			w.runner.layerPlacementObserved = true
 		}
 	}
 	for _, match := range fitOverflowingLayersRegex.FindAllSubmatch(b, -1) {
@@ -3332,13 +3341,24 @@ func (w *memoryParsingWriter) observeMemoryLineLocked(b []byte) {
 			if w.buffers == nil {
 				w.buffers = make(map[memoryBufferKey]memoryBuffer)
 			}
-			w.buffers[memoryBufferKey{
+			key := memoryBufferKey{
 				component:  string(match[1]),
 				backend:    string(match[2]),
 				kind:       kind,
 				cacheGroup: group,
-			}] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
+			}
+			w.buffers[key] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
+			if kind == "KV" {
+				w.lastKVBuffer = &key
+			}
 			w.updateRunnerMemoryLocked()
+		}
+	}
+	if match := kvGrowthCapacityRegex.FindSubmatch(b); match != nil && w.lastKVBuffer != nil {
+		if mib, err := strconv.ParseFloat(string(match[1]), 64); err == nil {
+			buffer := w.buffers[*w.lastKVBuffer]
+			buffer.capacityBytes, buffer.growing = uint64(mib*1024*1024), true
+			w.buffers[*w.lastKVBuffer] = buffer
 		}
 	}
 	if match := boundedExpertCacheRegex.FindSubmatch(b); match != nil {

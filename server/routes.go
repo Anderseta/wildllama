@@ -2999,6 +2999,10 @@ func (s *Server) PsHandler(c *gin.Context) {
 			Runner:        runner,
 			Loading:       v.loading,
 		}
+		if reporter, ok := v.llama.(llm.RuntimeMemoryReporter); ok && !v.loading {
+			memory := reporter.RuntimeMemory()
+			mr.Memory = &memory
+		}
 
 		models = append(models, mr)
 	}

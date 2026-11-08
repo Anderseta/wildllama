@@ -43,6 +43,22 @@ completion or `/api/generate` path.
 
 ## Physical KV commitment with unchanged context
 
+`/api/ps` includes an optional `memory` snapshot for a loaded llama.cpp runner.
+Layer counts and GPU/host buffer sizes come from its native logs, never from
+process RSS or equality of `size` and `size_vram`. `placement` distinguishes GPU,
+CPU, partial/streamed execution and unconfirmed placement. Host embedding
+mappings and pinned I/O do not imply layer offload. Host KV/recurrent state,
+partial layer overflow, streamed experts and a CPU projector do.
+
+`allocated_vram_bytes` uses live CUDA allocation telemetry when observed;
+component buffers are startup/log snapshots and are not a live breakdown.
+`kv_capacity_bytes` sums the cache capacities reported by native buffers;
+`kv_growth_observed` requires a native virtual-capacity growth line. A requested
+initial floor alone does not prove VMM compatibility. Components can omit driver,
+projector and graph allocations; Windows driver migration to shared RAM is not
+observed by this report. Status polling reads in-memory snapshots, without file
+scans, process spawning, GPU synchronization or another inference request.
+
 `options.kv_cache_initial_tokens` controls initial physical commitment, not
 logical context capacity:
 
