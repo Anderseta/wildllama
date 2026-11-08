@@ -43,6 +43,16 @@ completion or `/api/generate` path.
 
 ## Physical KV commitment with unchanged context
 
+Native memory denials are request failures, not reconnectable stream endings.
+The launcher recognizes allocator denials and frames their stderr diagnostics
+across pipe writes. A request-local sequence prevents an old OOM from being
+attributed to a later request. Chat and completion error frames stop immediately;
+`out_of_memory` responses include `retryable:false` and status 507 in streaming,
+nonstreaming and model-load failures. Opaque native compute failures use status
+422 with `model_compute_failed`, also nonretryable. Ordinary transport errors
+retain their existing recovery policy. The Portuguese error explains that memory
+or context/batch settings must change before a manual retry.
+
 `/api/ps` includes an optional `memory` snapshot for a loaded llama.cpp runner.
 Layer counts and GPU/host buffer sizes come from its native logs, never from
 process RSS or equality of `size` and `size_vram`. `placement` distinguishes GPU,

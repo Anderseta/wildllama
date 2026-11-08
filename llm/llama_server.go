@@ -1742,6 +1742,7 @@ type llamaServerMultimodalPrompt struct {
 
 // llamaServerCompletionResponse is the response format from llama-server's /completion endpoint.
 type llamaServerCompletionResponse struct {
+	Error                   any                        `json:"error"`
 	PromptProgress          *llamaServerPromptProgress `json:"prompt_progress"`
 	Content                 string                     `json:"content"`
 	Stop                    bool                       `json:"stop"`
@@ -1864,6 +1865,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	defer s.sem.Release(1)
 	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
+	memoryVersion := s.status.memoryFailureVersion()
 
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
 
@@ -1994,7 +1996,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 			return fmt.Errorf("failed reading llama-server error response: %w", err)
 		}
 
-		return api.StatusError{StatusCode: res.StatusCode, ErrorMessage: s.statusErrorMessage(bodyBytes)}
+		return s.runtimeStreamBodyError(bodyBytes, memoryVersion, res.StatusCode)
 	}
 
 	// Parse SSE stream from llama-server. Delay the final Done callback until
@@ -2031,6 +2033,9 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 			var lsResp llamaServerCompletionResponse
 			if err := json.Unmarshal(evt, &lsResp); err != nil {
 				return fmt.Errorf("error unmarshalling llama-server response: %v", err)
+			}
+			if lsResp.Error != nil {
+				return s.runtimeStreamBodyError(evt, memoryVersion, http.StatusInternalServerError)
 			}
 			if !lsResp.Stop {
 				if p := progress.next(lsResp.PromptProgress); p != nil {
@@ -2123,7 +2128,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errors.New("llama-server completion stream ended without a completion marker")
+	return s.runtimeStreamError("llama-server completion stream ended without a completion marker", memoryVersion, http.StatusInternalServerError)
 }
 
 func llamaServerStreamLimitError(label string, err error) error {
@@ -2287,6 +2292,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	defer s.sem.Release(1)
 	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
+	memoryVersion := s.status.memoryFailureVersion()
 
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
 
@@ -2339,7 +2345,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 			return fmt.Errorf("failed reading llama-server error response: %w", err)
 		}
 
-		return api.StatusError{StatusCode: res.StatusCode, ErrorMessage: s.statusErrorMessage(bodyBytes)}
+		return s.runtimeStreamBodyError(bodyBytes, memoryVersion, res.StatusCode)
 	}
 
 	scanner := bufio.NewScanner(res.Body)
@@ -2377,7 +2383,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				return fmt.Errorf("error unmarshalling llama-server chat response: %v", err)
 			}
 			if lsResp.Error != nil {
-				return fmt.Errorf("llama-server chat error: %v", lsResp.Error)
+				return s.runtimeStreamBodyError(evt, memoryVersion, http.StatusInternalServerError)
 			}
 			if len(lsResp.Choices) == 0 || lsResp.Choices[0].FinishReason == nil {
 				if p := progress.next(lsResp.PromptProgress); p != nil {
@@ -2483,7 +2489,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errors.New("llama-server chat stream ended without a completion marker")
+	return s.runtimeStreamError("llama-server chat stream ended without a completion marker", memoryVersion, http.StatusInternalServerError)
 }
 
 type llamaServerToolCallAccumulator struct {

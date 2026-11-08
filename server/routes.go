@@ -844,12 +844,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}); err != nil {
 			if parserErr == nil {
 				s.sched.expireRunnersForRuntimeOOM(m, err)
-				var serr api.StatusError
-				if errors.As(err, &serr) {
-					sendResponse(streamCtx, ch, gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode})
-				} else {
-					sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
-				}
+				sendResponse(streamCtx, ch, inferenceErrorPayload(err))
 			}
 		}
 		if parserErr != nil {
@@ -883,7 +878,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					status = http.StatusInternalServerError
 				}
 
-				c.JSON(status, gin.H{"error": msg})
+				c.JSON(status, inferenceErrorBody(t, msg))
 				return
 			default:
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
@@ -3139,7 +3134,7 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 					status = http.StatusInternalServerError
 				}
 
-				c.JSON(status, gin.H{"error": msg})
+				c.JSON(status, inferenceErrorBody(t, msg))
 				return
 			default:
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
@@ -3594,12 +3589,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
-			var serr api.StatusError
-			if errors.As(err, &serr) {
-				sendResponse(streamCtx, ch, gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode})
-			} else {
-				sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
-			}
+			sendResponse(streamCtx, ch, inferenceErrorPayload(err))
 		}
 	}()
 
@@ -3699,12 +3689,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		})
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
-			var serr api.StatusError
-			if errors.As(err, &serr) {
-				sendResponse(streamCtx, ch, gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode})
-			} else {
-				sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
-			}
+			sendResponse(streamCtx, ch, inferenceErrorPayload(err))
 		}
 	}()
 
@@ -3780,6 +3765,10 @@ func countChatImages(msgs []api.Message) int {
 }
 
 func handleScheduleError(c *gin.Context, name string, err error) {
+	if llm.IsOutOfMemory(err) {
+		c.JSON(http.StatusInsufficientStorage, inferenceErrorPayload(err))
+		return
+	}
 	if errors.Is(err, errImageResidentOnly) {
 		c.Header("Retry-After", "1")
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "code": "image_gpu_resident_only", "retryable": true})

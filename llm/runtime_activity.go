@@ -183,6 +183,14 @@ func (w *StatusWriter) observeActivity(b []byte) {
 }
 
 func (w *StatusWriter) observeActivityLine(line []byte, now int64) {
+	// This path already assembles full lines across pipe writes. Do not lose
+	// an allocation-denied diagnostic split between stdout/stderr chunks.
+	if !bytes.HasPrefix(line, []byte("wildllama_activity ")) && IsOutOfMemoryMessage(string(line)) {
+		w.memoryErrorMu.Lock()
+		w.memoryErrorVersion++
+		w.memoryErrorMessage = string(line)
+		w.memoryErrorMu.Unlock()
+	}
 	a := &w.activity
 	const marker = "wildllama_activity "
 	if bytes.HasPrefix(line, []byte(marker)) {
