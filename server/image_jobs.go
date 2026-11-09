@@ -117,6 +117,9 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 			}
 		}
 	}
+	if job.Config.Version != 0 && job.Config.Revision != v.config.Revision {
+		return nil, errors.New("image configuration changed while preparing the request; refresh and retry")
+	}
 	transfer := imageTransferJob(job)
 	queue := v.queue
 	if transfer {

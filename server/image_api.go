@@ -153,6 +153,7 @@ type imageJob struct {
 
 type imageService struct {
 	mu                sync.Mutex
+	libraryMu         sync.Mutex
 	server            *Server
 	root              string
 	config            imageConfig
@@ -224,6 +225,9 @@ func (s *Server) imageService() *imageService {
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			service.configError = err.Error()
+		}
+		if err := service.recoverImageLibraryDeletionLocked(); err != nil {
+			service.configError = "Image library cleanup requires attention: " + err.Error()
 		}
 		if data, err := os.ReadFile(filepath.Join(service.root, "jobs.json")); err == nil {
 			if json.Unmarshal(data, &service.jobs) != nil {
@@ -453,6 +457,8 @@ func (s *Server) registerImageRoutes(r *gin.Engine) {
 	r.POST("/api/images/models/import", s.imageImportHandler)
 	r.POST("/api/images/models/inventory", s.imageInventoryHandler)
 	r.POST("/api/images/models/copy", s.imageCopyHandler)
+	r.GET("/api/images/library", s.imageLibraryHandler)
+	r.POST("/api/images/library/delete", s.imageLibraryDeleteHandler)
 	r.GET("/api/images/loras", s.imageLoRAsHandler)
 	r.GET("/api/images/loras/files", s.imageLoRAFilesHandler)
 	r.POST("/api/images/loras/install", s.imageLoRAInstallHandler)
@@ -467,13 +473,15 @@ func (s *Server) registerImageRoutes(r *gin.Engine) {
 	r.POST("/api/images/assets", s.imageUploadHandler)
 	r.DELETE("/api/images/sessions/:session_id", s.imageSessionDeleteHandler)
 	r.GET("/api/images/capabilities", func(c *gin.Context) {
-		c.JSON(200, gin.H{"session_deletion": true, "asset_deletion": true})
+		c.JSON(200, gin.H{"session_deletion": true, "asset_deletion": true, "model_library": true})
 	})
 }
 
 func (s *Server) imageConfigHandler(c *gin.Context) {
 	v := s.imageService()
 	if c.Request.Method == http.MethodPatch {
+		v.libraryMu.Lock()
+		defer v.libraryMu.Unlock()
 		var patch map[string]json.RawMessage
 		if !imageBind(c, &patch) {
 			return
@@ -555,6 +563,8 @@ func (s *Server) imageImportHandler(c *gin.Context) {
 		return
 	}
 	v := s.imageService()
+	v.libraryMu.Lock()
+	defer v.libraryMu.Unlock()
 	v.mu.Lock()
 	config := cloneImageConfig(v.config)
 	v.mu.Unlock()
