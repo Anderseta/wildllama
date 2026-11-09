@@ -1,5 +1,19 @@
 # Responsive local inference workflows
 
+Non-streaming chat, generate and progress responses stop waiting on their response
+channel when the HTTP request is cancelled. A late producer can still finish its
+own cleanup, but it no longer retains an abandoned HTTP handler or buffered output
+while doing so. Streaming behavior and successful response aggregation are unchanged.
+
+Registry pushes share a blob upload only for the same destination repository.
+Preparation, progress and completion are published separately; cancelling one
+consumer preserves the others, and the last consumer cancels preparation, network
+I/O and retry backoff. A new consumer waits for a closing transfer before retrying.
+Fast or registry-mounted uploads still publish final progress. Relative upload
+locations are resolved against the registry URL, and parallel parts keep their
+authentication retry state separate. These changes do not alter model weights,
+inference quality, context or sampling.
+
 Image generation retains a single FIFO GPU execution worker and the existing
 exclusive transition lease. Model downloads, local imports and LoRA installation
 use a separate bounded I/O worker (one active transfer, sixteen waiting tasks).

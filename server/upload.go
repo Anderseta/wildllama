@@ -41,9 +41,13 @@ type blobUpload struct {
 
 	file *os.File
 
-	done       bool
-	err        error
-	references atomic.Int32
+	context     context.Context
+	done        chan struct{}
+	ready       chan struct{}
+	mounted     bool
+	err         error // published by closing done
+	references  atomic.Int32
+	referenceMu sync.Mutex
 }
 
 const (
@@ -87,7 +91,7 @@ func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *reg
 	// ref: https://distribution.github.io/distribution/spec/api/#cross-repository-blob-mount
 	if resp.StatusCode == http.StatusCreated {
 		b.Completed.Store(b.Total)
-		b.done = true
+		b.mounted = true
 		return nil
 	}
 
@@ -114,32 +118,30 @@ func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *reg
 		slog.Info(fmt.Sprintf("uploading %s in %d %s part(s)", b.Digest[7:19], len(b.Parts), format.HumanBytes(b.Parts[0].Size)))
 	}
 
-	requestURL, err = url.Parse(location)
+	nextURL, err := url.Parse(location)
 	if err != nil {
 		return err
 	}
 
 	b.nextURL = make(chan *url.URL, 1)
-	b.nextURL <- requestURL
+	b.nextURL <- requestURL.ResolveReference(nextURL)
 	return nil
 }
 
-// Run uploads blob parts to the upstream. If the upstream supports redirection, parts will be uploaded
-// in parallel as defined by Prepare. Otherwise, parts will be uploaded serially. Run sets b.err on error.
-func (b *blobUpload) Run(ctx context.Context, opts *registryOptions) {
-	defer blobUploadManager.Delete(b.Digest)
-	ctx, b.CancelFunc = context.WithCancel(ctx)
+// run uploads prepared parts. The shared transfer publishes its result through done.
+func (b *blobUpload) run(ctx context.Context, opts *registryOptions) error {
+	if b.mounted {
+		return nil
+	}
 
 	p, err := manifest.BlobsPath(b.Digest)
 	if err != nil {
-		b.err = err
-		return
+		return err
 	}
 
 	b.file, err = os.Open(p)
 	if err != nil {
-		b.err = err
-		return
+		return err
 	}
 	defer b.file.Close()
 
@@ -151,9 +153,10 @@ func (b *blobUpload) Run(ctx context.Context, opts *registryOptions) {
 		case <-inner.Done():
 		case requestURL := <-b.nextURL:
 			g.Go(func() error {
+				partOpts := *opts // auth retries must not race other parts' tokens
 				var err error
 				for try := range maxRetries {
-					err = b.uploadPart(inner, http.MethodPatch, requestURL, part, opts)
+					err = b.uploadPart(inner, http.MethodPatch, requestURL, part, &partOpts)
 					switch {
 					case errors.Is(err, context.Canceled):
 						return err
@@ -162,7 +165,9 @@ func (b *blobUpload) Run(ctx context.Context, opts *registryOptions) {
 					case err != nil:
 						sleep := time.Second * time.Duration(math.Pow(2, float64(try)))
 						slog.Info(fmt.Sprintf("%s part %d attempt %d failed: %v, retrying in %s", b.Digest[7:19], part.N, try, err, sleep))
-						time.Sleep(sleep)
+						if err := waitUploadRetry(inner, sleep); err != nil {
+							return err
+						}
 						continue
 					}
 
@@ -175,11 +180,15 @@ func (b *blobUpload) Run(ctx context.Context, opts *registryOptions) {
 	}
 
 	if err := g.Wait(); err != nil {
-		b.err = err
-		return
+		return err
 	}
 
-	requestURL := <-b.nextURL
+	var requestURL *url.URL
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case requestURL = <-b.nextURL:
+	}
 
 	// calculate md5 checksum and add it to the commit request
 	md5sum := md5.New()
@@ -204,15 +213,27 @@ func (b *blobUpload) Run(ctx context.Context, opts *registryOptions) {
 		} else if err != nil {
 			sleep := time.Second * time.Duration(math.Pow(2, float64(try)))
 			slog.Info(fmt.Sprintf("%s complete upload attempt %d failed: %v, retrying in %s", b.Digest[7:19], try, err, sleep))
-			time.Sleep(sleep)
+			if err := waitUploadRetry(ctx, sleep); err != nil {
+				return err
+			}
 			continue
 		}
 		defer resp.Body.Close()
 		break
 	}
 
-	b.err = err
-	b.done = true
+	return err
+}
+
+func waitUploadRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *url.URL, part *blobUploadPart, opts *registryOptions) error {
@@ -247,11 +268,16 @@ func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *
 		w.Rollback()
 		return err
 	}
+	nextURL = requestURL.ResolveReference(nextURL)
 
 	switch {
 	case resp.StatusCode == http.StatusTemporaryRedirect:
 		w.Rollback()
-		b.nextURL <- nextURL
+		select {
+		case b.nextURL <- nextURL:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 
 		redirectURL, err := resp.Location()
 		if err != nil {
@@ -269,7 +295,9 @@ func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *
 			case err != nil:
 				sleep := time.Second * time.Duration(math.Pow(2, float64(try)))
 				slog.Info(fmt.Sprintf("%s part %d attempt %d failed: %v, retrying in %s", b.Digest[7:19], part.N, try, err, sleep))
-				time.Sleep(sleep)
+				if err := waitUploadRetry(ctx, sleep); err != nil {
+					return err
+				}
 				continue
 			}
 
@@ -299,30 +327,60 @@ func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *
 	}
 
 	if method == http.MethodPatch {
-		b.nextURL <- nextURL
+		select {
+		case b.nextURL <- nextURL:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	part.Hash = md5sum
 	return nil
 }
 
-func (b *blobUpload) acquire() {
+func (b *blobUpload) acquire() bool {
+	b.referenceMu.Lock()
+	defer b.referenceMu.Unlock()
+	if b.context.Err() != nil {
+		return false
+	}
 	b.references.Add(1)
+	return true
 }
 
 func (b *blobUpload) release() {
+	b.referenceMu.Lock()
+	defer b.referenceMu.Unlock()
 	if b.references.Add(-1) == 0 {
 		b.CancelFunc()
 	}
 }
 
 func (b *blobUpload) Wait(ctx context.Context, fn func(api.ProgressResponse)) error {
-	b.acquire()
-	defer b.release()
+	finish := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if b.err == nil {
+			fn(api.ProgressResponse{Status: fmt.Sprintf("pushing %s", b.Digest[7:19]),
+				Digest: b.Digest, Total: b.Total, Completed: b.Completed.Load()})
+		}
+		return b.err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.done:
+		return finish()
+	case <-b.ready:
+	}
 
 	ticker := time.NewTicker(60 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
+		case <-b.done:
+			return finish()
 		case <-ticker.C:
 		case <-ctx.Done():
 			return ctx.Err()
@@ -335,9 +393,6 @@ func (b *blobUpload) Wait(ctx context.Context, fn func(api.ProgressResponse)) er
 			Completed: b.Completed.Load(),
 		})
 
-		if b.done || b.err != nil {
-			return b.err
-		}
 	}
 }
 
@@ -367,6 +422,9 @@ func (p *progressWriter) Rollback() {
 }
 
 func uploadBlob(ctx context.Context, n model.Name, layer manifest.Layer, opts *registryOptions, fn func(api.ProgressResponse)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	requestURL := n.BaseURL()
 	requestURL = requestURL.JoinPath("v2", n.DisplayNamespaceModel(), "blobs", layer.Digest)
 
@@ -387,19 +445,45 @@ func uploadBlob(ctx context.Context, n model.Name, layer manifest.Layer, opts *r
 		return nil
 	}
 
-	data, ok := blobUploadManager.LoadOrStore(layer.Digest, &blobUpload{Layer: layer})
-	upload := data.(*blobUpload)
-	if !ok {
-		requestURL := n.BaseURL()
-		requestURL = requestURL.JoinPath("v2", n.DisplayNamespaceModel(), "blobs/uploads/")
-		if err := upload.Prepare(ctx, requestURL, opts); err != nil {
-			blobUploadManager.Delete(layer.Digest)
+	// A digest alone cannot identify an upload: different repositories/registries
+	// each need their own session, even when their model weights are identical.
+	key := requestURL.String()
+	for {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-
-		//nolint:contextcheck
-		go upload.Run(context.Background(), opts)
+		shared, cancel := context.WithCancel(context.Background())
+		candidate := &blobUpload{Layer: layer, context: shared, CancelFunc: cancel,
+			done: make(chan struct{}), ready: make(chan struct{})}
+		candidate.acquire() // own the first consumer before publishing
+		data, loaded := blobUploadManager.LoadOrStore(key, candidate)
+		upload := data.(*blobUpload)
+		if loaded {
+			cancel()
+			if !upload.acquire() {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-upload.done:
+					continue
+				}
+			}
+		} else {
+			// Isolate mutable authentication state from the caller and other parts.
+			sharedOpts := *opts
+			go func() {
+				defer close(upload.done)
+				defer blobUploadManager.CompareAndDelete(key, upload)
+				defer cancel()
+				start := n.BaseURL().JoinPath("v2", n.DisplayNamespaceModel(), "blobs/uploads/")
+				if upload.err = upload.Prepare(shared, start, &sharedOpts); upload.err != nil {
+					return
+				}
+				close(upload.ready)
+				upload.err = upload.run(shared, &sharedOpts)
+			}()
+		}
+		defer upload.release()
+		return upload.Wait(ctx, fn)
 	}
-
-	return upload.Wait(ctx, fn)
 }

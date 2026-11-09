@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/api"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 )
@@ -28,6 +29,7 @@ func TestMemoryFailureSurvivesNonStreamingChatAndModelLoad(t *testing.T) {
 	for _, load := range []bool{false, true} {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/chat", nil)
 		failure := errors.New("out of memory: allocation denied")
 		if load {
 			handleScheduleError(c, "fixture", failure)

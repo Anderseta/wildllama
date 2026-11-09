@@ -40,6 +40,50 @@ var cancellationRoutes = []cancellationRoute{
 	}, false},
 }
 
+func TestNonStreamingInferenceDisconnectDoesNotWaitForLateProducer(t *testing.T) {
+	for _, route := range cancellationRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			s, started, releaseLate, finished := cancellationServer(t, route)
+			defer releaseLate()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			body, err := json.Marshal(route.request(false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, route.path, bytes.NewReader(body)).WithContext(ctx)
+			response := httptest.NewRecorder()
+			returned := make(chan struct{})
+			router := gin.New()
+			router.POST(route.path, routeHandler(s, route))
+			go func() { defer close(returned); router.ServeHTTP(response, request) }()
+			waitStreamEvent(t, started, "non-streaming inference")
+			cancel()
+			waitStreamEvent(t, returned, "cancelled non-streaming handler before late producer exits")
+			if response.Body.Len() != 0 {
+				t.Fatalf("cancelled request wrote a response: %s", response.Body.String())
+			}
+			releaseLate()
+			waitStreamEvent(t, finished, "late producer cleanup")
+		})
+	}
+}
+
+func TestNonStreamingProgressDisconnectDoesNotWaitForProducer(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodGet, "/progress", nil).WithContext(ctx)
+	ch := make(chan any)
+	returned := make(chan struct{})
+	go func() { defer close(returned); waitForStream(c, ch) }()
+	cancel()
+	waitStreamEvent(t, returned, "cancelled non-streaming progress handler")
+	if response.Body.Len() != 0 {
+		t.Fatalf("cancelled progress wrote a response: %s", response.Body.String())
+	}
+}
+
 // A cancelled inference can still deliver a queued token before returning its
 // error. That callback must finish before its deferred runner lease can release.
 func cancellationServer(t *testing.T, route cancellationRoute) (*Server, <-chan struct{}, func(), <-chan struct{}) {

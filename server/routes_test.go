@@ -2308,6 +2308,7 @@ func TestWaitForStream(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 
 			ch := make(chan any, len(tt.messages))
+			c.Request = httptest.NewRequest(http.MethodGet, "/progress", nil)
 			for _, msg := range tt.messages {
 				ch <- msg
 			}

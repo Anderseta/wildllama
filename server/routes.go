@@ -857,7 +857,17 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
-		for rr := range ch {
+		for {
+			var rr any
+			var ok bool
+			select {
+			case <-c.Request.Context().Done():
+				return
+			case rr, ok = <-ch:
+			}
+			if !ok {
+				break
+			}
 			switch t := rr.(type) {
 			case api.GenerateResponse:
 				sbThinking.WriteString(t.Thinking)
@@ -2714,7 +2724,17 @@ func Serve(ln net.Listener) error {
 func waitForStream(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/json")
 	var latest api.ProgressResponse
-	for resp := range ch {
+	for {
+		var resp any
+		var ok bool
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case resp, ok = <-ch:
+		}
+		if !ok {
+			break
+		}
 		switch r := resp.(type) {
 		case api.ProgressResponse:
 			latest = r
@@ -3111,7 +3131,17 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
-		for rr := range ch {
+		for {
+			var rr any
+			var ok bool
+			select {
+			case <-c.Request.Context().Done():
+				return
+			case rr, ok = <-ch:
+			}
+			if !ok {
+				break
+			}
 			switch t := rr.(type) {
 			case api.ChatResponse:
 				sbThinking.WriteString(t.Message.Thinking)
