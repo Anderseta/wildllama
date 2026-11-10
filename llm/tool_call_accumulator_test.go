@@ -113,7 +113,14 @@ func TestLlamaServerChatFragmentedToolCalls(t *testing.T) {
 	parts := strings.Split(srv.URL, ":")
 	var port int
 	fmt.Sscanf(parts[len(parts)-1], "%d", &port)
-	runner := &llamaServerRunner{port: port, cmd: fakeRunningCmd(), sem: semaphore.NewWeighted(1), options: api.Options{Runner: api.Runner{NumCtx: 2048}}}
+	cmd := fakeRunningCmd()
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	runner := &llamaServerRunner{port: port, cmd: cmd, sem: semaphore.NewWeighted(1), options: api.Options{Runner: api.Runner{NumCtx: 2048}}}
 	var responses []ChatResponse
 	var progressTimes []time.Time
 	err := runner.Chat(t.Context(), ChatRequest{Messages: []api.Message{{Role: "user", Content: "write two files"}}}, func(response ChatResponse) {
