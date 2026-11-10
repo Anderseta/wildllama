@@ -78,25 +78,33 @@ func embeddingOutputBytes(count int, m *Model, limits inferenceLimits) (int64, e
 	return int64(count) * dimensions * 4, nil
 }
 
-func shrinkEmbeddingReservation(c *gin.Context, outputBytes int64) {
+func shrinkEmbeddingReservation(c *gin.Context, outputBytes int64) error {
 	value, exists := c.Get("wildllama_reservation")
 	if !exists {
-		return
+		return nil
 	}
 	reservation, ok := value.(*inferenceReservation)
 	if !ok {
-		return
+		return nil
 	}
 	base, ok := c.Get("wildllama_input_reservation")
 	if !ok {
-		return
+		return nil
 	}
 	input, ok := base.(int64)
 	if !ok {
-		return
+		return nil
+	}
+	if value, exists := c.Get("wildllama_body_counter"); exists {
+		if counter, ok := value.(*inferenceBodyCounter); ok {
+			input = counter.read*3 + (1 << 20)
+		}
 	}
 	// Release conservative output capacity before inference. Small embedding
 	// batches then use all available slots, without a second acquisition that
 	// could deadlock while holding already parsed input buffers.
-	reservation.shrink(input + 3*outputBytes)
+	if outputBytes < 0 || !reservation.shrink(input+3*outputBytes) {
+		return errInferenceSize
+	}
+	return nil
 }

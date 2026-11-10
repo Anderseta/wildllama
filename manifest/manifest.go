@@ -141,7 +141,8 @@ func (m *Manifest) UnmarshalJSON(data []byte) error {
 }
 
 func (m *Manifest) Size() (size int64) {
-	for _, layer := range append(m.Layers, m.Config) {
+	size = m.Config.Size
+	for _, layer := range m.Layers {
 		size += layer.Size
 	}
 

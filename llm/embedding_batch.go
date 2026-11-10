@@ -23,6 +23,9 @@ func (s *llamaServerRunner) EmbeddingBatchLimits() (int, int) {
 }
 
 func (s *llamaServerRunner) batchJSON(ctx context.Context, route string, input, output any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	data, err := json.Marshal(input)
 	if err != nil {
 		return err

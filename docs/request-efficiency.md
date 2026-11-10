@@ -35,3 +35,34 @@ preparation, not GPU inference or model tokens per second.
 
 Validation uses local HTTP/file fixtures and race tests. No model download or
 GPU inference is needed to check these paths.
+
+## Cancellation, metadata and small request budgets
+
+Decision state/image encoding waits for its existing runner slot. Already
+canceled batch, tokenization and template requests stop before JSON preparation;
+queued admission cancellation aborts the handler chain instead of continuing
+into inference.
+
+Cancelable model-show requests can leave a shared metadata lookup promptly.
+The shared parse still finishes for other waiters and the cache. Unshared fresh
+responses avoid an extra deep copy; cached and shared responses retain separate
+ownership. A failed asynchronous lookup cannot publish a cache entry or bring
+down the server through panic propagation. Manifest size calculation reads its
+layers without changing their shared backing storage.
+
+Uncompressed requests to `/api/embed` and `/v1/embeddings` reserve conservative
+output capacity within the configured request memory budget. Small requests can
+therefore work with budgets below the former 97 MiB initial estimate. Exact
+full-dimension output must fit the already-held reservation before model loading;
+there is no second acquisition while decoded input is held. Uncompressed chunked
+input is counted without buffering. Encoded requests and the legacy
+`/api/embeddings` endpoint retain their original conservative reservations;
+compressed wire bytes never become the parsed-input estimate. Body and output
+limits remain enforced.
+
+Native capability caching includes library search order and the selected shared
+implementation's file identity, size and modification time (`.dll`, `.so`, or
+`.dylib`). Replacing the implementation with an unchanged launcher, or adding a
+higher-priority implementation, causes a fresh capability query.
+Changing payloads are rejected during discovery. These checks occur at runner
+startup and do not hash entire DLLs or run in the token-generation loop.

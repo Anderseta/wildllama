@@ -14,28 +14,36 @@ import (
 )
 
 func (s *llamaServerRunner) SystemOne(ctx context.Context, state, questions json.RawMessage, images []api.ImageData) (answers, usage json.RawMessage, err error) {
+	// Include expensive state/image preparation in the existing runner slot
+	// budget. Queued requests must not each retain a fully encoded extra copy.
+	if err := s.sem.Acquire(ctx, 1); err != nil {
+		return nil, nil, err
+	}
+	defer s.sem.Release(1)
+	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
+
 	request := struct {
 		State     json.RawMessage `json:"state"`
 		Images    []string        `json:"images,omitempty"`
 		Questions json.RawMessage `json:"questions"`
 	}{State: state, Questions: questions}
 	for _, image := range images {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		data, err := llamaServerMediaBytes(image)
 		if err != nil {
 			return nil, nil, api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: err.Error()}
 		}
 		request.Images = append(request.Images, "data:"+http.DetectContentType(data)+";base64,"+base64.StdEncoding.EncodeToString(data))
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	data, err := json.Marshal(request)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	if err := s.sem.Acquire(ctx, 1); err != nil {
-		return nil, nil, err
-	}
-	defer s.sem.Release(1)
-	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/systemone", s.port), bytes.NewReader(data))
 	if err != nil {

@@ -81,8 +81,9 @@ type modelShowCache struct {
 	cloudRefreshing           map[modelShowCloudKey]bool
 	cloudNextReadRefreshAfter map[modelShowCloudKey]time.Time
 
-	once         sync.Once
-	client       *http.Client
+	once   sync.Once
+	client *http.Client
+	// Like GetModelInfo, the loader returns fresh, caller-owned mutable fields.
 	getModelInfo func(api.ShowRequest) (*api.ShowResponse, error)
 }
 
@@ -164,18 +165,39 @@ func (c *modelShowCache) runStartup(ctx context.Context) {
 
 // GetLocal returns a cached local show response when the current manifest
 // digest matches. On a miss, it falls back to GetModelInfo, stores non-remote
-// local responses, and returns a clone to the caller.
+// local responses, and returns an independently owned response to the caller.
 func (c *modelShowCache) GetLocal(req api.ShowRequest) (*api.ShowResponse, error) {
+	return c.GetLocalContext(context.Background(), req)
+}
+
+// GetLocalContext lets a disconnected request leave a shared metadata lookup
+// without canceling the parse needed by another caller or the cache itself.
+func (c *modelShowCache) GetLocalContext(ctx context.Context, req api.ShowRequest) (*api.ShowResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	key, digest, err := modelShowLocalKeyForRequest(req)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp, ok := c.getLocal(key, digest); ok {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return resp, nil
 	}
 
-	value, err, _ := c.localFlights.Do(key.Model+"\x00"+key.Runner+"\x00"+fmt.Sprint(key.Verbose)+"\x00"+digest, func() (any, error) {
+	load := func() (value any, err error) {
+		// DoChan executes outside net/http's request recovery boundary. Keep
+		// a bad metadata lookup scoped to this result instead of terminating
+		// the server through singleflight's asynchronous panic propagation.
+		defer func() {
+			if cause := recover(); cause != nil {
+				slog.Error("model show metadata lookup panicked", "model", key.Model, "cause", cause)
+				value, err = nil, errors.New("model metadata lookup failed")
+			}
+		}()
 		if response, ok := c.getLocal(key, digest); ok {
 			return response, nil
 		}
@@ -190,11 +212,36 @@ func (c *modelShowCache) GetLocal(req api.ShowRequest) (*api.ShowResponse, error
 			c.setLocal(key, digest, response)
 		}
 		return response, nil
-	})
-	if err != nil {
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return cloneShowResponse(value.(*api.ShowResponse)), nil
+	flightKey := key.Model + "\x00" + key.Runner + "\x00" + fmt.Sprint(key.Verbose) + "\x00" + digest
+	var loaded singleflight.Result
+	if ctx.Done() == nil {
+		// Internal callers without cancellation need no extra worker/channel.
+		loaded.Val, loaded.Err, loaded.Shared = c.localFlights.Do(flightKey, load)
+	} else {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case loaded = <-c.localFlights.DoChan(flightKey, load):
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if loaded.Err != nil {
+		return nil, loaded.Err
+	}
+	response := loaded.Val.(*api.ShowResponse)
+	if loaded.Shared {
+		return cloneShowResponse(response), nil
+	}
+	// GetModelInfo creates a request-owned response; setLocal retains an
+	// independent clone. A single waiter can own this result without a
+	// second copy of its potentially large vocabulary or tensor arrays.
+	return response, nil
 }
 
 // GetCloudSWR returns a cached cloud show response and triggers a throttled

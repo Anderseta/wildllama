@@ -69,6 +69,21 @@ type inferenceReservation struct {
 	released  bool
 }
 
+// Only identity-encoded, unknown-length embedding bodies can use an exact count
+// of input bytes after JSON parsing; compressed wire bytes are not that count.
+// Counting the bounded reader avoids retaining a maximum-sized input reservation
+// for a small chunked request; it does not buffer or copy the body.
+type inferenceBodyCounter struct {
+	io.ReadCloser
+	read int64
+}
+
+func (r *inferenceBodyCounter) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.read += int64(n)
+	return n, err
+}
+
 func (r *inferenceReservation) release() {
 	a := r.admission
 	a.mu.Lock()
@@ -82,16 +97,20 @@ func (r *inferenceReservation) release() {
 	a.grantLocked()
 }
 
-func (r *inferenceReservation) shrink(weight int64) {
+func (r *inferenceReservation) shrink(weight int64) bool {
 	a := r.admission
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if r.released || weight < 0 || weight >= r.waiter.weight {
-		return
+	if r.released || weight < 0 || weight > r.waiter.weight {
+		return false
+	}
+	if weight == r.waiter.weight {
+		return true
 	}
 	a.bytes -= r.waiter.weight - weight
 	r.waiter.weight = weight
 	a.grantLocked()
+	return true
 }
 
 func (a *inferenceAdmission) snapshot() gin.H {
@@ -239,20 +258,37 @@ func (s *Server) inferenceGuard() gin.HandlerFunc {
 		// Reserve before decoding JSON/base64. Unknown-length bodies reserve their
 		// entire allowance; waiting requests hold no parsed prompts or media.
 		size := c.Request.ContentLength
-		extra := int64(1 << 20)
-		if strings.HasSuffix(c.Request.URL.Path, "/embed") || strings.HasSuffix(c.Request.URL.Path, "/embeddings") {
-			// Includes result vectors and their JSON encoding, before the input
-			// shape/model dimensions are available. Ordinary RAG batches are tiny.
-			extra += 3 * limits.OutputBytes
-		}
+		unknownLength := size < 0
+		embedding := strings.HasSuffix(c.Request.URL.Path, "/embed") || strings.HasSuffix(c.Request.URL.Path, "/embeddings")
+		encodings := c.Request.Header.Values("Content-Encoding")
+		identityBody := len(encodings) == 0 || len(encodings) == 1 && (strings.TrimSpace(encodings[0]) == "" || strings.EqualFold(strings.TrimSpace(encodings[0]), "identity"))
+		adaptiveEmbedding := (c.Request.URL.Path == "/api/embed" || c.Request.URL.Path == "/v1/embeddings") && identityBody
+		// Legacy float64 output has no exact validation here. Encoded requests
+		// can be decompressed/replaced downstream, so their wire byte count is
+		// not the parsed input footprint. Both retain the original reservation.
+		conservativeEmbedding := embedding && !adaptiveEmbedding
+		const base = int64(1 << 20)
 		bodyLimit := limits.BodyBytes
-		if size < 0 {
+		if unknownLength {
 			// Chunked clients are valid too. Reserve/enforce the largest input
 			// compatible with the aggregate budget instead of rejecting them all.
-			bodyLimit = min(bodyLimit, max(0, (limits.MemoryBytes-extra)/3))
+			inputBudget := limits.MemoryBytes - base
+			if conservativeEmbedding {
+				inputBudget -= 3 * limits.OutputBytes
+			}
+			bodyLimit = min(bodyLimit, max(0, inputBudget/3))
 			size = bodyLimit
 		}
-		weight := size*3 + extra
+		inputReservation := size*3 + base
+		weight := inputReservation
+		if conservativeEmbedding {
+			weight += 3 * limits.OutputBytes
+		} else if adaptiveEmbedding && inputReservation <= limits.MemoryBytes {
+			// Reserve as much conservative output capacity as fits. The exact
+			// full-dimension output must fit this reservation before scheduling;
+			// low RAM budgets need not reject every tiny embedding up front.
+			weight += min(3*limits.OutputBytes, limits.MemoryBytes-inputReservation)
+		}
 		priority := c.GetHeader("X-Wildgoose-Priority")
 		interactive := priority == "interactive" || priority != "background" && !strings.HasSuffix(c.Request.URL.Path, "/embed") && !strings.HasSuffix(c.Request.URL.Path, "/embeddings")
 		c.Request = c.Request.WithContext(api.WithRequestPriority(c.Request.Context(), interactive))
@@ -264,13 +300,22 @@ func (s *Server) inferenceGuard() gin.HandlerFunc {
 			} else if c.Request.Context().Err() == nil {
 				c.Header("Retry-After", "1")
 				inferenceError(c, 503, "inference_queue_full", err.Error())
+			} else {
+				// Returning from a Gin middleware does not stop later handlers.
+				// An abandoned admission wait must never continue into inference.
+				inferenceError(c, 499, "request_cancelled", c.Request.Context().Err().Error())
 			}
 			return
 		}
 		defer reservation.release()
 		c.Set("wildllama_reservation", reservation)
-		c.Set("wildllama_input_reservation", size*3+(1<<20))
+		c.Set("wildllama_input_reservation", inputReservation)
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, bodyLimit)
+		if adaptiveEmbedding && unknownLength {
+			counter := &inferenceBodyCounter{ReadCloser: c.Request.Body}
+			c.Request.Body = counter
+			c.Set("wildllama_body_counter", counter)
+		}
 		c.Header("X-Wildllama-Queue-Ms", strconv.FormatInt(time.Since(started).Milliseconds(), 10))
 		c.Next()
 		slog.Debug("inference completed", "request_id", id, "path", c.Request.URL.Path, "status", c.Writer.Status(), "elapsed", time.Since(started))

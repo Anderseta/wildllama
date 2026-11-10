@@ -2231,6 +2231,9 @@ func (s *llamaServerRunner) ApplyChatTemplateWithTokenCount(ctx context.Context,
 }
 
 func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatRequest, countTokens bool) (llamaServerApplyTemplateResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return llamaServerApplyTemplateResponse{}, err
+	}
 	data, err := s.llamaServerChatRequest(req, false)
 	if err != nil {
 		return llamaServerApplyTemplateResponse{}, err
@@ -2977,6 +2980,9 @@ func isEmbeddingInputLimitError(errMsg string) bool {
 }
 
 func (s *llamaServerRunner) tokenize(ctx context.Context, content any, addSpecial bool) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	req := struct {
 		Content    any  `json:"content"`
 		AddSpecial bool `json:"add_special,omitempty"`
@@ -3028,6 +3034,9 @@ func (s *llamaServerRunner) Tokenize(ctx context.Context, content string) ([]int
 
 // Detokenize calls llama-server's /detokenize endpoint.
 func (s *llamaServerRunner) Detokenize(ctx context.Context, tokens []int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	data, err := json.Marshal(map[string][]int{"tokens": tokens})
 	if err != nil {
 		return "", err

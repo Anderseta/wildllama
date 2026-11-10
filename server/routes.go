@@ -1224,7 +1224,10 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		inferenceError(c, 413, "embedding_output_limit", err.Error())
 		return
 	}
-	shrinkEmbeddingReservation(c, outputBytes)
+	if err := shrinkEmbeddingReservation(c, outputBytes); err != nil {
+		inferenceError(c, 413, "request_memory_limit", err.Error())
+		return
+	}
 	r, m, opts, err := s.scheduleRunnerForModel(c.Request.Context(), m, []model.Capability{}, req.Options, req.KeepAlive, nil)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
@@ -1940,7 +1943,7 @@ func (s *Server) ShowHandler(c *gin.Context) {
 	}
 
 	if modelShowCacheable(req) && s.modelCaches != nil && s.modelCaches.show != nil {
-		resp, err = s.modelCaches.show.GetLocal(req)
+		resp, err = s.modelCaches.show.GetLocalContext(c.Request.Context(), req)
 	} else {
 		resp, err = GetModelInfo(req)
 	}
