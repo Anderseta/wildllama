@@ -530,10 +530,17 @@ type PromptProgress struct {
 	ElapsedMS float64 `json:"elapsed_ms"`
 }
 
+// GenerationProgress reports real output that is still being parsed or buffered.
+// It contains no partial tool arguments and does not authorize tool execution.
+type GenerationProgress struct {
+	Phase string `json:"phase"`
+}
+
 // ChatResponse is the response returned by [Client.Chat]. Its fields are
 // similar to [GenerateResponse].
 type ChatResponse struct {
-	PromptProgress *PromptProgress `json:"prompt_progress,omitempty"`
+	PromptProgress     *PromptProgress     `json:"prompt_progress,omitempty"`
+	GenerationProgress *GenerationProgress `json:"generation_progress,omitempty"`
 	// Model is the model name that generated the response.
 	Model string `json:"model"`
 

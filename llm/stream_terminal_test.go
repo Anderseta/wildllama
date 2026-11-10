@@ -201,6 +201,12 @@ func TestLlamaServerChatToolCallLimit(t *testing.T) {
 				if !response.Done && len(response.Message.ToolCalls) != 0 {
 					t.Error("tool call leaked before final batch validation")
 				}
+				if response.GenerationProgress != nil {
+					if response.GenerationProgress.Phase != "tool_call" || response.Done || response.Message.Content != "" || response.Message.Thinking != "" {
+						t.Errorf("invalid buffered-tool progress: %+v", response)
+					}
+					return
+				}
 				responses = append(responses, response)
 			})
 			if tc.wantError {

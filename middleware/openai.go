@@ -28,6 +28,23 @@ type BaseWriter struct {
 	gin.ResponseWriter
 }
 
+// A parser may withhold complete tool calls while receiving real model output.
+// Keep transport activity separate from the protocol's message/tool lifecycle.
+func isGenerationProgressOnly(r api.ChatResponse) bool {
+	if r.GenerationProgress == nil || r.Done || r.Message.Content != "" || r.Message.Thinking != "" || len(r.Message.ToolCalls) > 0 || len(r.Logprobs) > 0 {
+		return false
+	}
+	return r.GenerationProgress.Phase == "tool_call" || r.GenerationProgress.Phase == "buffered_output"
+}
+
+func writeGenerationProgressComment(w gin.ResponseWriter) error {
+	if _, err := io.WriteString(w, ": generation_progress\n\n"); err != nil {
+		return err
+	}
+	w.Flush()
+	return nil
+}
+
 type ChatWriter struct {
 	stream         bool
 	streamOptions  *openai.StreamOptions
@@ -88,6 +105,13 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 	// chat chunk
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+
+		if isGenerationProgressOnly(chatResponse) {
+			if err := writeGenerationProgressComment(w.ResponseWriter); err != nil {
+				return 0, err
+			}
+			return len(data), nil
+		}
 
 		// OpenAI stamps one created value on every chunk in a stream; pin the
 		// timestamp from the first response (the server stamps each response).
@@ -535,6 +559,15 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+
+		if isGenerationProgressOnly(chatResponse) {
+			// SSE comments carry liveness without creating response events or
+			// consuming converter sequence numbers. The source bounds frequency.
+			if err := writeGenerationProgressComment(w.ResponseWriter); err != nil {
+				return 0, err
+			}
+			return len(data), nil
+		}
 
 		events := w.converter.Process(chatResponse)
 		for _, event := range events {

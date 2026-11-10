@@ -74,6 +74,15 @@ func (w *AnthropicWriter) writeResponse(data []byte) (int, error) {
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 
+		if isGenerationProgressOnly(chatResponse) {
+			// A ping is transport activity, not the beginning or end of a
+			// message or content block. The source bounds its frequency.
+			if err := w.writeEvent("ping", anthropic.PingEvent{Type: "ping"}); err != nil {
+				return 0, err
+			}
+			return len(data), nil
+		}
+
 		events := w.converter.Process(chatResponse)
 		logutil.Trace("anthropic middleware: stream chunk", "resp", anthropic.TraceChatResponse(chatResponse), "events", len(events))
 		for _, event := range events {

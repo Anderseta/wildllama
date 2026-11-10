@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ollama/ollama/api"
 	"golang.org/x/sync/semaphore"
@@ -114,7 +115,15 @@ func TestLlamaServerChatFragmentedToolCalls(t *testing.T) {
 	fmt.Sscanf(parts[len(parts)-1], "%d", &port)
 	runner := &llamaServerRunner{port: port, cmd: fakeRunningCmd(), sem: semaphore.NewWeighted(1), options: api.Options{Runner: api.Runner{NumCtx: 2048}}}
 	var responses []ChatResponse
+	var progressTimes []time.Time
 	err := runner.Chat(t.Context(), ChatRequest{Messages: []api.Message{{Role: "user", Content: "write two files"}}}, func(response ChatResponse) {
+		if response.GenerationProgress != nil {
+			if response.GenerationProgress.Phase != "tool_call" || response.Done || response.Message.Content != "" || response.Message.Thinking != "" || len(response.Message.ToolCalls) != 0 {
+				t.Errorf("tool progress leaked partial output: %+v", response)
+			}
+			progressTimes = append(progressTimes, time.Now())
+			return
+		}
 		responses = append(responses, response)
 	})
 	if err != nil {
@@ -122,6 +131,14 @@ func TestLlamaServerChatFragmentedToolCalls(t *testing.T) {
 	}
 	if len(responses) != 1 || !responses[0].Done || len(responses[0].Message.ToolCalls) != len(contents) {
 		t.Fatalf("unexpected response count or final tools: %d", len(responses))
+	}
+	if len(progressTimes) == 0 {
+		t.Fatal("fragmented tool calls emitted no progress")
+	}
+	for i := 1; i < len(progressTimes); i++ {
+		if progressTimes[i].Sub(progressTimes[i-1]) < 950*time.Millisecond {
+			t.Fatal("tool progress was not rate limited")
+		}
 	}
 	for index, call := range responses[0].Message.ToolCalls {
 		if call.ID != fmt.Sprintf("call_%d", index) || call.Function.Name != "write_file" || call.Function.Index != index*17 {

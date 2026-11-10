@@ -3507,6 +3507,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		defer cancel()
 
 		var parserErr error
+		var generationProgress llm.GenerationProgressEmitter
 
 		err := r.Completion(ctx, llm.CompletionRequest{
 			Prompt:          prompt,
@@ -3539,6 +3540,20 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					SpeculativeAcceptedTokens: r.SpeculativeAcceptedTokens,
 				},
 				Logprobs: toAPILogprobs(r.Logprobs),
+			}
+			// Parsers may buffer an entire tool argument (including source files).
+			// Keep the stream live on real incoming output without publishing an
+			// incomplete tool call or inventing model content/token counts.
+			sendBufferedProgress := func(phase string) {
+				if r.Done || r.Content == "" {
+					return
+				}
+				if p := generationProgress.Next(phase); p != nil {
+					sendResponse(streamCtx, ch, api.ChatResponse{
+						Model: req.Model, CreatedAt: res.CreatedAt,
+						Message: api.Message{Role: "assistant"}, GenerationProgress: p,
+					})
+				}
 			}
 
 			if r.Done {
@@ -3573,6 +3588,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					sendResponse(streamCtx, ch, res)
 				} else {
 					slog.Log(ctx, logutil.LevelTrace, "builtin parser empty output", "parser", parserName)
+					sendBufferedProgress("buffered_output")
 				}
 				return
 			}
@@ -3581,6 +3597,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				thinkingContent, remainingContent := thinkTagParser.AddContent(res.Message.Content)
 				if thinkingContent == "" && remainingContent == "" && !r.Done {
 					// need to accumulate more to decide what to send
+					sendBufferedProgress("buffered_output")
 					return
 				}
 				res.Message.Thinking = thinkingContent
@@ -3601,6 +3618,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						logprobRes.Message.Content = ""
 						logprobRes.Message.ToolCalls = nil
 						sendResponse(streamCtx, ch, logprobRes)
+					} else {
+						sendBufferedProgress("tool_call")
 					}
 
 					if r.Done {
@@ -3687,6 +3706,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		err := r.Chat(streamCtx, nativeReq, func(r llm.ChatResponse) {
 			res := api.ChatResponse{
 				PromptProgress:     r.PromptProgress,
+				GenerationProgress: r.GenerationProgress,
 				Model:              req.Model,
 				CreatedAt:          time.Now().UTC(),
 				Message:            r.Message,

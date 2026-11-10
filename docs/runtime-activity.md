@@ -1,9 +1,27 @@
 # Live runner activity
 
 WildLlama exposes `GET /api/activity` on the same HTTP listener as `/api/chat`
-and `/api/generate`. The normal inference request and streaming formats are
-unchanged. `/api/version` advertises the optional `live_activity` capability.
+and `/api/generate`. It does not require a separate inference endpoint.
+`/api/version` advertises the optional `live_activity` capability.
 Clients must opt into polling and presenting these additional observations.
+
+## Buffered chat output
+
+While a chat parser accumulates output, `/api/chat` can send an additive
+`generation_progress` object with phase `tool_call` or `buffered_output` and an
+empty assistant message. This is liveness information, not a completed tool call
+or a generated-token count. Partial arguments stay private until validation.
+
+The first actual buffered fragment produces progress immediately; subsequent
+updates are limited to one every 30 seconds while new fragments arrive. There is
+no timer that emits progress when inference is idle. This keeps the usual
+180-second stream inactivity timeout effective without flushing every token.
+Clients with shorter inactivity deadlines must allow for this interval.
+OpenAI-compatible streams use SSE comments for these frames; Anthropic Messages
+uses `ping`, without advancing the message or tool lifecycle. Nonstream responses
+retain the completed result and metrics.
+
+## Activity snapshots
 
 The response has `version: 1`, `scope: "shared_runner"`, an `observed_at` Unix
 timestamp in milliseconds, `scheduler_busy`, `queue_length`, and `runners`.

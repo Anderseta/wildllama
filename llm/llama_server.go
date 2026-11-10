@@ -2356,6 +2356,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	var finalResp ChatResponse
 	var hasFinalResp bool
 	var progress llamaServerProgressEmitter
+	var generationProgress GenerationProgressEmitter
 
 	for scanner.Scan() {
 		select {
@@ -2404,6 +2405,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				Logprobs: convertLogprobs(choice.Logprobs.Content, req.TopLogprobs > 0),
 			}
 
+			hasToolProgress := false
 			for _, tc := range choice.Delta.ToolCalls {
 				if tc.Index < 0 {
 					return fmt.Errorf("llama-server returned a negative tool call index: %d", tc.Index)
@@ -2414,6 +2416,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 					toolCalls[tc.Index] = acc
 				}
 				acc.append(tc.ID, tc.Function.Name, tc.Function.Arguments)
+				hasToolProgress = hasToolProgress || tc.ID != "" || tc.Function.Name != "" || tc.Function.Arguments != ""
 			}
 
 			if choice.FinishReason != nil {
@@ -2448,6 +2451,13 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 
 			if resp.Message.Content != "" || resp.Message.Thinking != "" || len(resp.Logprobs) > 0 {
 				fn(resp)
+			} else if hasToolProgress {
+				// Tool arguments remain atomic until the final batch is validated.
+				// Report only real incoming fragments so a long call stays live
+				// without hiding an upstream stall or exposing executable tools.
+				if p := generationProgress.Next("tool_call"); p != nil {
+					fn(ChatResponse{Message: api.Message{Role: "assistant"}, GenerationProgress: p})
+				}
 			}
 		}
 
