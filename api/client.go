@@ -262,6 +262,14 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+	// An HTTP failure may legitimately have no body (e.g. a reverse proxy).
+	// No frame reaches the status checks above in that case.
+	if response.StatusCode == http.StatusUnauthorized {
+		return AuthorizationError{StatusCode: response.StatusCode, Status: response.Status}
+	}
+	if response.StatusCode >= http.StatusBadRequest {
+		return StatusError{StatusCode: response.StatusCode, Status: response.Status}
+	}
 
 	return nil
 }
