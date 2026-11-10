@@ -2,6 +2,7 @@ package llm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -36,7 +37,7 @@ func filterCompletionFields(data []byte, fields []string) ([]byte, error) {
 }
 
 func TestCompletionResponseFieldsPreserveEveryConsumer(t *testing.T) {
-	request := llamaServerCompletionRequest{ResponseFields: []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress"}}
+	request := llamaServerCompletionRequest{ResponseFields: []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress", "error"}}
 	selected := make(map[string]bool)
 	for _, field := range request.ResponseFields {
 		selected[field] = true
@@ -48,7 +49,7 @@ func TestCompletionResponseFieldsPreserveEveryConsumer(t *testing.T) {
 			t.Errorf("native field selection omits consumed response field %q", key)
 		}
 	}
-	for _, event := range completionFieldEvents {
+	for _, event := range append(completionFieldEvents, `{"error":{"message":"native fixture failed","code":500}}`) {
 		filtered, err := filterCompletionFields([]byte(event), request.ResponseFields)
 		if err != nil {
 			t.Fatal(err)
@@ -80,7 +81,7 @@ func TestCompletionRequestsOnlyConsumedNativeFields(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if !reflect.DeepEqual(request.ResponseFields, []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress"}) {
+				if !reflect.DeepEqual(request.ResponseFields, []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress", "error"}) {
 					t.Errorf("unexpected native field selection: %v", request.ResponseFields)
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -112,6 +113,43 @@ func TestCompletionRequestsOnlyConsumedNativeFields(t *testing.T) {
 				reference = responses
 			} else if !reflect.DeepEqual(reference, responses) {
 				t.Fatalf("filtered events changed callbacks:\nfull=%+v\nfiltered=%+v", reference, responses)
+			}
+		})
+	}
+}
+
+func TestCompletionFilteredNativeErrorPropagates(t *testing.T) {
+	for _, nativeError := range []string{`"native fixture failed"`, `{"message":"native fixture failed","type":"server_error","code":500}`} {
+		t.Run(nativeError, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					fmt.Fprint(w, `{"status":"ok"}`)
+					return
+				}
+				var request llamaServerCompletionRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					return
+				}
+				event, err := filterCompletionFields([]byte(`{"error":`+nativeError+`,"id_slot":0}`), request.ResponseFields)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintf(w, "data: %s\n\n", event)
+			}))
+			defer server.Close()
+			u, _ := url.Parse(server.URL)
+			port, _ := strconv.Atoi(u.Port())
+			runner := &llamaServerRunner{port: port, cmd: fakeRunningCmd(), sem: semaphore.NewWeighted(1), options: api.Options{Runner: api.Runner{NumCtx: 2048}}}
+			opts := api.DefaultOptions()
+			err := runner.Completion(t.Context(), CompletionRequest{Prompt: "fixture", Options: &opts}, func(CompletionResponse) {
+				t.Error("native error reached success callback")
+			})
+			var failure api.StatusError
+			if !errors.As(err, &failure) || failure.StatusCode != http.StatusInternalServerError || failure.ErrorMessage != "native fixture failed" {
+				t.Fatalf("native filtered error lost: %T %v", err, err)
 			}
 		})
 	}

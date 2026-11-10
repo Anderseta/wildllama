@@ -29,6 +29,18 @@ func (s *llamaServerRunner) RuntimeMemory() api.RuntimeMemory {
 		result.AllocatedVRAMBytes, result.AllocationSource = managed, "cuda_allocator"
 	}
 	if s.output != nil {
+		result.ProjectorState = s.output.projectorState
+		if s.output.projectorProgress != nil {
+			progress := *s.output.projectorProgress
+			result.ProjectorProgress = &progress
+		}
+		if result.ProjectorState == "metadata" || result.ProjectorState == "unloaded" || result.ProjectorState == "error" {
+			result.ProjectorOffloadCPU = false
+		}
+		if s.output.kvCommitted != nil {
+			committed := *s.output.kvCommitted
+			result.KVCommitted = &committed
+		}
 		result.WeightStreaming = result.WeightStreaming || s.output.boundedExpertCache > 0
 		for key, value := range s.output.buffers {
 			buffers := &result.Host
@@ -53,9 +65,13 @@ func (s *llamaServerRunner) RuntimeMemory() api.RuntimeMemory {
 	}
 	// Host mappings for embeddings and pinned I/O exist with full GPU execution.
 	// They are not evidence of layer offload, nor are they resident process RAM.
+	hostKV := result.Host.KVBytes
+	if result.KVCommitted != nil {
+		hostKV = result.KVCommitted.HostBytes
+	}
 	if result.LayersObserved && result.TotalLayers > 0 && result.GPULayers == 0 {
 		result.Placement = "cpu"
-	} else if result.WeightStreaming || result.OverflowLayers > 0 || result.Host.KVBytes > 0 || result.Host.RecurrentBytes > 0 || result.ProjectorOffloadCPU {
+	} else if result.WeightStreaming || result.OverflowLayers > 0 || hostKV > 0 || result.Host.RecurrentBytes > 0 || result.ProjectorOffloadCPU {
 		result.Placement = "offload"
 	} else if result.LayersObserved && result.TotalLayers > 0 {
 		switch {

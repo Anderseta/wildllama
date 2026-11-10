@@ -1,0 +1,243 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4,6 +4,7 @@
+ #include "server-batch-overlap.h"
+ #include "server-slot-iteration.h"
+ #include "server-prefill-budget.h"
++#include "server-checkpoint-budget.h"
+ #include "runtime-kv-memory.h"
+ #include "../../src/llama-context.h"
+ #include "../../src/llama-sampler.h"
+@@ -2810,9 +2811,62 @@
+         return true;
+     }
+ 
++    bool checkpoint_ram_adaptive() const {
++        const char * value = std::getenv("WILDLLAMA_PREFIX_RAM_ADAPTIVE");
++        return value && std::strcmp(value, "1") == 0;
++    }
++
++    size_t checkpoint_ram_held() const {
++        size_t held = 0;
++        for (const auto & slot : slots) {
++            for (const auto & checkpoint : slot.prompt.checkpoints) {
++                // Capacity remains allocated even after an auxiliary blob was cleared.
++                held = server_checkpoint_add_bytes(held, checkpoint.data_tgt.capacity());
++                held = server_checkpoint_add_bytes(held, checkpoint.data_dft.capacity());
++                held = server_checkpoint_add_bytes(held, checkpoint.data_spec.capacity());
++            }
++        }
++        return held;
++    }
++
++    void compact_checkpoints(server_slot & slot) {
++        server_checkpoint_compact(slot.prompt.checkpoints, params_base.checkpoint_min_step,
++                [&](const common_prompt_checkpoint & checkpoint) {
++            SLT_TRC(slot, "coalescing optional checkpoint (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
++                    checkpoint.n_tokens, double(checkpoint.size()) / 1024 / 1024);
++        });
++    }
++
++    bool checkpoint_ram_admit(size_t bytes) {
++        if (!checkpoint_ram_adaptive()) { return true; }
++        auto fits = [&] {
++            return server_checkpoint_can_allocate(checkpoint_ram_held(), bytes, server_prefix_system_ram());
++        };
++        if (fits()) { return true; }
++        // Optional global snapshots can also open physical headroom; this uses
++        // the existing configured disk tier when available, never a new path.
++        if (prompt_cache) { prompt_cache->make_room(bytes); }
++        while (!fits()) {
++            server_slot * victim = nullptr;
++            for (auto & other : slots) {
++                // Prefer replaying older history, retain each slot's two newest.
++                if (other.prompt.checkpoints.size() <= 2) { continue; }
++                if (!victim || other.prompt.checkpoints.front().id_task < victim->prompt.checkpoints.front().id_task) {
++                    victim = &other;
++                }
++            }
++            if (!victim) { return false; }
++            SLT_TRC(*victim, "evicting optional checkpoint under RAM pressure (size = %.3f MiB)\n",
++                    double(victim->prompt.checkpoints.front().size()) / 1024 / 1024);
++            victim->prompt.checkpoints.pop_front();
++        }
++        return true;
++    }
++
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         const int id_task = slot.task->id;
++        if (checkpoint_ram_adaptive()) { compact_checkpoints(slot); }
+ 
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+@@ -2856,8 +2910,17 @@
+             }
+         }
+ 
+-        auto & cur = slot.prompt.checkpoints.emplace_back();
+-
++        const size_t target_bytes = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        const size_t draft_bytes = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : 0;
++        const size_t state_bytes = server_checkpoint_add_bytes(target_bytes, draft_bytes);
++        if (!checkpoint_ram_admit(state_bytes)) {
++            SLT_TRC(slot, "%s", "skipping optional checkpoint: insufficient RAM headroom; prompt replay remains available\n");
++            return;
++        }
++
++        // Publish only a complete snapshot. Optional allocation failure must not
++        // leave an empty rollback point or abort the user's current request.
++        common_prompt_checkpoint cur;
+         cur.id_task = id_task;
+ 
+         // [TAG_CHECKPOINTS_FIX_POS_MIN]
+@@ -2865,15 +2928,26 @@
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
+-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-        // stash the draft's speculative state with the checkpoint
+-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++        try {
++            // Capture the small auxiliary state first, then recheck physical RAM
++            // before the large target/draft vectors. It is already resident and
++            // must not be charged as another pending allocation by the check.
++            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++            if (!checkpoint_ram_admit(state_bytes)) { return; }
++            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++            slot.prompt.checkpoints.emplace_back(std::move(cur));
++        } catch (const std::bad_alloc &) {
++            SLT_WRN(slot, "%s", "optional checkpoint allocation failed; continuing with prompt replay available\n");
++            return;
++        }
++        if (checkpoint_ram_adaptive()) { compact_checkpoints(slot); }
++        const auto & saved = slot.prompt.checkpoints.back();
+ 
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
++                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, saved.pos_min,
++                saved.pos_max, saved.n_tokens, (float) saved.size() / 1024 / 1024);
+     }
+ 
+     // checkpoints are appended to the slot save file, after the llama state payload
+diff --git a/tools/server/server-checkpoint-budget.h b/tools/server/server-checkpoint-budget.h
+new file mode 100644
+--- /dev/null
++++ b/tools/server/server-checkpoint-budget.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include "server-prefix-ram-budget.h"
++#include <cstdint>
++#include <iterator>
++#include <limits>
++
++inline size_t server_checkpoint_add_bytes(size_t a, size_t b) {
++    return b > SIZE_MAX - a ? SIZE_MAX : a + b;
++}
++
++// Already allocated snapshots are held, not a second pending allocation. The
++// system's available RAM already excludes active model/KV/speculative state.
++inline bool server_checkpoint_can_allocate(size_t held, size_t candidate,
++        server_prefix_ram_info memory) {
++    const size_t budget = server_prefix_ram_budget(0, held, memory);
++    return held <= budget && candidate <= budget - held;
++}
++
++// Keep interval anchors and the two newest exact rewind points. Removing an
++// intermediate optional checkpoint only extends replay from the prior anchor;
++// it never changes prompt tokens or the mandatory speculative rollback state.
++template <class List, class Erased>
++size_t server_checkpoint_compact(List & snapshots, int64_t min_step, Erased erased) {
++    if (min_step <= 0 || snapshots.size() <= 3) { return 0; }
++    auto anchor = snapshots.begin();
++    auto it = std::next(anchor);
++    size_t remaining = snapshots.size() - 1;
++    size_t removed = 0;
++    while (it != snapshots.end() && remaining > 2) {
++        const auto position = it->n_tokens;
++        if (position >= anchor->n_tokens &&
++                uint64_t(position) - uint64_t(anchor->n_tokens) < uint64_t(min_step)) {
++            erased(*it);
++            it = snapshots.erase(it);
++            ++removed;
++        } else {
++            anchor = it++;
++        }
++        --remaining;
++    }
++    return removed;
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -539,3 +539,7 @@
+ target_compile_features(test-mtmd-on-demand PRIVATE cxx_std_17)
+ target_link_libraries(test-mtmd-on-demand PRIVATE Threads::Threads)
+ llama_test(test-mtmd-on-demand)
++
++add_executable(test-server-checkpoint-budget test-server-checkpoint-budget.cpp)
++target_compile_features(test-server-checkpoint-budget PRIVATE cxx_std_17)
++llama_test(test-server-checkpoint-budget LABEL "main behavior")
+diff --git a/tests/test-server-checkpoint-budget.cpp b/tests/test-server-checkpoint-budget.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-server-checkpoint-budget.cpp
+@@ -0,0 +1,52 @@
++#include "../tools/server/server-checkpoint-budget.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <list>
++#include <vector>
++
++#define CHECK(x) do { if (!(x)) { std::abort(); } } while (0)
++struct snapshot { int64_t n_tokens; };
++static std::vector<int64_t> positions(const std::list<snapshot> & items) {
++    std::vector<int64_t> result;
++    for (const auto & item : items) { result.push_back(item.n_tokens); }
++    return result;
++}
++int main() {
++    constexpr size_t mib = 1024ULL*1024ULL;
++    constexpr size_t gib = 1024ULL*mib;
++    const auto no_log = [](const snapshot &) {};
++    std::list<snapshot> short_chat;
++    for (int n : {22,89,92,122,134,136,158,168,170,203}) { short_chat.push_back({n}); }
++    CHECK(server_checkpoint_compact(short_chat, 8192, no_log) == 7);
++    CHECK(positions(short_chat) == std::vector<int64_t>({22,170,203}));
++
++    // Every edit/shorter prefix is reconstructed exactly from a retained anchor
++    // or full replay, including positions whose optional snapshot was removed.
++    for (int cutoff = 0; cutoff <= 210; ++cutoff) {
++        int64_t restored = 0;
++        for (const auto & item : short_chat) {
++            if (item.n_tokens <= cutoff) { restored = item.n_tokens; }
++        }
++        int64_t state = restored*(restored+1)/2;
++        for (int64_t n = restored+1; n <= cutoff; ++n) { state += n; }
++        CHECK(state == int64_t(cutoff)*(cutoff+1)/2);
++    }
++    std::list<snapshot> long_chat{{1},{8194},{8200},{16387},{16500},{17000}};
++    CHECK(server_checkpoint_compact(long_chat,8192,no_log) == 1);
++    CHECK(positions(long_chat) == std::vector<int64_t>({1,8194,16387,16500,17000}));
++    CHECK(server_checkpoint_compact(long_chat,0,no_log) == 0);
++    std::list<snapshot> three{{1},{2},{3}};
++    CHECK(server_checkpoint_compact(three,8192,no_log) == 0);
++
++    // 16 GiB RAM reserves 819.2 MiB. Already held bytes must not be charged
++    // twice; only the next target/draft allocation needs physical headroom.
++    const size_t reserve = 16*gib/20;
++    CHECK(server_checkpoint_can_allocate(3*gib, 8*mib, {reserve+16*mib,16*gib,true}));
++    CHECK(!server_checkpoint_can_allocate(3*gib, 17*mib, {reserve+16*mib,16*gib,true}));
++    CHECK(!server_checkpoint_can_allocate(3*gib, 0, {reserve-1,16*gib,true}));
++    CHECK(server_checkpoint_can_allocate(3*gib, 2*gib, {})); // unknown probe preserves fallback
++    CHECK(!server_checkpoint_can_allocate(SIZE_MAX-1,2,{}));
++    CHECK(server_checkpoint_add_bytes(SIZE_MAX-1,2) == SIZE_MAX);
++    return 0;
++}

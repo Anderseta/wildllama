@@ -498,6 +498,11 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	}
 	cmd.SysProcAttr = LlamaServerSysProcAttr
 	childEnvs := cloneStringMap(launch.extraEnvsForStart())
+	projectorLifecycleSupported := len(launch.projectors) > 0 && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, projectorOnDemandEnvironment)
+	setProjectorLifecycleEnvironment(childEnvs, launch.projectors, projectorLifecycleSupported)
+	adaptivePrefixRequested := adaptivePrefixCacheRequested(launch.opts, launch.decision)
+	adaptivePrefixSupported := adaptivePrefixRequested && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, adaptivePrefixCacheEnvironment)
+	setAdaptivePrefixCacheEnvironment(childEnvs, adaptivePrefixRequested, adaptivePrefixSupported)
 	setCUDATuningEnvironment(childEnvs, exe, launch.gpus, launch.gpuLibs)
 	SetupLlamaServerCommandEnv(cmd, exe, launch.gpuLibs, childEnvs)
 
@@ -1334,6 +1339,9 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 		s.output.kvCacheGroup = ""
 		s.output.hasContextBuffers = false
 		s.output.boundedExpertCache = 0
+		s.output.kvCommitted = nil
+		s.output.projectorState = ""
+		s.output.projectorProgress = nil
 	}
 	s.loadActivity.Store(0)
 	s.loadTracking.Store(false)
@@ -1889,7 +1897,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		Stream:              true,
 		CachePrompt:         true,
 		ReturnProgress:      true,
-		ResponseFields:      []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress"},
+		ResponseFields:      []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress", "error"},
 		NPredict:            req.Options.NumPredict,
 		NKeep:               req.Options.NumKeep,
 		Temperature:         req.Options.Temperature,
@@ -3201,6 +3209,9 @@ type memoryParsingWriter struct {
 	hasContextBuffers  bool
 	boundedExpertCache uint64
 	lastKVBuffer       *memoryBufferKey
+	kvCommitted        *api.RuntimeKVCommitment
+	projectorState     string
+	projectorProgress  *float64
 }
 
 type memoryBufferKey struct {
@@ -3301,10 +3312,17 @@ func (w *memoryParsingWriter) resetContextMemoryLocked() {
 	}
 	w.kvCacheGroup, w.hasContextBuffers, w.boundedExpertCache = "", false, 0
 	w.lastKVBuffer = nil
+	w.kvCommitted = nil
 	w.updateRunnerMemoryLocked()
 }
 
 func (w *memoryParsingWriter) observeMemoryLineLocked(b []byte) {
+	if w.observeKVCommitmentLocked(b) {
+		return
+	}
+	if w.observeProjectorMemoryLocked(b) {
+		return
+	}
 	if bytes.Contains(b, []byte("llama_context: constructing llama_context")) {
 		w.resetContextMemoryLocked()
 	}
@@ -3345,7 +3363,8 @@ func (w *memoryParsingWriter) observeMemoryLineLocked(b []byte) {
 	for _, match := range bufferSizeRegex.FindAllSubmatch(b, -1) {
 		if mib, err := strconv.ParseFloat(string(match[4]), 64); err == nil {
 			kind := string(match[3])
-			if kind == "model" && w.hasContextBuffers {
+			projector := w.projectorState == "loading" || w.projectorState != "" && string(match[1]) == "reserve_compute_meta"
+			if kind == "model" && w.hasContextBuffers && !projector {
 				// The final model load also replaces fit/probe KV buffers when
 				// an older payload omits the context construction line.
 				w.resetContextMemoryLocked()
@@ -3362,6 +3381,9 @@ func (w *memoryParsingWriter) observeMemoryLineLocked(b []byte) {
 				backend:    string(match[2]),
 				kind:       kind,
 				cacheGroup: group,
+			}
+			if projector {
+				key.component = "mmproj:" + key.component
 			}
 			w.buffers[key] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
 			if kind == "KV" {

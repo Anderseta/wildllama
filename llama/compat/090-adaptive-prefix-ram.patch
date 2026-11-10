@@ -1,0 +1,342 @@
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -12,6 +12,59 @@
+ 
+ #include <sstream>
+ #include <cmath>
++#include <cstdio>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#elif defined(__APPLE__)
++#include <mach/mach.h>
++#include <sys/sysctl.h>
++#endif
++
++server_prefix_ram_info server_prefix_system_ram() {
++#ifdef _WIN32
++    MEMORYSTATUSEX status = {};
++    status.dwLength = sizeof(status);
++    if (GlobalMemoryStatusEx(&status)) {
++        return { size_t(status.ullAvailPhys), size_t(status.ullTotalPhys), true };
++    }
++#elif defined(__linux__)
++    // MemFree alone ignores reclaimable page cache and would over-evict.
++    if (FILE * file = std::fopen("/proc/meminfo", "r")) {
++        unsigned long long available = 0, total = 0;
++        bool have_available = false;
++        char line[256];
++        while (std::fgets(line, sizeof(line), file)) {
++            if (std::sscanf(line, "MemAvailable: %llu kB", &available) == 1) { have_available = true; }
++            std::sscanf(line, "MemTotal: %llu kB", &total);
++        }
++        std::fclose(file);
++        if (have_available && total && total <= SIZE_MAX / 1024 && available <= total) {
++            return { size_t(available * 1024), size_t(total * 1024), true };
++        }
++    }
++#elif defined(__APPLE__)
++    uint64_t total = 0;
++    size_t length = sizeof(total);
++    vm_statistics64_data_t statistics = {};
++    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++    vm_size_t page_size = 0;
++    const mach_port_t host = mach_host_self();
++    const bool ok = sysctlbyname("hw.memsize", &total, &length, nullptr, 0) == 0 &&
++        host_page_size(host, &page_size) == KERN_SUCCESS &&
++        host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&statistics), &count) == KERN_SUCCESS;
++    mach_port_deallocate(mach_task_self(), host);
++    if (ok && total && total <= SIZE_MAX) {
++        const uint64_t pages = uint64_t(statistics.free_count) + statistics.inactive_count;
++        if (page_size && pages <= total / page_size) {
++            return { size_t(pages * page_size), size_t(total), true };
++        }
++    }
++#endif
++    return {};
++}
+ 
+ //
+ // task_params
+@@ -1808,10 +1861,22 @@
+     } catch (...) { return false; }
+ }
+ 
+-void server_prompt_cache::make_room(size_t bytes, server_prompt_cache_state * preserve) {
++size_t server_prompt_cache::ram_budget(size_t in_flight) const {
++    const size_t unlimited = std::numeric_limits<size_t>::max();
++    // Retained shared cells may live on the GPU; their logical charge is not
++    // host RAM. Keep the established policy for that optional memory layout.
++    if (!adaptive_ram || retain_tokens || !memory_probe) { return limit_size ? limit_size : unlimited; }
++    const size_t used = size();
++    const size_t held = in_flight > unlimited - used ? unlimited : used + in_flight;
++    return server_prefix_ram_budget(limit_size, held, memory_probe());
++}
++
++void server_prompt_cache::make_room(size_t bytes, server_prompt_cache_state * preserve, size_t in_flight) {
+     collect_writebacks();
+-    if (!limit_size || bytes > limit_size) { return; }
+-    while (size() > limit_size - bytes) {
++    const size_t budget = ram_budget(in_flight);
++    if (budget == std::numeric_limits<size_t>::max()) { return; }
++    const size_t target = bytes <= budget ? budget - bytes : 0;
++    while (size() > target) {
+         auto victim = states.end();
+         for (auto it = states.begin(); it != states.end(); ++it) {
+             if (&*it != preserve && !it->is_cold()) { victim = it; break; }
+@@ -1833,7 +1898,8 @@
+     if (bytes > SIZE_MAX || (limit_size && bytes > limit_size - std::min(limit_size, state->size()))) { return false; }
+     try {
+         make_room(size_t(bytes), &*state);
+-        if (limit_size && size() > limit_size - size_t(bytes)) { return false; }
++        const size_t budget = ram_budget();
++        if (bytes > budget || size() > budget - size_t(bytes)) { return false; }
+         if (!server_state_pager::load(state->backing, state->buffers())) { return false; }
+         return true;
+     } catch (...) { return false; }
+@@ -1906,19 +1972,29 @@
+     return true;
+ }
+ 
+-bool server_prompt_cache::can_save(const server_prompt & prompt, size_t state_size) const {
++bool server_prompt_cache::can_save(const server_prompt & prompt, size_t state_size, size_t in_flight) {
++    const bool adaptive_host = adaptive_ram && !retain_tokens && bool(memory_probe);
+     const bool indexed = prepare_prefix_lengths(prompt.tokens);
+     for (const auto & state : states) {
+         const size_t lcp = indexed ? state.indexed_lcp : state.prompt.tokens.get_common_prefix(prompt.tokens);
+         if (lcp == prompt.tokens.size()) {
++            if (adaptive_host) { make_room(0, nullptr, in_flight); }
+             return false;
+         }
+     }
+-    if (limit_size > 0 && state_size > limit_size) { return false; }
++    size_t budget = ram_budget(in_flight);
++    if (state_size > budget) { return false; }
+     for (const auto & ckpt : prompt.checkpoints) {
+         if (ckpt.size() > SIZE_MAX - state_size) { return false; }
+         state_size += ckpt.size();
+-        if (limit_size > 0 && state_size > limit_size) { return false; }
++        if (state_size > budget) { return false; }
++    }
++    if (adaptive_host) {
++        // Do this before common_state_capture allocates the next serialized
++        // snapshot. A ceiling including old entries is not free headroom.
++        make_room(state_size, nullptr, in_flight);
++        budget = ram_budget(in_flight);
++        if (state_size > budget || size() > budget - state_size) { return false; }
+     }
+     return true;
+ }
+@@ -1926,7 +2002,7 @@
+ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, server_prompt_data data, llama_memory_prefix_ptr resident) {
+     if (resident && (!resident->valid() || !data.main.empty())) { return nullptr; }
+     const size_t charged_bytes = data.size() + (resident ? resident->size() : 0);
+-    if ((!resident && data.main.empty()) || !can_save(prompt, charged_bytes)) { return nullptr; }
++    if ((!resident && data.main.empty()) || !can_save(prompt, charged_bytes, data.size())) { return nullptr; }
+     size_t state_size_new = charged_bytes;
+     for (const auto & ckpt : prompt.checkpoints) { state_size_new += ckpt.size(); }
+ 
+@@ -1955,7 +2031,11 @@
+ 
+     // The optional cold tier preserves complete target/draft/spec/checkpoint
+     // transactions. Disabled or failed spill retains ordinary FIFO eviction.
+-    make_room(state_size_new);
++    // The pending vectors already occupy RAM. Count them as held when probing
++    // available memory so the admission check does not charge their bytes twice.
++    make_room(state_size_new, nullptr, state_size_new);
++    const size_t budget = ram_budget(state_size_new);
++    if (state_size_new > budget || size() > budget - state_size_new) { return nullptr; }
+ 
+     // Splice is noexcept: only a complete entry becomes visible, after all
+     // allocations and the target/draft/spec capture have succeeded.
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -7,12 +7,14 @@
+ #include "server-prefix-index.h"
+ #include "server-state-pager.h"
+ #include "server-state-writeback.h"
++#include "server-prefix-ram-budget.h"
+ 
+ #include <string>
+ #include <cstdlib>
+ #include <unordered_set>
+ #include <list>
+ #include <map>
++#include <functional>
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
+@@ -737,6 +739,8 @@
+     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+         this->limit_tokens = limit_tokens;
++        const char * adaptive = std::getenv("WILDLLAMA_PREFIX_RAM_ADAPTIVE");
++        adaptive_ram = adaptive && std::string(adaptive) == "1";
+         const char * value = std::getenv("WILDLLAMA_PREFIX_RETAIN_TOKENS");
+         if (value && value[0] >= '0' && value[0] <= '9') {
+             char * end = nullptr;
+@@ -753,6 +757,9 @@
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+     uint32_t retain_tokens = 0; // explicit shared-cell budget, default disabled
++    bool adaptive_ram = false;
++    std::function<server_prefix_ram_info()> memory_probe = server_prefix_system_ram;
++    size_t ram_budget(size_t in_flight = 0) const;
+     server_state_pager pager;
+     server_state_writeback writer;
+     void queue_writebacks();
+@@ -760,7 +767,7 @@
+     bool finish_writeback(server_prompt_cache_state & state, bool keep_ram, bool wait);
+     bool spill(server_prompt_cache_state & state);
+     bool materialize(std::list<server_prompt_cache_state>::iterator state);
+-    void make_room(size_t bytes, server_prompt_cache_state * preserve = nullptr);
++    void make_room(size_t bytes, server_prompt_cache_state * preserve = nullptr, size_t in_flight = 0);
+ 
+     size_t size() const;
+ 
+@@ -773,7 +780,7 @@
+     void observe_prompt(uint64_t tokens, double duration_us);
+     std::list<server_prompt_cache_state>::iterator find_best(const server_prompt & prompt, const server_tokens & tokens);
+ 
+-    bool can_save(const server_prompt & prompt, size_t state_size) const;
++    bool can_save(const server_prompt & prompt, size_t state_size, size_t in_flight = 0);
+ 
+     server_prompt_cache_state * alloc(const server_prompt & prompt, server_prompt_data data,
+             llama_memory_prefix_ptr resident = {});
+diff --git a/tests/test-server-prefix-cache.cpp b/tests/test-server-prefix-cache.cpp
+--- a/tests/test-server-prefix-cache.cpp
++++ b/tests/test-server-prefix-cache.cpp
+@@ -273,6 +273,57 @@
+     std::puts("PASS: four prefixes through two tickets; 8 exact warm/cold cycles without rewrites; warm scoring; missing/corrupt backing and quotas");
+ }
+ 
++static void adaptive_ram_budget() {
++    constexpr size_t mib = 1024ull * 1024ull;
++    constexpr size_t gib = 1024ull * mib;
++    const size_t unlimited = std::numeric_limits<size_t>::max();
++    require(server_prefix_ram_budget(8*gib, 0, {}) == 8*gib, "unknown memory changed configured ceiling");
++    require(server_prefix_ram_budget(0, 0, {}) == unlimited, "legacy unlimited ceiling changed");
++    require(server_prefix_ram_budget(8*gib, 2*gib, {2*gib, 32*gib, true}) == 2*gib + 2*gib - (32*gib)/20,
++            "available memory reserve is incorrect");
++    require(server_prefix_ram_budget(8*gib, 0, {0, 32*gib, true}) == 0, "zero available RAM admitted allocation");
++    require(server_prefix_ram_budget(8*gib, 0, {2*gib, gib, true}) == 8*gib, "invalid probe changed ceiling");
++    require(server_prefix_ram_budget(8*gib, unlimited, {unlimited, unlimited, true}) == 8*gib,
++            "budget arithmetic overflowed");
++
++    server_prompt_cache cache(4, 0);
++    require(cache.alloc(make_prompt({1,2}), make_data(300)), "first fixture snapshot failed");
++    require(cache.alloc(make_prompt({1,3}), make_data(300)), "second fixture snapshot failed");
++    cache.adaptive_ram = true;
++    // OS availability rises when old snapshots are released. Only 512 bytes
++    // remain available to this optional cache above the 512 MiB reserve.
++    cache.memory_probe = [&]() { return server_prefix_ram_info{512*mib + 512 - cache.size(), gib, true}; };
++    cache.make_room(0);
++    require(cache.states.size() == 1 && cache.states.back().prompt.tokens.get_tokens().back() == 3,
++            "pressure did not retain the newest useful snapshot");
++    require(cache.size() <= 512, "cache exceeds available RAM budget");
++    const auto incoming = make_prompt({1,4});
++    require(!cache.can_save(incoming, 513), "oversized snapshot admitted before serialization");
++    require(cache.can_save(incoming, 400), "bounded snapshot incorrectly rejected");
++    require(cache.states.empty(), "new snapshot admitted before old allocation was released");
++
++    size_t external = 0;
++    cache.memory_probe = [&]() { return server_prefix_ram_info{512*mib + 100 - external, gib, true}; };
++    const size_t before = cache.ram_budget();
++    external = 200;
++    require(cache.ram_budget(external) == before, "pending snapshot memory was counted twice");
++
++    cache.memory_probe = []() { return server_prefix_ram_info{}; };
++    require(cache.ram_budget() == 4*mib, "failed OS probe did not preserve configured behavior");
++    cache.memory_probe = [=]() { return server_prefix_ram_info{0, gib, true}; };
++    cache.retain_tokens = 1;
++    require(cache.ram_budget() == 4*mib, "GPU retained-cell logical bytes treated as host RAM");
++    cache.retain_tokens = 0;
++    require(!cache.can_save(incoming, 1) && cache.states.empty(), "critical pressure retained optional snapshots");
++    cache.adaptive_ram = false;
++    const auto covered = make_prompt({2,8});
++    require(cache.alloc(covered, make_data(300)), "covered-prefix pressure fixture failed");
++    cache.adaptive_ram = true;
++    require(!cache.can_save(covered, 0) && cache.states.empty(), "covered prefix bypassed pressure eviction");
++    require(incoming.tokens.get_tokens() == llama_tokens({1,4}), "cache pressure changed request tokens");
++    std::puts("PASS: adaptive prefix RAM admission, oldest eviction, newest reuse, unknown probe, in-flight bytes and retained-cell fallback");
++}
++
+ static void benchmark() {
+     const auto live = make_prompt({});
+     for (size_t length : {size_t(16), size_t(8192)}) {
+@@ -316,6 +367,7 @@
+         }
+         selection_and_mutation();
+         fallback_paths();
++        adaptive_ram_budget();
+         if (argc == 3 && std::string(argv[1]) == "--state-dir") { warm_disk_backing(argv[2]); }
+         if (argc > 1 && std::string(argv[1]) == "--bench") { benchmark(); }
+         std::puts("server prefix cache: PASS");
+diff --git a/tools/server/server-prefix-ram-budget.h b/tools/server/server-prefix-ram-budget.h
+new file mode 100644
+--- /dev/null
++++ b/tools/server/server-prefix-ram-budget.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <limits>
++
++struct server_prefix_ram_info {
++    size_t available = 0;
++    size_t total = 0;
++    bool known = false;
++};
++
++// This is an admission ceiling for optional cached snapshots, not a process
++// memory limit. Live model/KV state is never discarded by this policy.
++inline size_t server_prefix_ram_budget(size_t configured, size_t held,
++        server_prefix_ram_info memory) {
++    const size_t unlimited = std::numeric_limits<size_t>::max();
++    const size_t ceiling = configured ? configured : unlimited;
++    if (!memory.known || !memory.total || memory.available > memory.total) { return ceiling; }
++    constexpr size_t mib = 1024ull * 1024ull;
++    const size_t reserve = std::min(size_t(2048 * mib), std::max(size_t(512 * mib), memory.total / 20));
++    size_t effective;
++    if (memory.available >= reserve) {
++        const size_t extra = memory.available - reserve;
++        effective = extra > unlimited - held ? unlimited : held + extra;
++    } else {
++        const size_t shortfall = reserve - memory.available;
++        effective = held > shortfall ? held - shortfall : 0;
++    }
++    return std::min(ceiling, effective);
++}
++
++server_prefix_ram_info server_prefix_system_ram();
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -227,6 +227,10 @@
+     llama-context/test-util.cpp
+ )
+ llama_build(${LLAMA_CONTEXT_TEST_SRC})
++
++llama_build_and_test(test-server-prefix-cache.cpp LABEL behavior)
++target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
++target_link_libraries(test-server-prefix-cache PRIVATE server-context)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

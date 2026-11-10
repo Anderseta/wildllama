@@ -33,7 +33,7 @@ func TestGPUExclusiveDiscoveryRejectsCPUWithoutLaunching(t *testing.T) {
 	opts := api.DefaultOptions()
 	enabled := true
 	opts.GPUExclusive = &enabled
-	request := &LlmRequest{model: &Model{}, opts: opts, errCh: make(chan error, 1)}
+	request := &LlmRequest{ctx: t.Context(), model: &Model{}, opts: opts, errCh: make(chan error, 1)}
 	if (&Scheduler{}).load(request, ml.SystemInfo{}, nil, false) {
 		t.Fatal("requested retry instead of rejecting missing CUDA")
 	}

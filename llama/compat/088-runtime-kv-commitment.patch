@@ -1,0 +1,243 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -634,6 +634,16 @@
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+ 
++    // Physical KV storage for the target attention memory, excluding recurrent
++    // state and speculative child contexts. Unsupported layouts return false;
++    // capacity is virtual address space and must not be reported as residency.
++    struct llama_kv_memory_stats {
++        uint64_t gpu_bytes;
++        uint64_t host_bytes;
++        uint64_t capacity_bytes;
++    };
++    LLAMA_API bool llama_get_kv_memory_stats(const struct llama_context * ctx, struct llama_kv_memory_stats * result);
++
+     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
+     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
+     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -152,6 +152,8 @@
+     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
++
++    bool physical_memory_stats(llama_kv_memory_stats & result) const;
+ 
+     // state write/load
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1201,6 +1201,31 @@
+     return ret;
+ }
+ 
++bool llama_kv_cache::physical_memory_stats(llama_kv_memory_stats & result) const {
++    if (hparams.no_alloc || other || typeid(*this) != typeid(llama_kv_cache)) { return false; }
++    llama_kv_memory_stats measured {};
++    for (const auto & entry : ctxs_bufs) {
++        const auto & buf = entry.second;
++        const auto buft = ggml_backend_buffer_get_type(buf.get());
++        const auto dev = ggml_backend_buft_get_device(buft);
++        if (!dev) { return false; }
++        const auto type = ggml_backend_dev_type(dev);
++        const bool gpu = type == GGML_BACKEND_DEVICE_TYPE_IGPU ||
++            (type == GGML_BACKEND_DEVICE_TYPE_GPU && !ggml_backend_buft_is_host(buft));
++        const bool host = !gpu && (ggml_backend_buft_is_host(buft) || type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_ACCEL);
++        if (!host && !gpu) { return false; }
++        const auto * growth = growth_initial_tokens ? llama_kv_growth_api(buft) : nullptr;
++        const uint64_t physical = growth ? growth->committed(buf.get()) : ggml_backend_buffer_get_size(buf.get());
++        const uint64_t capacity = ggml_backend_buffer_get_size(buf.get());
++        auto & used = gpu ? measured.gpu_bytes : measured.host_bytes;
++        if (physical > UINT64_MAX - used || capacity > UINT64_MAX - measured.capacity_bytes) { return false; }
++        used += physical;
++        measured.capacity_bytes += capacity;
++    }
++    result = measured;
++    return true;
++}
++
+ llama_memory_context_ptr llama_kv_cache::init_batch(
+             llama_batch_allocr & balloc,
+             uint32_t n_ubatch,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -5830,6 +5830,21 @@
+     ctx->set_nextn_layer_offset(offset);
+ }
+ 
++bool llama_get_kv_memory_stats(const struct llama_context * ctx, struct llama_kv_memory_stats * result) {
++    if (!ctx || !result) { return false; }
++    const auto * memory = ctx->get_memory();
++    if (!memory) { return false; }
++    const llama_kv_cache * attention = nullptr;
++    if (typeid(*memory) == typeid(llama_kv_cache)) {
++        attention = static_cast<const llama_kv_cache *>(memory);
++    } else if (typeid(*memory) == typeid(llama_memory_hybrid)) {
++        attention = static_cast<const llama_memory_hybrid *>(memory)->get_mem_attn();
++    }
++    // Derived/indexed memories can own additional caches, so a partial count
++    // would be misleading. Leave their live commitment explicitly unknown.
++    return attention && attention->physical_memory_stats(*result);
++}
++
+ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+     if (!ctx) {
+         return nullptr;
+diff --git a/common/runtime-kv-memory.h b/common/runtime-kv-memory.h
+new file mode 100644
+--- /dev/null
++++ b/common/runtime-kv-memory.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include "llama.h"
++
++#include <cinttypes>
++#include <cstdio>
++
++// Sampling runs on the server's existing context owner thread. No additional
++// worker, synchronization of GPU work, or per-token log output is introduced.
++class common_kv_memory_reporter {
++public:
++    using sink = void (*)(const llama_kv_memory_stats &);
++    explicit common_kv_memory_reporter(sink emit = write_event) : emit(emit) {}
++
++    bool sample(const llama_context * ctx, bool force = false) {
++        if (!ctx) { previous_context = nullptr; observed = false; return false; }
++        if (ctx != previous_context) {
++            previous_context = ctx;
++            observed = false;
++            next_sample = 0;
++        }
++        const int64_t now = llama_time_us();
++        if (!force && now < next_sample) { return false; }
++        next_sample = now + 500000;
++        llama_kv_memory_stats measured {};
++        if (!llama_get_kv_memory_stats(ctx, &measured)) { observed = false; return false; }
++        const bool changed = !observed || measured.gpu_bytes != previous.gpu_bytes ||
++            measured.host_bytes != previous.host_bytes || measured.capacity_bytes != previous.capacity_bytes;
++        previous = measured;
++        observed = true;
++        if (!changed && !force) { return false; }
++        emit(measured);
++        return true;
++    }
++
++private:
++    static void write_event(const llama_kv_memory_stats & memory) {
++        std::fprintf(stderr, "wildllama_activity {\"kind\":\"kv_memory\",\"scope\":\"target\",\"gpu_bytes\":%" PRIu64
++            ",\"host_bytes\":%" PRIu64 ",\"capacity_bytes\":%" PRIu64 "}\n",
++            memory.gpu_bytes, memory.host_bytes, memory.capacity_bytes);
++    }
++    sink emit;
++    const llama_context * previous_context = nullptr;
++    llama_kv_memory_stats previous {};
++    int64_t next_sample = 0;
++    bool observed = false;
++};
+diff --git a/tests/test-kv-memory-report.cpp b/tests/test-kv-memory-report.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-kv-memory-report.cpp
+@@ -0,0 +1,45 @@
++#include "runtime-kv-memory.h"
++
++#include <cstdio>
++#include <stdexcept>
++
++static int64_t clock_us = 0;
++static int queries = 0, events = 0;
++static bool available = true;
++static llama_kv_memory_stats actual {320, 0, 2176};
++static llama_kv_memory_stats emitted {};
++
++int64_t llama_time_us() { return clock_us; }
++bool llama_get_kv_memory_stats(const llama_context *, llama_kv_memory_stats * out) {
++    ++queries;
++    if (!available) { return false; }
++    *out = actual;
++    return true;
++}
++static void event(const llama_kv_memory_stats & memory) { ++events; emitted = memory; }
++static void require(bool value, const char * reason) { if (!value) { throw std::runtime_error(reason); } }
++
++int main() {
++    const auto * target = reinterpret_cast<const llama_context *>(uintptr_t(1));
++    const auto * replacement = reinterpret_cast<const llama_context *>(uintptr_t(2));
++    common_kv_memory_reporter reporter(event);
++    require(reporter.sample(target) && emitted.gpu_bytes == 320, "initial measured commitment missing");
++    actual.gpu_bytes = 1088;
++    clock_us = 100;
++    require(!reporter.sample(target) && queries == 1, "per-token sampling was not throttled");
++    clock_us = 500000;
++    require(reporter.sample(target) && emitted.gpu_bytes == 1088, "grown physical commitment was not observed");
++    clock_us = 1000000;
++    require(!reporter.sample(target) && events == 2, "unchanged counters produced duplicate events");
++    actual.gpu_bytes = 320;
++    require(reporter.sample(target, true) && emitted.gpu_bytes == 320, "idle reclamation must bypass throttle");
++    available = false;
++    require(!reporter.sample(replacement, true), "unsupported layout must remain unknown");
++    require(!reporter.sample(nullptr), "null context must not fabricate a zero measurement");
++    available = true;
++    actual = {0, 0, 0};
++    require(reporter.sample(target) && emitted.gpu_bytes == 0 && emitted.capacity_bytes == 0,
++        "a measured zero must remain distinct from unsupported memory");
++    std::puts("PASS: measured initial/grown/trimmed KV, throttle, context change and unknown layouts");
++    return 0;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4,6 +4,7 @@
+ #include "server-batch-overlap.h"
+ #include "server-slot-iteration.h"
+ #include "server-prefill-budget.h"
++#include "runtime-kv-memory.h"
+ #include "../../src/llama-context.h"
+ #include "../../src/llama-sampler.h"
+ #include <atomic>
+@@ -1154,6 +1155,7 @@
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
+     server_metrics metrics;
++    common_kv_memory_reporter kv_memory_reporter;
+ 
+     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
+     // note: kept out of server_metrics, which is copied as-is into the task result
+@@ -3857,6 +3859,7 @@
+     }
+ 
+     void update_slots() {
++        kv_memory_reporter.sample(ctx_tgt);
+         admission.resume_ready([this](int id_task) { queue_tasks.pop_deferred_task_by_id(id_task); });
+ #ifdef DEBUG_TIMINGS
+         static int64_t t_prev = 0;
+@@ -3894,6 +3897,7 @@
+                 if (reclaimed_tgt || reclaimed_dft) {
+                     SRV_DBG("KV paging: released %zu target bytes and %zu draft bytes while idle\n", reclaimed_tgt, reclaimed_dft);
+                 }
++                kv_memory_reporter.sample(ctx_tgt, true);
+ 
+                 return; // skip further processing
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -474,6 +474,10 @@
+ endforeach()
+ 
+ llama_build_and_test(test-mtp-state.cpp LABEL "main behavior" LINK llama-common)
++add_executable(test-kv-memory-report test-kv-memory-report.cpp)
++target_include_directories(test-kv-memory-report PRIVATE ../include ../common ../ggml/include)
++target_compile_features(test-kv-memory-report PRIVATE cxx_std_17)
++llama_test(test-kv-memory-report LABEL "main behavior")
+ add_dependencies(test-mtp-state ggml-cpu)
+ target_compile_definitions(test-mtp-state PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+ llama_build_and_test(test-mtp-device-state.cpp LABEL "main behavior" LINK llama-common)

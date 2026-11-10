@@ -1,8 +1,10 @@
 # WildLlama runtime performance
 
 This private fork keeps model files, quantization and the requested context unchanged.
-The native delta is `llama/compat/003-runtime-performance.patch`, applied after the
-existing compatibility and MoE RAM patches. These changes are not an upstream PR.
+Native changes live in the numbered `llama/compat/*.patch` stack against the
+revision pinned in `LLAMA_CPP_VERSION`, including the original runtime-performance
+patch and the newer memory/lifecycle changes described below. These are fork changes,
+not an upstream PR.
 
 ## Automatic improvements
 
@@ -61,6 +63,27 @@ inherited runner override. Explicit API options and command-line settings retain
 their existing precedence. The RAM budget still covers MoE weights, not total
 process memory or dense offload.
 
+### Adaptive prompt RAM admission
+
+Native runners advertising `WILDLLAMA_PREFIX_RAM_ADAPTIVE` use an adaptive ceiling
+for optional serialized prompt snapshots when the configured prompt RAM cache is
+positive. The Go launcher enables the capability only on a compatible executable;
+older payloads retain their original behavior and do not inherit the switch.
+
+The user cache setting remains the upper bound. Admission additionally reserves
+5% of physical RAM, clamped to 512–2048 MiB, using OS available-memory information.
+Under pressure the existing eviction/spill path releases old optional snapshots;
+an oversized snapshot is skipped before serialization. Pending allocations are
+accounted once, and the active request's tokens and live KV/recurrent state are
+preserved. A smaller cache can require more prompt processing on a later revisit.
+
+Unknown OS memory data retains the configured ceiling. The optional native
+shared-cell retention layout also retains its existing policy: its logical GPU
+charge must not be mistaken for serialized host RAM. This is cache admission,
+not a hard process RSS/commit limit and not a reduction of model context or KV
+precision. It creates no new cache directories and keeps the configured disk
+tier optional.
+
 `num_ubatch` separates the physical microbatch from `num_batch`; zero/omitted keeps
 the previous behavior. Smaller physical batches can save scratch space but may
 reduce prefill throughput. Whole-prompt pooling/decision models reject a microbatch
@@ -70,6 +93,56 @@ Wildgoose detects this capability. Applying load-affecting settings unloads only
 the affected model. Sampling-only changes keep its weights resident. Truly global
 settings such as maximum loaded models and keep-alive can still require a daemon
 restart; official Ollama retains the legacy profile behavior.
+
+## On-demand visual projectors
+
+The launcher enables `WILDLLAMA_MMPROJ_ON_DEMAND=1` only when a runner advertises
+it through `--wildllama-runtime-features`. A vision-only MTMD context initially
+keeps tensor metadata and preprocessing rules without encoder weights or device
+buffers. Vision remains available to the model. The encoder loads when an image
+needs encoding and releases its weights and compute buffers once no slot has a
+pending prompt to process; generation, cached image embeddings and text KV remain
+valid. Re-encoding images in a later request loads it again. Prefix reuse that
+already contains the image embeddings needs no reload.
+
+`runtime_memory.projector_state` and `projector_progress` report the observed
+lifecycle. Released projector buffers are removed from placement telemetry. Each
+cold encoder load has a latency cost and still needs enough memory alongside the
+text model and its current KV. Allocation failure returns a request error without
+resetting the text model. In-flight encoding retains ownership until it finishes,
+including cancellation. Audio and mixed audio/vision projectors retain their
+conventional lifecycle; older payloads retain their original loading behavior.
+
+## Live KV allocation measurements
+
+Compatible native contexts publish `runtime_memory.kv_committed` with physical
+`gpu_bytes`, `host_bytes`, logical `capacity_bytes`, a timestamp and source.
+Measurements run on the context owner thread, are throttled during work, and are
+refreshed at idle after trimming. They follow KV growth and release rather than
+reporting only its startup allocation. These counters exclude model weights,
+recurrent state and compute buffers. An unsupported layout or older payload leaves
+the measurement absent; its load-time KV counters remain a separate snapshot and
+must not be treated as current allocation.
+
+## Optional recurrent prompt checkpoints
+
+With `WILDLLAMA_PREFIX_RAM_ADAPTIVE=1`, per-slot optional rewind snapshots also
+use the available-RAM reserve described above, independently of whether the global
+prompt cache is enabled. Before allocating large target/draft copies, admission
+can release older optional snapshots or skip the new snapshot. Existing allocated
+vector capacity is counted; pending bytes are charged once. Allocation failure
+leaves the current request running, and only complete snapshots enter the list.
+
+Coalescing retains spaced interval anchors and the two newest checkpoints. The
+configured count limit and spacing setting remain unchanged. It removes nearby
+intermediate snapshots even before the list reaches its count limit. Short chats
+therefore avoid accumulating a full recurrent-state copy at every nearby boundary.
+An older edit can require replay from an earlier anchor or the full prompt. The
+prompt tokens, live KV/recurrent state and mandatory speculative rollback state
+are preserved; context and sampling are unchanged. This remains optional-cache
+admission, not a hard process RAM limit. Unknown OS memory information preserves
+the existing admission fallback. Explicit restoration of checkpoint appendices
+from manually saved slot files retains its existing parser and allocation policy.
 
 ## Optional experiments
 

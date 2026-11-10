@@ -1,0 +1,377 @@
+diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -61,6 +61,7 @@
+     mtmd_progress_callback progress_callback;
+     void * progress_callback_user_data;
+     bool gpu_exclusive;
++    bool metadata_only = false; // preprocessing without encoder weights or device buffers
+ };
+ 
+ struct clip_init_result {
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -170,6 +170,7 @@
+     bool debug_output_embeddings = false;
+ 
+     // for measuring memory usage
++    bool metadata_only = false;
+     bool no_alloc = false;
+     bool gpu_exclusive = false;
+     std::map<ggml_backend_dev_t, size_t> mem_usage;
+@@ -180,6 +181,13 @@
+     clip_ctx(clip_context_params & ctx_params) {
+         if (ctx_params.gpu_exclusive && !ctx_params.use_gpu) {
+             throw std::runtime_error("gpu-exclusive: a multimodal projector requires CUDA");
++        }
++        metadata_only = ctx_params.metadata_only;
++        if (metadata_only) {
++            flash_attn_type = ctx_params.flash_attn_type;
++            model.hparams.custom_image_min_tokens = ctx_params.image_min_tokens;
++            model.hparams.custom_image_max_tokens = ctx_params.image_max_tokens;
++            return; // no backend initialization, weight allocation or warmup
+         }
+         flash_attn_type = ctx_params.flash_attn_type;
+         no_alloc = ctx_params.no_alloc;
+@@ -244,6 +252,10 @@
+     }
+ 
+     ~clip_ctx() {
++        // Release graphs and device allocations before destroying their backends.
++        if (sched) { ggml_backend_sched_synchronize(sched.get()); }
++        sched.reset();
++        buf.reset();
+         ggml_backend_free(backend);
+         if (backend != backend_cpu) {
+             ggml_backend_free(backend_cpu);
+@@ -2383,7 +2395,9 @@
+                 loaded_tensor_names.insert(name);
+                 cur = data_tensor;
+                 // add to weight memory counter
+-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
++                if (ctx_clip.backend) {
++                    ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
++                }
+             }
+             return cur;
+         };
+@@ -3892,6 +3906,9 @@
+                 GGML_ASSERT(false && "unknown projector type");
+         }
+ 
++        // Tensor shapes remain available to preprocessing; no weights are read.
++        if (ctx_clip.metadata_only) { return; }
++
+         // load data
+         {
+             std::vector<uint8_t> read_buf;
+@@ -3910,6 +3927,9 @@
+             // alloc memory and offload data
+             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
++            if (!ctx_clip.buf) {
++                throw std::runtime_error("insufficient memory for multimodal projector weights");
++            }
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+             // read the weight from file
+             if (!ctx_clip.no_alloc) {
+@@ -4074,9 +4094,9 @@
+     // only initialize backend buffers, but do not allocate them yet
+     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
+-        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf) && ctx_clip.gpu_exclusive) {
++        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+             const char * reason = ggml_backend_sched_get_error(ctx_clip.sched.get());
+-            throw std::runtime_error(std::string("gpu-exclusive: cannot reserve multimodal graph: ") +
++            throw std::runtime_error(std::string("cannot reserve multimodal graph: ") +
+                     (reason && reason[0] ? reason : "insufficient CUDA memory"));
+         }
+ 
+@@ -4287,7 +4307,7 @@
+             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
+             loader.load_tensors(*ctx_vision);
+             loader.init_ctx(*ctx_vision);
+-            if (ctx_params.warmup) {
++            if (ctx_params.warmup && !ctx_params.metadata_only) {
+                 loader.warmup(*ctx_vision);
+             }
+ 
+diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
+--- a/tools/mtmd/mtmd.h
++++ b/tools/mtmd/mtmd.h
+@@ -139,6 +139,11 @@
+                                             const struct mtmd_context_params ctx_params);
+ 
+ MTMD_API void mtmd_free(mtmd_context * ctx);
++
++// Release an idle on-demand vision encoder. Preprocessing, chunks and text KV
++// remain valid. Conventional/audio contexts are unchanged; in-flight users keep
++// a shared lease until encoding has completed.
++MTMD_API void mtmd_unload_projector(mtmd_context * ctx);
+ 
+ // whether we need to set non-causal mask before llama_decode
+ // if chunk is nullptr, we assume the default case where chunk is an image chunk
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -4,6 +4,7 @@
+ #include "mtmd-internal.h"
+ #include "mtmd-audio.h"
+ #include "mtmd-image.h"
++#include "mtmd-on-demand.h"
+ #include "debug/mtmd-debug.h"
+ 
+ #include "llama.h"
+@@ -566,12 +567,20 @@
+     // batching
+     int32_t batch_max_tokens;
+ 
++    // The metadata context stays valid for tokenization and cached chunks. Only
++    // the separate encoder owns device weights; preprocessing never borrows it.
++    bool on_demand = false;
++    std::string projector_path;
++    mtmd_context_params encoder_params{};
++    mtmd_on_demand<mtmd_context> encoder;
++
+     // TODO @ngxson : add timings
+ 
+     mtmd_context(const char * mmproj_fname,
+                    const llama_model * text_model,
+                    const mtmd_context_params & ctx_params,
+-                   bool no_alloc = false) :
++                   bool no_alloc = false,
++                   bool allow_on_demand = true) :
+         print_timings   (ctx_params.print_timings),
+         n_threads       (ctx_params.n_threads),
+         media_marker    (ctx_params.media_marker),
+@@ -607,6 +616,26 @@
+             }
+         }
+ 
++        const char * lazy_env = std::getenv("WILDLLAMA_MMPROJ_ON_DEMAND");
++        if (!no_alloc && allow_on_demand && lazy_env && std::strcmp(lazy_env, "1") == 0) {
++            const auto caps = clip_get_cap(mmproj_fname);
++            // Streaming/generative audio has persistent encoder state and keeps
++            // the conventional lifecycle until it has a separate safe policy.
++            on_demand = caps.has_vision && !caps.has_audio && !caps.has_gen_audio;
++        }
++        if (on_demand) {
++            projector_path = mmproj_fname;
++            encoder_params = ctx_params;
++            encoder_params.media_marker = media_marker.c_str();
++            // The startup callback's user data belongs to load_model's stack.
++            encoder_params.progress_callback = [](float progress, void *) {
++                fprintf(stderr, "wildllama_mmproj state=loading progress=%.4f\n", progress);
++                fflush(stderr);
++                return true;
++            };
++            encoder_params.progress_callback_user_data = nullptr;
++        }
++
+         clip_context_params ctx_clip_params {
+             /* use_gpu           */ ctx_params.use_gpu,
+             /* device            */ ctx_params.device,
+@@ -620,6 +649,7 @@
+             /* progress_callback */ ctx_params.progress_callback,
+             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+             /* gpu_exclusive */ ctx_params.gpu_exclusive,
++            /* metadata_only */ on_demand,
+         };
+ 
+         auto res = clip_init(mmproj_fname, ctx_clip_params);
+@@ -665,6 +695,28 @@
+         if (ctx_a) {
+             init_audio();
+         }
++        if (on_demand) {
++            fprintf(stderr, "wildllama_mmproj state=metadata\n");
++            fflush(stderr);
++        }
++    }
++
++    std::shared_ptr<mtmd_context> acquire_encoder() {
++        return encoder.acquire([this] {
++            fprintf(stderr, "wildllama_mmproj state=loading progress=0\n");
++            fflush(stderr);
++            try {
++                auto result = std::make_shared<mtmd_context>(projector_path.c_str(), text_model,
++                                                            encoder_params, false, false);
++                fprintf(stderr, "wildllama_mmproj state=loaded\n");
++                fflush(stderr);
++                return result;
++            } catch (...) {
++                fprintf(stderr, "wildllama_mmproj state=error\n");
++                fflush(stderr);
++                throw;
++            }
++        });
+     }
+ 
+     void init_vision() {
+@@ -1953,6 +2005,10 @@
+ }
+ 
+ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
++    if (ctx->on_demand) {
++        auto encoder = ctx->acquire_encoder();
++        return mtmd_encode_impl(encoder.get(), image_tokens, out_embd);
++    }
+     clip_ctx * ctx_clip = ctx->ctx_v;
+     if (!ctx_clip) {
+         LOG_ERR("%s: this API does not support non-vision input, please use mtmd_encode_chunk instead\n", __func__);
+@@ -2276,6 +2332,13 @@
+ 
+ mtmd_batch * mtmd_batch_init(mtmd_context * ctx) {
+     return new mtmd_batch(ctx);
++}
++
++void mtmd_unload_projector(mtmd_context * ctx) {
++    if (ctx && ctx->on_demand && ctx->encoder.reset()) {
++        fprintf(stderr, "wildllama_mmproj state=unloaded\n");
++        fflush(stderr);
++    }
+ }
+ 
+ void mtmd_batch_free(mtmd_batch * batch) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3874,6 +3874,18 @@
+         }
+ #endif
+ 
++        // Encoded image embeddings own their data; neither cached chunks nor
++        // text generation borrow the projector. Release before generation once
++        // no slot can still need media preprocessing in this prompt.
++        bool projector_busy = false;
++        for (const auto & slot : slots) {
++            if (slot.is_processing() && slot.state != SLOT_STATE_GENERATING && slot.state != SLOT_STATE_DONE_PROMPT) {
++                projector_busy = true;
++                break;
++            }
++        }
++        if (!projector_busy) { mtmd_unload_projector(mctx); }
++
+         // check if all slots are idle
+         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
+         {
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -528,3 +528,10 @@
+     set_tests_properties(test-hybrid-device-mask-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+ endif()
+ endif()
++
++# Encoder lifecycle tests need no model, backend or GPU.
++find_package(Threads REQUIRED)
++add_executable(test-mtmd-on-demand test-mtmd-on-demand.cpp)
++target_compile_features(test-mtmd-on-demand PRIVATE cxx_std_17)
++target_link_libraries(test-mtmd-on-demand PRIVATE Threads::Threads)
++llama_test(test-mtmd-on-demand)
+diff --git a/tools/mtmd/mtmd-on-demand.h b/tools/mtmd/mtmd-on-demand.h
+new file mode 100644
+--- /dev/null
++++ b/tools/mtmd/mtmd-on-demand.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <memory>
++#include <mutex>
++
++// A failed factory is never cached. Reset detaches ownership without invalidating
++// an in-flight encoder: its shared lease outlives cancellation/idle cleanup.
++template <class T> class mtmd_on_demand {
++    std::mutex mutex;
++    std::shared_ptr<T> value;
++public:
++    template <class Factory> std::shared_ptr<T> acquire(Factory factory) {
++        std::lock_guard<std::mutex> lock(mutex);
++        if (!value) { value = factory(); }
++        return value;
++    }
++    bool reset() {
++        std::shared_ptr<T> old;
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            old.swap(value);
++        }
++        return bool(old);
++    }
++};
+diff --git a/tests/test-mtmd-on-demand.cpp b/tests/test-mtmd-on-demand.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-mtmd-on-demand.cpp
+@@ -0,0 +1,58 @@
++#include "../tools/mtmd/mtmd-on-demand.h"
++
++#include <atomic>
++#include <cstdlib>
++#include <stdexcept>
++#include <thread>
++#include <vector>
++
++#define CHECK(x) do { if (!(x)) { std::abort(); } } while (0)
++
++struct resource {
++    std::atomic<int> & live;
++    explicit resource(std::atomic<int> & count) : live(count) { ++live; }
++    ~resource() { --live; }
++};
++
++int main() {
++    mtmd_on_demand<resource> lifecycle;
++    std::atomic<int> live{0}, loads{0};
++    auto factory = [&] { ++loads; return std::make_shared<resource>(live); };
++    CHECK(live == 0 && !lifecycle.reset()); // text-only never invokes a factory
++
++    std::vector<std::shared_ptr<resource>> leases(16);
++    std::vector<std::thread> workers;
++    for (int i = 0; i < 16; ++i) {
++        workers.emplace_back([&, i] { leases[i] = lifecycle.acquire(factory); });
++    }
++    for (auto & worker : workers) { worker.join(); }
++    CHECK(loads == 1 && live == 1);
++    for (const auto & lease : leases) { CHECK(lease == leases.front()); }
++
++    CHECK(lifecycle.reset()); // cancellation detaches the owner safely
++    CHECK(live == 1);         // an in-flight encoder cannot be destroyed
++    CHECK(!lifecycle.reset());
++    leases.clear();
++    CHECK(live == 0);
++
++    // An image in a later request reloads, and its embeddings can outlive it.
++    std::vector<float> embeddings;
++    {
++        auto lease = lifecycle.acquire(factory);
++        embeddings = {1.0f, 2.0f, 3.0f};
++        CHECK(loads == 2 && live == 1);
++    }
++    CHECK(lifecycle.reset() && live == 0 && embeddings[1] == 2.0f);
++
++    bool failed = false;
++    try {
++        lifecycle.acquire([]() -> std::shared_ptr<resource> { throw std::runtime_error("load failed"); });
++    } catch (const std::runtime_error &) { failed = true; }
++    CHECK(failed && !lifecycle.reset() && live == 0);
++    {
++        auto retry = lifecycle.acquire(factory);
++        CHECK(loads == 3 && live == 1);
++    }
++    CHECK(lifecycle.reset() && live == 0);
++    return 0;
++}

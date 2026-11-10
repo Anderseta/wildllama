@@ -2,7 +2,7 @@ package api
 
 // RuntimeMemory is placement evidence from the loaded runner, not a prediction
 // from file size or process RSS. Buffer sizes are startup/log snapshots; only
-// AllocatedVRAMBytes may come from the live native CUDA allocator.
+// AllocatedVRAMBytes and KVCommitted may come from live native measurements.
 type RuntimeMemory struct {
 	Placement           string               `json:"placement"`
 	LayersObserved      bool                 `json:"layers_observed"`
@@ -18,7 +18,21 @@ type RuntimeMemory struct {
 	KVInitialTokens     int                  `json:"kv_initial_tokens"`
 	KVCapacityBytes     uint64               `json:"kv_capacity_bytes,omitempty"`
 	KVGrowthObserved    bool                 `json:"kv_growth_observed"`
+	KVCommitted         *RuntimeKVCommitment `json:"kv_committed,omitempty"`
+	ProjectorState      string               `json:"projector_state,omitempty"`
+	ProjectorProgress   *float64             `json:"projector_progress,omitempty"`
 	ProjectorOffloadCPU bool                 `json:"projector_offload_cpu"`
+}
+
+// RuntimeKVCommitment is a live physical measurement for the target context.
+// A nil pointer means the native payload did not publish this counter. Legacy
+// GPU/Host.KVBytes remain load-time snapshots, never a substitute after growth.
+type RuntimeKVCommitment struct {
+	GPUBytes      uint64 `json:"gpu_bytes"`
+	HostBytes     uint64 `json:"host_bytes"`
+	CapacityBytes uint64 `json:"capacity_bytes"`
+	ObservedAt    int64  `json:"observed_at"`
+	Source        string `json:"source"`
 }
 
 type RuntimeMemoryBuffers struct {
