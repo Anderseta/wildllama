@@ -91,8 +91,9 @@ bit for bit across 108 cases, including several grouped-head geometries,
 short/long KV views, three input patterns and padded strides. Negative controls
 reproduced the old partition-selection error. Nine trained-weight IQ3 row-pair
 cases also matched bit for bit. The square-range fixture uses a 5,120-row prefix
-of an actual 10,240-row QKV tensor; it does not establish a measured benefit for
-that full QKV shape, which remains on the original path.
+of an actual 10,240-row QKV tensor. Patch `097` subsequently measured and
+enabled the full projection. Its additional geometries, streaming changes and
+measurements are documented in [resident CUDA kernels](resident-cuda-kernels.md#additional-iq3_s-projections-and-streaming).
 
 The full patch stack was applied offline to a clean copy of the pinned native
 archive; new patched files matched the compiled source. The API race tests

@@ -1,0 +1,303 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index ba44172..5be7461 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -7,9 +7,18 @@
+ #include <cstdint>
+ #include <type_traits>
+ 
+-// Keep the experiment confined to the two geometries with measured wins.
+-static constexpr bool mmvq_iq3_row_pair_geometry(int64_t columns, int64_t rows) {
+-    return columns == 5120 && (rows == 5120 || rows == 17408);
++// One trace bit for each projection measured on SM120. Zero retains the original dispatch.
++static constexpr unsigned mmvq_iq3_row_pair_geometry(int64_t columns, int64_t rows) {
++    if (columns == 5120) {
++        switch (rows) {
++            case 5120:  return 1u;
++            case 17408: return 2u;
++            case 10240: return 4u;
++            case 12288: return 8u;
++            case 1024:  return 16u;
++        }
++    }
++    return columns == 6144 && rows == 5120 ? 32u : 0u;
+ }
+ 
+ static constexpr bool mmvq_iq3_row_pair_setting(const char * value) {
+@@ -1722,7 +1731,7 @@ void ggml_cuda_mul_mat_vec_q(
+             }();
+             if (trace) {
+                 static std::atomic<unsigned> reported{0};
+-                const unsigned bit = ne01 == 5120 ? 1u : 2u;
++                const unsigned bit = mmvq_iq3_row_pair_geometry(ne00, ne01);
+                 if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                     std::fprintf(stderr, "cuda_iq3_row_pair: launched k=%lld rows=%lld threads=128 rows_per_cta=2\n",
+                         (long long) ne00, (long long) ne01);
+diff --git a/tests/test-cuda-iq3-row-pair.cu b/tests/test-cuda-iq3-row-pair.cu
+index 162e85e..50918da 100644
+--- a/tests/test-cuda-iq3-row-pair.cu
++++ b/tests/test-cuda-iq3-row-pair.cu
+@@ -17,6 +17,10 @@
+ // slower down projection and unmeasured neighboring shapes must stay legacy.
+ static_assert(mmvq_iq3_row_pair_geometry(5120,5120), "measured square geometry excluded");
+ static_assert(mmvq_iq3_row_pair_geometry(5120,17408), "measured up geometry excluded");
++static_assert(mmvq_iq3_row_pair_geometry(5120,10240), "measured recurrent QKV excluded");
++static_assert(mmvq_iq3_row_pair_geometry(5120,12288), "measured query projection excluded");
++static_assert(mmvq_iq3_row_pair_geometry(6144,5120), "measured attention output excluded");
++static_assert(mmvq_iq3_row_pair_geometry(5120,1024), "measured key/value projection excluded");
+ static_assert(!mmvq_iq3_row_pair_geometry(17408,5120), "slower down geometry enabled");
+ static_assert(!mmvq_iq3_row_pair_geometry(4096,4096), "unmeasured smaller geometry enabled");
+ static_assert(!mmvq_iq3_row_pair_geometry(5120,5122), "unmeasured adjacent row count enabled");
+@@ -187,7 +191,7 @@ int main(int argc,char ** argv) {
+         attributes("pair",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,true>);
+         std::unique_ptr<gguf_context,decltype(&gguf_free)> metadata(gguf_init_from_file(path,{true,nullptr}),gguf_free);
+         require(bool(metadata),"cannot read GGUF metadata without allocating weights");
+-        const std::pair<int,int> shapes[]={{5120,5120},{5120,17408},{17408,5120}};
++        const std::pair<int,int> shapes[]={{5120,5120},{5120,17408},{17408,5120},{5120,10240},{5120,12288},{6144,5120},{5120,1024}};
+         int cases=0;
+         for (const auto & shape:shapes) {
+             const auto weights=read_weights(path,metadata.get(),shape.first,shape.second);
+diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
+index d738b21..eb29e10 100644
+--- a/tests/test-server-component.cpp
++++ b/tests/test-server-component.cpp
+@@ -670,6 +670,41 @@ static void test_grammar_first_request_contract(testing & t) {
+     t.assert_true("string cannot silently change order",rejected);
+ }
+ 
++static void test_stream_message_materialization(testing & t) {
++    for (const auto type : {TASK_RESPONSE_TYPE_NONE, TASK_RESPONSE_TYPE_OAI_CMPL,
++                            TASK_RESPONSE_TYPE_OAI_CHAT, TASK_RESPONSE_TYPE_OAI_RESP,
++                            TASK_RESPONSE_TYPE_ANTHROPIC, TASK_RESPONSE_TYPE_OAI_ASR}) {
++        const bool plain = type == TASK_RESPONSE_TYPE_NONE || type == TASK_RESPONSE_TYPE_OAI_CMPL;
++        task_result_state state;
++        std::string expected;
++        for (const std::string piece : {"one", " two"}) {
++            server_task_result_cmpl_partial part{};
++            part.res_type = type;
++            part.content = common_chat_input(piece);
++            part.n_decoded = expected.empty() ? 1 : 2;
++            expected += piece;
++            part.update(state);
++            t.assert_true("partial marked updated", part.is_updated);
++            if (plain) {
++                const auto output = part.to_json();
++                const auto & text = type == TASK_RESPONSE_TYPE_NONE ? output.at("content") :
++                    output.at("choices").at(0).at("text");
++                t.assert_true("plain response emits this chunk", text == piece);
++                t.assert_true("plain response needs no parser history", state.chat_msg.content.empty());
++            } else {
++                t.assert_true("structured response retains transcript", state.chat_msg.content == expected);
++                t.assert_true("structured response emits only new bytes", part.oaicompat_msg_diffs.size() == 1 &&
++                    part.oaicompat_msg_diffs.front().content_delta == piece);
++            }
++        }
++        server_task_result_cmpl_final final{};
++        final.res_type = type;
++        final.update(state);
++        t.assert_true("final transcript is available to structured serializers",
++            final.oaicompat_msg.content == (plain ? std::string{} : expected));
++    }
++}
++
+ int main(int argc, char ** argv) {
+     testing t;
+ 
+@@ -697,5 +732,7 @@ int main(int argc, char ** argv) {
+     t.test("grammar_first_request", test_grammar_first_request_contract);
+     t.test("prompt_response_materialization", test_prompt_response_materialization);
+ 
++    t.test("stream_message_materialization", test_stream_message_materialization);
++
+     return t.summary();
+ }
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index cdd1d3a..e0cb0ce 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1660,7 +1660,7 @@ json format_response_rerank(
+ // other utils
+ //
+ 
+-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
++std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top, llama_token selected, float & selected_prob) {
+     std::vector<llama_token_data> cur;
+ 
+     const auto * logits = llama_get_logits_ith(ctx, idx);
+@@ -1699,12 +1699,20 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
+             max_l = std::max(max_l, t.logit);
+         }
+     }
++    // Preserve the partial-sort order used by the original FP32 sum. Only
++    // the returned prefix and the selected token need normalized probabilities.
+     float cum_sum = 0.0f;
+     for (auto & t : cur) {
+-        float p = expf(t.logit - max_l);
+-        t.p = p;
+-        cum_sum += p;
++        t.p = expf(t.logit - max_l);
++        cum_sum += t.p;
+     }
++    const auto chosen = std::find_if(cur.begin(), cur.end(), [selected](const llama_token_data & t) {
++        return t.id == selected;
++    });
++    if (chosen != cur.end()) {
++        selected_prob = chosen->p / cum_sum;
++    }
++    cur.resize(n_top);
+     for (auto & t : cur) {
+         t.p /= cum_sum;
+     }
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index d25804b..07966b5 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -664,7 +664,7 @@ struct server_metrics {
+ // other utils
+ //
+ 
+-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top);
++std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top, llama_token selected, float & selected_prob);
+ 
+ std::string safe_json_to_str(const json & data);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7dbcb9a..442a7e3 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -584,7 +584,9 @@ struct server_slot {
+             return;
+         }
+ 
+-        generated_token_probs.push_back(token);
++        if (!task->params.stream && task->params.sampling.n_probs > 0) {
++            generated_token_probs.push_back(token);
++        }
+     }
+ 
+     int get_n_draft_max() const {
+@@ -2223,7 +2225,7 @@ private:
+         slot.sampled = result.tok;
+ 
+         slot.generated.append(token_str, result.tok);
+-        if (slot.task->params.return_tokens) {
++        if (slot.task->params.return_tokens && !slot.task->params.stream) {
+             slot.generated_tokens.push_back(result.tok);
+         }
+         slot.has_next_token = true;
+@@ -2382,26 +2384,13 @@ private:
+                 });
+             }
+         } else {
+-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+-            const size_t max_probs = cur.size();
+-            const size_t n_probs = std::min(max_probs, n_probs_request);
+-
+-            // set probability for sampled token
+-            for (size_t i = 0; i < max_probs; i++) {
+-                // set probability for sampled token
+-                if (cur[i].id == result.tok) {
+-                    result.prob = cur[i].p;
+-                    break;
+-                }
+-            }
+-
+-            // set probability for top n_probs tokens
+-            result.probs.reserve(n_probs);
+-            for (size_t i = 0; i < n_probs; i++) {
++            const auto top = get_token_probabilities(ctx_tgt, idx, n_probs_request, result.tok, result.prob);
++            result.probs.reserve(top.size());
++            for (const auto & candidate : top) {
+                 result.probs.push_back({
+-                    cur[i].id,
+-                    common_token_to_piece(ctx_tgt, cur[i].id, special),
+-                    cur[i].p
++                    candidate.id,
++                    common_token_to_piece(ctx_tgt, candidate.id, special),
++                    candidate.p
+                 });
+             }
+         }
+@@ -2541,19 +2530,14 @@ private:
+         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+ 
+         // populate res.probs_output
+-        if (slot.task->params.sampling.n_probs > 0) {
+-            if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
++        if (!slot.task->params.stream && slot.task->params.sampling.n_probs > 0) {
++            if (slot.stop == STOP_TYPE_WORD) {
+                 const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
+ 
+                 size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());
+-                res->probs_output = std::vector<completion_token_output>(
+-                        slot.generated_token_probs.begin(),
+-                        slot.generated_token_probs.end() - safe_offset);
+-            } else {
+-                res->probs_output = std::vector<completion_token_output>(
+-                        slot.generated_token_probs.begin(),
+-                        slot.generated_token_probs.end());
++                slot.generated_token_probs.resize(slot.generated_token_probs.size() - safe_offset);
+             }
++            res->probs_output = std::move(slot.generated_token_probs);
+         }
+ 
+         res->generation_params = slot.task->params; // copy the parameters
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index d6dc658..4388011 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -212,17 +212,16 @@ task_result_state::task_result_state(common_chat_session session)
+     , oai_resp_message_id("msg_" + random_string()) {
+ }
+ 
+-common_chat_msg task_result_state::update_chat_msg(
++const common_chat_msg & task_result_state::update_chat_msg(
+         const common_chat_input & added,
+         bool is_partial,
+         std::vector<common_chat_msg_diff> & diffs,
+         bool filter_tool_calls) {
+-    auto msg_prv_copy = chat_msg;
+     auto new_msg = is_partial ? chat_session.feed(added) : chat_session.finish(added);
+     if (!new_msg.empty()) {
+         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+-        chat_msg = new_msg;
+-        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
++        auto all_diffs = common_chat_msg_diff::compute_diffs(chat_msg, new_msg);
++        chat_msg = std::move(new_msg);
+ 
+         if (!filter_tool_calls) {
+             diffs = std::move(all_diffs);
+@@ -1046,8 +1045,8 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
+ //
+ void server_task_result_cmpl_partial::update(task_result_state & state) {
+     is_updated = true;
+-    if (is_begin) {
+-        return; // begin marker only flushes headers, skip parsing
++    if (is_begin || res_type == TASK_RESPONSE_TYPE_NONE || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
++        return; // plain completion serializers consume the chunk directly
+     }
+     state.update_chat_msg(content, true, oaicompat_msg_diffs);
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 4d3e557..adc9205 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -160,7 +160,7 @@ struct task_result_state {
+     task_result_state(common_chat_session session = {});
+ 
+     // parse partial tool calls and update the internal state
+-    common_chat_msg update_chat_msg(
++    const common_chat_msg & update_chat_msg(
+         const common_chat_input & added,
+         bool is_partial,
+         std::vector<common_chat_msg_diff> & diffs,
+@@ -452,6 +452,9 @@ struct server_task_result_cmpl_final : server_task_result {
+ 
+     virtual void update(task_result_state & state) override {
+         is_updated = true;
++        if (res_type == TASK_RESPONSE_TYPE_NONE || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
++            return; // plain completions serialize content directly
++        }
+         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+ 
+         oai_resp_id = state.oai_resp_id;

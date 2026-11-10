@@ -55,8 +55,9 @@ Two independent output rows share a CTA while retaining the original four-warp
 K assignment, vector dot implementation and per-row reduction order. Production
 eligibility is limited to SM120, IQ3_S weights, contiguous plain 2D matrices,
 one F32 input token, F32 output, no gathered expert IDs and no fused operation.
-The only enabled weight geometries are input width 5,120 with either 5,120 or
-17,408 output rows. Q8 and other quantizations retain their existing kernels.
+Patch `096` enabled input width 5,120 with either 5,120 or 17,408 output rows.
+Patch `097` extends this gate to the four measured projections below.
+Q8 and other quantizations retain their existing kernels.
 
 `GGML_CUDA_IQ3_ROW_PAIR` accepts unset/empty or exact `1` for those eligible
 geometries. Exact `0` and malformed values disable it. Explicit opt-in does not
@@ -66,8 +67,8 @@ Nine tests using small ranges of the installed model's trained IQ3_S weights and
 three activation-scale patterns were bitwise identical. The final isolated
 component run measured 1.106x for the 5,120-row square range and 1.043x for the up
 projection. The square range was a 5,120-row prefix of a real 10,240-row QKV
-tensor, not a full 5,120-row projection from the model. The complete 10,240-row
-QKV shape remains on the legacy path. The down projection measured 0.966x and
+tensor. The complete 10,240-row QKV shape was subsequently measured in `097`.
+The down projection measured 0.966x and
 is explicitly excluded, together with all unmeasured neighboring shapes.
 The combined whole-model run below establishes compatibility; it does not
 establish an isolated whole-model throughput benefit from `096`.
@@ -115,3 +116,54 @@ measurements, not an absence of system-wide paging throughout the session.
 The performance suite did not run separate functional/tool-call cases. Results
 are specific to these prompts, hardware and payloads, rather than a universal
 speedup guarantee.
+
+## Additional IQ3_S projections and streaming
+
+Patch `097` extends single-token, two-row dispatch on SM120. Each new shape
+won all 12 paired GPU-event comparisons on an RTX 5060 Ti. The fixture reads
+the indicated trained matrix, quantizes three input patterns and compares
+every output bit with the original kernel. The table measures kernel execution.
+
+| Input width | Output rows | Projection in the Huihui model | Kernel speedup |
+| ---: | ---: | --- | ---: |
+| 5,120 | 10,240 | Combined QKV | 1.111× |
+| 5,120 | 12,288 | Query | 1.113× |
+| 6,144 | 5,120 | Attention output | 1.101× |
+| 5,120 | 1,024 | Key or value | 1.071× |
+
+The fixture also exercises the previous shapes and the excluded down
+projection. All 21 comparisons matched bit for bit. These additions reuse the
+existing activation buffer. Multi-token, fused and other device paths keep
+their original dispatch.
+
+On the host, plain completion streams emit token chunks directly. Structured
+chat streams keep the incremental parser and compare its new message against
+the current message before moving it into place. Streaming avoids building a
+second vector of token IDs and a probability history for the final event.
+Requests for pre-sampling log probabilities keep the same partial sort, FP32
+sum order and selected-token probability, including tokens outside the top
+list. They normalize only entries returned to the client.
+
+The Windows comparison against `83745f24` used the same Huihui GGUF, RTX 5060
+Ti, 65,536-token capacity, Q8 KV and temperature 0.6 with a fixed seed.
+Each median covers three warm streams of 160 generated tokens. The 32,768-token
+workload started a fresh server for each version to isolate it from earlier
+chat and tool requests.
+
+| Input tokens | Previous tokens/s | Updated tokens/s | Previous / updated peak device use |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 29.272 | 29.292 | 13,956 / 13,936 MiB |
+| 32,768 | 24.128 | 24.106 | 14,730 / 14,730 MiB |
+
+The decode medians differ by less than 0.1%. Device use includes the desktop.
+Both versions reported 1,152 MiB of device KV at the long input. All 14 paired
+requests matched on their recorded output fields, including streamed token IDs,
+selected/top-three log probabilities, Portuguese chat deltas and a tool's name
+and arguments. One candidate timing window was repeated after a paging signal.
+All retained timed windows passed the same paging check.
+
+A separate CPU replay fed 8,192 six-byte chunks through the server's update
+and JSON serialization routines. Median time over five measured replays fell
+from 5,395 ms to 39 ms for plain completions. Structured chat measured 5,345
+and 5,402 ms respectively. This isolates server-side work on a long response
+and excludes model generation and network transport.
