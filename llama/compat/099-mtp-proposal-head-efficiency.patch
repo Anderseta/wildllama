@@ -1,0 +1,621 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 66e5270..6d0caf7 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1547,6 +1547,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     //   neither (qwen35 / qwen35moe): a single trained MTP head.
+     int32_t n_mtp_layers  = 1;
+     bool    is_mem_shared = false;   // gemma4
++    int32_t draft_vocab_size = 0;
++    bool draft_vocab_active = false;
++    unsigned vocab_rounds = 0, vocab_accepted = 0;
+     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+ 
+     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
+@@ -1606,6 +1609,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    void refresh_draft_vocab(int index) {
++        const char * mode = std::getenv("WILDLLAMA_MTP_DRAFT_VOCAB_SEED");
++        if (!draft_vocab_active || (mode && std::strcmp(mode,"0") == 0)) { return; }
++        const auto output = llama_get_sampler_output_ith(params.ctx_tgt, index);
++        if (output.raw_logits) {
++            llama_mtp_draft_vocab_seed(params.ctx_dft, output.raw_logits,
++                llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_tgt))));
++        }
++    }
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1631,11 +1644,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         batch = common_batch(ctx_dft);
+ 
++        // Greedy MTP with no confidence cutoff uses only the maximum logit.
++        // Preserve top-10 probabilities for rejection sampling and p_min.
++        const int draft_top_k = common_speculative_mtp_top_k(this->params.probabilistic, this->params.p_min);
+         smpls.resize(n_seq);
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+             sparams.no_perf  = false;
+-            sparams.top_k    = 10;
++            sparams.top_k    = draft_top_k;
+             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+         }
+@@ -1645,7 +1661,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (this->params.backend_sampling) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                llama_sampler_chain_add(chain, llama_sampler_init_top_k(draft_top_k));
+ 
+                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+@@ -1672,6 +1688,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+         this->n_max = this->params.n_max;
+ 
++        // Optional proposal-only shortlist. Probabilistic rejection keeps its
++        // complete-q path; this optimization uses target sample-and-match.
++        const char * shortlist = std::getenv("WILDLLAMA_MTP_DRAFT_VOCAB");
++        if (shortlist && *shortlist && !this->params.probabilistic && n_seq == 1 && !chain_heads && !is_mem_shared) {
++            char * end = nullptr;
++            const long count = std::strtol(shortlist, &end, 10);
++            if (end && !*end && count >= 256 && count <= 131072 && llama_set_mtp_draft_vocab(ctx_dft, int32_t(count))) {
++                draft_vocab_size = int32_t(count);
++                draft_vocab_active = true;
++            }
++        }
++
++
+         state.assign(n_seq, common_mtp_state(uint32_t(n_embd)));
+         zero_h.assign(n_embd, 0.0f);
+         position_tracking.assign(n_seq, true);
+@@ -1704,6 +1733,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+     ~common_speculative_impl_draft_mtp() override {
+         auto * ctx_dft = this->params.ctx_dft;
++        if (ctx_dft && draft_vocab_size) { llama_set_mtp_draft_vocab(ctx_dft, 0); }
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+                 continue;
+@@ -1723,6 +1753,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        if (draft_vocab_size && seq_id == 0) {
++            draft_vocab_active = llama_set_mtp_draft_vocab(params.ctx_dft, draft_vocab_size);
++            if (!draft_vocab_active) { llama_set_mtp_draft_vocab(params.ctx_dft, 0); }
++            refresh_draft_vocab(-1);
++            if (draft_vocab_active) { llama_mtp_draft_vocab_observe(params.ctx_dft, prompt.data(), prompt.size()); }
++            vocab_rounds = vocab_accepted = 0;
++        }
+         // reset here rather than per round, or two identical requests differ
+         common_sampler_reset(smpls[seq_id].get());
+ 
+@@ -2096,6 +2133,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
++        if (draft_vocab_active && seq_id == 0) {
++            ++vocab_rounds; vocab_accepted += n_accepted;
++            if (vocab_rounds % 32 == 0) { refresh_draft_vocab(-1); }
++            if ((vocab_rounds == 8 && vocab_accepted == 0) ||
++                (vocab_rounds == 32 && vocab_accepted < 8)) {
++                llama_set_mtp_draft_vocab(params.ctx_dft, 0);
++                draft_vocab_active = false;
++                SPC_WRN("%s", "draft vocabulary coverage low; restoring the complete proposal head\n");
++            }
++        }
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+         }
+diff --git a/common/speculative.h b/common/speculative.h
+index f291e64..b00fd94 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -6,6 +6,12 @@
+ 
+ struct common_speculative;
+ 
++// A confidence cutoff needs the original proposal probabilities; probabilistic
++// rejection needs its q distribution. Plain greedy proposals need one maximum.
++inline int common_speculative_mtp_top_k(bool probabilistic, float p_min) {
++    return !probabilistic && p_min <= 0.0f ? 1 : 10;
++}
++
+ // Neural drafters consume their existing native state, not a full token-history
+ // copy. N-gram and unknown/future implementations conservatively need history.
+ bool common_speculative_type_needs_prompt_tokens(common_speculative_type type);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ca2f53..89aff54 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2009,6 +2009,45 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+     sched_need_reserve = true;
+ }
+ 
++bool llama_context::set_mtp_draft_vocab(int32_t count) {
++    if (!count) { mtp_draft_vocab_enabled = false; return true; }
++    // Measured implementation: a single CUDA-resident, unscaled Q4_K head.
++    // Preserve all other architectures, tensor splits and adapter semantics.
++    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || cparams.n_seq_max != 1 ||
++        (model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE) ||
++        model.ram_cache || !loras->empty() || !model.hdmd.rot.empty() || model.hparams.n_layer_nextn != 1) { return false; }
++    const auto & layer = model.layers[model.hparams.n_layer()];
++    auto * w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
++    auto * scale = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
++    if (!w || scale || !w->buffer || w->type != GGML_TYPE_Q4_K || !ggml_is_matrix(w) || !ggml_is_contiguous(w)) { return false; }
++    auto * buft = ggml_backend_buffer_get_type(w->buffer);
++    auto * device = ggml_backend_buft_get_device(buft);
++    if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
++        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") ||
++        buft != ggml_backend_dev_buffer_type(device)) { return false; }
++    try {
++        if (!mtp_draft_vocab.reset(model.vocab.n_tokens(), count)) { return false; }
++    } catch (const std::bad_alloc &) { return false; }
++    mtp_draft_vocab_enabled = true;
++    LLAMA_LOG_INFO("mtp_draft_vocab: %d/%d indexed proposal rows, original quantized weights shared\n", count, model.vocab.n_tokens());
++    return true;
++}
++
++bool llama_mtp_draft_vocab_seed(llama_context * ctx, const float * logits, size_t count) {
++    try { return ctx && ctx->mtp_draft_vocab_enabled && ctx->mtp_draft_vocab.seed(logits, count); }
++    catch (const std::bad_alloc &) { return false; }
++}
++
++void llama_mtp_draft_vocab_observe(llama_context * ctx, const llama_token * tokens, size_t count) {
++    if (ctx && ctx->mtp_draft_vocab_enabled && tokens) {
++        for (size_t i = 0; i < count; ++i) { ctx->mtp_draft_vocab.observe(tokens[i]); }
++    }
++}
++
++bool llama_set_mtp_draft_vocab(llama_context * ctx, int32_t count) {
++    return ctx && ctx->set_mtp_draft_vocab(count);
++}
++
+ void llama_context::set_nextn_layer_offset(int32_t offset) {
+     cparams.nextn_layer_offset = offset;
+ }
+@@ -2488,6 +2527,9 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    if (mtp_draft_vocab_enabled && ubatch.token) {
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) { mtp_draft_vocab.observe(ubatch.token[i]); }
++    }
+     preflight_device_verifier(mctx);
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -3875,6 +3917,8 @@ llm_graph_params llama_context::graph_params(
+         /*.nextn_input_backend =*/ nextn_input_backend(),
+         /*.sampler_bindings    =*/ gtype != LLM_GRAPH_TYPE_ENCODER && res != gf_res_reserve.get() && graph_sampler_bindings_enabled(),
+         /*.sampler_bindings_limit =*/ graph_variant_budget,
++        /*.draft_vocab =*/ mtp_draft_vocab_enabled ? &mtp_draft_vocab : nullptr,
++        /*.draft_vocab_size =*/ mtp_draft_vocab_enabled ? mtp_draft_vocab.ids.size() : 0,
+     };
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index cd2b324..0f89d81 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -4,6 +4,7 @@
+ #include "llama-ext.h"
+ #include "llama-cparams.h"
+ #include "llama-graph.h"
++#include "llama-draft-vocab.h"
+ #include "llama-graph-variant-policy.h"
+ #include "llama-execution-plan.h"
+ #include "llama-adapter.h"
+@@ -227,6 +228,9 @@ struct llama_context {
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
++    bool set_mtp_draft_vocab(int32_t count);
++    llama_draft_vocab mtp_draft_vocab;
++    bool mtp_draft_vocab_enabled = false;
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
+diff --git a/src/llama-draft-head.h b/src/llama-draft-head.h
+new file mode 100644
+index 0000000..23d803f
+--- /dev/null
++++ b/src/llama-draft-head.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include "ggml.h"
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
++struct llama_indexed_head_graph {
++    ggml_tensor * logits = nullptr;
++    std::vector<ggml_tensor *> operations;
++};
++
++// Quantized weights remain views of the original allocation. The output keeps
++// global vocabulary IDs so the existing sampler sees no local-ID remapping.
++inline llama_indexed_head_graph llama_build_indexed_head(
++        ggml_context * ctx, ggml_tensor * w, ggml_tensor * input, ggml_tensor * ids) {
++    GGML_ASSERT(w->type == GGML_TYPE_Q4_K && ggml_is_matrix(w) && ggml_is_contiguous(w));
++    GGML_ASSERT(input->ne[0] == w->ne[0] && ggml_nrows(input) == 1);
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0] > 0 && ggml_nrows(ids) == 1);
++    llama_indexed_head_graph result;
++    auto * weights = ggml_reshape_3d(ctx, w, w->ne[0], 1, w->ne[1]);
++    auto * activation = ggml_reshape_3d(ctx, input, input->ne[0], 1, 1);
++    ggml_tensor * compact = nullptr;
++    // MMVQ maps selected rows to the Y grid dimension (CUDA maximum 65535).
++    for (int64_t offset = 0; offset < ids->ne[0]; offset += 32768) {
++        const int64_t count = std::min<int64_t>(32768, ids->ne[0] - offset);
++        auto * selected = ggml_view_2d(ctx, ids, count, 1, ids->nb[1], size_t(offset)*sizeof(int32_t));
++        auto * part = ggml_mul_mat_id(ctx, weights, activation, selected);
++        result.operations.push_back(part);
++        if (compact) {
++            compact = ggml_concat(ctx, compact, part, 1);
++            result.operations.push_back(compact);
++        } else { compact = part; }
++    }
++    auto * base = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, w->ne[1], 1), -INFINITY);
++    auto * scattered = ggml_set_rows(ctx, base, compact, ids);
++    result.operations.push_back(base); result.operations.push_back(scattered);
++    result.logits = ggml_reshape_2d(ctx, scattered, w->ne[1], 1);
++    return result;
++}
+diff --git a/src/llama-draft-vocab.h b/src/llama-draft-vocab.h
+new file mode 100644
+index 0000000..90282d5
+--- /dev/null
++++ b/src/llama-draft-vocab.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <cmath>
++#include <numeric>
++#include <vector>
++
++// A bounded proposal vocabulary. It never changes the target vocabulary or
++// tokenizer. The stable BPE prefix is augmented by recently observed tokens,
++// including prompt/control tokens outside the prefix. No weight copies.
++struct llama_draft_vocab {
++    std::vector<int32_t> ids;
++    std::vector<int32_t> positions;
++    size_t cursor = 0;
++    size_t stable = 0;
++
++    bool reset(int32_t vocab, int32_t count) {
++        if (count < 256 || count > 131072 || count >= vocab || vocab > 1048576) { return false; }
++        std::vector<int32_t> next_ids(size_t(count), 0);
++        std::vector<int32_t> next_positions(size_t(vocab), -1);
++        std::iota(next_ids.begin(), next_ids.end(), 0);
++        std::iota(next_positions.begin(), next_positions.begin() + count, 0);
++        ids.swap(next_ids); positions.swap(next_positions);
++        stable = ids.size()*3/4; cursor = stable;
++        return true;
++    }
++
++    void observe(int32_t token) {
++        if (ids.empty() || token < 0 || size_t(token) >= positions.size() || positions[size_t(token)] >= 0) { return; }
++        positions[size_t(ids[cursor])] = -1;
++        ids[cursor] = token; positions[size_t(token)] = int32_t(cursor);
++        if (++cursor == ids.size()) { cursor = stable; }
++    }
++
++    // Reuse already materialized target logits; this never runs another head
++    // or downloads a full GPU output solely to choose proposal candidates.
++    bool seed(const float * scores, size_t count) {
++        if (!scores || ids.empty() || count != positions.size()) { return false; }
++        std::vector<int32_t> ranking;
++        ranking.reserve(count);
++        for (size_t i = 0; i < count; ++i) {
++            if (std::isnan(scores[i]) || scores[i] == INFINITY) { return false; }
++            if (std::isfinite(scores[i])) { ranking.push_back(int32_t(i)); }
++        }
++        if (ranking.size() < ids.size()) { return false; }
++        const auto better = [scores](int32_t a, int32_t b) {
++            return scores[a] > scores[b] || (scores[a] == scores[b] && a < b);
++        };
++        if (ranking.size() > ids.size()) { std::nth_element(ranking.begin(), ranking.begin()+ids.size(), ranking.end(), better); }
++        ranking.resize(ids.size());
++        std::sort(ranking.begin(), ranking.end(), better);
++        std::fill(positions.begin(), positions.end(), -1);
++        ids.swap(ranking);
++        for (size_t i = 0; i < ids.size(); ++i) { positions[size_t(ids[i])] = int32_t(i); }
++        cursor = stable;
++        return true;
++    }
++};
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 9c24f7b..21dacce 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -5,6 +5,11 @@
+ // try as much as possible to not include this header in the rest of the codebase
+ 
+ #include "llama.h"
++
++// Restrict only MTP proposals. Zero disables; target verification remains full-vocabulary.
++LLAMA_API bool llama_set_mtp_draft_vocab(struct llama_context * ctx, int32_t count);
++LLAMA_API void llama_mtp_draft_vocab_observe(struct llama_context * ctx, const llama_token * tokens, size_t count);
++LLAMA_API bool llama_mtp_draft_vocab_seed(struct llama_context * ctx, const float * logits, size_t count);
+ #include "llama-nextn-device.h"
+ 
+ #include <cstdint>
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index fb7bc5d..7918ab6 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "llama-draft-head.h"
+ #include "../ggml/src/ggml-impl.h"
+ #include "../ggml/src/ggml-attn-mask-compact.h"
+ #include <typeinfo>
+@@ -1896,6 +1897,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     samplers         (params.samplers),
+     cb_func          (params.cb),
+     res              (params.res),
++    draft_vocab      (params.draft_vocab),
+     ctx0             (res->get_ctx()),
+     gf               (res->get_gf()) {
+         if (moe_cache) { moe_cache->begin_graph(); }
+@@ -1947,6 +1949,58 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
+     return x;
+ }
+ 
++namespace {
++class llm_graph_input_draft_vocab final : public llm_graph_input_i {
++public:
++    const llama_draft_vocab * vocab;
++    ggml_tensor * ids;
++    explicit llm_graph_input_draft_vocab(const llama_draft_vocab * vocab, ggml_tensor * ids) : vocab(vocab), ids(ids) {}
++    void set_input(const llama_ubatch *) override {
++        GGML_ASSERT(vocab && vocab->ids.size() == size_t(ids->ne[0]));
++        // Inputs can share scheduler storage with other graph variants. Refresh
++        // even unchanged IDs after a variant switch or compute-arena reuse.
++        ggml_backend_tensor_set(ids, vocab->ids.data(), 0, vocab->ids.size()*sizeof(int32_t));
++    }
++    bool can_reuse(const llm_graph_params & params) override {
++        return params.draft_vocab == vocab && params.draft_vocab_size == size_t(ids->ne[0]);
++    }
++};
++}
++
++ggml_tensor * llm_graph_context::build_mtp_head(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * scale) const {
++    if (!draft_vocab || draft_vocab->ids.empty() || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
++        n_outputs != 1 || n_tokens != 1 || ubatch.n_seqs_unq != 1 ||
++        !loras->empty() || hdmd || scale || w->type != GGML_TYPE_Q4_K ||
++        !ggml_is_contiguous(w) || !ggml_is_matrix(w)) {
++        return build_lora_mm(w, cur, scale);
++    }
++    const int64_t selected = int64_t(draft_vocab->ids.size());
++    auto * ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, selected, 1);
++    ggml_set_input(ids); ggml_set_name(ids, "mtp_draft_vocab_ids");
++
++    auto head = llama_build_indexed_head(ctx0, w, cur, ids);
++    if (prec_policy) {
++        for (auto * operation : head.operations) {
++            if (operation->op == GGML_OP_MUL_MAT_ID) { prec_policy->apply(operation); }
++        }
++    }
++
++    auto * device = w->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer)) : nullptr;
++    ggml_backend_t backend = nullptr;
++    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++        auto * candidate = ggml_backend_sched_get_backend(sched, i);
++        if (ggml_backend_get_device(candidate) == device) { backend = candidate; break; }
++    }
++    if (!backend) { return build_lora_mm(w, cur, scale); }
++    for (auto * operation : head.operations) {
++        if (!ggml_backend_supports_op(backend, operation)) { return build_lora_mm(w, cur, scale); }
++    }
++    for (auto * operation : head.operations) { ggml_backend_sched_set_tensor_backend(sched, operation, backend); }
++    ggml_backend_sched_set_tensor_backend(sched, ids, backend);
++    res->add_input(std::make_unique<llm_graph_input_draft_vocab>(draft_vocab, ids));
++    return head.logits;
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 5ecbf33..197a4be 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "llama-arch.h"
++#include "llama-draft-vocab.h"
+ #include "llama-batch.h"
+ #include "llama-hparams.h"
+ #include "llama-adapter.h"
+@@ -858,6 +859,8 @@ struct llm_graph_params {
+     // graph attached to a logical sampler. Part of the reuse contract.
+     bool sampler_bindings = false;
+     size_t sampler_bindings_limit = 0;
++    const llama_draft_vocab * draft_vocab = nullptr;
++    size_t draft_vocab_size = 0;
+ 
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+@@ -923,6 +926,7 @@ struct llm_graph_params {
+         }
+ 
+         return
++            draft_vocab_size               == other.draft_vocab_size               &&
+             sampler_bindings               == other.sampler_bindings               &&
+             sampler_bindings_limit         == other.sampler_bindings_limit         &&
+             nextn_input_backend             == other.nextn_input_backend             &&
+@@ -1116,6 +1120,10 @@ struct llm_graph_context {
+ 
+     llm_graph_result * res;
+ 
++    const llama_draft_vocab * draft_vocab = nullptr;
++
++    ggml_tensor * build_mtp_head(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * scale) const;
++
+     ggml_context * ctx0 = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 6c34600..1141ff0 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -666,7 +666,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++    cur = build_mtp_head(head_w, cur, head_s);
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 939f10f..24f4b98 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -728,7 +728,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++    cur = build_mtp_head(head_w, cur, head_s);
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index de1ac53..4910c8d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -543,3 +543,6 @@ llama_test(test-mtmd-on-demand)
+ add_executable(test-server-checkpoint-budget test-server-checkpoint-budget.cpp)
+ target_compile_features(test-server-checkpoint-budget PRIVATE cxx_std_17)
+ llama_test(test-server-checkpoint-budget LABEL "main behavior")
++
++llama_build_and_test(test-mtp-draft-vocab.cpp LABEL "main behavior" LINK ggml)
++target_include_directories(test-mtp-draft-vocab PRIVATE ../include)
+diff --git a/tests/test-mtp-draft-vocab.cpp b/tests/test-mtp-draft-vocab.cpp
+new file mode 100644
+index 0000000..b6e18b3
+--- /dev/null
++++ b/tests/test-mtp-draft-vocab.cpp
+@@ -0,0 +1,111 @@
++#include "../src/llama-draft-vocab.h"
++#include "../src/llama-draft-head.h"
++#include "../common/speculative.h"
++#include "ggml-cpp.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++
++static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++
++static void policy() {
++    require(common_speculative_mtp_top_k(false,0.0f)==1, "greedy no-cutoff MTP did not simplify selection");
++    require(common_speculative_mtp_top_k(false,0.01f)==10, "confidence probabilities were reduced");
++    require(common_speculative_mtp_top_k(true,0.0f)==10, "rejection distribution was reduced");
++    require(common_speculative_mtp_top_k(false,NAN)==10, "invalid cutoff enabled reduced selection");
++    llama_draft_vocab v;
++    require(!v.reset(248320, 0) && !v.reset(248320, 255) && !v.reset(256,256), "invalid counts accepted");
++    require(!v.reset(248320,131073) && !v.reset(1048577,65536), "memory bounds ignored");
++    require(v.reset(248320,32768), "valid shortlist rejected");
++    const auto original = v.ids;
++    v.observe(-1); v.observe(248320); v.observe(0);
++    require(v.ids == original, "invalid/duplicate token changed shortlist");
++    for (int i = 0; i < 40000; ++i) { v.observe(140000+i); }
++    std::vector<int32_t> ids = v.ids; std::sort(ids.begin(),ids.end());
++    require(std::adjacent_find(ids.begin(),ids.end()) == ids.end(), "duplicate token mapping");
++    for (size_t i = 0; i < v.ids.size(); ++i) {
++        require(v.positions[size_t(v.ids[i])] == int32_t(i), "inconsistent inverse index");
++        if (i < v.stable) { require(v.ids[i] == int32_t(i), "stable vocabulary was evicted"); }
++    }
++    require(v.positions[140000] == -1 && v.positions[179999] >= 0, "recent-token eviction failed");
++    require(!v.reset(248320,-1) && v.ids.size()==32768, "invalid reset destroyed state");
++    require(v.reset(248320,65536) && v.positions[179999] == -1, "request reset leaked prior selection");
++    require(v.reset(1024,256), "small valid selection rejected");
++    std::vector<float> scores(1024, -INFINITY);
++    for (int i=500;i<900;++i) { scores[size_t(i)] = float(i%97); }
++    require(v.seed(scores.data(),scores.size()), "finite target seed rejected");
++    const auto seeded=v.ids;
++    for (int id:seeded) { require(id>=500 && id<900, "excluded target token included"); }
++    for (size_t i=1;i<seeded.size();++i) { require(scores[seeded[i-1]]>=scores[seeded[i]], "target rank lost"); }
++    scores[12]=NAN;
++    require(!v.seed(scores.data(),scores.size()) && v.ids==seeded, "NaN changed valid selection");
++    scores.assign(1024,-INFINITY);
++    require(!v.seed(scores.data(),scores.size()) && v.ids==seeded, "empty target seed changed state");
++    std::puts("PASS: bounded indices, deduplication, eviction, invalid input, request reset");
++}
++
++static void graph_case(ggml_backend_t backend, const char * path, bool large) {
++    gguf_context_ptr metadata(gguf_init_from_file(path,{true,nullptr}));
++    require(bool(metadata), "cannot read GGUF metadata");
++    const int64_t index = gguf_find_tensor(metadata.get(),"output.weight");
++    require(index>=0 && gguf_get_tensor_type(metadata.get(),index)==GGML_TYPE_Q4_K,"expected original Q4_K output head");
++    const int64_t k=large ? 256 : gguf_get_tensor_ne(metadata.get(),index)[0], rows=large ? 131073 : 4097, selected=large ? 131072 : 512;
++    require(k>0 && k<=8192 && gguf_get_tensor_ne(metadata.get(),index)[1]>=rows+17000,"unsupported fixture dimensions");
++    const size_t bytes=ggml_row_size(GGML_TYPE_Q4_K,k)*rows;
++    require(bytes<32*1024*1024,"fixture exceeds weight memory cap");
++    std::vector<unsigned char> weights(bytes);
++    std::ifstream file(path,std::ios::binary);
++    file.seekg(std::streamoff(gguf_get_data_offset(metadata.get())+gguf_get_tensor_offset(metadata.get(),index)+17000*ggml_row_size(GGML_TYPE_Q4_K,k)));
++    file.read(reinterpret_cast<char *>(weights.data()),bytes);
++    require(size_t(file.gcount())==bytes,"truncated head weight range");
++
++    ggml_context_ptr ctx(ggml_init({ggml_graph_overhead_custom(96,false)+96*ggml_tensor_overhead(),nullptr,true}));
++    auto * w=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q4_K,k,rows);
++    auto * input=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,k,1);
++    auto * ids=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_I32,selected,1);
++    auto * full=ggml_mul_mat(ctx.get(),w,input);
++    auto head=llama_build_indexed_head(ctx.get(),w,input,ids);
++    auto * scattered=head.logits;
++    for (auto * operation:head.operations) { require(ggml_backend_supports_op(backend,operation),"backend unsupported"); }
++    auto * graph=ggml_new_graph_custom(ctx.get(),96,false);
++    ggml_build_forward_expand(graph,full); ggml_build_forward_expand(graph,scattered);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend));
++    require(bool(buffer),"cannot allocate bounded fixture");
++    ggml_backend_tensor_set(w,weights.data(),0,bytes);
++    std::vector<float> x(size_t(k),0),a(size_t(rows),0),b(size_t(rows),0);
++    std::vector<int32_t> mapping(size_t(selected),0);
++    for (int replay=0;replay<8;++replay) {
++        for(int64_t i=0;i<k;++i) { x[size_t(i)] = std::sin(float(i+replay*37)*.073f)*(replay+1); }
++        for(int64_t i=0;i<selected;++i) { mapping[size_t(i)] = int32_t((i*17+replay*131)%rows); }
++        ggml_backend_tensor_set(input,x.data(),0,x.size()*sizeof(float));
++        ggml_backend_tensor_set(ids,mapping.data(),0,mapping.size()*sizeof(int32_t));
++        require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"indexed graph failed");
++        ggml_backend_tensor_get(full,a.data(),0,a.size()*sizeof(float));
++        ggml_backend_tensor_get(scattered,b.data(),0,b.size()*sizeof(float));
++        std::vector<bool> seen(size_t(rows),false);
++        for(int32_t id:mapping) {
++            seen[size_t(id)]=true;
++            require(std::isfinite(a[size_t(id)]) && std::isfinite(b[size_t(id)]),"nonfinite selected logit");
++            require(std::memcmp(&a[size_t(id)],&b[size_t(id)],sizeof(float))==0,"indexed head changed selected logit bits");
++        }
++        for(int64_t i=0;i<rows;++i) { if(!seen[size_t(i)]) { require(b[size_t(i)]==-INFINITY,"stale/unselected proposal logit"); } }
++    }
++    std::printf("PASS: 8 CUDA graph replays, selected=%lld logits bitwise equal, excluded logits -inf; weights=%zu bytes\n",(long long)selected,bytes);
++}
++
++int main(int argc,char **argv) {
++    try {
++        policy();
++        if(argc==1) { return 0; }
++        require(argc==3,"Usage: test-mtp-draft-vocab [CUDA_BACKEND GGUF]");
++        auto * reg=ggml_backend_load(argv[1]); require(reg,"cannot load CUDA backend");
++        auto * device=ggml_backend_reg_dev_get(reg,0);
++        ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr)); require(bool(backend),"cannot initialize CUDA");
++        graph_case(backend.get(),argv[2],false); graph_case(backend.get(),argv[2],true);
++        return 0;
++    } catch(const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
++}

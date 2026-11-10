@@ -1,0 +1,266 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 5be7461..55cb922 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -25,6 +25,14 @@ static constexpr bool mmvq_iq3_row_pair_setting(const char * value) {
+     return !value || value[0] == '\0' || (value[0] == '1' && value[1] == '\0');
+ }
+ 
++static constexpr unsigned mmvq_iq3_row_pair_geometry(int64_t columns, int64_t rows, int64_t tokens) {
++    if (tokens < 1 || tokens > 3) { return 0; }
++    // Four-row tiles win only for the measured batch/shape combinations.
++    if (tokens == 2 && ((columns == 5120 && (rows == 17408 || rows == 1024)) || columns == 17408)) { return 0; }
++    if (tokens == 3 && columns == 17408 && rows == 5120) { return 64u; }
++    return mmvq_iq3_row_pair_geometry(columns, rows);
++}
++
+ #ifndef GGML_CUDA_MMVQ_KERNELS_ONLY
+ struct ggml_cuda_mmvq_reuse_scope::state {
+     struct input { char * quantized = nullptr; int last; };
+@@ -724,7 +732,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
+ }
+ 
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+-        bool iq3_two_rows = false>
++        bool iq3_row_tile = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -743,9 +751,9 @@ static __global__ void mul_mat_vec_q(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    static_assert(!iq3_two_rows || (type == GGML_TYPE_IQ3_S && ncols_dst == 1 && !has_fusion && !small_k && !halve_iters),
+-        "IQ3 row pairing requires the unchanged plain single-token reduction");
+-    constexpr int rows_per_cuda_block = iq3_two_rows ? 2 : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
++    static_assert(!iq3_row_tile || (type == GGML_TYPE_IQ3_S && ncols_dst >= 1 && ncols_dst <= 3 && !has_fusion && !small_k && !halve_iters),
++        "IQ3 row tiling requires the unchanged plain one-to-three-token reduction");
++    constexpr int rows_per_cuda_block = iq3_row_tile ? (ncols_dst == 1 ? 2 : 4) : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -1708,33 +1716,43 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+-    // Experimental, plain dense IQ3_S only. The K assignment, four-warps per
+-    // row and final reduction stay identical; only independent rows share a CTA.
+-    if (src0->type == GGML_TYPE_IQ3_S && !ids && !fusion && ne11 == 1 && ne01 % 2 == 0 &&
+-            mmvq_iq3_row_pair_geometry(ne00, ne01) &&
++    // Plain dense IQ3_S only. K assignment and the four-warp reduction stay
++    // identical. One token uses two rows; two/three tokens use four rows per CTA.
++    if (src0->type == GGML_TYPE_IQ3_S && !ids && !fusion && ne01 % 2 == 0 &&
++            mmvq_iq3_row_pair_geometry(ne00, ne01, ne11) &&
+             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+             ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
+             ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+             ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL) {
+         static const bool enabled = mmvq_iq3_row_pair_setting(std::getenv("GGML_CUDA_IQ3_ROW_PAIR"));
+-        if (enabled) {
+-            const dim3 grid((ne01 + 1)/2, 1, 1), block(WARP_SIZE, 4, 1);
++        static const bool batch_enabled = mmvq_iq3_row_pair_setting(std::getenv("GGML_CUDA_IQ3_ROW_PAIR_BATCH"));
++        if (enabled && (ne11 == 1 || batch_enabled)) {
++            const int rows_per_block = ne11 == 1 ? 2 : 4;
++            const dim3 grid((ne01 + rows_per_block - 1)/rows_per_block, 1, 1), block(WARP_SIZE, 4, 1);
+             const ggml_cuda_kernel_launch_params parameters = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+-            ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,true>, parameters,
+-                src0->data, quantized, nullptr, ggml_cuda_mm_fusion_args_device{}, dst_d,
+-                uint32_t(ne00), init_fastdiv_values(1), uint32_t(s01), uint32_t(s11), uint32_t(s1),
+-                init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+-                init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), 0u, uint32_t(ne01));
++            const auto launch = [&](auto token_tag) {
++                constexpr int tokens = decltype(token_tag)::value;
++                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,tokens,false,false,false,true>, parameters,
++                    src0->data, quantized, nullptr, ggml_cuda_mm_fusion_args_device{}, dst_d,
++                    uint32_t(ne00), init_fastdiv_values(1), uint32_t(s01), uint32_t(s11), uint32_t(s1),
++                    init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
++                    init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), 0u, uint32_t(ne01));
++            };
++            switch (ne11) {
++                case 1: launch(std::integral_constant<int, 1>{}); break;
++                case 2: launch(std::integral_constant<int, 2>{}); break;
++                case 3: launch(std::integral_constant<int, 3>{}); break;
++            }
+             static const bool trace = [] {
+                 const char * value = std::getenv("GGML_CUDA_IQ3_ROW_PAIR_TRACE");
+                 return value && value[0] == '1' && value[1] == '\0';
+             }();
+             if (trace) {
+                 static std::atomic<unsigned> reported{0};
+-                const unsigned bit = mmvq_iq3_row_pair_geometry(ne00, ne01);
++                const unsigned bit = mmvq_iq3_row_pair_geometry(ne00, ne01, ne11) << (7*(ne11-1));
+                 if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+-                    std::fprintf(stderr, "cuda_iq3_row_pair: launched k=%lld rows=%lld threads=128 rows_per_cta=2\n",
+-                        (long long) ne00, (long long) ne01);
++                    std::fprintf(stderr, "cuda_iq3_row_pair: launched k=%lld rows=%lld tokens=%lld threads=128 rows_per_cta=%d\n",
++                        (long long) ne00, (long long) ne01, (long long) ne11, rows_per_block);
+                 }
+             }
+             return;
+diff --git a/tests/test-cuda-iq3-row-pair.cu b/tests/test-cuda-iq3-row-pair.cu
+index 50918da..f04df6b 100644
+--- a/tests/test-cuda-iq3-row-pair.cu
++++ b/tests/test-cuda-iq3-row-pair.cu
+@@ -27,6 +27,13 @@ static_assert(!mmvq_iq3_row_pair_geometry(5120,5122), "unmeasured adjacent row c
+ static_assert(!mmvq_iq3_row_pair_geometry(5122,17408), "unmeasured adjacent width enabled");
+ static_assert(!mmvq_iq3_row_pair_geometry(5120,17409), "odd geometry enabled");
+ static_assert(!mmvq_iq3_row_pair_geometry(0,0), "empty geometry enabled");
++static_assert(mmvq_iq3_row_pair_geometry(5120,5120,2), "measured two-token tile excluded");
++static_assert(!mmvq_iq3_row_pair_geometry(5120,17408,2), "slower two-token up tile enabled");
++static_assert(!mmvq_iq3_row_pair_geometry(17408,5120,2), "slower two-token down tile enabled");
++static_assert(!mmvq_iq3_row_pair_geometry(5120,1024,2), "unproven two-token small tile enabled");
++static_assert(mmvq_iq3_row_pair_geometry(17408,5120,3), "measured three-token down tile excluded");
++static_assert(!mmvq_iq3_row_pair_geometry(5120,5120,0), "empty batch admitted");
++static_assert(!mmvq_iq3_row_pair_geometry(5120,5120,4), "unmeasured batch admitted");
+ static_assert(mmvq_iq3_row_pair_setting(nullptr), "unset must select the guarded automatic policy");
+ static_assert(mmvq_iq3_row_pair_setting(""), "empty must select the guarded automatic policy");
+ static_assert(mmvq_iq3_row_pair_setting("1"), "explicit enable rejected");
+@@ -75,20 +82,20 @@ static std::vector<block_iq3_s> read_weights(const char * path, const gguf_conte
+     return result;
+ }
+ 
+-struct fixture {
++template<int cols> struct fixture {
+     int k, rows;
+     cudaStream_t stream = nullptr;
+     device_buffer<block_iq3_s> weights;
+     device_buffer<block_q8_1> input;
+     device_buffer<float> output;
+     fixture(int columns,int output_rows,const std::vector<block_iq3_s> & values) : k(columns),rows(output_rows),
+-        weights(values.size()),input(columns/32),output(output_rows) {
++        weights(values.size()),input(cols*columns/32),output(cols*output_rows) {
+         CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+         CUDA_CHECK(cudaMemcpy(weights.data,values.data(),values.size()*sizeof(block_iq3_s),cudaMemcpyHostToDevice));
+     }
+     ~fixture() { if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
+     void set_input(int pattern) {
+-        std::vector<block_q8_1> value(k/32);
++        std::vector<block_q8_1> value(cols*k/32);
+         uint32_t seed = 1234567+pattern;
+         for (size_t b = 0; b < value.size(); ++b) {
+             int sum=0;
+@@ -104,7 +111,8 @@ struct fixture {
+     }
+     template<bool pair> void launch() {
+         const uint32_t weight_channel = uint32_t(rows*(k/256)), input_channel = uint32_t(k/32);
+-        mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,pair><<<dim3(pair ? rows/2 : rows,1,1),dim3(32,4,1),0,stream>>>(
++        constexpr int rpb = pair ? (cols == 1 ? 2 : 4) : calc_rows_per_block(GGML_TYPE_IQ3_S, cols, MMVQ_PARAMETERS_GENERIC, false, 4);
++        mul_mat_vec_q<GGML_TYPE_IQ3_S,cols,false,false,false,pair><<<dim3((rows+rpb-1)/rpb,1,1),dim3(32,4,1),0,stream>>>(
+             weights.data,input.data,(const int32_t *)nullptr,ggml_cuda_mm_fusion_args_device{},output.data,
+             uint32_t(k),init_fastdiv_values(1),uint32_t(k/256),input_channel,uint32_t(rows),init_fastdiv_values(1),
+             weight_channel,input_channel,uint32_t(rows),init_fastdiv_values(1),weight_channel,input_channel,uint32_t(rows),0u,uint32_t(rows));
+@@ -112,7 +120,7 @@ struct fixture {
+     }
+     std::vector<float> download() {
+         CUDA_CHECK(cudaStreamSynchronize(stream));
+-        std::vector<float> result(rows);
++        std::vector<float> result(cols*rows);
+         CUDA_CHECK(cudaMemcpy(result.data(),output.data,result.size()*sizeof(float),cudaMemcpyDeviceToHost));
+         return result;
+     }
+@@ -128,16 +136,16 @@ struct graph_timing {
+         if (begin) { cudaEventDestroy(begin); }
+         if (end) { cudaEventDestroy(end); }
+     }
+-    template<bool pair> void capture(fixture & data,int batch) {
++    template<bool pair,int cols> void capture(fixture<cols> & data,int batch) {
+         CUDA_CHECK(cudaEventCreate(&begin)); CUDA_CHECK(cudaEventCreate(&end));
+         CUDA_CHECK(cudaStreamBeginCapture(data.stream,cudaStreamCaptureModeThreadLocal));
+         CUDA_CHECK(cudaEventRecordWithFlags(begin,data.stream,cudaEventRecordExternal));
+-        for (int i=0;i<batch;++i) { data.launch<pair>(); }
++        for (int i=0;i<batch;++i) { data.template launch<pair>(); }
+         CUDA_CHECK(cudaEventRecordWithFlags(end,data.stream,cudaEventRecordExternal));
+         CUDA_CHECK(cudaStreamEndCapture(data.stream,&graph));
+         CUDA_CHECK(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+     }
+-    float measure(fixture & data,int batch) {
++    template<int cols> float measure(fixture<cols> & data,int batch) {
+         CUDA_CHECK(cudaGraphLaunch(executable,data.stream)); CUDA_CHECK(cudaStreamSynchronize(data.stream));
+         float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,begin,end));
+         require(std::isfinite(ms) && ms>0,"invalid GPU event timing"); return ms/batch;
+@@ -146,7 +154,7 @@ struct graph_timing {
+ static float median(std::vector<float> values) {
+     std::sort(values.begin(),values.end()); return (values[values.size()/2-1]+values[values.size()/2])*.5f;
+ }
+-static void benchmark(fixture & data) {
++template<int cols> static void benchmark(fixture<cols> & data) {
+     constexpr int batch=32,pairs=12,warmups=3;
+     graph_timing legacy,pair; legacy.capture<false>(data,batch); pair.capture<true>(data,batch);
+     for (int i=0;i<warmups;++i) { legacy.measure(data,batch); pair.measure(data,batch); }
+@@ -157,12 +165,38 @@ static void benchmark(fixture & data) {
+         else { x=legacy.measure(data,batch); y=pair.measure(data,batch); }
+         a.push_back(x); b.push_back(y); wins += y<x;
+     }
+-    std::printf("IQ3_GPU_EVENTS k=%d rows=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g timing_scope=actual_kernel excludes=allocation_copy_capture_host_scheduling\n",
+-        data.k,data.rows,batch,pairs,warmups,double(median(a)),double(median(b)),double(median(a)/median(b)),wins,
++    std::printf("IQ3_GPU_EVENTS cols=%d k=%d rows=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g timing_scope=actual_kernel excludes=allocation_copy_capture_host_scheduling\n",
++        cols,data.k,data.rows,batch,pairs,warmups,double(median(a)),double(median(b)),double(median(a)/median(b)),wins,
+         double(*std::min_element(a.begin(),a.end())),double(*std::max_element(a.begin(),a.end())),
+         double(*std::min_element(b.begin(),b.end())),double(*std::max_element(b.begin(),b.end())));
+ }
+ 
++template<int cols> static int check(const char * path,const gguf_context * metadata,bool measure) {
++int cases=0;
++const std::pair<int,int> shapes[]={{5120,5120},{5120,17408},{17408,5120},{5120,10240},{5120,12288},{6144,5120},{5120,1024},{5120,1023}};
++        for (const auto & shape:shapes) {
++            const auto weights=read_weights(path,metadata,shape.first,shape.second);
++            fixture<cols> data(shape.first,shape.second,weights);
++            for (int pattern:{0,1,2}) {
++                data.set_input(pattern); data.template launch<false>(); const auto a=data.download();
++                data.template launch<true>(); const auto b=data.download();
++                size_t bits=0; float max_abs=0,max_rel=0;
++                for (size_t i=0;i<a.size();++i) {
++                    require(std::isfinite(a[i]) && std::isfinite(b[i]),"nonfinite MMVQ output");
++                    uint32_t x,y; std::memcpy(&x,&a[i],4); std::memcpy(&y,&b[i],4); bits += x!=y;
++                    const float error=std::abs(a[i]-b[i]); max_abs=std::max(max_abs,error);
++                    max_rel=std::max(max_rel,error/std::max(std::abs(a[i]),1e-20f));
++                }
++                const bool changed=std::max_element(a.begin(),a.end())-a.begin()!=std::max_element(b.begin(),b.end())-b.begin();
++                std::printf("IQ3_EQUIVALENCE cols=%d k=%d rows=%d pattern=%d policy_eligible=%d different_bits=%zu max_abs=%.9g max_rel=%.9g changed_argmax=%d\n",
++                    cols,data.k,data.rows,pattern,int(mmvq_iq3_row_pair_geometry(data.k,data.rows,cols)),bits,double(max_abs),double(max_rel),int(changed));
++                require(bits==0,"IQ3 row pairing changed a trained-weight result bitwise"); ++cases;
++            }
++            if (measure) { benchmark(data); }
++        }
++return cases;
++}
++
+ int main(int argc,char ** argv) {
+     try {
+         const char * path=nullptr; bool measure=false;
+@@ -189,30 +223,13 @@ int main(int argc,char ** argv) {
+         };
+         attributes("legacy",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,false>);
+         attributes("pair",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,true>);
++        attributes("legacy2",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,2,false,false,false,false>);
++        attributes("tiled2",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,2,false,false,false,true>);
++        attributes("legacy3",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,3,false,false,false,false>);
++        attributes("tiled3",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,3,false,false,false,true>);
+         std::unique_ptr<gguf_context,decltype(&gguf_free)> metadata(gguf_init_from_file(path,{true,nullptr}),gguf_free);
+         require(bool(metadata),"cannot read GGUF metadata without allocating weights");
+-        const std::pair<int,int> shapes[]={{5120,5120},{5120,17408},{17408,5120},{5120,10240},{5120,12288},{6144,5120},{5120,1024}};
+-        int cases=0;
+-        for (const auto & shape:shapes) {
+-            const auto weights=read_weights(path,metadata.get(),shape.first,shape.second);
+-            fixture data(shape.first,shape.second,weights);
+-            for (int pattern:{0,1,2}) {
+-                data.set_input(pattern); data.launch<false>(); const auto a=data.download();
+-                data.launch<true>(); const auto b=data.download();
+-                size_t bits=0; float max_abs=0,max_rel=0;
+-                for (size_t i=0;i<a.size();++i) {
+-                    require(std::isfinite(a[i]) && std::isfinite(b[i]),"nonfinite MMVQ output");
+-                    uint32_t x,y; std::memcpy(&x,&a[i],4); std::memcpy(&y,&b[i],4); bits += x!=y;
+-                    const float error=std::abs(a[i]-b[i]); max_abs=std::max(max_abs,error);
+-                    max_rel=std::max(max_rel,error/std::max(std::abs(a[i]),1e-20f));
+-                }
+-                const bool changed=std::max_element(a.begin(),a.end())-a.begin()!=std::max_element(b.begin(),b.end())-b.begin();
+-                std::printf("IQ3_EQUIVALENCE k=%d rows=%d pattern=%d policy_eligible=%d different_bits=%zu max_abs=%.9g max_rel=%.9g changed_argmax=%d\n",
+-                    data.k,data.rows,pattern,int(mmvq_iq3_row_pair_geometry(data.k,data.rows)),bits,double(max_abs),double(max_rel),int(changed));
+-                require(bits==0,"IQ3 row pairing changed a trained-weight result bitwise"); ++cases;
+-            }
+-            if (measure) { benchmark(data); }
+-        }
++        int cases=check<1>(path,metadata.get(),measure)+check<2>(path,metadata.get(),measure)+check<3>(path,metadata.get(),measure);
+         std::printf("PASS: %d trained-weight IQ3 row-pair cases bitwise equal\n",cases); return 0;
+     } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
+ }

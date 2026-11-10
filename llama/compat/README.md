@@ -144,6 +144,12 @@ monolithic vision models, also update the `compatClipArches` allowlist in
 
 ## Regenerating the Patch File
 
+The measured short-batch IQ3_S dispatch in `098` and MTP proposal changes in
+`099` are documented in [MTP verification efficiency](../../docs/mtp-verification-efficiency.md).
+The indexed output-head experiment in `099` is opt-in and remains disabled in
+the validated profile; the guarded short-batch kernel and exact greedy proposal
+selection are enabled by default.
+
 After a llama.cpp bump moves the insertion points, re-apply the edits to a
 fresh checkout and run:
 
