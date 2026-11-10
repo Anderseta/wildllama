@@ -3,7 +3,7 @@ package api
 import "testing"
 
 func TestDenseCUDAOptionsRequireExplicitBoolean(t *testing.T) {
-	for _, key := range []string{"GGML_CUDA_DENSE_OPT", "GGML_CUDA_IQ3_INPUT_REUSE", "WILDLLAMA_CUDA_GQA_Q8"} {
+	for _, key := range []string{"GGML_CUDA_DENSE_OPT", "GGML_CUDA_IQ3_INPUT_REUSE", "WILDLLAMA_CUDA_GQA_Q8", "GGML_CUDA_IQ3_ROW_PAIR"} {
 		for _, value := range []string{"", "0", "1"} {
 			options, err := ParseRunnerEnvironment(map[string]string{key: value})
 			if err != nil || options[key] != value {

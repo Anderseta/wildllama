@@ -1,0 +1,323 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 568fcdc..ba44172 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -7,6 +7,16 @@
+ #include <cstdint>
+ #include <type_traits>
+ 
++// Keep the experiment confined to the two geometries with measured wins.
++static constexpr bool mmvq_iq3_row_pair_geometry(int64_t columns, int64_t rows) {
++    return columns == 5120 && (rows == 5120 || rows == 17408);
++}
++
++static constexpr bool mmvq_iq3_row_pair_setting(const char * value) {
++    return !value || value[0] == '\0' || (value[0] == '1' && value[1] == '\0');
++}
++
++#ifndef GGML_CUDA_MMVQ_KERNELS_ONLY
+ struct ggml_cuda_mmvq_reuse_scope::state {
+     struct input { char * quantized = nullptr; int last; };
+     struct allocation {
+@@ -90,6 +100,7 @@ static char * mmvq_reuse_input(ggml_backend_cuda_context & ctx, const ggml_tenso
+     ggml_cuda_dense_trace(ggml_cuda_dense_event::quantize, input);
+     return result;
+ }
++#endif // GGML_CUDA_MMVQ_KERNELS_ONLY
+ 
+ // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
+ // has little exposed latency left to hide and the extra requests cost more than they save.
+@@ -703,7 +714,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
+     return 1;
+ }
+ 
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
++        bool iq3_two_rows = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -722,7 +734,9 @@ static __global__ void mul_mat_vec_q(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
++    static_assert(!iq3_two_rows || (type == GGML_TYPE_IQ3_S && ncols_dst == 1 && !has_fusion && !small_k && !halve_iters),
++        "IQ3 row pairing requires the unchanged plain single-token reduction");
++    constexpr int rows_per_cuda_block = iq3_two_rows ? 2 : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -1131,6 +1145,7 @@ static __global__ void mul_mat_vec_q_moe(
+     }
+ }
+ 
++#ifndef GGML_CUDA_MMVQ_KERNELS_ONLY
+ template<ggml_type type>
+ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+@@ -1684,6 +1699,39 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    // Experimental, plain dense IQ3_S only. The K assignment, four-warps per
++    // row and final reduction stay identical; only independent rows share a CTA.
++    if (src0->type == GGML_TYPE_IQ3_S && !ids && !fusion && ne11 == 1 && ne01 % 2 == 0 &&
++            mmvq_iq3_row_pair_geometry(ne00, ne01) &&
++            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++            ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
++            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL) {
++        static const bool enabled = mmvq_iq3_row_pair_setting(std::getenv("GGML_CUDA_IQ3_ROW_PAIR"));
++        if (enabled) {
++            const dim3 grid((ne01 + 1)/2, 1, 1), block(WARP_SIZE, 4, 1);
++            const ggml_cuda_kernel_launch_params parameters = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
++            ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,true>, parameters,
++                src0->data, quantized, nullptr, ggml_cuda_mm_fusion_args_device{}, dst_d,
++                uint32_t(ne00), init_fastdiv_values(1), uint32_t(s01), uint32_t(s11), uint32_t(s1),
++                init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
++                init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), 0u, uint32_t(ne01));
++            static const bool trace = [] {
++                const char * value = std::getenv("GGML_CUDA_IQ3_ROW_PAIR_TRACE");
++                return value && value[0] == '1' && value[1] == '\0';
++            }();
++            if (trace) {
++                static std::atomic<unsigned> reported{0};
++                const unsigned bit = ne01 == 5120 ? 1u : 2u;
++                if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
++                    std::fprintf(stderr, "cuda_iq3_row_pair: launched k=%lld rows=%lld threads=128 rows_per_cta=2\n",
++                        (long long) ne00, (long long) ne01);
++                }
++            }
++            return;
++        }
++    }
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, quantized, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+@@ -1721,3 +1769,4 @@ void ggml_cuda_op_mul_mat_vec_q(
+ 
+     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+ }
++#endif // GGML_CUDA_MMVQ_KERNELS_ONLY
+diff --git a/tests/test-cuda-iq3-row-pair.cu b/tests/test-cuda-iq3-row-pair.cu
+new file mode 100644
+index 0000000..162e85e
+--- /dev/null
++++ b/tests/test-cuda-iq3-row-pair.cu
+@@ -0,0 +1,214 @@
++// Include the actual production kernel without its private host/backend wrappers.
++#define GGML_CUDA_MMVQ_KERNELS_ONLY
++#include "../ggml/src/ggml-cuda/mmvq.cu"
++#include "gguf.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++// Host launch policy uses this same pure helper. In particular, the measured
++// slower down projection and unmeasured neighboring shapes must stay legacy.
++static_assert(mmvq_iq3_row_pair_geometry(5120,5120), "measured square geometry excluded");
++static_assert(mmvq_iq3_row_pair_geometry(5120,17408), "measured up geometry excluded");
++static_assert(!mmvq_iq3_row_pair_geometry(17408,5120), "slower down geometry enabled");
++static_assert(!mmvq_iq3_row_pair_geometry(4096,4096), "unmeasured smaller geometry enabled");
++static_assert(!mmvq_iq3_row_pair_geometry(5120,5122), "unmeasured adjacent row count enabled");
++static_assert(!mmvq_iq3_row_pair_geometry(5122,17408), "unmeasured adjacent width enabled");
++static_assert(!mmvq_iq3_row_pair_geometry(5120,17409), "odd geometry enabled");
++static_assert(!mmvq_iq3_row_pair_geometry(0,0), "empty geometry enabled");
++static_assert(mmvq_iq3_row_pair_setting(nullptr), "unset must select the guarded automatic policy");
++static_assert(mmvq_iq3_row_pair_setting(""), "empty must select the guarded automatic policy");
++static_assert(mmvq_iq3_row_pair_setting("1"), "explicit enable rejected");
++static_assert(!mmvq_iq3_row_pair_setting("0"), "explicit disable ignored");
++static_assert(!mmvq_iq3_row_pair_setting("10"), "malformed numeric value enabled");
++static_assert(!mmvq_iq3_row_pair_setting("01"), "malformed numeric prefix enabled");
++static_assert(!mmvq_iq3_row_pair_setting("true"), "malformed text value enabled");
++static_assert(!mmvq_iq3_row_pair_setting(" "), "whitespace value enabled");
++
++[[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
++    throw std::runtime_error(std::string("CUDA fixture: ")+stmt+" in "+func+" at "+file+":"+
++        std::to_string(line)+": "+msg);
++}
++static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++template<class T> struct device_buffer {
++    T * data = nullptr;
++    explicit device_buffer(size_t count) { CUDA_CHECK(cudaMalloc((void **)&data,count*sizeof(T))); }
++    ~device_buffer() { if (data) { cudaFree(data); } }
++    device_buffer(const device_buffer &) = delete;
++    device_buffer & operator=(const device_buffer &) = delete;
++};
++static uint32_t random_next(uint32_t & s) { s ^= s<<13; s ^= s>>17; s ^= s<<5; return s; }
++
++static std::vector<block_iq3_s> read_weights(const char * path, const gguf_context * metadata, int k, int rows) {
++    const size_t bytes = size_t(k/256)*rows*sizeof(block_iq3_s);
++    require(2*bytes+4*size_t(rows)*sizeof(float)+2*size_t(k/32)*sizeof(block_q8_1) < 128*1024*1024,
++        "fixture resident host/device storage exceeds 128 MiB");
++    int64_t tensor = -1;
++    for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i) {
++        const int64_t * ne = gguf_get_tensor_ne(metadata,i);
++        if (gguf_get_tensor_type(metadata,i) != GGML_TYPE_IQ3_S || ne[0] != k || ne[1] < rows || ne[2] != 1 || ne[3] != 1) { continue; }
++        if (tensor < 0 || ne[1] == rows) { tensor=i; }
++        if (ne[1] == rows) { break; }
++    }
++    require(tensor >= 0,"GGUF has no matching IQ3_S tensor/range; no other precision is substituted");
++    require(gguf_get_tensor_size(metadata,tensor) >= bytes,"IQ3 tensor byte size is smaller than selected rows");
++    const uint64_t offset = uint64_t(gguf_get_data_offset(metadata))+gguf_get_tensor_offset(metadata,tensor);
++    std::ifstream file(path,std::ios::binary);
++    require(bool(file),"cannot open GGUF weight range");
++    file.seekg(std::streamoff(offset));
++    std::vector<block_iq3_s> result(bytes/sizeof(block_iq3_s));
++    file.read(reinterpret_cast<char *>(result.data()),std::streamsize(bytes));
++    require(size_t(file.gcount()) == bytes,"short GGUF weight-range read");
++    std::printf("IQ3_WEIGHT_RANGE tensor=%s k=%d rows=%d tensor_rows=%lld bytes=%zu offset=%llu\n",
++        gguf_get_tensor_name(metadata,tensor),k,rows,(long long)gguf_get_tensor_ne(metadata,tensor)[1],bytes,(unsigned long long)offset);
++    return result;
++}
++
++struct fixture {
++    int k, rows;
++    cudaStream_t stream = nullptr;
++    device_buffer<block_iq3_s> weights;
++    device_buffer<block_q8_1> input;
++    device_buffer<float> output;
++    fixture(int columns,int output_rows,const std::vector<block_iq3_s> & values) : k(columns),rows(output_rows),
++        weights(values.size()),input(columns/32),output(output_rows) {
++        CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++        CUDA_CHECK(cudaMemcpy(weights.data,values.data(),values.size()*sizeof(block_iq3_s),cudaMemcpyHostToDevice));
++    }
++    ~fixture() { if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
++    void set_input(int pattern) {
++        std::vector<block_q8_1> value(k/32);
++        uint32_t seed = 1234567+pattern;
++        for (size_t b = 0; b < value.size(); ++b) {
++            int sum=0;
++            for (int i=0;i<32;++i) {
++                value[b].qs[i] = int8_t(int(random_next(seed)%255)-127);
++                sum += value[b].qs[i];
++            }
++            const float scale = pattern == 0 ? .003f : std::ldexp(1.0f,int(random_next(seed)%10)-12);
++            const half2 ds=__floats2half2_rn(scale,scale*sum);
++            std::memcpy(&value[b].ds,&ds,sizeof(ds));
++        }
++        CUDA_CHECK(cudaMemcpy(input.data,value.data(),value.size()*sizeof(block_q8_1),cudaMemcpyHostToDevice));
++    }
++    template<bool pair> void launch() {
++        const uint32_t weight_channel = uint32_t(rows*(k/256)), input_channel = uint32_t(k/32);
++        mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,pair><<<dim3(pair ? rows/2 : rows,1,1),dim3(32,4,1),0,stream>>>(
++            weights.data,input.data,(const int32_t *)nullptr,ggml_cuda_mm_fusion_args_device{},output.data,
++            uint32_t(k),init_fastdiv_values(1),uint32_t(k/256),input_channel,uint32_t(rows),init_fastdiv_values(1),
++            weight_channel,input_channel,uint32_t(rows),init_fastdiv_values(1),weight_channel,input_channel,uint32_t(rows),0u,uint32_t(rows));
++        CUDA_CHECK(cudaGetLastError());
++    }
++    std::vector<float> download() {
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        std::vector<float> result(rows);
++        CUDA_CHECK(cudaMemcpy(result.data(),output.data,result.size()*sizeof(float),cudaMemcpyDeviceToHost));
++        return result;
++    }
++};
++
++struct graph_timing {
++    cudaGraph_t graph = nullptr;
++    cudaGraphExec_t executable = nullptr;
++    cudaEvent_t begin = nullptr,end = nullptr;
++    ~graph_timing() {
++        if (executable) { cudaGraphExecDestroy(executable); }
++        if (graph) { cudaGraphDestroy(graph); }
++        if (begin) { cudaEventDestroy(begin); }
++        if (end) { cudaEventDestroy(end); }
++    }
++    template<bool pair> void capture(fixture & data,int batch) {
++        CUDA_CHECK(cudaEventCreate(&begin)); CUDA_CHECK(cudaEventCreate(&end));
++        CUDA_CHECK(cudaStreamBeginCapture(data.stream,cudaStreamCaptureModeThreadLocal));
++        CUDA_CHECK(cudaEventRecordWithFlags(begin,data.stream,cudaEventRecordExternal));
++        for (int i=0;i<batch;++i) { data.launch<pair>(); }
++        CUDA_CHECK(cudaEventRecordWithFlags(end,data.stream,cudaEventRecordExternal));
++        CUDA_CHECK(cudaStreamEndCapture(data.stream,&graph));
++        CUDA_CHECK(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
++    }
++    float measure(fixture & data,int batch) {
++        CUDA_CHECK(cudaGraphLaunch(executable,data.stream)); CUDA_CHECK(cudaStreamSynchronize(data.stream));
++        float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,begin,end));
++        require(std::isfinite(ms) && ms>0,"invalid GPU event timing"); return ms/batch;
++    }
++};
++static float median(std::vector<float> values) {
++    std::sort(values.begin(),values.end()); return (values[values.size()/2-1]+values[values.size()/2])*.5f;
++}
++static void benchmark(fixture & data) {
++    constexpr int batch=32,pairs=12,warmups=3;
++    graph_timing legacy,pair; legacy.capture<false>(data,batch); pair.capture<true>(data,batch);
++    for (int i=0;i<warmups;++i) { legacy.measure(data,batch); pair.measure(data,batch); }
++    std::vector<float> a,b; int wins=0;
++    for (int i=0;i<pairs;++i) {
++        float x,y;
++        if (i%2) { y=pair.measure(data,batch); x=legacy.measure(data,batch); }
++        else { x=legacy.measure(data,batch); y=pair.measure(data,batch); }
++        a.push_back(x); b.push_back(y); wins += y<x;
++    }
++    std::printf("IQ3_GPU_EVENTS k=%d rows=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g timing_scope=actual_kernel excludes=allocation_copy_capture_host_scheduling\n",
++        data.k,data.rows,batch,pairs,warmups,double(median(a)),double(median(b)),double(median(a)/median(b)),wins,
++        double(*std::min_element(a.begin(),a.end())),double(*std::max_element(a.begin(),a.end())),
++        double(*std::min_element(b.begin(),b.end())),double(*std::max_element(b.begin(),b.end())));
++}
++
++int main(int argc,char ** argv) {
++    try {
++        const char * path=nullptr; bool measure=false;
++        for (int i=1;i<argc;++i) {
++            const std::string arg=argv[i];
++            if (arg=="--weights" && !path && i+1<argc) { path=argv[++i]; }
++            else if (arg=="--benchmark" && !measure) { measure=true; }
++            else { throw std::runtime_error("Usage: test-cuda-iq3-row-pair --weights GGUF [--benchmark]"); }
++        }
++        require(path,"--weights GGUF is required; fixture reads only small selected trained ranges");
++        int devices=0; const auto status=cudaGetDeviceCount(&devices);
++        if (status==cudaErrorNoDevice || status==cudaErrorInsufficientDriver || (status==cudaSuccess && !devices)) {
++            std::puts("SKIP: no CUDA device/driver available"); return 77;
++        }
++        CUDA_CHECK(status); cudaDeviceProp props{}; int device;
++        CUDA_CHECK(cudaGetDevice(&device)); CUDA_CHECK(cudaGetDeviceProperties(&props,device));
++        if (props.major!=12 || props.minor!=0) { std::puts("SKIP: experimental IQ3 row pair targets SM120 only"); return 77; }
++        const auto attributes=[](const char * name,const void * kernel) {
++            cudaFuncAttributes a{}; int occupancy=0;
++            CUDA_CHECK(cudaFuncGetAttributes(&a,kernel));
++            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy,kernel,128,0));
++            std::printf("IQ3_KERNEL_ATTR kernel=%s registers_per_thread=%d static_smem_bytes=%zu local_bytes=%zu max_threads_per_block=%d active_blocks_per_sm=%d\n",
++                name,a.numRegs,a.sharedSizeBytes,a.localSizeBytes,a.maxThreadsPerBlock,occupancy);
++        };
++        attributes("legacy",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,false>);
++        attributes("pair",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,1,false,false,false,true>);
++        std::unique_ptr<gguf_context,decltype(&gguf_free)> metadata(gguf_init_from_file(path,{true,nullptr}),gguf_free);
++        require(bool(metadata),"cannot read GGUF metadata without allocating weights");
++        const std::pair<int,int> shapes[]={{5120,5120},{5120,17408},{17408,5120}};
++        int cases=0;
++        for (const auto & shape:shapes) {
++            const auto weights=read_weights(path,metadata.get(),shape.first,shape.second);
++            fixture data(shape.first,shape.second,weights);
++            for (int pattern:{0,1,2}) {
++                data.set_input(pattern); data.launch<false>(); const auto a=data.download();
++                data.launch<true>(); const auto b=data.download();
++                size_t bits=0; float max_abs=0,max_rel=0;
++                for (size_t i=0;i<a.size();++i) {
++                    require(std::isfinite(a[i]) && std::isfinite(b[i]),"nonfinite MMVQ output");
++                    uint32_t x,y; std::memcpy(&x,&a[i],4); std::memcpy(&y,&b[i],4); bits += x!=y;
++                    const float error=std::abs(a[i]-b[i]); max_abs=std::max(max_abs,error);
++                    max_rel=std::max(max_rel,error/std::max(std::abs(a[i]),1e-20f));
++                }
++                const bool changed=std::max_element(a.begin(),a.end())-a.begin()!=std::max_element(b.begin(),b.end())-b.begin();
++                std::printf("IQ3_EQUIVALENCE k=%d rows=%d pattern=%d policy_eligible=%d different_bits=%zu max_abs=%.9g max_rel=%.9g changed_argmax=%d\n",
++                    data.k,data.rows,pattern,int(mmvq_iq3_row_pair_geometry(data.k,data.rows)),bits,double(max_abs),double(max_rel),int(changed));
++                require(bits==0,"IQ3 row pairing changed a trained-weight result bitwise"); ++cases;
++            }
++            if (measure) { benchmark(data); }
++        }
++        std::printf("PASS: %d trained-weight IQ3 row-pair cases bitwise equal\n",cases); return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}

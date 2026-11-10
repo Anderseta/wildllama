@@ -53,15 +53,16 @@ allocation failure preserves the other owners and their original bytes.
 
 ## Attention and sampler boundaries
 
-Patch `094` adds an experimental Q8 grouped-query attention pair kernel. It is
-off by default; `WILDLLAMA_CUDA_GQA_Q8=1` explicitly opts in before backend
-initialization. Eligibility is restricted to NVIDIA CUDA, 256-wide heads,
-one query and sequence, Q8 K/V, an even query-to-KV head ratio and the supported
-dense mask/layout. Sinks, softcap, ALiBi bias and unsupported shapes retain
-the original kernel. The paired query heads keep independent accumulators and
-write the canonical output and split-reduction rows; the existing merge remains
-unchanged. GPU correctness and performance checks are required before enabling
-this path by default.
+Patches `094` and `095` provide guarded Q8 grouped-query attention. The final
+implementation preserves the legacy KV partitions and uses two independent
+four-warp head groups, with specialization confined to conditions checked by
+the host. Automatic selection is limited to SM120, 24 query heads and four KV
+heads, 256-wide Q8 K/V, one query/sequence and the supported dense F16 mask and
+strides. Sinks, softcap, ALiBi bias and unsupported shapes retain the original
+kernel. `WILDLLAMA_CUDA_GQA_Q8=0` disables the addition; `1` explicitly opts in
+on other eligible NVIDIA layouts. See [resident CUDA kernels](resident-cuda-kernels.md)
+for arithmetic, activation and validation details, including the separately
+bounded IQ3_S two-row matrix-vector path in patch `096`.
 
 Thinking-aware backend sampling cannot drop the reasoning-budget object merely
 because its limit is effectively unbounded: that object also controls lazy
@@ -85,36 +86,44 @@ tokens and mixed consumers. The output dumps were byte-identical with reuse
 disabled, the IQ3-only default and the legacy opt-in. Counters confirmed that
 the IQ3 default actually ran without activating pure Q8/K reuse; all three
 stayed below the 64 MiB test quota and had the same managed allocation peak.
-The grouped-attention fixture also matched the original kernel exactly across
-24 cases covering grouped heads, split-K, padded strides, masks and clipped KV.
+The grouped-attention production-planner fixture matched the original kernel
+bit for bit across 108 cases, including several grouped-head geometries,
+short/long KV views, three input patterns and padded strides. Negative controls
+reproduced the old partition-selection error. Nine trained-weight IQ3 row-pair
+cases also matched bit for bit. The square-range fixture uses a 5,120-row prefix
+of an actual 10,240-row QKV tensor; it does not establish a measured benefit for
+that full QKV shape, which remains on the original path.
 
 The full patch stack was applied offline to a clean copy of the pinned native
 archive; new patched files matched the compiled source. The API race tests
-passed. These results do not alone establish inference throughput. Whole-model comparisons must
-report context, sampling, warmup, memory and the exact payload identity; component
-results alone do not establish a tokens-per-second improvement.
+passed. The final whole-model comparison used Windows/RTX 5060 Ti 16 GiB,
+resident Huihui Qwen35 27B IQ3_S weights, 65,536-token context capacity, Q8 KV,
+greedy sampling and 128 output tokens. Each of baseline, attention-only and
+combined automatic settings completed eight requests: one warmup and three
+measured warm requests at each input length. Medians use native completion
+decode timings, excluding WildGoose and model startup/loading.
 
-One sequential Windows/RTX 5060 Ti comparison used the same resident Huihui
-Qwen35 27B IQ3_S weights, 65,536-token context capacity, Q8 KV, greedy sampling,
-128 output tokens, one warmup and three warm requests per prompt length:
+| Input tokens | Previous CUDA payload, median tokens/s | Attention | Combined automatic |
+| --- | ---: | ---: | ---: |
+| 1,024 | 26.946 | 27.478 (+1.98%) | 27.448 (+1.86%) |
+| 32,768 | 16.530 | 22.647 (+37.00%) | 22.532 (+36.31%) |
 
-| Input tokens | Previous payload, median tokens/s | New default, median tokens/s |
-| --- | ---: | ---: |
-| 1,024 | 23.23 | 23.62 |
-| 32,768 | 13.21 | 13.74 |
+Model/profile and prompt identities matched. The candidate CUDA payload was
+distinct while eight common native files were unchanged. All accepted cases
+had exactly identical content, selected token IDs and reported selected and
+top-three token IDs/order/log probabilities. The combined result is less than
+1% from attention-only at either length, so it establishes no separate
+whole-model throughput gain for `096`. Its small component results do not
+justify claiming additional model tokens/s.
 
-All generated text, selected token IDs, top-three IDs/order and reported log
-probabilities matched exactly for the new default. Peak process working set was
-about 267 MiB lower and peak private bytes about 127 MiB lower. Whole-device
-VRAM differed by about 3 MiB; it includes unrelated display/driver allocations.
-These short measurements establish no universal speedup or hard process-memory
-limit, and small timing differences can vary between runs and hardware.
-
-The optional grouped-attention path improved these timings further, but its
-whole-model log probabilities differed reproducibly even though greedy text
-matched. The fixed-split component fixture is therefore insufficient evidence
-of whole-model numerical equivalence. This path remains experimental and off;
-it is excluded from the default results above and needs further investigation.
+One attention timing window contained paging and was discarded; its repeated,
+accepted window and every other retained timed window passed the paging checks.
+This does not claim the entire machine was paging-free outside those windows.
+The suite measured performance and recorded probability equivalence, without
+separate functional/tool-call cases. These short measurements establish no
+universal speedup, complete vocabulary-logit equivalence or hard process-memory
+limit. See [resident CUDA kernels](resident-cuda-kernels.md) for activation
+controls, the corrected FP32 partition/reduction order and component results.
 
 Builds and model tests in this workspace use owned process trees with RAM,
 commit-headroom and VRAM guards. Test outputs remain separate from the installed

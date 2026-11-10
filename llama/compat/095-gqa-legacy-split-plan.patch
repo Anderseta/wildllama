@@ -1,0 +1,769 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 504a0d6..da15e2a 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1003,11 +1003,39 @@ static __global__ void flash_attn_combine_results(
+     dst[tid] = VKQ_numerator / VKQ_denominator;
+ }
+ 
++// Preserve the established non-stream-K split policy in one host-only helper.
++// Grouped-head launches may use the legacy per-head planning geometry so KV
++// partitions, accumulator rescaling and merge order remain unchanged.
++inline int ggml_cuda_fattn_parallel_blocks(int ntiles_KV, int ntiles_dst, int nsm, int max_blocks_per_sm) {
++    int parallel_blocks = std::min(max_blocks_per_sm, ntiles_KV);
++    const int blocks_per_wave = nsm * max_blocks_per_sm;
++    int nwaves_best = 0;
++    int efficiency_percent_best = 0;
++    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
++        const int nblocks_total = ntiles_dst * parallel_blocks_test;
++        const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
++        const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
++
++        // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
++        if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
++            break;
++        }
++
++        if (efficiency_percent > efficiency_percent_best) {
++            nwaves_best = nwaves;
++            efficiency_percent_best = efficiency_percent;
++            parallel_blocks = parallel_blocks_test;
++        }
++    }
++    return parallel_blocks;
++}
++
+ template <int DV, int ncols1, int ncols2>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
++    const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
++    const fattn_kernel_t legacy_per_head_kernel = nullptr, const int legacy_per_head_nthreads = 0
+ ) {
+     constexpr int ncols = ncols1 * ncols2;
+ 
+@@ -1161,7 +1189,10 @@ void launch_fattn(
+ 
+     const dim3 block_dim(warp_size, nwarps, 1);
+     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
++    const fattn_kernel_t planning_kernel = !stream_k && legacy_per_head_kernel ? legacy_per_head_kernel : fattn_kernel;
++    const int planning_nthreads = !stream_k && legacy_per_head_kernel && legacy_per_head_nthreads > 0 ?
++        legacy_per_head_nthreads : block_dim.x * block_dim.y * block_dim.z;
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, planning_kernel, planning_nthreads, nbytes_shared));
+     GGML_ASSERT(max_blocks_per_sm > 0);
+     int parallel_blocks = max_blocks_per_sm;
+ 
+@@ -1216,30 +1247,15 @@ void launch_fattn(
+             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+         }
+     } else {
+-        // parallel_blocks must not be larger than what the tensor size allows:
+-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+-
+-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
+-        const int blocks_per_wave = nsm * max_blocks_per_sm;
+-        int nwaves_best = 0;
+-        int efficiency_percent_best = 0;
+-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
+-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+-
+-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+-                break;
+-            }
+-
+-            if (efficiency_percent > efficiency_percent_best) {
+-                nwaves_best = nwaves;
+-                efficiency_percent_best = efficiency_percent;
+-                parallel_blocks = parallel_blocks_test;
+-            }
++        int planning_tiles = ntiles_dst;
++        if (legacy_per_head_kernel) {
++            // Pairing query heads changes occupancy and halves the output tile
++            // count. Reusing those new values would change the KV partitions
++            // and floating-point accumulation/rescaling order, even with the
++            // same per-head math. The occupancy query above uses its reference.
++            planning_tiles = ntiles_x * gqa_ratio * K->ne[2] * Q->ne[3];
+         }
++        parallel_blocks = ggml_cuda_fattn_parallel_blocks(ntiles_KV, planning_tiles, nsm, max_blocks_per_sm);
+ 
+         blocks_num.x = ntiles_x;
+         blocks_num.y = parallel_blocks;
+diff --git a/ggml/src/ggml-cuda/fattn-vec-gqa.h b/ggml/src/ggml-cuda/fattn-vec-gqa.h
+index 234aac8..40ccdb5 100644
+--- a/ggml/src/ggml-cuda/fattn-vec-gqa.h
++++ b/ggml/src/ggml-cuda/fattn-vec-gqa.h
+@@ -21,6 +21,25 @@ inline bool ggml_cuda_fattn_vec_gqa_eligible(bool enabled, const ggml_cuda_fattn
+         s.k_stride >= 8*34 && s.v_stride >= 8*34;
+ }
+ 
++enum class ggml_cuda_fattn_vec_gqa_mode { disabled, automatic, enabled };
++
++inline ggml_cuda_fattn_vec_gqa_mode ggml_cuda_fattn_vec_gqa_parse(const char * value) {
++    if (!value || !value[0]) { return ggml_cuda_fattn_vec_gqa_mode::automatic; }
++    if (value[0] == '1' && !value[1]) { return ggml_cuda_fattn_vec_gqa_mode::enabled; }
++    // Explicit zero and malformed values both retain the legacy path.
++    return ggml_cuda_fattn_vec_gqa_mode::disabled;
++}
++
++inline bool ggml_cuda_fattn_vec_gqa_select(ggml_cuda_fattn_vec_gqa_mode mode, int cc, bool nvidia,
++        const ggml_cuda_fattn_vec_gqa_shape & s) {
++    // Automatic use is limited to the measured SM120 geometry. An explicit
++    // opt-in may use other eligible NVIDIA layouts, with every safety guard.
++    const bool enabled = nvidia && (mode == ggml_cuda_fattn_vec_gqa_mode::enabled ||
++        (mode == ggml_cuda_fattn_vec_gqa_mode::automatic && cc == 1200 &&
++            s.query_heads == 24 && s.kv_heads == 4));
++    return ggml_cuda_fattn_vec_gqa_eligible(enabled, s);
++}
++
+ // Host tests use the exact canonical row mapping written by the kernel. Split-K
+ // metadata and output values must agree so the existing merge stays unchanged.
+ inline size_t ggml_cuda_fattn_vec_gqa_row(int sequence, int query, int head,
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 3c49cdd..fd54958 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -5,12 +5,9 @@
+ #include <cstdlib>
+ #include <atomic>
+ 
+-static bool ggml_cuda_fattn_vec_gqa_enabled() {
+-    static const bool enabled = [] {
+-        const char * value = std::getenv("WILDLLAMA_CUDA_GQA_Q8");
+-        return value && value[0] == '1' && value[1] == '\0';
+-    }();
+-    return enabled;
++static ggml_cuda_fattn_vec_gqa_mode ggml_cuda_fattn_vec_gqa_mode_from_env() {
++    static const auto mode = ggml_cuda_fattn_vec_gqa_parse(std::getenv("WILDLLAMA_CUDA_GQA_Q8"));
++    return mode;
+ }
+ 
+ static void ggml_cuda_fattn_vec_gqa_trace(bool grouped, const ggml_tensor * Q, const ggml_tensor * K) {
+@@ -43,8 +40,9 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wpass-failed"
+ #endif // __clang__
+-template<int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
++template<int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap,
++        int parallel_head_groups = 1> // D == head size
++__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device()*parallel_head_groups, 1)
+ static __global__ void flash_attn_ext_vec(
+         const char * Q_ptr,
+         const char * K_ptr,
+@@ -74,7 +72,7 @@ static __global__ void flash_attn_ext_vec(
+     const char * GGML_CUDA_RESTRICT K        = K_ptr;
+     const char * GGML_CUDA_RESTRICT V        = V_ptr;
+     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
+-    const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
++    const char * GGML_CUDA_RESTRICT sinks    = parallel_head_groups > 1 ? nullptr : sinks_ptr;
+     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+@@ -112,6 +110,7 @@ static __global__ void flash_attn_ext_vec(
+ #endif // GGML_USE_HIP
+ 
+     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
++    constexpr int nwarps      = nthreads / WARP_SIZE;
+     constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
+     constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
+ 
+@@ -129,35 +128,50 @@ static __global__ void flash_attn_ext_vec(
+     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+ #endif // V_DOT2_F32_F16_AVAILABLE
+ 
+-    const int ic0 = blockIdx.x * ncols1; // First token column, independent of grouped heads.
+-
+-    const int head_groups = ne02/ncols2;
+-    const int sequence = blockIdx.z / head_groups;
+-    const int head = (blockIdx.z - sequence*head_groups)*ncols2;
++    const int ic0 = parallel_head_groups > 1 ? 0 : blockIdx.x * ncols1;
++
++    int warp_id = threadIdx.y;
++    int parallel_head = 0;
++    if constexpr (parallel_head_groups > 1) {
++        static_assert(parallel_head_groups == 2 && ncols1 == 1 && ncols2 == 1,
++            "parallel head groups require single-head single-query math");
++        parallel_head = threadIdx.y / nwarps;
++        warp_id = threadIdx.y % nwarps;
++        // The host gate admits only one query/sequence, a dense nonnull mask,
++        // no sinks and zero ALiBi bias. Other specializations keep the generic
++        // indexing/branches and their existing floating-point operations.
++        __builtin_assume(mask != nullptr);
++    }
++    const int head_groups = ne02/(ncols2*parallel_head_groups);
++    const int sequence = parallel_head_groups > 1 ? 0 : blockIdx.z / head_groups;
++    const int head = (blockIdx.z - sequence*head_groups)*(ncols2*parallel_head_groups) + parallel_head*ncols2;
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+     Q += nb03*sequence + nb02* head              + nb01*ic0;
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+     V += nb23*sequence + nb22*(head / gqa_ratio);
+ 
+-    const bool compact_mask=nb31<0;
+-    const half * mask_base=mask ? (const half *)(mask+nb33*(sequence%ne33)) : nullptr;
+-    const half * maskh=compact_mask ? mask_base : (mask ? (const half *)((const char *)mask_base+nb31*ic0) : nullptr);
++    const bool compact_mask=parallel_head_groups > 1 ? false : nb31<0;
++    const half * mask_base=parallel_head_groups > 1 ? (const half *)mask :
++        (mask ? (const half *)(mask+nb33*(sequence%ne33)) : nullptr);
++    const half * maskh=parallel_head_groups > 1 ? mask_base :
++        (compact_mask ? mask_base : (mask ? (const half *)((const char *)mask_base+nb31*ic0) : nullptr));
+ 
+-    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
++    const float slope = parallel_head_groups > 1 ? 1.0f : get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+ 
+     static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
+-    constexpr int nwarps = nthreads / WARP_SIZE;
+-    const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
++    const int tid = WARP_SIZE*warp_id + threadIdx.x;
+     __builtin_assume(tid < nthreads);
+ 
+     constexpr int ne_KQ      = ncols*D;
+     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
+-    __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
++    __shared__ half   KQ_storage[parallel_head_groups][ne_KQ > ne_combine ? ne_KQ : ne_combine];
++    half * KQ = KQ_storage[parallel_head];
+ #else
+     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
+-    __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
++    __shared__ float  KQ_storage[parallel_head_groups][ne_KQ > ne_combine ? ne_KQ : ne_combine];
++    float * KQ = KQ_storage[parallel_head];
+ #endif // V_DOT2_F32_F16_AVAILABLE
+ 
+     float KQ_max[ncols];
+@@ -181,7 +195,7 @@ static __global__ void flash_attn_ext_vec(
+     if constexpr (Q_q8_1) {
+ #pragma unroll
+         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+-            const int j = j0 + threadIdx.y;
++            const int j = j0 + warp_id;
+ 
+             if (j0 + nwarps > ncols && j >= ncols) {
+                 break;
+@@ -297,7 +311,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+-            const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
++            const int i_KQ = warp_id*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+ 
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
+@@ -353,7 +367,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
+-            const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
++            const int k = warp_id*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
+ 
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+             half2 KQ_k[ncols];
+@@ -415,7 +429,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+-            const int j = j0 + threadIdx.y;
++            const int j = j0 + warp_id;
+ 
+             if (j0 + nwarps > ncols && j >= ncols) {
+                 break;
+@@ -443,11 +457,13 @@ static __global__ void flash_attn_ext_vec(
+         }
+     }
+ 
+-    __shared__ float KQ_max_shared[ncols][WARP_SIZE];
+-    __shared__ float KQ_sum_shared[ncols][WARP_SIZE];
++    __shared__ float KQ_max_storage[parallel_head_groups][ncols][WARP_SIZE];
++    __shared__ float KQ_sum_storage[parallel_head_groups][ncols][WARP_SIZE];
++    auto & KQ_max_shared = KQ_max_storage[parallel_head];
++    auto & KQ_sum_shared = KQ_sum_storage[parallel_head];
+ #pragma unroll
+     for (int j = 0; j < ncols; ++j) {
+-        if (threadIdx.y == 0) {
++        if (warp_id == 0) {
+             KQ_max_shared[j][threadIdx.x] = -FLT_MAX/2.0f;
+             KQ_sum_shared[j][threadIdx.x] = 0.0f;
+         }
+@@ -458,7 +474,7 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+     for (int j = 0; j < ncols; ++j) {
+         if (threadIdx.x == 0) {
+-            KQ_max_shared[j][threadIdx.y] = KQ_max[j];
++            KQ_max_shared[j][warp_id] = KQ_max[j];
+         }
+     }
+     __syncthreads();
+@@ -475,7 +491,7 @@ static __global__ void flash_attn_ext_vec(
+         KQ_max[j_VKQ] = kqmax_new;
+ 
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+-        half2 * VKQ_tmp = (half2 *) KQ + threadIdx.y*(V_cols_per_iter*D/2)
++        half2 * VKQ_tmp = (half2 *) KQ + warp_id*(V_cols_per_iter*D/2)
+             + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V)*(D/2);
+ 
+         const half2 kqmax_scale_h2 = make_half2(kqmax_scale, kqmax_scale);
+@@ -490,7 +506,7 @@ static __global__ void flash_attn_ext_vec(
+             ggml_cuda_memcpy_1<V_rows_per_thread*sizeof(half)>(VKQ_tmp + i_VKQ, &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
+         }
+ #else
+-        float2 * VKQ_tmp = (float2 *) KQ + threadIdx.y*(V_cols_per_iter*D/2)
++        float2 * VKQ_tmp = (float2 *) KQ + warp_id*(V_cols_per_iter*D/2)
+             + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V)*(D/2);
+ 
+ #pragma unroll
+@@ -510,7 +526,7 @@ static __global__ void flash_attn_ext_vec(
+         KQ_sum[j_VKQ] *= kqmax_scale;
+         KQ_sum[j_VKQ] = warp_reduce_sum(KQ_sum[j_VKQ]);
+         if (threadIdx.x == 0) {
+-            KQ_sum_shared[j_VKQ][threadIdx.y] = KQ_sum[j_VKQ];
++            KQ_sum_shared[j_VKQ][warp_id] = KQ_sum[j_VKQ];
+         }
+ 
+         __syncthreads();
+@@ -562,17 +578,26 @@ static __global__ void flash_attn_ext_vec(
+ #pragma clang diagnostic pop
+ #endif // __clang__
+ 
+-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int heads_per_block = 1>
++template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap,
++        int heads_per_block = 1, int parallel_head_groups = 1>
+ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
+     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
+-    const int nwarps   = nthreads / WARP_SIZE;
+-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, heads_per_block, type_K, type_V, use_logit_softcap>;
++    const int nwarps   = (nthreads / WARP_SIZE)*parallel_head_groups;
++    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, heads_per_block, type_K, type_V, use_logit_softcap, parallel_head_groups>;
+     const bool need_f16_K = type_K == GGML_TYPE_F16;
+     const bool need_f16_V = type_V == GGML_TYPE_F16;
+     constexpr size_t nbytes_shared = 0;
+-    launch_fattn<D, cols_per_block, heads_per_block>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
++    if constexpr (heads_per_block*parallel_head_groups == 1) {
++        launch_fattn<D, cols_per_block, heads_per_block>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
++    } else {
++        static_assert(heads_per_block*parallel_head_groups == 2 && cols_per_block == 1,
++            "paired vector decode requires single-query tiles");
++        fattn_kernel_t legacy_per_head_kernel = flash_attn_ext_vec<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>;
++        launch_fattn<D, cols_per_block, heads_per_block*parallel_head_groups>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D,
++            need_f16_K, need_f16_V, false, false, WARP_SIZE, false, legacy_per_head_kernel, nthreads);
++    }
+ }
+ 
+ template <int D, ggml_type type_K, ggml_type type_V>
+@@ -601,11 +626,11 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+                 mask->nb[0] == sizeof(half),
+             dst->src[4] != nullptr, max_bias, logit_softcap};
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-        const bool grouped = ggml_cuda_fattn_vec_gqa_eligible(
+-            ggml_cuda_fattn_vec_gqa_enabled() && GGML_CUDA_CC_IS_NVIDIA(cc), shape);
++        const bool grouped = ggml_cuda_fattn_vec_gqa_select(
++            ggml_cuda_fattn_vec_gqa_mode_from_env(), cc, GGML_CUDA_CC_IS_NVIDIA(cc), shape);
+         ggml_cuda_fattn_vec_gqa_trace(grouped, Q, K);
+         if (grouped) {
+-            ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, false, 2>(ctx, dst);
++            ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, false, 1, 2>(ctx, dst);
+             return;
+         }
+     }
+diff --git a/tests/test-cuda-fattn-gqa-launch.cu b/tests/test-cuda-fattn-gqa-launch.cu
+new file mode 100644
+index 0000000..dbf2099
+--- /dev/null
++++ b/tests/test-cuda-fattn-gqa-launch.cu
+@@ -0,0 +1,313 @@
++// Unlike the fixed-split fixture, use the production split selector and actual
++// CUDA occupancy. Reuse the exact production kernels and existing merge runner.
++#define main fixed_split_fixture_main
++#include "test-cuda-fattn-vec-gqa.cu"
++#undef main
++
++#include <cstdint>
++#include <limits>
++
++static uint32_t next_random(uint32_t & state) {
++    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++    return state;
++}
++
++struct difference {
++    size_t different_bits = 0;
++    float max_absolute = 0, max_relative = 0;
++    int changed_head_argmax = 0;
++};
++
++static difference compare_attention(const std::vector<float> & reference, const std::vector<float> & actual) {
++    require(reference.size() == actual.size(), "attention comparison shape mismatch");
++    difference result;
++    for (size_t i = 0; i < reference.size(); ++i) {
++        require(std::isfinite(reference[i]) && std::isfinite(actual[i]), "nonfinite attention output");
++        uint32_t a, b;
++        std::memcpy(&a, &reference[i], sizeof(a)); std::memcpy(&b, &actual[i], sizeof(b));
++        result.different_bits += a != b;
++        const float error = std::abs(reference[i]-actual[i]);
++        result.max_absolute = std::max(result.max_absolute, error);
++        result.max_relative = std::max(result.max_relative, error/std::max(std::abs(reference[i]), 1e-20f));
++    }
++    for (size_t start = 0; start < reference.size(); start += 256) {
++        const auto a = std::max_element(reference.begin()+start, reference.begin()+start+256)-reference.begin();
++        const auto b = std::max_element(actual.begin()+start, actual.begin()+start+256)-actual.begin();
++        result.changed_head_argmax += a != b;
++    }
++    return result;
++}
++
++static void print_difference(const char * name, const difference & value) {
++    std::printf(" %s_bits=%zu %s_max_abs=%.9g %s_max_rel=%.9g %s_changed_head_argmax=%d",
++        name,value.different_bits,name,double(value.max_absolute),name,double(value.max_relative),
++        name,value.changed_head_argmax);
++}
++
++static bool production_geometry_case(int tokens, int pattern, bool padded, int nsm, int legacy_occupancy,
++        int pair_occupancy, int parallel_occupancy, uint32_t seed, int heads = 24, int kv_heads = 4) {
++    constexpr int dimension = 256;
++    require(heads > 0 && kv_heads > 0 && heads % (2*kv_heads) == 0, "fixture requires even grouped-query ratio");
++    const int q_stride = dimension + (padded ? 16 : 0);
++    const int kv_stride = dimension/32 + (padded ? 2 : 0);
++    // Live KV views may expose fewer rows than the allocated per-head pitch.
++    const int pitch_rows = padded ? ((tokens+8191)/8192)*8192+7 : tokens;
++    const int head_stride = pitch_rows*kv_stride;
++    const int visible = padded ? tokens-37 : tokens;
++    const int kv_max = ((visible+255)/256)*256;
++    const size_t host_bytes = size_t(heads)*q_stride*sizeof(float) +
++        2*size_t(kv_heads)*head_stride*sizeof(block_q8_0) + size_t(tokens)*sizeof(half);
++    require(host_bytes < 256*1024*1024, "fixture host inputs exceed 256 MiB");
++    std::vector<float> q(size_t(heads)*q_stride, 1234);
++    std::vector<block_q8_0> k(size_t(kv_heads)*head_stride), v(k.size());
++    std::vector<half> mask(tokens);
++    uint32_t random = seed;
++    for (int head = 0; head < heads; ++head) {
++        for (int d = 0; d < dimension; ++d) {
++            const float value = pattern == 0 ? std::sin(float(13*head+d)*.031f) :
++                (int(next_random(random)%20001)-10000)/10000.0f;
++            q[head*q_stride+d] = pattern == 2 ? std::ldexp(value, (head+d)%5-3) : value;
++        }
++    }
++    for (int head = 0; head < kv_heads; ++head) {
++        for (int row = 0; row < tokens; ++row) {
++            for (int b = 0; b < dimension/32; ++b) {
++                const size_t index = size_t(head)*head_stride + row*kv_stride+b;
++                const half ks = __float2half(pattern == 2 ? std::ldexp(1.0f, int(next_random(random)%5)-8) : .003f+.0001f*((row+head+b)%11));
++                const half vs = __float2half(pattern == 2 ? std::ldexp(1.0f, int(next_random(random)%15)-12) : .003f+.0001f*((row+head+b)%11));
++                std::memcpy(&k[index].d,&ks,sizeof(ks)); std::memcpy(&v[index].d,&vs,sizeof(vs));
++                for (int d = 0; d < 32; ++d) {
++                    k[index].qs[d] = pattern == 0 ? int8_t((row*7+head*13+b*3+d*11)%127-63) : int8_t(int(next_random(random)%255)-127);
++                    v[index].qs[d] = pattern == 0 ? int8_t((row*3+head*19+b*17+d*5)%125-62) : int8_t(int(next_random(random)%255)-127);
++                }
++            }
++        }
++    }
++    for (int row = 0; row < tokens; ++row) {
++        const bool hidden = row >= visible || (pattern && row > 0 && next_random(random)%31 == 0);
++        mask[row] = __float2half(hidden ? -INFINITY : 0.0f);
++    }
++    // Production vec wrapper passes nbatch_fa=D, ncols1=1 and ncols2=1/2.
++    const int tiles_kv = (tokens+dimension-1)/dimension;
++    const int legacy_splits = ggml_cuda_fattn_parallel_blocks(tiles_kv, heads, nsm, legacy_occupancy);
++    const int old_pair_splits = ggml_cuda_fattn_parallel_blocks(tiles_kv, heads/2, nsm, pair_occupancy);
++    const int reference_pair_splits = ggml_cuda_fattn_parallel_blocks(tiles_kv, heads, nsm, legacy_occupancy);
++    require(legacy_splits > 0 && old_pair_splits > 0 && reference_pair_splits == legacy_splits,
++        "production reference split policy changed");
++    const auto legacy = run<1>(q,k,v,mask,heads,kv_heads,tokens,legacy_splits,q_stride,kv_stride,head_stride,kv_max);
++    const auto old_pair = run<2>(q,k,v,mask,heads,kv_heads,tokens,old_pair_splits,q_stride,kv_stride,head_stride,kv_max);
++    const auto reference_pair = run<2>(q,k,v,mask,heads,kv_heads,tokens,reference_pair_splits,q_stride,kv_stride,head_stride,kv_max);
++    const auto parallel_pair = run<1,2>(q,k,v,mask,heads,kv_heads,tokens,reference_pair_splits,q_stride,kv_stride,head_stride,kv_max);
++    const auto previous = compare_attention(legacy,old_pair), corrected = compare_attention(legacy,reference_pair);
++    const auto parallel = compare_attention(legacy,parallel_pair);
++    std::printf("GQA_PRODUCTION_PLAN tokens=%d q_heads=%d kv_heads=%d D=256 pattern=%d padded=%d seed=%u sms=%d legacy_occupancy=%d pair_occupancy=%d parallel_occupancy=%d legacy_splits=%d previous_pair_splits=%d corrected_pair_splits=%d host_input_bytes=%zu",
++        tokens,heads,kv_heads,pattern,int(padded),seed,nsm,legacy_occupancy,pair_occupancy,parallel_occupancy,legacy_splits,old_pair_splits,reference_pair_splits,host_bytes);
++    print_difference("previous",previous); print_difference("corrected",corrected); print_difference("parallel",parallel); std::puts("");
++    require(corrected.different_bits == 0, "legacy-reference pair differs bitwise from baseline");
++    require(parallel.different_bits == 0, "parallel warp-group pair differs bitwise from baseline");
++    return previous.different_bits != 0;
++}
++
++// Captured event nodes bracket a batch of kernel/merge launches on the device.
++// Host scheduling delays, allocation, copies and graph creation are not timed.
++struct benchmark_graph {
++    cudaGraph_t graph = nullptr;
++    cudaGraphExec_t executable = nullptr;
++    cudaEvent_t begin = nullptr, end = nullptr;
++    ~benchmark_graph() {
++        if (executable) { cudaGraphExecDestroy(executable); }
++        if (graph) { cudaGraphDestroy(graph); }
++        if (begin) { cudaEventDestroy(begin); }
++        if (end) { cudaEventDestroy(end); }
++    }
++    float measure(cudaStream_t stream, int repetitions) {
++        CUDA_CHECK(cudaGraphLaunch(executable,stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        float milliseconds = 0;
++        CUDA_CHECK(cudaEventElapsedTime(&milliseconds,begin,end));
++        require(std::isfinite(milliseconds) && milliseconds > 0, "invalid GPU event timing");
++        return milliseconds/repetitions;
++    }
++};
++
++struct benchmark_inputs {
++    static constexpr int heads = 24, kv_heads = 4, dimension = 256;
++    int tokens, splits;
++    cudaStream_t stream = nullptr;
++    device_buffer<float> q, output, final;
++    device_buffer<block_q8_0> k, v;
++    device_buffer<half> mask;
++    device_buffer<float2> meta;
++    device_buffer<int> max_rows;
++
++    benchmark_inputs(int rows, int partitions) : tokens(rows), splits(partitions), q(heads*dimension),
++        output(size_t(heads)*dimension*splits), final(heads*dimension),
++        k(size_t(kv_heads)*tokens*(dimension/32)), v(size_t(kv_heads)*tokens*(dimension/32)),
++        mask(tokens), meta(size_t(heads)*splits), max_rows(1) {
++        const size_t input_bytes = size_t(heads)*dimension*sizeof(float) +
++            2*size_t(kv_heads)*tokens*(dimension/32)*sizeof(block_q8_0) + size_t(tokens)*sizeof(half);
++        require(input_bytes < 256*1024*1024, "benchmark inputs exceed 256 MiB");
++        CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++        std::vector<float> host_q(heads*dimension);
++        std::vector<block_q8_0> host_k(size_t(kv_heads)*tokens*(dimension/32)), host_v(host_k.size());
++        std::vector<half> host_mask(tokens);
++        uint32_t random = 7331;
++        for (auto & value : host_q) { value = (int(next_random(random)%20001)-10000)/10000.0f; }
++        for (size_t i = 0; i < host_k.size(); ++i) {
++            const half scale = __float2half(.003f+.0001f*(i%11));
++            std::memcpy(&host_k[i].d,&scale,sizeof(scale)); std::memcpy(&host_v[i].d,&scale,sizeof(scale));
++            for (int d = 0; d < 32; ++d) {
++                host_k[i].qs[d] = int8_t(int(next_random(random)%255)-127);
++                host_v[i].qs[d] = int8_t(int(next_random(random)%255)-127);
++            }
++        }
++        for (int row = 0; row < tokens; ++row) {
++            host_mask[row] = __float2half(row >= tokens-37 || (row > 0 && row%31 == 0) ? -INFINITY : 0.0f);
++        }
++        CUDA_CHECK(cudaMemcpy(q.data,host_q.data(),host_q.size()*sizeof(float),cudaMemcpyHostToDevice));
++        CUDA_CHECK(cudaMemcpy(k.data,host_k.data(),host_k.size()*sizeof(block_q8_0),cudaMemcpyHostToDevice));
++        CUDA_CHECK(cudaMemcpy(v.data,host_v.data(),host_v.size()*sizeof(block_q8_0),cudaMemcpyHostToDevice));
++        CUDA_CHECK(cudaMemcpy(mask.data,host_mask.data(),host_mask.size()*sizeof(half),cudaMemcpyHostToDevice));
++        CUDA_CHECK(cudaMemcpy(max_rows.data,&tokens,sizeof(tokens),cudaMemcpyHostToDevice));
++    }
++    ~benchmark_inputs() { if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
++
++    template<int group, int parallel_groups = 1> void launch() {
++        const int row_bytes = (dimension/32)*sizeof(block_q8_0), head_bytes = tokens*row_bytes;
++        flash_attn_ext_vec<dimension,1,group,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false,parallel_groups><<<dim3(1,splits,heads/(group*parallel_groups)),dim3(32,4*parallel_groups,1),0,stream>>>(
++            (const char *)q.data,(const char *)k.data,(const char *)v.data,(const char *)mask.data,
++            nullptr,max_rows.data,output.data,meta.data,1.0f/16,0,1,1,1,0,
++            dimension,init_fastdiv_values(1),heads,1,dimension*sizeof(float),dimension*sizeof(float),heads*dimension*sizeof(float),
++            dimension,tokens,kv_heads,1,row_bytes,head_bytes,int64_t(kv_heads)*head_bytes,
++            row_bytes,head_bytes,int64_t(kv_heads)*head_bytes,tokens,1,1,tokens*sizeof(half),tokens*sizeof(half),tokens*sizeof(half));
++        CUDA_CHECK(cudaGetLastError());
++        if (splits > 1) {
++            flash_attn_combine_results<dimension><<<dim3(1,heads,1),dim3(dimension,1,1),splits*sizeof(float2),stream>>>(
++                output.data,meta.data,final.data,splits);
++            CUDA_CHECK(cudaGetLastError());
++        }
++    }
++    std::vector<float> download() {
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        std::vector<float> values(heads*dimension);
++        CUDA_CHECK(cudaMemcpy(values.data(),splits > 1 ? final.data : output.data,values.size()*sizeof(float),cudaMemcpyDeviceToHost));
++        return values;
++    }
++    template<int group, int parallel_groups = 1> void capture(benchmark_graph & result, int repetitions) {
++        CUDA_CHECK(cudaEventCreate(&result.begin)); CUDA_CHECK(cudaEventCreate(&result.end));
++        CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
++        CUDA_CHECK(cudaEventRecordWithFlags(result.begin,stream,cudaEventRecordExternal));
++        for (int i = 0; i < repetitions; ++i) { launch<group,parallel_groups>(); }
++        CUDA_CHECK(cudaEventRecordWithFlags(result.end,stream,cudaEventRecordExternal));
++        CUDA_CHECK(cudaStreamEndCapture(stream,&result.graph));
++        CUDA_CHECK(cudaGraphInstantiate(&result.executable,result.graph,nullptr,nullptr,0));
++    }
++};
++
++static float median(std::vector<float> values) {
++    std::sort(values.begin(),values.end());
++    return (values[values.size()/2-1]+values[values.size()/2])*.5f;
++}
++
++static void benchmark(int tokens, int nsm, int legacy_occupancy) {
++    constexpr int batch = 32, pairs = 12, warmups = 3;
++    const int splits = ggml_cuda_fattn_parallel_blocks((tokens+255)/256,24,nsm,legacy_occupancy);
++    benchmark_inputs inputs(tokens,splits);
++    inputs.launch<1>(); const auto reference = inputs.download();
++    inputs.launch<2>(); require(compare_attention(reference,inputs.download()).different_bits == 0,
++        "benchmark pair changed reference output");
++    inputs.launch<1,2>(); require(compare_attention(reference,inputs.download()).different_bits == 0,
++        "benchmark parallel warp-group pair changed reference output");
++    benchmark_graph legacy, pair, parallel;
++    inputs.capture<1>(legacy,batch); inputs.capture<2>(pair,batch); inputs.capture<1,2>(parallel,batch);
++    for (int i = 0; i < warmups; ++i) {
++        legacy.measure(inputs.stream,batch); pair.measure(inputs.stream,batch); parallel.measure(inputs.stream,batch);
++    }
++    std::vector<float> legacy_ms, pair_ms, parallel_ms;
++    int pair_wins = 0, parallel_wins = 0;
++    const int orders[6][3] = {{0,1,2},{2,1,0},{1,2,0},{0,2,1},{2,0,1},{1,0,2}};
++    benchmark_graph * graphs[] = {&legacy,&pair,&parallel};
++    for (int i = 0; i < pairs; ++i) {
++        float samples[3];
++        for (int position : orders[i%6]) { samples[position]=graphs[position]->measure(inputs.stream,batch); }
++        legacy_ms.push_back(samples[0]); pair_ms.push_back(samples[1]); parallel_ms.push_back(samples[2]);
++        pair_wins += samples[1]<samples[0]; parallel_wins += samples[2]<samples[0];
++    }
++    const float a=median(legacy_ms),b=median(pair_ms),c=median(parallel_ms);
++    std::printf("GQA_GPU_EVENTS tokens=%d q_heads=24 kv_heads=4 splits=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g parallel_ms=%.9g parallel_speedup=%.6g parallel_wins=%d parallel_min_ms=%.9g parallel_max_ms=%.9g comparison_order=balanced_six_permutations timing_scope=kernel_plus_canonical_merge excludes=allocation_copy_capture_host_scheduling\n",
++        tokens,splits,batch,pairs,warmups,double(a),double(b),double(a/b),pair_wins,
++        double(*std::min_element(legacy_ms.begin(),legacy_ms.end())),double(*std::max_element(legacy_ms.begin(),legacy_ms.end())),
++        double(*std::min_element(pair_ms.begin(),pair_ms.end())),double(*std::max_element(pair_ms.begin(),pair_ms.end())),
++        double(c),double(a/c),parallel_wins,double(*std::min_element(parallel_ms.begin(),parallel_ms.end())),
++        double(*std::max_element(parallel_ms.begin(),parallel_ms.end())));
++}
++
++int main(int argc, char ** argv) {
++    try {
++        bool measure = false, require_drift = false;
++        for (int i = 1; i < argc; ++i) {
++            const std::string argument = argv[i];
++            if (argument == "--benchmark" && !measure) { measure = true; }
++            else if (argument == "--require-drift" && !require_drift) { require_drift = true; }
++            else { throw std::runtime_error("Usage: test-cuda-fattn-gqa-launch [--benchmark] [--require-drift]"); }
++        }
++        int devices = 0;
++        const auto status = cudaGetDeviceCount(&devices);
++        if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver || (status == cudaSuccess && !devices)) {
++            std::puts("SKIP: no CUDA device/driver available"); return 77;
++        }
++        CUDA_CHECK(status);
++        cudaDeviceProp properties{};
++        int device; CUDA_CHECK(cudaGetDevice(&device)); CUDA_CHECK(cudaGetDeviceProperties(&properties,device));
++        int legacy_occupancy = 0, pair_occupancy = 0, parallel_occupancy = 0;
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&legacy_occupancy,
++            flash_attn_ext_vec<256,1,1,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false>,128,0));
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&pair_occupancy,
++            flash_attn_ext_vec<256,1,2,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false>,128,0));
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&parallel_occupancy,
++            flash_attn_ext_vec<256,1,1,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false,2>,256,0));
++        cudaFuncAttributes legacy_attributes{},pair_attributes{},parallel_attributes{};
++        CUDA_CHECK(cudaFuncGetAttributes(&legacy_attributes,flash_attn_ext_vec<256,1,1,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false>));
++        CUDA_CHECK(cudaFuncGetAttributes(&pair_attributes,flash_attn_ext_vec<256,1,2,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false>));
++        CUDA_CHECK(cudaFuncGetAttributes(&parallel_attributes,flash_attn_ext_vec<256,1,1,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false,2>));
++        const auto print_attributes = [](const char * name, const cudaFuncAttributes & value) {
++            std::printf("GQA_KERNEL_ATTR kernel=%s registers_per_thread=%d static_smem_bytes=%zu local_bytes=%zu max_threads_per_block=%d binary_version=%d ptx_version=%d\n",
++                name,value.numRegs,value.sharedSizeBytes,value.localSizeBytes,value.maxThreadsPerBlock,value.binaryVersion,value.ptxVersion);
++        };
++        print_attributes("legacy128",legacy_attributes); print_attributes("pair128",pair_attributes);
++        print_attributes("parallel256",parallel_attributes);
++        std::printf("GQA_DEVICE_ATTR sms=%d registers_per_sm=%d max_threads_per_sm=%d shared_bytes_per_sm=%zu\n",
++            properties.multiProcessorCount,properties.regsPerMultiprocessor,properties.maxThreadsPerMultiProcessor,properties.sharedMemPerMultiprocessor);
++        require(legacy_occupancy > 0 && pair_occupancy > 0 && parallel_occupancy > 0, "invalid production occupancy");
++        int cases = 0, previous_drift_cases = 0;
++        for (int tokens : {1280,33024}) {
++            for (int pattern : {0,1,2}) {
++                for (bool padded : {false,true}) {
++                    previous_drift_cases += production_geometry_case(tokens,pattern,padded,properties.multiProcessorCount,
++                        legacy_occupancy,pair_occupancy,parallel_occupancy,pattern == 0 ? 42u : 8675309u+pattern);
++                    ++cases;
++                }
++            }
++        }
++        // Cover every head geometry from the original fixed-split fixture,
++        // including early decode lengths below one full occupancy wave.
++        const std::pair<int,int> shapes[] = {{4,1},{6,1},{8,2},{12,2}};
++        for (const auto & shape : shapes) {
++            for (int tokens : {256,512,768,1024}) {
++                for (int pattern : {0,1,2}) {
++                    for (bool padded : {false,true}) {
++                        previous_drift_cases += production_geometry_case(tokens,pattern,padded,properties.multiProcessorCount,
++                            legacy_occupancy,pair_occupancy,parallel_occupancy,8675309u+pattern,shape.first,shape.second);
++                        ++cases;
++                    }
++                }
++            }
++        }
++        if (require_drift) {
++            require(previous_drift_cases > 0, "negative control did not reproduce prior automatic-split drift on this GPU");
++        }
++        std::printf("PASS production GQA planner cases=%d previous_drift_cases=%d corrected_bitwise=1 require_drift=%d\n",cases,previous_drift_cases,int(require_drift));
++        if (measure) { for (int tokens : {256,512,1024,1280,8192,33024,65536}) { benchmark(tokens,properties.multiProcessorCount,legacy_occupancy); } }
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}
+diff --git a/tests/test-cuda-fattn-vec-gqa.cu b/tests/test-cuda-fattn-vec-gqa.cu
+index 11be1ab..067d6e5 100644
+--- a/tests/test-cuda-fattn-vec-gqa.cu
++++ b/tests/test-cuda-fattn-vec-gqa.cu
+@@ -30,7 +30,7 @@ static void require(bool value, const char * message) {
+     if (!value) { throw std::runtime_error(message); }
+ }
+ 
+-template<int heads_per_block>
++template<int heads_per_block, int parallel_head_groups = 1>
+ static std::vector<float> run(const std::vector<float> & q, const std::vector<block_q8_0> & k,
+         const std::vector<block_q8_0> & v, const std::vector<half> & mask,
+         int heads, int kv_heads, int tokens, int splits, int q_stride, int kv_stride,
+@@ -49,8 +49,8 @@ static std::vector<float> run(const std::vector<float> & q, const std::vector<bl
+     CUDA_CHECK(cudaMemset(meta.data, 0xff, size_t(heads)*splits*sizeof(float2)));
+     const int row_bytes = kv_stride*sizeof(block_q8_0);
+     const int head_bytes = head_stride*sizeof(block_q8_0);
+-    const dim3 grid(1, splits, heads/heads_per_block), block(32, 4, 1);
+-    flash_attn_ext_vec<256, 1, heads_per_block, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false><<<grid, block>>>(
++    const dim3 grid(1, splits, heads/(heads_per_block*parallel_head_groups)), block(32, 4*parallel_head_groups, 1);
++    flash_attn_ext_vec<256, 1, heads_per_block, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, parallel_head_groups><<<grid, block>>>(
+         (const char *)dq.data, (const char *)dk.data, (const char *)dv.data, (const char *)dm.data,
+         nullptr, max_rows.data, output.data, meta.data,
+         1.0f/16, 0, 1, 1, 1, 0,
+diff --git a/tests/test-fattn-vec-gqa.cpp b/tests/test-fattn-vec-gqa.cpp
+index c666447..8b8e120 100644
+--- a/tests/test-fattn-vec-gqa.cpp
++++ b/tests/test-fattn-vec-gqa.cpp
+@@ -13,7 +13,29 @@ int main() {
+         const ggml_cuda_fattn_vec_gqa_shape good{
+             256, 1, 8, 2, 1, 1024, 1024, 272, 272, true, true, true, false, 0, 0};
+         require(ggml_cuda_fattn_vec_gqa_eligible(true, good), "supported pair layout rejected");
+-        require(!ggml_cuda_fattn_vec_gqa_eligible(false, good), "default unexpectedly enabled");
++        require(!ggml_cuda_fattn_vec_gqa_eligible(false, good), "explicit disable unexpectedly enabled");
++        auto measured = good; measured.query_heads = 24; measured.kv_heads = 4;
++        const auto use = [](const char * value, int cc, bool nvidia, const ggml_cuda_fattn_vec_gqa_shape & shape) {
++            return ggml_cuda_fattn_vec_gqa_select(ggml_cuda_fattn_vec_gqa_parse(value),cc,nvidia,shape);
++        };
++        for (const char * value : {static_cast<const char *>(nullptr), ""}) {
++            require(use(value,1200,true,measured), "measured automatic geometry rejected");
++            require(!use(value,1200,true,good), "unmeasured automatic head geometry enabled");
++            auto other_heads = measured; other_heads.query_heads = 48;
++            require(!use(value,1200,true,other_heads), "unmeasured query head count enabled");
++            auto other_kv = measured; other_kv.kv_heads = 2;
++            require(!use(value,1200,true,other_kv), "unmeasured KV head count enabled");
++            require(!use(value,1200,false,measured), "non-NVIDIA automatic use enabled");
++            for (int cc : {750,800,860,890,900,1000,1210}) {
++                require(!use(value,cc,true,measured), "unmeasured automatic GPU enabled");
++            }
++        }
++        for (const char * value : {"0","2","true","auto","01","10","1 "," 1","-1"}) {
++            require(!use(value,1200,true,measured), "disabled or malformed policy enabled");
++        }
++        require(use("1",1200,true,measured), "explicit measured opt-in rejected");
++        require(use("1",890,true,good), "explicit eligible NVIDIA opt-in rejected");
++        require(!use("1",1200,false,measured), "explicit non-NVIDIA opt-in admitted");
+         for (int field = 0; field < 15; ++field) {
+             auto bad = good;
+             switch (field) {
+@@ -34,9 +56,16 @@ int main() {
+                 case 14: bad.max_bias = 1; break;
+             }
+             require(!ggml_cuda_fattn_vec_gqa_eligible(true, bad), "unsupported pair layout admitted");
++            require(!use("1",1200,true,bad), "explicit policy bypassed layout guard");
++            auto bad_measured = bad; bad_measured.query_heads = 24; bad_measured.kv_heads = 4;
++            if (field != 3 && field != 4 && field != 5) {
++                require(!use(nullptr,1200,true,bad_measured), "automatic policy bypassed layout guard");
++            }
+         }
+         auto softcap = good; softcap.softcap = 1;
+         require(!ggml_cuda_fattn_vec_gqa_eligible(true, softcap), "softcap admitted");
++        measured.softcap = 1;
++        require(!use(nullptr,1200,true,measured), "automatic policy admitted softcap");
+ 
+         size_t checked = 0;
+         for (int heads : {2, 4, 6, 8, 12, 16, 32}) {

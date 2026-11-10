@@ -227,19 +227,30 @@ if(TARGET ggml-cuda)
     # ggml enables CUDA in its own directory; load the parent-scope rules too.
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    add_executable(test-cuda-fattn-vec-gqa "${WILDLLAMA_NATIVE}/tests/test-cuda-fattn-vec-gqa.cu")
-    target_include_directories(test-cuda-fattn-vec-gqa PRIVATE
-        "${WILDLLAMA_NATIVE}/ggml/include" "${WILDLLAMA_NATIVE}/ggml/src")
-    target_compile_features(test-cuda-fattn-vec-gqa PRIVATE cxx_std_17)
-    set_target_properties(test-cuda-fattn-vec-gqa PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     get_target_property(_gqa_cuda_architectures ggml-cuda CUDA_ARCHITECTURES)
-    set_target_properties(test-cuda-fattn-vec-gqa PROPERTIES CUDA_ARCHITECTURES "${_gqa_cuda_architectures}")
-    target_compile_options(test-cuda-fattn-vec-gqa PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>
-        $<$<COMPILE_LANGUAGE:CUDA>:-extended-lambda>)
-    target_link_libraries(test-cuda-fattn-vec-gqa PRIVATE ggml CUDA::cudart)
+    foreach(attention_fixture IN ITEMS test-cuda-fattn-vec-gqa test-cuda-fattn-gqa-launch test-cuda-iq3-row-pair)
+        add_executable(${attention_fixture} "${WILDLLAMA_NATIVE}/tests/${attention_fixture}.cu")
+        target_include_directories(${attention_fixture} PRIVATE
+            "${WILDLLAMA_NATIVE}/ggml/include" "${WILDLLAMA_NATIVE}/ggml/src")
+        target_compile_features(${attention_fixture} PRIVATE cxx_std_17)
+        set_target_properties(${attention_fixture} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+            CUDA_ARCHITECTURES "${_gqa_cuda_architectures}" CUDA_RUNTIME_LIBRARY Shared)
+        target_compile_options(${attention_fixture} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>
+            $<$<COMPILE_LANGUAGE:CUDA>:-extended-lambda>)
+        if(MSVC)
+            target_compile_options(${attention_fixture} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+        endif()
+        target_link_libraries(${attention_fixture} PRIVATE ggml CUDA::cudart)
+    endforeach()
     add_test(NAME cuda-fattn-vec-gqa COMMAND test-cuda-fattn-vec-gqa)
-    set_tests_properties(cuda-fattn-vec-gqa PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+    add_test(NAME cuda-fattn-gqa-launch COMMAND test-cuda-fattn-gqa-launch)
+    set_tests_properties(cuda-fattn-vec-gqa cuda-fattn-gqa-launch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+    set(WILDLLAMA_IQ3_TEST_MODEL "" CACHE FILEPATH "Optional existing IQ3_S GGUF for trained-weight CUDA checks")
+    if(WILDLLAMA_IQ3_TEST_MODEL)
+        add_test(NAME cuda-iq3-row-pair COMMAND test-cuda-iq3-row-pair --weights "${WILDLLAMA_IQ3_TEST_MODEL}")
+        set_tests_properties(cuda-iq3-row-pair PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+    endif()
 endif()
 
 add_executable(wildllama-cuda-calibrate "${CMAKE_CURRENT_LIST_DIR}/cuda-calibrate.cpp")
