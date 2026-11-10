@@ -105,8 +105,8 @@ static options parse(int argc, char ** argv) {
     require(!o.backend.empty() && fs::u8path(o.backend).is_absolute(), "backend must be an absolute path");
     require(!o.output.empty() && fs::u8path(o.output).is_absolute(), "output must be an absolute path");
     require(tuning::fingerprint_valid(o.fingerprint), "fingerprint must be 64 lowercase hexadecimal characters");
-    require(o.k >= 256 && o.k <= 16384 && o.k % 256 == 0 && o.m >= 128 && o.m <= 16384 && o.m % 128 == 0 && o.n <= 8,
-        "unsupported shape: k multiple256<=16384, m multiple128<=16384, n1..8");
+    require(tuning::supported_shape(o.k, o.m, o.n),
+        "unsupported shape: k multiple256, m multiple128, dimensions<=16384 or exactly17408, n1..8");
     require(o.pairs >= 3 && o.pairs <= 16 && o.time_ms <= 10000 && o.max_mib <= 256 && o.scratch_mib <= o.max_mib,
         "limits: pairs3..16, time<=10000ms, scratch<=max<=256MiB");
     return o;
@@ -114,7 +114,7 @@ static options parse(int argc, char ** argv) {
 
 static ggml_type quant_type(const std::string & name) {
     for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
-                           GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+                           GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S}) {
         if (name == ggml_type_name(type)) { return type; }
     }
     throw std::runtime_error("unsupported quantization type");
@@ -181,9 +181,11 @@ int main(int argc, char ** argv) {
         require(fs::is_directory(fs::u8path(o.output).parent_path()), "cache parent directory must exist");
         const size_t max_bytes = o.max_mib * 1024 * 1024, scratch_bytes = o.scratch_mib * 1024 * 1024;
         const size_t weight_floats = size_t(o.k) * size_t(o.m), input_floats = size_t(o.k) * size_t(o.n);
+        const size_t importance_floats = type == GGML_TYPE_IQ3_S ? size_t(o.k) : 0;
         const size_t quant_bytes = ggml_row_size(type, o.k) * size_t(o.m);
         const size_t fixture_gpu = quant_bytes + (input_floats + size_t(o.m) * size_t(o.n)) * sizeof(float) + 1024;
-        const size_t owned_bytes = weight_floats * sizeof(float) + quant_bytes + input_floats * sizeof(float) + fixture_gpu + scratch_bytes;
+        const size_t owned_bytes = (weight_floats + importance_floats) * sizeof(float) + quant_bytes +
+            input_floats * sizeof(float) + fixture_gpu + scratch_bytes;
         require(owned_bytes <= max_bytes, "fixture exceeds --max-mib (host + device fixture + scratch)");
         std::signal(SIGINT, interrupt);
         std::signal(SIGTERM, interrupt);
@@ -214,6 +216,7 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_clear(buffer.get(), 0);
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> floats(weight_floats), activations(input_floats);
+        std::vector<float> importance(importance_floats, 1.0f);
         std::vector<uint8_t> quantized(quant_bytes);
         tuning::entry selected;
         selected.shape = {int(type), o.k, o.m, o.n};
@@ -228,7 +231,8 @@ int main(int argc, char ** argv) {
             }
             for (size_t i = 0; i < floats.size(); ++i) { floats[i] = std::sin(float(i % 104729) * 0.017f + float(fixture) * 0.41f) * (fixture + 1); }
             for (size_t i = 0; i < activations.size(); ++i) { activations[i] = std::cos(float(i) * 0.013f + float(fixture) * 0.37f) / (fixture + 1); }
-            require(ggml_quantize_chunk(type, floats.data(), quantized.data(), 0, o.m, o.k, nullptr) == quant_bytes,
+            require(ggml_quantize_chunk(type, floats.data(), quantized.data(), 0, o.m, o.k,
+                importance.empty() ? nullptr : importance.data()) == quant_bytes,
                 "weight quantization failed");
             if (interrupted || std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(o.time_ms)) {
                 report(interrupted ? GGML_CUDA_TUNING_CANCELLED : GGML_CUDA_TUNING_BUDGET, result); return 0;

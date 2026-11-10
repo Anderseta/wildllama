@@ -21,13 +21,13 @@ binary compiled for one CUDA architecture compatible with every other GPU.
 The initial implementation supports CUDA only, one physical/logical GPU in the
 normal server launch, and contiguous two-dimensional quantized weights with F32
 activations/output. Dimensions are bounded: input width is a multiple of 256
-between 256 and 16384, output width is a multiple of 128 between 128 and 16384,
-and the token batch is 1–8. Supported weight types are Q4_0, Q4_1, Q5_0, Q5_1,
-Q8_0 and Q2_K through Q6_K.
+between 256 and 16384 or exactly 17408; output width is a multiple of 128
+between 128 and 16384 or exactly 17408. The token batch is 1–8. Supported weight
+types are Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K through Q6_K and IQ3_S.
 
 Views, split buffers, MoE routing, nondefault precision, fused operations and
-explicit forced-kernel builds retain their original paths. Q8 inputs with a
-shared activation-quantization plan also retain MMVQ: isolated matrix timings
+explicit forced-kernel builds retain their original paths. Eligible inputs with
+a shared activation-quantization plan also retain MMVQ: isolated matrix timings
 must not discard savings shared by several graph consumers.
 
 A policy can select an alternative only when the inference pool already has

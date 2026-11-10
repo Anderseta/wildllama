@@ -13,7 +13,7 @@ if(MSVC)
     file(WRITE "${_prefix_probe_dir}/probe.cpp" "#include \"probe.h\"\n")
     execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /nologo /utf-8 /showIncludes /EP /TP "${_prefix_probe_dir}/probe.cpp"
         WORKING_DIRECTORY "${_prefix_probe_dir}" RESULT_VARIABLE _prefix_probe_status
-        OUTPUT_VARIABLE _prefix_probe_out ERROR_VARIABLE _prefix_probe_err ENCODING UTF8)
+        OUTPUT_VARIABLE _prefix_probe_out ERROR_VARIABLE _prefix_probe_err ENCODING NONE)
     file(TO_NATIVE_PATH "${_prefix_probe_dir}/probe.h" _prefix_probe_header)
     set(_prefix_probe_text "${_prefix_probe_err}${_prefix_probe_out}")
     string(FIND "${_prefix_probe_text}" "${_prefix_probe_header}" _prefix_probe_position)
@@ -213,6 +213,35 @@ add_executable(test-cuda-tuning-policy "${CMAKE_CURRENT_LIST_DIR}/tests/test-cud
 target_compile_features(test-cuda-tuning-policy PRIVATE cxx_std_17)
 target_include_directories(test-cuda-tuning-policy PRIVATE "${WILDLLAMA_NATIVE}/ggml/include" "${WILDLLAMA_NATIVE}/ggml/src")
 add_test(NAME cuda-tuning-policy COMMAND test-cuda-tuning-policy)
+
+# These checks exercise host ownership/mapping and allocate no model or device.
+foreach(native_host_policy IN ITEMS test-checkpoint-buffer test-fattn-vec-gqa)
+    add_executable(${native_host_policy} "${WILDLLAMA_NATIVE}/tests/${native_host_policy}.cpp")
+    target_compile_features(${native_host_policy} PRIVATE cxx_std_17)
+    target_include_directories(${native_host_policy} PRIVATE "${WILDLLAMA_NATIVE}/include")
+    add_test(NAME ${native_host_policy} COMMAND ${native_host_policy})
+endforeach()
+
+if(TARGET ggml-cuda)
+    # Direct production-kernel comparison, including canonical split-K merge.
+    # ggml enables CUDA in its own directory; load the parent-scope rules too.
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test-cuda-fattn-vec-gqa "${WILDLLAMA_NATIVE}/tests/test-cuda-fattn-vec-gqa.cu")
+    target_include_directories(test-cuda-fattn-vec-gqa PRIVATE
+        "${WILDLLAMA_NATIVE}/ggml/include" "${WILDLLAMA_NATIVE}/ggml/src")
+    target_compile_features(test-cuda-fattn-vec-gqa PRIVATE cxx_std_17)
+    set_target_properties(test-cuda-fattn-vec-gqa PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    get_target_property(_gqa_cuda_architectures ggml-cuda CUDA_ARCHITECTURES)
+    set_target_properties(test-cuda-fattn-vec-gqa PROPERTIES CUDA_ARCHITECTURES "${_gqa_cuda_architectures}")
+    target_compile_options(test-cuda-fattn-vec-gqa PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>
+        $<$<COMPILE_LANGUAGE:CUDA>:-extended-lambda>)
+    target_link_libraries(test-cuda-fattn-vec-gqa PRIVATE ggml CUDA::cudart)
+    add_test(NAME cuda-fattn-vec-gqa COMMAND test-cuda-fattn-vec-gqa)
+    set_tests_properties(cuda-fattn-vec-gqa PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()
+
 add_executable(wildllama-cuda-calibrate "${CMAKE_CURRENT_LIST_DIR}/cuda-calibrate.cpp")
 target_compile_features(wildllama-cuda-calibrate PRIVATE cxx_std_17)
 target_include_directories(wildllama-cuda-calibrate PRIVATE "${WILDLLAMA_NATIVE}/ggml/include" "${WILDLLAMA_NATIVE}/ggml/src")

@@ -1,0 +1,566 @@
+diff --git a/common/checkpoint-buffer.h b/common/checkpoint-buffer.h
+new file mode 100644
+index 0000000..5ab887c
+--- /dev/null
++++ b/common/checkpoint-buffer.h
+@@ -0,0 +1,88 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <initializer_list>
++#include <limits>
++#include <memory>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++// Completed host checkpoints share their byte storage. Mutable vector borrows
++// are scoped to capture/restore and pager handoffs on the context owner thread;
++// they must not survive publication or another copy of this buffer.
++class common_checkpoint_buffer {
++    std::shared_ptr<std::vector<uint8_t>> storage;
++public:
++    common_checkpoint_buffer() = default;
++    common_checkpoint_buffer(std::initializer_list<uint8_t> bytes) { assign(bytes); }
++
++    const std::vector<uint8_t> & get() const noexcept {
++        static const std::vector<uint8_t> empty;
++        return storage ? *storage : empty;
++    }
++    operator const std::vector<uint8_t> &() const noexcept { return get(); }
++    size_t size() const noexcept { return get().size(); }
++    size_t capacity() const noexcept { return storage ? storage->capacity() : 0; }
++    bool empty() const noexcept { return get().empty(); }
++    const uint8_t * data() const noexcept { return get().data(); }
++    const void * identity() const noexcept { return storage.get(); }
++    bool shared() const noexcept { return storage && !storage.unique(); }
++
++    std::vector<uint8_t> & mutable_buffer() {
++        if (!storage) { storage = std::make_shared<std::vector<uint8_t>>(); }
++        else if (!storage.unique()) {
++            auto replacement = std::make_shared<std::vector<uint8_t>>(*storage);
++            storage = std::move(replacement);
++        }
++        return *storage;
++    }
++    // Capture replaces every byte, so detaching need not copy the old payload.
++    uint8_t * overwrite(size_t bytes) {
++        if (!storage || !storage.unique()) {
++            auto replacement = std::make_shared<std::vector<uint8_t>>(bytes);
++            storage = std::move(replacement);
++        } else { storage->resize(bytes); }
++        return storage->data();
++    }
++    void assign(size_t count, uint8_t value) {
++        if (!storage || !storage.unique()) {
++            auto replacement = std::make_shared<std::vector<uint8_t>>(count, value);
++            storage = std::move(replacement);
++        } else { storage->assign(count, value); }
++    }
++    void assign(std::initializer_list<uint8_t> bytes) {
++        auto replacement = std::make_shared<std::vector<uint8_t>>(bytes);
++        storage = std::move(replacement);
++    }
++    common_checkpoint_buffer & operator=(std::initializer_list<uint8_t> bytes) { assign(bytes); return *this; }
++    void clear() noexcept {
++        if (storage && storage.unique()) { storage->clear(); }
++        else { storage.reset(); }
++    }
++    void release() noexcept { storage.reset(); }
++    friend bool operator==(const common_checkpoint_buffer & a, const common_checkpoint_buffer & b) {
++        return a.get() == b.get();
++    }
++};
++
++// Logical cache charges deliberately remain per-entry. Physical RAM admission
++// counts each shared host allocation once and includes retained empty capacity.
++// Failure to allocate the tiny identity set fails closed, never inventing room.
++class common_checkpoint_memory {
++    std::unordered_set<const void *> seen;
++    size_t held = 0;
++public:
++    void add(const common_checkpoint_buffer & buffer) noexcept {
++        if (!buffer.capacity() || held == std::numeric_limits<size_t>::max()) { return; }
++        try {
++            if (seen.insert(buffer.identity()).second) {
++                const size_t bytes = buffer.capacity();
++                held = bytes > std::numeric_limits<size_t>::max() - held ?
++                    std::numeric_limits<size_t>::max() : held + bytes;
++            }
++        } catch (...) { held = std::numeric_limits<size_t>::max(); }
++    }
++    size_t bytes() const noexcept { return held; }
++};
+diff --git a/common/common.cpp b/common/common.cpp
+index 573813d..efb13d2 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2413,9 +2413,7 @@ void common_prompt_checkpoint::update_tgt(
+ 
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+-    data_tgt.resize(ckpt_size);
+-
+-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
++    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.overwrite(ckpt_size), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+     }
+@@ -2431,9 +2429,7 @@ void common_prompt_checkpoint::update_dft(
+ 
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+-    data_dft.resize(ckpt_size);
+-
+-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
++    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.overwrite(ckpt_size), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+     }
+diff --git a/common/common.h b/common/common.h
+index 036d365..b2593a0 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include "llama-cpp.h"
++#include "checkpoint-buffer.h"
+ 
+ #include "ggml-opt.h"
+ #include "ggml.h"
+@@ -1303,12 +1304,12 @@ struct common_prompt_checkpoint {
+     llama_pos pos_min;
+     llama_pos pos_max;
+ 
+-    std::vector<uint8_t> data_tgt;
+-    std::vector<uint8_t> data_dft;
++    common_checkpoint_buffer data_tgt;
++    common_checkpoint_buffer data_dft;
+ 
+     // (optional) speculative-decoding implementation state stashed with the checkpoint
+     // (e.g. eagle3's deferred-boundary g_embd row)
+-    std::vector<uint8_t> data_spec;
++    common_checkpoint_buffer data_spec;
+ 
+     size_t size() const;
+ 
+diff --git a/tests/test-checkpoint-buffer.cpp b/tests/test-checkpoint-buffer.cpp
+new file mode 100644
+index 0000000..576d4c2
+--- /dev/null
++++ b/tests/test-checkpoint-buffer.cpp
+@@ -0,0 +1,83 @@
++#include "../common/checkpoint-buffer.h"
++#include "../common/state-transaction.h"
++#include "../tools/server/server-prefix-ram-budget.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include <new>
++
++static bool fail_next_allocation = false;
++void * operator new(std::size_t size) {
++    if (fail_next_allocation) { fail_next_allocation = false; throw std::bad_alloc(); }
++    if (void * value = std::malloc(size ? size : 1)) { return value; }
++    throw std::bad_alloc();
++}
++void operator delete(void * value) noexcept { std::free(value); }
++void operator delete(void * value, std::size_t) noexcept { std::free(value); }
++
++#define CHECK(condition) do { if (!(condition)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); std::abort(); } } while (0)
++
++int main() {
++    common_checkpoint_buffer original {1,2,3,4};
++    const auto * bytes = original.data();
++    const auto capacity = original.capacity();
++    fail_next_allocation = true;
++    auto clone = original; // a completed checkpoint clone cannot allocate/copy payload
++    CHECK(fail_next_allocation && clone.data() == bytes && original.shared());
++    fail_next_allocation = false;
++    common_checkpoint_memory held;
++    held.add(original); held.add(clone);
++    CHECK(held.bytes() == capacity);
++    CHECK(original.size() + clone.size() == 8); // configured logical charge stays per entry
++
++    fail_next_allocation = true;
++    bool failed = false;
++    try { clone.mutable_buffer()[0] = 9; } catch (const std::bad_alloc &) { failed = true; }
++    CHECK(failed && clone.data() == bytes && original.data()[0] == 1);
++    clone.mutable_buffer()[0] = 9;
++    CHECK(original.data() == bytes && original.data()[0] == 1 && clone.data()[0] == 9);
++    CHECK(clone.data() != original.data());
++    common_checkpoint_memory detached;
++    detached.add(original); detached.add(clone);
++    CHECK(detached.bytes() == original.capacity() + clone.capacity());
++
++    auto overwritten = original;
++    auto * destination = overwritten.overwrite(3);
++    destination[0] = 8; destination[1] = 7; destination[2] = 6;
++    CHECK(original.data() == bytes && original.size() == 4 && original.data()[0] == 1);
++    auto released = original;
++    released.clear();
++    CHECK(released.empty() && released.capacity() == 0 && original.data() == bytes);
++    clone.clear();
++    CHECK(clone.empty() && clone.capacity() > 0); // unique scratch retains reusable capacity
++    clone.release();
++    CHECK(clone.capacity() == 0);
++
++    common_checkpoint_buffer draft {5,6}, spec {7};
++    const common_state_view checkpoint {original, draft, spec};
++    CHECK(checkpoint.main.data() == bytes);
++    int clears = 0;
++    CHECK(!common_state_restore(checkpoint,
++        [](const uint8_t *, size_t size) { return size; },
++        [](const uint8_t *, size_t size) { return size - 1; },
++        [](const auto &) { CHECK(false); }, [&] { ++clears; }));
++    CHECK(clears == 1 && original.data() == bytes && original.data()[0] == 1);
++    CHECK(common_state_restore(checkpoint,
++        [&](const uint8_t * source, size_t size) { CHECK(source == bytes); return size; },
++        [](const uint8_t *, size_t size) { return size; },
++        [&](const auto & value) { CHECK(value == spec.get()); }, [&] { ++clears; }));
++    CHECK(clears == 1);
++
++    // Unique-capacity accounting remains valid after last-owner changes, and a
++    // failed bookkeeping allocation cannot create fictitious RAM headroom.
++    common_checkpoint_memory refused;
++    fail_next_allocation = true;
++    refused.add(original);
++    CHECK(refused.bytes() == std::numeric_limits<size_t>::max());
++    CHECK(server_prefix_ram_budget(32, 0, {0, 1024, true}) == 0);
++    auto survivor = original;
++    original.release();
++    CHECK(survivor.data() == bytes && survivor.data()[0] == 1);
++    std::puts("PASS: zero-copy checkpoint clone, unique capacity, detach/failure isolation, overwrite, release and transactional restore");
++}
+diff --git a/tests/test-server-prefix-cache.cpp b/tests/test-server-prefix-cache.cpp
+index fbea5e6..e266576 100644
+--- a/tests/test-server-prefix-cache.cpp
++++ b/tests/test-server-prefix-cache.cpp
+@@ -237,6 +237,7 @@ static void warm_disk_backing(const std::filesystem::path & directory) {
+     auto state = cache.states.begin();
+     const auto expected = state->data;
+     const auto checkpoint = state->prompt.checkpoints.front();
++    const auto * shared_target = checkpoint.data_tgt.data();
+     const auto path = state->backing->path;
+     const auto used = cache.pager.used();
+     cache.prompt_us_per_token = 10000;
+@@ -247,6 +248,9 @@ static void warm_disk_backing(const std::filesystem::path & directory) {
+     for (int round = 0; round < 8; ++round) {
+         require(cache.spill(*state) && state->is_cold() && state->data.main.capacity() == 0,
+                 "backed eviction did not release RAM capacity");
++        require(checkpoint.data_tgt.data() == shared_target && checkpoint.data_tgt.size() == 31 &&
++                checkpoint.data_tgt.get().front() == 21,
++                "spilling a shared checkpoint changed its live owner");
+         require(cache.pager.used() == used && state->backing->path == path, "backed eviction rewrote snapshot");
+         require(cache.materialize(state) && !state->is_cold() && state->backing->path == path &&
+                 state->data.main == expected.main && state->data.drft == expected.drft && state->data.spec == expected.spec &&
+@@ -270,9 +274,86 @@ static void warm_disk_backing(const std::filesystem::path & directory) {
+             "corrupt retained backing published partial state");
+     cache.states.clear();
+     require(cache.pager.used() == 0, "warm/cold backing lifetime leaked disk quota");
++
++    // Pressure must not detach a shared checkpoint for optional prewriting.
++    // With headroom, small shared checkpoints keep the existing async path.
++    server_prompt_cache shared(1, 0);
++    shared.limit_size = 64*1024;
++    require(shared.pager.configure(directory, disk_limit), "shared checkpoint pager configure failed");
++    shared.writer.set_enabled(true);
++    auto live = make_prompt({61,62,63});
++    common_prompt_checkpoint live_checkpoint {};
++    live_checkpoint.data_tgt.assign(4096, 73);
++    live.checkpoints.push_back(std::move(live_checkpoint));
++    const auto * live_bytes = live.checkpoints.front().data_tgt.data();
++    auto * shared_state = shared.alloc(live, make_data(48*1024, 79));
++    require(shared_state && shared_state->has_shared_checkpoint_buffers(), "shared prewrite fixture was not shared");
++    shared.memory_probe = [] { return server_prefix_ram_info{0, 1024*1024*1024, true}; };
++    shared.queue_writebacks();
++    require(!shared_state->writeback && shared_state->prompt.checkpoints.front().data_tgt.data() == live_bytes,
++            "prewrite detached or moved a live shared checkpoint");
++    require(shared.spill(*shared_state) && shared_state->is_cold() &&
++            live.checkpoints.front().data_tgt.data() == live_bytes && live.checkpoints.front().data_tgt.get().front() == 73,
++            "synchronous shared spill did not preserve the active prompt");
++    require(shared.materialize(shared.states.begin()) &&
++            shared_state->prompt.checkpoints.front().data_tgt == live.checkpoints.front().data_tgt,
++            "shared checkpoint spill/restore changed bytes");
++    shared.queue_writebacks();
++    require(!shared_state->writeback, "a retained backing was needlessly rewritten");
++    shared.states.clear();
++    require(shared.pager.used() == 0 && live.checkpoints.front().data_tgt.get().front() == 73,
++            "shared disk cleanup released the active prompt owner");
++    shared.memory_probe = [] { return server_prefix_ram_info{1024*1024*1024, 2ull*1024*1024*1024, true}; };
++    shared_state = shared.alloc(live, make_data(48*1024, 83));
++    require(shared_state, "small shared prewrite fixture failed");
++    shared.queue_writebacks();
++    require(bool(shared_state->writeback) && live.checkpoints.front().data_tgt.data() == live_bytes,
++            "bounded shared checkpoint lost async prewriting or changed its live owner");
++    shared_state->writeback->wait();
++    shared.collect_writebacks();
++    require(!shared_state->writeback && shared_state->backing &&
++            shared_state->prompt.checkpoints.front().data_tgt == live.checkpoints.front().data_tgt &&
++            shared.size() <= shared.limit_size,
++            "bounded shared checkpoint prewrite did not preserve its complete hot payload/quota");
++    shared.states.clear();
++    require(shared.pager.used() == 0, "bounded shared checkpoint prewrite leaked disk quota");
+     std::puts("PASS: four prefixes through two tickets; 8 exact warm/cold cycles without rewrites; warm scoring; missing/corrupt backing and quotas");
+ }
+ 
++static void shared_checkpoint_ownership() {
++    auto prompt = make_prompt({1,2,3});
++    common_prompt_checkpoint checkpoint {};
++    checkpoint.n_tokens = 2;
++    checkpoint.data_tgt.assign(4096, 31);
++    checkpoint.data_dft.assign(1024, 47);
++    checkpoint.data_spec = {11,13,17};
++    const auto * target = checkpoint.data_tgt.data();
++    prompt.checkpoints.push_back(checkpoint);
++    auto cloned = prompt.clone();
++    require(cloned.checkpoints.front().data_tgt.data() == target,
++            "prompt clone duplicated an immutable checkpoint payload");
++
++    server_prompt_cache cache(1, 0);
++    auto data = make_data(64);
++    const size_t logical = data.size() + checkpoint.size();
++    auto * state = cache.alloc(prompt, std::move(data));
++    require(state && state->prompt.checkpoints.front().data_tgt.data() == target,
++            "cache publication copied an already complete checkpoint");
++    require(state->size() == logical && cache.size() == logical,
++            "sharing bypassed the configured logical cache charge");
++    const auto sources = state->const_buffers();
++    require(sources.size() == 6 && sources[3]->data() == target,
++            "read-only serialization detached a shared checkpoint");
++    state->release_buffers();
++    require(state->prompt.checkpoints.front().data_tgt.capacity() == 0 &&
++            checkpoint.data_tgt.data() == target && checkpoint.data_tgt.get().front() == 31,
++            "cache release changed another checkpoint owner");
++    cloned.checkpoints.front().data_tgt.mutable_buffer()[0] = 99;
++    require(checkpoint.data_tgt.get().front() == 31 && cloned.checkpoints.front().data_tgt.get().front() == 99,
++            "mutable checkpoint clone changed its published ancestor");
++    std::puts("PASS: prompt/cache checkpoint sharing, unchanged logical quota, read-only pager sources and detached mutation");
++}
++
+ static void adaptive_ram_budget() {
+     constexpr size_t mib = 1024ull * 1024ull;
+     constexpr size_t gib = 1024ull * mib;
+@@ -367,6 +448,7 @@ int main(int argc, char ** argv) {
+         }
+         selection_and_mutation();
+         fallback_paths();
++        shared_checkpoint_ownership();
+         adaptive_ram_budget();
+         if (argc == 3 && std::string(argv[1]) == "--state-dir") { warm_disk_backing(argv[2]); }
+         if (argc > 1 && std::string(argv[1]) == "--bench") { benchmark(); }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4a24ee3..7dbcb9a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2817,16 +2817,16 @@ private:
+     }
+ 
+     size_t checkpoint_ram_held() const {
+-        size_t held = 0;
++        common_checkpoint_memory held;
+         for (const auto & slot : slots) {
+             for (const auto & checkpoint : slot.prompt.checkpoints) {
+                 // Capacity remains allocated even after an auxiliary blob was cleared.
+-                held = server_checkpoint_add_bytes(held, checkpoint.data_tgt.capacity());
+-                held = server_checkpoint_add_bytes(held, checkpoint.data_dft.capacity());
+-                held = server_checkpoint_add_bytes(held, checkpoint.data_spec.capacity());
++                held.add(checkpoint.data_tgt);
++                held.add(checkpoint.data_dft);
++                held.add(checkpoint.data_spec);
+             }
+         }
+-        return held;
++        return held.bytes();
+     }
+ 
+     void compact_checkpoints(server_slot & slot) {
+@@ -2932,7 +2932,7 @@ private:
+             // Capture the small auxiliary state first, then recheck physical RAM
+             // before the large target/draft vectors. It is already resident and
+             // must not be charged as another pending allocation by the check.
+-            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++            common_speculative_get_state(spec.get(), slot.id, cur.data_spec.mutable_buffer());
+             if (!checkpoint_ram_admit(state_bytes)) { return; }
+             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+             cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+@@ -3048,9 +3048,9 @@ private:
+             if (!ckpt_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens), n_read) ||
+                 !ckpt_read(ifs, &cur.pos_min,  sizeof(cur.pos_min),  n_read) ||
+                 !ckpt_read(ifs, &cur.pos_max,  sizeof(cur.pos_max),  n_read) ||
+-                !ckpt_read_buf(ifs, cur.data_tgt,  n_avail, n_read) ||
+-                !ckpt_read_buf(ifs, cur.data_dft,  n_avail, n_read) ||
+-                !ckpt_read_buf(ifs, cur.data_spec, n_avail, n_read)) {
++                !ckpt_read_buf(ifs, cur.data_tgt.mutable_buffer(),  n_avail, n_read) ||
++                !ckpt_read_buf(ifs, cur.data_dft.mutable_buffer(),  n_avail, n_read) ||
++                !ckpt_read_buf(ifs, cur.data_spec.mutable_buffer(), n_avail, n_read)) {
+                 SLT_WRN(slot, "truncated context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+                 return 0;
+             }
+diff --git a/tools/server/server-state-writeback.h b/tools/server/server-state-writeback.h
+index eab7638..f62a1c5 100644
+--- a/tools/server/server-state-writeback.h
++++ b/tools/server/server-state-writeback.h
+@@ -170,7 +170,7 @@ public:
+         std::lock_guard<std::mutex> lock(state->mutex);
+         return !state->stopping && state->requests < maximum_requests && state->bytes < maximum_bytes;
+     }
+-    static size_t charge(const std::vector<std::vector<uint8_t> *> & parts) noexcept {
++    template<class Parts> static size_t charge_of(const Parts & parts, bool readonly = false) noexcept {
+         if (parts.empty() || parts.size() > 4096) { return SIZE_MAX; }
+         // Include the eventual disk-handle descriptors as well as vector and
+         // request metadata; allocating a worker does not free a RAM-cache byte.
+@@ -182,11 +182,33 @@ public:
+             auto * part = parts[i];
+             if (!part || part->capacity() > SIZE_MAX - total) { return SIZE_MAX; }
+             // Moving one vector twice would silently change its second part.
+-            for (size_t j = 0; j < i; ++j) { if (parts[j] == part) { return SIZE_MAX; } }
++            for (size_t j = 0; j < i; ++j) {
++                if (parts[j] == part && !(readonly && !part->capacity())) { return SIZE_MAX; }
++            }
+             total += part->capacity();
+         }
+         return total;
+     }
++    static size_t charge(const std::vector<std::vector<uint8_t> *> & parts) noexcept { return charge_of(parts); }
++    // Admit read-only sources before a shared checkpoint is detached. This
++    // preflight creates no worker and moves no bytes; submit rechecks the actual
++    // mutable buffers and all reservations before handing them to the worker.
++    bool can_submit(const server_state_pager & pager,
++            const std::vector<const std::vector<uint8_t> *> & parts, size_t allowed_bytes) const noexcept {
++        if (!can_submit() || !pager.enabled()) { return false; }
++        // Empty immutable fields can borrow the same zero-capacity vector.
++        // Mutable handoff creates distinct destinations before submit.
++        const size_t bytes = charge_of(parts, true);
++        if (bytes > allowed_bytes || bytes > maximum_bytes) { return false; }
++        try {
++            const size_t descriptors = pager.page_metadata_charge(parts);
++            if (descriptors > maximum_bytes - bytes || descriptors > allowed_bytes - bytes) { return false; }
++            if (!state) { return true; }
++            std::lock_guard<std::mutex> lock(state->mutex);
++            return !state->stopping && state->requests < maximum_requests &&
++                state->bytes <= maximum_bytes - bytes - descriptors;
++        } catch (...) { return false; }
++    }
+     handle submit(const server_state_pager & pager,
+             const std::vector<std::vector<uint8_t> *> & parts, size_t allowed_bytes) noexcept {
+         if (!can_submit() || !pager.enabled()) { return {}; }
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index a597087..d6dc658 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1815,9 +1815,9 @@ void server_prompt_cache::queue_writebacks() {
+         if (state.backing || state.writeback || state.writeback_failed || state.resident ||
+                 state.data.main.empty() || state.prompt.tokens.has_mtmd) { continue; }
+         try {
+-            auto buffers = state.buffers();
++            const auto sources = state.const_buffers();
+             size_t payload = 0;
+-            for (auto * buffer : buffers) {
++            for (auto * buffer : sources) {
+                 if (buffer->size() > SIZE_MAX - payload) { return; }
+                 payload += buffer->size();
+             }
+@@ -1827,7 +1827,17 @@ void server_prompt_cache::queue_writebacks() {
+             if (base > limit_size || metadata > limit_size - base) { continue; }
+             const size_t previous = state.size();
+             if (previous > current) { return; }
+-            auto pending = writer.submit(pager, buffers, limit_size - base - metadata);
++            const size_t allowance = limit_size - base - metadata;
++            if (!writer.can_submit(pager, sources, allowance)) { continue; }
++            const size_t detach = state.shared_checkpoint_capacity();
++            if (detach) {
++                // Preserve bounded prewrites for small models, but do not copy
++                // shared snapshots when physical RAM cannot cover that copy.
++                const auto memory = memory_probe ? memory_probe() : server_prefix_system_ram();
++                if (detach > server_prefix_ram_budget(0, 0, memory)) { continue; }
++            }
++            auto buffers = state.buffers();
++            auto pending = writer.submit(pager, buffers, allowance);
+             if (pending) {
+                 state.writeback = std::move(pending);
+                 // The complete pending charge was bounded by the allowance
+@@ -1843,19 +1853,20 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
+     if (state.writeback) { return finish_writeback(state, false, true); }
+     if (!pager.enabled() || state.resident || state.data.main.empty() || state.prompt.tokens.has_mtmd) { return false; }
+     try {
+-        auto buffers = state.buffers();
+         if (state.backing) {
+             if (server_state_pager::backing_available(state.backing)) {
+-                for (auto * buffer : buffers) { std::vector<uint8_t>().swap(*buffer); }
++                state.release_buffers();
+                 return true;
+             }
+             state.backing.reset();
+         }
+-        std::vector<const std::vector<uint8_t> *> sources(buffers.begin(), buffers.end());
++        // Borrow immutable payloads for the synchronous write. Making mutable
++        // vector handoffs here would duplicate shared checkpoints under pressure.
++        const auto sources = state.const_buffers();
+         auto saved = pager.store(sources);
+         if (!saved) { return false; }
+         // Publish only after complete write; release capacities, not just sizes.
+-        for (auto * buffer : buffers) { std::vector<uint8_t>().swap(*buffer); }
++        state.release_buffers();
+         state.backing = std::move(saved);
+         return true;
+     } catch (...) { return false; }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 300e780..4d3e557 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -707,12 +707,48 @@ struct server_prompt_cache_state {
+     std::vector<std::vector<uint8_t> *> buffers() {
+         std::vector<std::vector<uint8_t> *> result { &data.main, &data.drft, &data.spec };
+         for (auto & checkpoint : prompt.checkpoints) {
+-            result.push_back(&checkpoint.data_tgt);
+-            result.push_back(&checkpoint.data_dft);
+-            result.push_back(&checkpoint.data_spec);
++            result.push_back(&checkpoint.data_tgt.mutable_buffer());
++            result.push_back(&checkpoint.data_dft.mutable_buffer());
++            result.push_back(&checkpoint.data_spec.mutable_buffer());
+         }
+         return result;
+     }
++    std::vector<const std::vector<uint8_t> *> const_buffers() const {
++        std::vector<const std::vector<uint8_t> *> result { &data.main, &data.drft, &data.spec };
++        for (const auto & checkpoint : prompt.checkpoints) {
++            result.push_back(&checkpoint.data_tgt.get());
++            result.push_back(&checkpoint.data_dft.get());
++            result.push_back(&checkpoint.data_spec.get());
++        }
++        return result;
++    }
++    bool has_shared_checkpoint_buffers() const {
++        for (const auto & checkpoint : prompt.checkpoints) {
++            if (checkpoint.data_tgt.shared() || checkpoint.data_dft.shared() || checkpoint.data_spec.shared()) { return true; }
++        }
++        return false;
++    }
++    size_t shared_checkpoint_capacity() const {
++        size_t bytes = 0;
++        for (const auto & checkpoint : prompt.checkpoints) {
++            for (const auto * buffer : { &checkpoint.data_tgt, &checkpoint.data_dft, &checkpoint.data_spec }) {
++                if (!buffer->shared()) { continue; }
++                if (buffer->capacity() > SIZE_MAX - bytes) { return SIZE_MAX; }
++                bytes += buffer->capacity();
++            }
++        }
++        return bytes;
++    }
++    void release_buffers() noexcept {
++        std::vector<uint8_t>().swap(data.main);
++        std::vector<uint8_t>().swap(data.drft);
++        std::vector<uint8_t>().swap(data.spec);
++        for (auto & checkpoint : prompt.checkpoints) {
++            checkpoint.data_tgt.release();
++            checkpoint.data_dft.release();
++            checkpoint.data_spec.release();
++        }
++    }
+     bool is_cold() const { return backing && data.main.empty() && !writeback; }
+     size_t storage_size() const {
+         return backing ? size_t(backing->payload_bytes) : writeback ? writeback->payload_bytes() : size();

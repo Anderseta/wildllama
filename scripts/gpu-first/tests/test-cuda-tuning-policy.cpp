@@ -1,4 +1,5 @@
 #include "ggml-cuda/resident-tuning-policy.h"
+#include "ggml-cuda/dense-reuse.h"
 
 #include <cstdio>
 #include <limits>
@@ -81,8 +82,50 @@ static void validation() {
     require(!tuning::repeatable_gain(mv, mq, 2, GGML_CUDA_TUNING_MMVQ, gain), "too few pairs approved");
 }
 
+static void iq3_and_ffn_admission() {
+    require(ggml_cuda_iq3_input_reuse_setting(nullptr) && ggml_cuda_iq3_input_reuse_setting("") &&
+            ggml_cuda_iq3_input_reuse_setting("1"), "IQ3 automatic/explicit enable rejected");
+    require(!ggml_cuda_iq3_input_reuse_setting("0") && !ggml_cuda_iq3_input_reuse_setting("false") &&
+            !ggml_cuda_iq3_input_reuse_setting("invalid"), "IQ3 opt-out/malformed setting enabled reuse");
+    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ3_S}) {
+        require(ggml_cuda_dense_q8_1_input(type), "validated Q8_1 activation format rejected");
+        require(ggml_cuda_dense_reuse_type(type, false, true) == (type == GGML_TYPE_IQ3_S),
+            "default IQ3 mode changed other formats");
+        require(ggml_cuda_dense_reuse_type(type, true, false) == (type != GGML_TYPE_IQ3_S),
+            "IQ3 opt-out changed legacy eligibility");
+        require(!ggml_cuda_dense_reuse_type(type, false, false), "both opt-outs ignored");
+    }
+    for (const auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL}) {
+        require(!ggml_cuda_dense_q8_1_input(type), "unvalidated activation format admitted");
+    }
+    require(tuning::supported_shape(256, 128, 1) && tuning::supported_shape(16384, 16384, 8),
+        "original shape boundary regressed");
+    require(tuning::supported_shape(5120, 17408, 1) && tuning::supported_shape(17408, 5120, 8),
+        "17408-wide FFN rejected");
+    for (const auto shape : {tuning::key{GGML_TYPE_IQ3_S, 16640, 5120, 1},
+            {GGML_TYPE_IQ3_S, 5120, 17536, 1}, {GGML_TYPE_IQ3_S, 5120, 17408, 0},
+            {GGML_TYPE_IQ3_S, 5120, 17408, 9}, {GGML_TYPE_IQ3_S, 5119, 17408, 1},
+            {GGML_TYPE_IQ3_S, std::numeric_limits<int64_t>::max(), 17408, 1}}) {
+        require(!tuning::supported_shape(shape.k, shape.m, shape.n), "unsupported shape admitted");
+    }
+    auto p = fixture();
+    p.entries[0].shape = {GGML_TYPE_IQ3_S, 5120, 17408, 1};
+    const std::string identity(64, 'a');
+    std::ostringstream bytes;
+    require(tuning::serialize(bytes, identity, p), "IQ3_S FFN policy serialization failed");
+    tuning::policy loaded;
+    std::istringstream input(bytes.str());
+    require(tuning::parse(input, identity, loaded), "IQ3_S FFN policy round trip failed");
+    require(loaded.lookup(p.entries[0].shape, GGML_CUDA_TUNING_MMVQ, 4095) == GGML_CUDA_TUNING_DEFAULT,
+        "IQ3_S policy grew workspace");
+    require(loaded.lookup(p.entries[0].shape, GGML_CUDA_TUNING_MMVQ, 4096) == GGML_CUDA_TUNING_MMQ,
+        "IQ3_S policy with available workspace rejected");
+}
+
 int main() {
-    try { persistence(); validation(); }
+    try { persistence(); validation(); iq3_and_ffn_admission(); }
     catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
     std::puts("PASS: bounded policy persistence, fingerprint invalidation, real lookup, bitwise/finite validation, repeatable gain");
     return 0;

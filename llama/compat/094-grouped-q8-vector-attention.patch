@@ -1,0 +1,471 @@
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 6d80f5c..3c49cdd 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -1,5 +1,32 @@
+ #include "common.cuh"
+ #include "fattn-common.cuh"
++#include "fattn-vec-gqa.h"
++
++#include <cstdlib>
++#include <atomic>
++
++static bool ggml_cuda_fattn_vec_gqa_enabled() {
++    static const bool enabled = [] {
++        const char * value = std::getenv("WILDLLAMA_CUDA_GQA_Q8");
++        return value && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
++
++static void ggml_cuda_fattn_vec_gqa_trace(bool grouped, const ggml_tensor * Q, const ggml_tensor * K) {
++    static const bool enabled = [] {
++        const char * value = std::getenv("WILDLLAMA_CUDA_GQA_Q8_TRACE");
++        return value && value[0] == '1' && value[1] == '\0';
++    }();
++    if (!enabled) { return; }
++    static std::atomic<unsigned> seen{0};
++    const unsigned bit = grouped ? 1u : 2u;
++    if (!(seen.fetch_or(bit, std::memory_order_relaxed) & bit)) {
++        GGML_LOG_INFO("CUDA_GQA_Q8 path=%s D=%lld queries=%lld q_heads=%lld kv_heads=%lld kv=%lld\n",
++            grouped ? "pair" : "legacy", (long long)Q->ne[0], (long long)Q->ne[1],
++            (long long)Q->ne[2], (long long)K->ne[2], (long long)K->ne[1]);
++    }
++}
+ 
+ static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
+     return 128;
+@@ -16,7 +43,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wpass-failed"
+ #endif // __clang__
+-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
++template<int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+ static __global__ void flash_attn_ext_vec(
+         const char * Q_ptr,
+@@ -42,6 +69,7 @@ static __global__ void flash_attn_ext_vec(
+                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+     ggml_cuda_pdl_lc();
+ #ifdef FLASH_ATTN_AVAILABLE
++    constexpr int ncols = ncols1*ncols2;
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+     const char * GGML_CUDA_RESTRICT K        = K_ptr;
+     const char * GGML_CUDA_RESTRICT V        = V_ptr;
+@@ -101,10 +129,11 @@ static __global__ void flash_attn_ext_vec(
+     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+ #endif // V_DOT2_F32_F16_AVAILABLE
+ 
+-    const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
++    const int ic0 = blockIdx.x * ncols1; // First token column, independent of grouped heads.
+ 
+-    const int sequence = blockIdx.z / ne02;
+-    const int head = blockIdx.z - sequence*ne02;
++    const int head_groups = ne02/ncols2;
++    const int sequence = blockIdx.z / head_groups;
++    const int head = (blockIdx.z - sequence*head_groups)*ncols2;
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+     Q += nb03*sequence + nb02* head              + nb01*ic0;
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+@@ -163,7 +192,7 @@ static __global__ void flash_attn_ext_vec(
+             float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
+ 
+             // Set memory to zero if out of bounds:
+-            if (ncols > 1 && ic0 + j >= int(ne01.z)) {
++            if (ncols1 > 1 && ic0 + j/ncols2 >= int(ne01.z)) {
+ #pragma unroll
+                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
+                     const int i = i0 + threadIdx.x;
+@@ -176,7 +205,7 @@ static __global__ void flash_attn_ext_vec(
+                     tmp_q_ds[threadIdx.x] = make_float2(0.0f, 0.0f);
+                 }
+             } else {
+-                const float * Q_f = (const float *) (Q + j*nb01);
++                const float * Q_f = (const float *) (Q + (j/ncols2)*nb01 + (j%ncols2)*nb02);
+                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+ #pragma unroll
+                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+@@ -208,13 +237,13 @@ static __global__ void flash_attn_ext_vec(
+         const half2 scale_h2 = make_half2(scale, scale);
+ #pragma unroll
+         for (int j = 0; j < ncols; ++j) {
+-            const float2 * Q_j = (const float2 *) (Q + j*nb01);
++            const float2 * Q_j = (const float2 *) (Q + (j/ncols2)*nb01 + (j%ncols2)*nb02);
+ #pragma unroll
+             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
+                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne;
+ 
+                 __align__(16) float2 tmp[cpy_ne] = {{0.0f, 0.0f}};
+-                if (ncols == 1 || ic0 + j < int(ne01.z)) {
++                if (ncols1 == 1 || ic0 + j/ncols2 < int(ne01.z)) {
+                     ggml_cuda_memcpy_1<cpy_nb>(tmp,            &Q_j[i]);
+                     ggml_cuda_memcpy_1<cpy_nb>(tmp + cpy_ne/2, &Q_j[i + cpy_ne/2]);
+                 }
+@@ -231,11 +260,11 @@ static __global__ void flash_attn_ext_vec(
+ #else
+ #pragma unroll
+         for (int j = 0; j < ncols; ++j) {
+-            const float2 * Q_j = (const float2 *) (Q + j*nb01);
++            const float2 * Q_j = (const float2 *) (Q + (j/ncols2)*nb01 + (j%ncols2)*nb02);
+ #pragma unroll
+             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
+                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne;
+-                if (ncols == 1 || ic0 + j < int(ne01.z)) {
++                if (ncols1 == 1 || ic0 + j/ncols2 < int(ne01.z)) {
+                     ggml_cuda_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ],            &Q_j[i]);
+                     ggml_cuda_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ + cpy_ne/2], &Q_j[i + cpy_ne/2]);
+                 }
+@@ -279,9 +308,9 @@ static __global__ void flash_attn_ext_vec(
+                     sum = logit_softcap*tanhf(sum);
+                 }
+ 
+-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
++                if (mask && (ncols1 == 1 || ic0 + j/ncols2 < int(ne01.z))) {
+                     sum += slope*__half2float(compact_mask ?
+-                        fattn_mask_value(mask_base,nb31/int(sizeof(half)),ic0+j,k_VKQ_0+i_KQ) : maskh[j*ne11 + i_KQ]);
++                        fattn_mask_value(mask_base,nb31/int(sizeof(half)),ic0+j/ncols2,k_VKQ_0+i_KQ) : maskh[(j/ncols2)*ne11 + i_KQ]);
+                 }
+ 
+                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+@@ -436,7 +465,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+     for (int j_VKQ = 0; j_VKQ < ncols; ++j_VKQ) {
+-        if (ncols > 1 && ic0 + j_VKQ >= int(ne01.z)) {
++        if (ncols1 > 1 && ic0 + j_VKQ/ncols2 >= int(ne01.z)) {
+             break;
+         }
+ 
+@@ -503,7 +532,7 @@ static __global__ void flash_attn_ext_vec(
+                 if (gridDim.y == 1) {
+                     dst_val /= KQ_sum[j_VKQ];
+                 }
+-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
++                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ/ncols2)*ne02 + head + j_VKQ%ncols2)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+             }
+         }
+ 
+@@ -513,8 +542,8 @@ static __global__ void flash_attn_ext_vec(
+ 
+     }
+ 
+-    if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
+-        dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
++    if (gridDim.y != 1 && tid < ncols && (ncols1 == 1 || ic0 + tid/ncols2 < int(ne01.z))) {
++        dst_meta[((sequence*int(ne01.z) + ic0 + tid/ncols2)*ne02 + head + tid%ncols2)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+     }
+ #else
+     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+@@ -533,17 +562,17 @@ static __global__ void flash_attn_ext_vec(
+ #pragma clang diagnostic pop
+ #endif // __clang__
+ 
+-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
++template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int heads_per_block = 1>
+ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
+     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
+     const int nwarps   = nthreads / WARP_SIZE;
+-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
++    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, heads_per_block, type_K, type_V, use_logit_softcap>;
+     const bool need_f16_K = type_K == GGML_TYPE_F16;
+     const bool need_f16_V = type_V == GGML_TYPE_F16;
+     constexpr size_t nbytes_shared = 0;
+-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
++    launch_fattn<D, cols_per_block, heads_per_block>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+ }
+ 
+ template <int D, ggml_type type_K, ggml_type type_V>
+@@ -554,6 +583,33 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+     float logit_softcap;
+     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+ 
++    if constexpr (D == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
++        const ggml_tensor * K = dst->src[1];
++        const ggml_tensor * V = dst->src[2];
++        const ggml_tensor * mask = dst->src[3];
++        float max_bias;
++        memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
++        const ggml_cuda_fattn_vec_gqa_shape shape{
++            D, Q->ne[1], Q->ne[2], K->ne[2], Q->ne[3], K->ne[1],
++            Q->nb[2], K->nb[1], V->nb[1], Q->type == GGML_TYPE_F32 && Q->nb[0] == sizeof(float),
++            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
++                K->nb[0] == sizeof(block_q8_0) && V->nb[0] == sizeof(block_q8_0) &&
++                V->ne[0] == D && V->ne[1] == K->ne[1] && V->ne[2] == K->ne[2] &&
++                K->ne[3] == 1 && V->ne[3] == 1,
++            mask && mask->type == GGML_TYPE_F16 && !ggml_attn_mask_is_compact(mask) &&
++                mask->ne[0] == K->ne[1] && mask->ne[1] >= 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
++                mask->nb[0] == sizeof(half),
++            dst->src[4] != nullptr, max_bias, logit_softcap};
++        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        const bool grouped = ggml_cuda_fattn_vec_gqa_eligible(
++            ggml_cuda_fattn_vec_gqa_enabled() && GGML_CUDA_CC_IS_NVIDIA(cc), shape);
++        ggml_cuda_fattn_vec_gqa_trace(grouped, Q, K);
++        if (grouped) {
++            ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, false, 2>(ctx, dst);
++            return;
++        }
++    }
++
+     if (Q->ne[1] == 1) {
+         constexpr int cols_per_block = 1;
+         if (logit_softcap == 0.0f) {
+diff --git a/ggml/src/ggml-cuda/fattn-vec-gqa.h b/ggml/src/ggml-cuda/fattn-vec-gqa.h
+new file mode 100644
+index 0000000..234aac8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-vec-gqa.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// The experimental pair kernel preserves the vector kernel's independent
++// arithmetic for each query head. Keep unsupported layouts on the old path.
++struct ggml_cuda_fattn_vec_gqa_shape {
++    int64_t dimension, queries, query_heads, kv_heads, sequences, kv_tokens;
++    size_t q_stride, k_stride, v_stride;
++    bool q_f32, kv_q8, dense_mask, sinks;
++    float max_bias, softcap;
++};
++
++inline bool ggml_cuda_fattn_vec_gqa_eligible(bool enabled, const ggml_cuda_fattn_vec_gqa_shape & s) {
++    return enabled && s.dimension == 256 && s.queries == 1 && s.sequences == 1 &&
++        s.query_heads > 0 && s.kv_heads > 0 && s.query_heads % s.kv_heads == 0 &&
++        (s.query_heads/s.kv_heads) % 2 == 0 && s.kv_tokens > 0 && s.kv_tokens % 256 == 0 &&
++        s.q_f32 && s.kv_q8 && s.dense_mask && !s.sinks && s.max_bias == 0.0f && s.softcap == 0.0f &&
++        s.q_stride >= 256*sizeof(float) && s.q_stride % 16 == 0 &&
++        s.k_stride >= 8*34 && s.v_stride >= 8*34;
++}
++
++// Host tests use the exact canonical row mapping written by the kernel. Split-K
++// metadata and output values must agree so the existing merge stays unchanged.
++inline size_t ggml_cuda_fattn_vec_gqa_row(int sequence, int query, int head,
++        int queries, int heads, int splits, int split) {
++    return ((size_t(sequence)*queries + query)*heads + head)*splits + split;
++}
+diff --git a/tests/test-fattn-vec-gqa.cpp b/tests/test-fattn-vec-gqa.cpp
+new file mode 100644
+index 0000000..c666447
+--- /dev/null
++++ b/tests/test-fattn-vec-gqa.cpp
+@@ -0,0 +1,70 @@
++#include "../ggml/src/ggml-cuda/fattn-vec-gqa.h"
++
++#include <cstdio>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++int main() {
++    try {
++        const ggml_cuda_fattn_vec_gqa_shape good{
++            256, 1, 8, 2, 1, 1024, 1024, 272, 272, true, true, true, false, 0, 0};
++        require(ggml_cuda_fattn_vec_gqa_eligible(true, good), "supported pair layout rejected");
++        require(!ggml_cuda_fattn_vec_gqa_eligible(false, good), "default unexpectedly enabled");
++        for (int field = 0; field < 15; ++field) {
++            auto bad = good;
++            switch (field) {
++                case 0: bad.dimension = 128; break;
++                case 1: bad.queries = 2; break;
++                case 2: bad.sequences = 2; break;
++                case 3: bad.kv_heads = 0; break;
++                case 4: bad.query_heads = 7; break;
++                case 5: bad.query_heads = 6; break;
++                case 6: bad.kv_tokens = 1023; break;
++                case 7: bad.q_stride = 1028; break;
++                case 8: bad.k_stride = 271; break;
++                case 9: bad.v_stride = 271; break;
++                case 10: bad.q_f32 = false; break;
++                case 11: bad.kv_q8 = false; break;
++                case 12: bad.dense_mask = false; break;
++                case 13: bad.sinks = true; break;
++                case 14: bad.max_bias = 1; break;
++            }
++            require(!ggml_cuda_fattn_vec_gqa_eligible(true, bad), "unsupported pair layout admitted");
++        }
++        auto softcap = good; softcap.softcap = 1;
++        require(!ggml_cuda_fattn_vec_gqa_eligible(true, softcap), "softcap admitted");
++
++        size_t checked = 0;
++        for (int heads : {2, 4, 6, 8, 12, 16, 32}) {
++            for (int kv_heads : {1, 2, 4}) {
++                if (heads % kv_heads || (heads/kv_heads) % 2) { continue; }
++                for (int splits : {1, 2, 3, 4, 8, 16}) {
++                    std::vector<int> visits(size_t(heads)*splits);
++                    for (int group = 0; group < heads/2; ++group) {
++                        const int head_base = 2*group;
++                        require(head_base/(heads/kv_heads) == (head_base+1)/(heads/kv_heads),
++                            "pair crosses KV-head boundary");
++                        for (int j = 0; j < 2; ++j) {
++                            for (int split = 0; split < splits; ++split) {
++                                const auto row = ggml_cuda_fattn_vec_gqa_row(0, 0, head_base+j, 1, heads, splits, split);
++                                require(row == size_t(head_base+j)*splits + split,
++                                    "pair scratch does not match legacy split-K merge");
++                                require(++visits.at(row) == 1, "overlapping pair rows");
++                                ++checked;
++                            }
++                        }
++                    }
++                    for (int visits_per_row : visits) { require(visits_per_row == 1, "missing pair row"); }
++                }
++            }
++        }
++        std::printf("PASS GQA Q8 policy/default/fallback and canonical row mapping: %zu rows\n", checked);
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1;
++    }
++}
+diff --git a/tests/test-cuda-fattn-vec-gqa.cu b/tests/test-cuda-fattn-vec-gqa.cu
+new file mode 100644
+index 0000000..11be1ab
+--- /dev/null
++++ b/tests/test-cuda-fattn-vec-gqa.cu
+@@ -0,0 +1,141 @@
++// Standalone CUDA fixture: includes the production kernels, compares the pair
++// specialization with the legacy per-head kernel and its existing split merge.
++#include "../ggml/src/ggml-cuda/fattn-vec.cuh"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++// CUDA_CHECK uses this module-private diagnostic symbol. Keep the standalone
++// fixture independent of the production CUDA DLL and report failures to main.
++[[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
++    throw std::runtime_error(std::string("CUDA fixture: ")+stmt+" in "+func+" at "+file+":"+
++        std::to_string(line)+": "+msg);
++}
++
++template<class T> struct device_buffer {
++    T * data = nullptr;
++    explicit device_buffer(size_t count) { CUDA_CHECK(cudaMalloc((void **)&data, count*sizeof(T))); }
++    ~device_buffer() { if (data) { cudaFree(data); } }
++    device_buffer(const device_buffer &) = delete;
++    device_buffer & operator=(const device_buffer &) = delete;
++};
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++template<int heads_per_block>
++static std::vector<float> run(const std::vector<float> & q, const std::vector<block_q8_0> & k,
++        const std::vector<block_q8_0> & v, const std::vector<half> & mask,
++        int heads, int kv_heads, int tokens, int splits, int q_stride, int kv_stride,
++        int head_stride, int kv_max) {
++    device_buffer<float> dq(q.size()), output(size_t(heads)*256*splits), final(size_t(heads)*256);
++    device_buffer<block_q8_0> dk(k.size()), dv(v.size());
++    device_buffer<half> dm(mask.size());
++    device_buffer<float2> meta(size_t(heads)*splits);
++    device_buffer<int> max_rows(1);
++    CUDA_CHECK(cudaMemcpy(dq.data, q.data(), q.size()*sizeof(float), cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(dk.data, k.data(), k.size()*sizeof(block_q8_0), cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(dv.data, v.data(), v.size()*sizeof(block_q8_0), cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(dm.data, mask.data(), mask.size()*sizeof(half), cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(max_rows.data, &kv_max, sizeof(kv_max), cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemset(output.data, 0xff, size_t(heads)*256*splits*sizeof(float)));
++    CUDA_CHECK(cudaMemset(meta.data, 0xff, size_t(heads)*splits*sizeof(float2)));
++    const int row_bytes = kv_stride*sizeof(block_q8_0);
++    const int head_bytes = head_stride*sizeof(block_q8_0);
++    const dim3 grid(1, splits, heads/heads_per_block), block(32, 4, 1);
++    flash_attn_ext_vec<256, 1, heads_per_block, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false><<<grid, block>>>(
++        (const char *)dq.data, (const char *)dk.data, (const char *)dv.data, (const char *)dm.data,
++        nullptr, max_rows.data, output.data, meta.data,
++        1.0f/16, 0, 1, 1, 1, 0,
++        256, init_fastdiv_values(1), heads, 1, 256*sizeof(float), q_stride*sizeof(float), q.size()*sizeof(float),
++        256, tokens, kv_heads, 1, row_bytes, head_bytes, k.size()*sizeof(block_q8_0),
++        row_bytes, head_bytes, v.size()*sizeof(block_q8_0),
++        tokens, 1, 1, tokens*sizeof(half), tokens*sizeof(half), tokens*sizeof(half));
++    CUDA_CHECK(cudaGetLastError());
++    const float * result = output.data;
++    if (splits > 1) {
++        flash_attn_combine_results<256><<<dim3(1, heads, 1), dim3(256, 1, 1), splits*sizeof(float2)>>>(
++            output.data, meta.data, final.data, splits);
++        CUDA_CHECK(cudaGetLastError());
++        result = final.data;
++    }
++    std::vector<float> host(size_t(heads)*256);
++    CUDA_CHECK(cudaMemcpy(host.data(), result, host.size()*sizeof(float), cudaMemcpyDeviceToHost));
++    return host;
++}
++
++static void check(int heads, int kv_heads, int tokens, int splits, bool padded, bool clipped) {
++    const int q_stride = 256 + (padded ? 16 : 0);
++    const int kv_stride = 8 + (padded ? 2 : 0);
++    const int head_stride = (tokens + (padded ? 7 : 0))*kv_stride;
++    const int visible = clipped ? tokens/2 - 17 : tokens;
++    const int kv_max = clipped ? ((visible + 255)/256)*256 : tokens;
++    std::vector<float> q(size_t(heads)*q_stride, 1234);
++    std::vector<block_q8_0> k(size_t(kv_heads)*head_stride), v(k.size());
++    std::vector<half> mask(tokens);
++    for (int head = 0; head < heads; ++head) {
++        for (int d = 0; d < 256; ++d) { q[head*q_stride+d] = std::sin(float(13*head+d)*.031f); }
++    }
++    for (int head = 0; head < kv_heads; ++head) {
++        for (int row = 0; row < tokens; ++row) {
++            for (int b = 0; b < 8; ++b) {
++                const size_t index = size_t(head)*head_stride + row*kv_stride + b;
++                const half scale = __float2half(.003f + .0001f*((row+head+b)%11));
++                std::memcpy(&k[index].d, &scale, sizeof(scale));
++                std::memcpy(&v[index].d, &scale, sizeof(scale));
++                for (int d = 0; d < 32; ++d) {
++                    k[index].qs[d] = int8_t((row*7+head*13+b*3+d*11)%127-63);
++                    v[index].qs[d] = int8_t((row*3+head*19+b*17+d*5)%125-62);
++                }
++            }
++        }
++    }
++    for (int row = 0; row < tokens; ++row) {
++        mask[row] = __float2half(row >= visible || row%17 == 3 ? -INFINITY : 0.0f);
++    }
++    const auto legacy = run<1>(q,k,v,mask,heads,kv_heads,tokens,splits,q_stride,kv_stride,head_stride,kv_max);
++    const auto pair = run<2>(q,k,v,mask,heads,kv_heads,tokens,splits,q_stride,kv_stride,head_stride,kv_max);
++    float max_error = 0;
++    for (size_t i = 0; i < pair.size(); ++i) {
++        require(std::isfinite(legacy[i]) && std::isfinite(pair[i]), "nonfinite attention output");
++        max_error = std::max(max_error, std::abs(legacy[i]-pair[i]));
++        require(std::abs(legacy[i]-pair[i]) <= 2e-6f + 2e-5f*std::abs(legacy[i]), "attention mismatch");
++    }
++    for (int head = 0; head < heads; ++head) {
++        const auto begin = size_t(head)*256;
++        require(std::max_element(legacy.begin()+begin, legacy.begin()+begin+256)-legacy.begin() ==
++                std::max_element(pair.begin()+begin, pair.begin()+begin+256)-pair.begin(), "attention argmax changed");
++    }
++    std::printf("GQA_Q8_REFERENCE heads=%d kv_heads=%d tokens=%d splits=%d padded=%d clipped=%d max_error=%.9g PASS\n",
++        heads,kv_heads,tokens,splits,int(padded),int(clipped),double(max_error));
++}
++
++int main() {
++    try {
++        int devices = 0;
++        const auto status = cudaGetDeviceCount(&devices);
++        if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver ||
++                (status == cudaSuccess && devices == 0)) {
++            std::puts("SKIP: no CUDA device/driver available"); return 77;
++        }
++        CUDA_CHECK(status);
++        const std::pair<int,int> shapes[] = {{4,1}, {6,1}, {8,2}, {12,2}};
++        for (const auto & shape : shapes) {
++            for (int splits : {1,4,16}) {
++                check(shape.first,shape.second,2048,splits,false,false);
++                check(shape.first,shape.second,2048,splits,true,true);
++            }
++        }
++        std::puts("PASS grouped Q8 attention matches legacy heads, dense masks, padded strides, bounded live KV and split-K");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1;
++    }
++}
