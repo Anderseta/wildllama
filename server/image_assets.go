@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -24,6 +25,25 @@ import (
 )
 
 const imageUploadLimit = 48 << 20
+
+// Upload validation may expand a compact image into a large pixel buffer.
+// Stop reading when the request is abandoned, including file/hash reads after
+// the HTTP body has already completed. No decoder mode or image bytes change.
+type imageRequestReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r imageRequestReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.reader.Read(p)
+	if cancelled := r.ctx.Err(); cancelled != nil {
+		return n, cancelled
+	}
+	return n, err
+}
 
 func (asset imageAssetRecord) relativePath() string {
 	if asset.Input {
@@ -121,6 +141,11 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 		c.JSON(413, gin.H{"error": "reference images are limited to48 MiB"})
 		return
 	}
+	ctx := c.Request.Context()
+	if err := ctx.Err(); err != nil {
+		imageUploadReadError(c, err)
+		return
+	}
 	v := s.imageService()
 	// Full decoder validation is serialized. The64-megapixel bound is checked
 	// before allocating pixels; concurrent uploads cannot multiply that cost.
@@ -128,6 +153,11 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 	case v.uploadSlot <- struct{}{}:
 		defer func() { <-v.uploadSlot }()
 	case <-c.Request.Context().Done():
+		imageUploadReadError(c, ctx.Err())
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		imageUploadReadError(c, err)
 		return
 	}
 	v.mu.Lock()
@@ -154,7 +184,11 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 			c.JSON(409, gin.H{"error": "image upload request_id belongs to different image bytes or media type"})
 			return
 		}
-		if err := imageVerifyUploadedAsset(existing); err != nil {
+		if err := imageVerifyUploadedAsset(ctx, existing); err != nil {
+			if ctx.Err() != nil {
+				imageUploadReadError(c, ctx.Err())
+				return
+			}
 			c.JSON(410, gin.H{"error": "the original uploaded image is unavailable or changed; submit a new request_id"})
 			return
 		}
@@ -191,6 +225,9 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 	defer os.Remove(temporary)
 	fingerprint, err := imageReadUpload(c, file, sessionID, kind)
 	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
 		err = file.Sync()
 	}
 	closeErr := file.Close()
@@ -206,7 +243,12 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	config, err := imageDecodeConfig(io.LimitReader(input, imageUploadLimit), kind)
+	config, err := imageDecodeConfig(io.LimitReader(imageRequestReader{ctx, input}, imageUploadLimit), kind)
+	if ctx.Err() != nil {
+		input.Close()
+		imageUploadReadError(c, ctx.Err())
+		return
+	}
 	if err != nil || config.Width <= 0 || config.Height <= 0 || int64(config.Width)*int64(config.Height) > 64<<20 {
 		input.Close()
 		c.JSON(400, gin.H{"error": "invalid reference image or dimensions above64 megapixels"})
@@ -214,12 +256,16 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 	}
 	if _, err = input.Seek(0, io.SeekStart); err == nil {
 		var decoded image.Image
-		decoded, err = imageDecode(io.LimitReader(input, imageUploadLimit), kind)
+		decoded, err = imageDecode(io.LimitReader(imageRequestReader{ctx, input}, imageUploadLimit), kind)
 		if err == nil && (decoded.Bounds().Dx() != config.Width || decoded.Bounds().Dy() != config.Height) {
 			err = errors.New("image dimensions changed while decoding")
 		}
 	}
 	input.Close()
+	if ctx.Err() != nil {
+		imageUploadReadError(c, ctx.Err())
+		return
+	}
 	if err != nil {
 		c.JSON(400, gin.H{"error": "reference image data is incomplete or invalid"})
 		return
@@ -234,6 +280,12 @@ func (s *Server) imageUploadHandler(c *gin.Context) {
 		asset.UploadFingerprint = fingerprint
 	}
 	v.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		v.mu.Unlock()
+		_ = os.Remove(path)
+		imageUploadReadError(c, err)
+		return
+	}
 	if err := v.checkImageSessionLocked(sessionID, requestID); err != nil {
 		v.mu.Unlock()
 		_ = os.Remove(path)
@@ -280,20 +332,23 @@ func imageUploadHash(sessionID, kind string) hash.Hash {
 func imageReadUpload(c *gin.Context, target io.Writer, sessionID, kind string) (string, error) {
 	digest := imageUploadHash(sessionID, kind)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, imageUploadLimit)
-	if _, err := io.Copy(io.MultiWriter(target, digest), c.Request.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(target, digest), imageRequestReader{c.Request.Context(), c.Request.Body}); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func imageVerifyUploadedAsset(asset imageAssetRecord) error {
+func imageVerifyUploadedAsset(ctx context.Context, asset imageAssetRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	file, err := openImageAsset(asset)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	digest := imageUploadHash(asset.SessionID, asset.MIMEType)
-	if _, err := io.Copy(digest, io.LimitReader(file, imageUploadLimit+1)); err != nil {
+	if _, err := io.Copy(digest, io.LimitReader(imageRequestReader{ctx, file}, imageUploadLimit+1)); err != nil {
 		return err
 	}
 	if hex.EncodeToString(digest.Sum(nil)) != asset.UploadFingerprint {
@@ -304,7 +359,9 @@ func imageVerifyUploadedAsset(asset imageAssetRecord) error {
 
 func imageUploadReadError(c *gin.Context, err error) {
 	var max *http.MaxBytesError
-	if errors.As(err, &max) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		c.JSON(499, gin.H{"error": err.Error()})
+	} else if errors.As(err, &max) {
 		c.JSON(413, gin.H{"error": "reference images are limited to48 MiB"})
 	} else {
 		c.JSON(400, gin.H{"error": err.Error()})

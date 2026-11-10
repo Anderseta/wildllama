@@ -352,22 +352,35 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 // collate messages based on role. consecutive messages of the same role are merged
 // into a single message (except for tool messages which preserve individual metadata).
 // collate also collects and returns all system messages.
-// collate mutates message content adding image tags ([img-%d]) as needed
-// todo(parthsareen): revisit for contextual image support
+// The first message's metadata is preserved when merging, without changing the
+// caller's history. Join each run once instead of copying its growing prefix.
 func collate(msgs []api.Message) (string, []*api.Message) {
 	var system []string
 	var collated []*api.Message
-	for i := range msgs {
+	for i := 0; i < len(msgs); {
+		end := i + 1
+		if msgs[i].Role != "tool" {
+			for end < len(msgs) && msgs[end].Role == msgs[i].Role {
+				end++
+			}
+		}
 		if msgs[i].Role == "system" {
-			system = append(system, msgs[i].Content)
+			for j := i; j < end; j++ {
+				system = append(system, msgs[j].Content)
+			}
 		}
-
-		// merges consecutive messages of the same role into a single message (except for tool messages)
-		if len(collated) > 0 && collated[len(collated)-1].Role == msgs[i].Role && msgs[i].Role != "tool" {
-			collated[len(collated)-1].Content += "\n\n" + msgs[i].Content
-		} else {
+		if end == i+1 {
 			collated = append(collated, &msgs[i])
+		} else {
+			merged := msgs[i]
+			parts := make([]string, end-i)
+			for j := i; j < end; j++ {
+				parts[j-i] = msgs[j].Content
+			}
+			merged.Content = strings.Join(parts, "\n\n")
+			collated = append(collated, &merged)
 		}
+		i = end
 	}
 
 	return strings.Join(system, "\n\n"), collated

@@ -87,7 +87,7 @@ func TestTransferPermanentDiskErrorDoesNotRetryOrRemovePartial(t *testing.T) {
 	failure := errors.New("space guard fixture")
 	attempts := 0
 	client := &http.Client{Transport: diskTestTransport(func(request *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader([]byte("abc"))), Header: make(http.Header)}, nil
+		return &http.Response{StatusCode: 200, ContentLength: 3, Body: io.NopCloser(bytes.NewReader([]byte("abc"))), Header: make(http.Header)}, nil
 	})}
 	partial := filepath.Join(directory, digestToPath(digest)+".tmp")
 	require.NoError(t, os.WriteFile(partial, []byte("partial"), 0600))

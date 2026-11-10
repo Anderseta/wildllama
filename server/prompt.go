@@ -30,14 +30,22 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	imageNumTokens := 768
 
 	currMsgIdx := 0
+	countedStart := -1
+	var countedPrompt string
 
 	if truncate {
+		textOnly := !slices.ContainsFunc(msgs, func(message api.Message) bool { return len(message.Images) > 0 })
 		var err error
 		currMsgIdx, err = fittingPromptStart(ctx, msgs, opts.NumCtx, monotonicPromptLimit(m, msgs, false), func(i int) (int, error) {
+			// Retain only the latest candidate, never every truncation attempt.
+			countedPrompt, countedStart = "", -1
 			candidate := promptMessagesFrom(msgs, i)
 			p, err := renderPrompt(m, candidate, tools, think)
 			if err != nil {
 				return 0, err
+			}
+			if textOnly {
+				countedPrompt, countedStart = p, i
 			}
 			s, err := tokenize(ctx, p)
 			if err != nil {
@@ -65,6 +73,12 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	if currMsgIdx > 0 {
 		slog.Debug("truncating input messages which exceed context length", "truncated", len(msgs[currMsgIdx:]))
 	}
+	if countedStart == currMsgIdx {
+		// Text-only preparation need not tag media or render the same history
+		// a second time. Submit exactly the prompt whose tokens were counted.
+		return countedPrompt, nil, nil
+	}
+	countedPrompt = ""
 
 	renderMsgs, media, err := imageTaggedMessages(m, msgs, currMsgIdx, false)
 	if err != nil {

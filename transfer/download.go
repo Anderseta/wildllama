@@ -198,6 +198,9 @@ func (d *downloader) download(ctx context.Context, blob Blob) error {
 		}
 
 		d.progress.add(-n) // rollback
+		if errors.Is(err, ErrInvalidDownloadRange) {
+			return err
+		}
 		if d.permanentError != nil && d.permanentError(err) {
 			return err
 		}
@@ -287,14 +290,12 @@ func (d *downloader) downloadOnce(ctx context.Context, blob Blob) (int64, error)
 	}
 	defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusOK:
+	if resp.StatusCode == http.StatusOK {
 		// Full response — reset any partial state
 		existingSize = 0
-	case http.StatusPartialContent:
-		// Resume succeeded
-	default:
-		return 0, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	if err := ValidateDownloadResponse(resp, existingSize, blob.Size-existingSize, blob.Size); err != nil {
+		return 0, err
 	}
 
 	return d.save(ctx, cancel, blob, resp.Body, existingSize)

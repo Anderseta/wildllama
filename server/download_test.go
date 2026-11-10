@@ -78,7 +78,7 @@ func TestDownloadChunkRedirects(t *testing.T) {
 			if tc.name == "lookup" {
 				requestURL, _ = url.Parse(strings.Replace(server.URL, "127.0.0.1", "localhost", 1) + "/data")
 			}
-			download := &blobDownload{Name: filepath.Join(t.TempDir(), "blob")}
+			download := &blobDownload{Name: filepath.Join(t.TempDir(), "blob"), Total: 1}
 			part := &blobDownloadPart{Size: 1, blobDownload: download}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
@@ -143,6 +143,7 @@ func TestSharedBlobCancellationKeepsRemainingConsumer(t *testing.T) {
 	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gets.Add(1)
 		w.Header().Set("Content-Length", "1")
+		w.Header().Set("Content-Range", "bytes 0-0/1")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("x"))
 	}))
@@ -428,6 +429,7 @@ func BenchmarkDownloadChunkCompletion(b *testing.B) {
 	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write(data)
 	}))
@@ -443,7 +445,7 @@ func BenchmarkDownloadChunkCompletion(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		download := &blobDownload{Name: downloadPath, Digest: digest}
+		download := &blobDownload{Name: downloadPath, Digest: digest, Total: int64(len(data))}
 		part := &blobDownloadPart{Size: int64(len(data)), blobDownload: download}
 		if err := download.downloadChunk(b.Context(), server.Client(), requestURL, io.Discard, part); err != nil {
 			b.Fatal(err)
@@ -454,6 +456,7 @@ func BenchmarkDownloadChunkCompletion(b *testing.B) {
 func TestDownloadChunkReturnsWhenTransferCompletes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "1")
+		w.Header().Set("Content-Range", "bytes 0-0/1")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte{0})
 	}))
@@ -467,6 +470,7 @@ func TestDownloadChunkReturnsWhenTransferCompletes(t *testing.T) {
 	download := &blobDownload{
 		Name:   filepath.Join(t.TempDir(), "blob"),
 		Digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		Total:  1,
 	}
 	part := &blobDownloadPart{Size: 1, blobDownload: download}
 	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
@@ -482,6 +486,7 @@ func TestDownloadChunkDetectsStallBeforeFirstByte(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(requestStarted)
 		w.Header().Set("Content-Length", "1")
+		w.Header().Set("Content-Range", "bytes 0-0/1")
 		w.WriteHeader(http.StatusPartialContent)
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
@@ -493,7 +498,7 @@ func TestDownloadChunkDetectsStallBeforeFirstByte(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	download := &blobDownload{Digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+	download := &blobDownload{Total: 1, Digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
 	part := &blobDownloadPart{Size: 1, blobDownload: download}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()

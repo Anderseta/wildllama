@@ -296,8 +296,9 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 				}
 				err = b.downloadChunk(inner, client, directURL, w, part)
 				switch {
-				case errors.Is(err, context.Canceled), errors.Is(err, syscall.ENOSPC), imagegen.IsDiskSpaceError(err):
-					// return immediately if the context is canceled or the device is out of space
+				case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, syscall.ENOSPC), imagegen.IsDiskSpaceError(err), errors.Is(err, transfer.ErrInvalidDownloadRange):
+					// Do not retry cancellation, disk exhaustion or a response that
+					// cannot safely advance this byte range.
 					return err
 				case errors.Is(err, errPartStalled):
 					try--
@@ -307,9 +308,9 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 					slog.Info(fmt.Sprintf("%s part %d attempt %d failed: %v, retrying in %s", b.Digest[7:19], part.N, try, err, sleep))
 					timer := time.NewTimer(sleep)
 					select {
-					case <-ctx.Done():
+					case <-inner.Done():
 						timer.Stop()
-						return ctx.Err()
+						return inner.Err()
 					case <-timer.C:
 					}
 					continue
@@ -395,6 +396,9 @@ func (b *blobDownload) downloadChunk(ctx context.Context, client *http.Client, r
 			return err
 		}
 		defer resp.Body.Close()
+		if err := transfer.ValidateDownloadResponse(resp, part.StartsAt(), part.Size-part.Completed.Load(), b.Total); err != nil {
+			return err
+		}
 
 		n, err := io.CopyN(downloadProgressWriter{writer: w, part: part}, resp.Body, part.Size-part.Completed.Load())
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrUnexpectedEOF) && !imagegen.IsDiskSpaceError(err) && !errors.Is(err, syscall.ENOSPC) {

@@ -148,6 +148,14 @@ func (c *Client) do(ctx context.Context, method, path string, reqData, respData 
 	}
 	defer respObj.Body.Close()
 
+	if respObj.StatusCode < http.StatusBadRequest && respData == nil {
+		// Drain successful acknowledgements without retaining a response-sized
+		// allocation. Reading to EOF still permits HTTP connection reuse and
+		// propagates body read errors (including request cancellation).
+		_, err := io.Copy(io.Discard, respObj.Body)
+		return err
+	}
+
 	respBody, err := io.ReadAll(respObj.Body)
 	if err != nil {
 		return err
