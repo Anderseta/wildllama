@@ -1,0 +1,1633 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 7eb0871093a542896b259156659cea0f9eb860f9..a6822230012518780a44cad6a728b2a9a08f3e8b 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/common/mtp-proposal-policy.h b/common/mtp-proposal-policy.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..666ec10478474407d16e712c515d417eae077527
+--- /dev/null
++++ b/common/mtp-proposal-policy.h
+@@ -0,0 +1,61 @@
++#pragma once
++#include "llama.h"
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <vector>
++
++// Tune only the proposal. The verifier must still receive the exact q used by
++// that proposal; target temperature, filters, RNG and vocabulary never change.
++struct common_mtp_proposal_feedback {
++    static constexpr std::array<float, 3> factors{1.f, .85f, 1.15f};
++    std::array<double, 3> overlap{};
++    double weight = 0;
++    float factor = 1;
++    void observe(const llama_token_data_array & p, const std::vector<llama_token_data> & q, double prefix) {
++        if (q.empty() || q.size() > 10 || prefix <= 0 || !std::isfinite(prefix)) { return; }
++        std::array<llama_token_data, 10> ordered{};
++        std::copy(q.begin(), q.end(), ordered.begin());
++        std::sort(ordered.begin(), ordered.begin() + q.size(), [](const auto & a, const auto & b) { return a.logit > b.logit; });
++        double p_sum = 0;
++        for (size_t i = 0; i < p.size; ++i) { p_sum += p.data[i].p; }
++        if (!(p_sum > 0) || !std::isfinite(p_sum)) { return; }
++        for (size_t arm = 0; arm < factors.size(); ++arm) {
++            const size_t count = q.size();
++            std::array<double, 10> probability{};
++            double sum = 0;
++            for (size_t i = 0; i < count; ++i) {
++                probability[i] = std::exp(double(ordered[i].logit - ordered[0].logit) * factor / factors[arm]);
++                sum += probability[i];
++            }
++            if (!(sum > 0) || !std::isfinite(sum)) { return; }
++            double mass = 0;
++            for (size_t i = 0; i < count; ++i) {
++                for (size_t j = 0; j < p.size; ++j) {
++                    if (ordered[i].id == p.data[j].id) { mass += std::min(double(p.data[j].p) / p_sum, probability[i] / sum); break; }
++                }
++            }
++            overlap[arm] += prefix * mass;
++        }
++        weight += prefix;
++    }
++};
++
++struct common_mtp_proposal_policy {
++    std::array<double, 3> score{};
++    size_t rounds = 0;
++    size_t arm = 0;
++    void update(const common_mtp_proposal_feedback & feedback) {
++        if (!(feedback.weight > 0) || !std::isfinite(feedback.weight)) { return; }
++        for (size_t i = 0; i < score.size(); ++i) {
++            const double next = feedback.overlap[i] / feedback.weight;
++            if (!std::isfinite(next)) { return; }
++            score[i] = rounds ? .875 * score[i] + .125 * next : next;
++        }
++        ++rounds;
++        if (rounds < 8 || rounds % 8) { return; }
++        const size_t best = std::max_element(score.begin(), score.end()) - score.begin();
++        if (score[best] > score[arm] + .02) { arm = best; }
++    }
++};
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 0226717d462b229abdccf4f5df1e958009f86b6c..f99df16c757804dfd8851b8bc2b263cd23b3221d 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,5 +1,6 @@
+ #include "sampling.h"
+ #include "sampling-probability.h"
++#include "mtp-proposal-policy.h"
+ #include "sampling-block-verification.h"
+ #include "../src/llama-ext.h"
+ #include "../src/llama-sampler.h"
+@@ -195,6 +196,15 @@ struct common_sampler {
+     // Rejection-only workspace, not sampler state: do not clone/copy it.
+     std::vector<uint32_t> residual_order;
+     uint64_t verified_blocks = 0;
++    // Request-owned scratch. Never copy it into sampler checkpoints.
++    common_sampler_ptr block_preview;
++    std::vector<std::pair<llama_token, double>> block_residual;
++    std::vector<llama_token_data> block_unmasked;
++    uint64_t gpu_distribution_rows = 0;
++    bool block_preview_enabled = [] {
++        const char * value = std::getenv("WILDLLAMA_MTP_BLOCK_PREVIEW");
++        return !value || !*value || std::strcmp(value, "1") == 0;
++    }();
+ };
+ 
+ std::string common_params_sampling::print() const {
+@@ -474,7 +484,12 @@ struct common_sampler * common_sampler_init(
+ 
+     llama_sampler_ptr thinking_prefilter;
+     const char * thinking_prefilter_env = std::getenv("WILDLLAMA_GPU_THINKING_SAMPLE");
+-    if ((!grmr || params.grammar_lazy) && params.n_probs == 0 && thinking_prefilter_env &&
++    const char * distribution_env = std::getenv("WILDLLAMA_MTP_GPU_DISTRIBUTION");
++    if ((!grmr || params.grammar_lazy) && params.n_probs == 0 && distribution_env &&
++            std::strcmp(distribution_env, "1") == 0) {
++        thinking_prefilter.reset(llama_sampler_init_gpu_distribution(chain.get(), llama_vocab_n_tokens(vocab)));
++    }
++    if (!thinking_prefilter && (!grmr || params.grammar_lazy) && params.n_probs == 0 && thinking_prefilter_env &&
+             std::strcmp(thinking_prefilter_env, "1") == 0) {
+         thinking_prefilter.reset(llama_sampler_init_thinking_prefilter(chain.get(), llama_vocab_n_tokens(vocab)));
+     }
+@@ -571,7 +586,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
+     gsmpl->reset();
+ }
+ 
+-struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
++static common_sampler * common_sampler_clone_impl(common_sampler * gsmpl, bool candidates) {
+     llama_sampler_ptr grmr(llama_sampler_clone(gsmpl->grmr));
+     llama_sampler_ptr rbudget(llama_sampler_clone(gsmpl->rbudget));
+     llama_sampler_ptr chain(llama_sampler_clone(gsmpl->chain));
+@@ -583,20 +598,40 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .token_mask = */ gsmpl->token_mask ? llama_sampler_chain_get(chain.get(),0) : nullptr,
+         /* .thinking_prefilter = */ llama_sampler_ptr(llama_sampler_clone(gsmpl->thinking_prefilter.get())),
+         /* .prev    = */ gsmpl->prev,
+-        /* .cur     = */ gsmpl->cur,
+-        /* .cur_p   = */ gsmpl->cur_p,
++        /* .cur     = */ candidates ? gsmpl->cur : std::vector<llama_token_data>{},
++        /* .cur_p   = */ candidates ? gsmpl->cur_p : llama_token_data_array{},
+         /* .rng     = */ gsmpl->rng,
+         /* .t_total_us = */ 0,
+         /* .candidate_rows = */ 0,
+         /* .thinking_prefilter_rows = */ gsmpl->thinking_prefilter_rows,
+     };
+-    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
++    result->cur_p.data = candidates && gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
++    result->block_preview_enabled = gsmpl->block_preview_enabled;
+     grmr.release();
+     rbudget.release();
+     chain.release();
+     return result;
+ }
+ 
++struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
++    return common_sampler_clone_impl(gsmpl, true);
++}
++
++static common_sampler * common_sampler_block_preview(common_sampler * source) {
++    if (!source->block_preview) {
++        source->block_preview.reset(common_sampler_clone_impl(source, false));
++    } else {
++        auto * preview = source->block_preview.get();
++        llama_sampler_copy(source->grmr, preview->grmr);
++        llama_sampler_copy(source->rbudget, preview->rbudget);
++        llama_sampler_copy(source->chain, preview->chain);
++        preview->prev = source->prev;
++        preview->rng = source->rng;
++        preview->cur_p = {};
++    }
++    return source->block_preview.get();
++}
++
+ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     if (!src || !dst || src == dst) {
+         return;
+@@ -619,6 +654,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     dst->t_total_us = src->t_total_us;
+     dst->candidate_rows = src->candidate_rows;
+     dst->thinking_prefilter_rows = src->thinking_prefilter_rows;
++    dst->block_preview_enabled = src->block_preview_enabled;
+ }
+ 
+ void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
+@@ -640,6 +676,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+         // note: the sampling time includes the samplers time + extra time spent in common/sampling
+         LOG_INF("%s:    sampling time = %10.2f ms\n", __func__, t_sampling_ms);
+         LOG_INF("%s:    samplers time = %10.2f ms / %5d tokens\n", __func__, data.t_sample_ms, data.n_sample);
++        if (gsmpl->block_preview && gsmpl->block_preview->gpu_distribution_rows) {
++            LOG_INF("%s: GPU probability rows = %llu\n", __func__,
++                (unsigned long long) gsmpl->block_preview->gpu_distribution_rows);
++        }
+     }
+ 
+     if (ctx) {
+@@ -688,6 +728,10 @@ uint64_t common_sampler_get_thinking_prefilter_rows(const struct common_sampler
+     return gsmpl ? gsmpl->thinking_prefilter_rows : 0;
+ }
+ 
++uint64_t common_sampler_get_gpu_distribution_rows(const struct common_sampler * gsmpl) {
++    return gsmpl && gsmpl->block_preview ? gsmpl->block_preview->gpu_distribution_rows : 0;
++}
++
+ struct llama_sampler * common_sampler_get_backend_speculative(const struct common_sampler * gsmpl) {
+     auto * backend = common_sampler_get_backend(gsmpl);
+     if (backend && gsmpl->params.n_probs == 0 && !gsmpl->grmr && !gsmpl->rbudget &&
+@@ -775,6 +819,9 @@ static llama_token common_sampler_sample_synchronized(struct common_sampler * gs
+     // Borrow after the existing fence/timer boundary: output reordering remains
+     // included in sampler CPU time while GPU waits remain excluded.
+     auto output = llama_get_sampler_output_ith_synchronized(ctx, idx);
++    if (output.raw_logits && llama_sampler_is_gpu_distribution(gsmpl->thinking_prefilter.get())) {
++        output.sampled_logits = nullptr; output.sampled_probs = nullptr; output.candidates = nullptr;
++    }
+     bool compact_thinking_candidates = false;
+     // Only an attached prefilter publishes both original logits and a compact
+     // view. The MTP drafter's independently attached top-k output is complete.
+@@ -973,18 +1020,92 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+ 
+ bool common_sampler_can_verify_block(const common_sampler * sampler, bool grammar_first) {
+     const auto & params = sampler->params;
+-    // Grammar-last resampling is a mixture of two distributions. The compact
+-    // candidate array describes only one of them. Stateful RNG-driven filters
+-    // and per-token probability reporting retain the existing verifier too.
++    // Grammar-last requires the complete mixture preview. Stateful RNG-driven
++    // filters and per-token probability reporting retain the existing verifier.
+     return params.temp > 0.0f && !params.backend_sampling && params.n_probs == 0 && params.mirostat == 0 &&
+            params.xtc_probability == 0.0f && params.adaptive_target < 0.0f &&
+-           (!sampler->grmr || grammar_first || params.grammar_first) && !sampler->token_mask;
++           (!sampler->grmr || grammar_first || params.grammar_first ||
++               (sampler->block_preview_enabled && llama_sampler_can_preview_distribution(sampler->chain))) && !sampler->token_mask;
++}
++
++static void common_sampler_block_distribution(common_sampler * preview, llama_context * ctx, int index, bool grammar_first) {
++    auto output = llama_get_sampler_output_ith_synchronized(ctx, index);
++    const bool grammar_active = grammar_should_apply(preview) && !llama_sampler_grammar_awaiting_trigger(preview->grmr);
++    if (!grammar_active && common_reasoning_budget_get_state(preview->rbudget) != REASONING_BUDGET_FORCING &&
++            llama_sampler_is_gpu_distribution(preview->thinking_prefilter.get()) && output.sampled_probs &&
++            output.sampled_logits && output.candidates && output.sampled_probs_count > 0 &&
++            output.sampled_probs_count == output.sampled_logits_count && output.candidates_count == output.sampled_probs_count) {
++        preview->set_logits(ctx, output);
++        double sum = 0;
++        bool valid = true;
++        for (const auto & token : preview->cur) {
++            valid &= std::isfinite(token.p) && token.p >= 0;
++            sum += token.p;
++        }
++        if (valid && std::abs(sum - 1.0) < 1e-4) { ++preview->gpu_distribution_rows; return; }
++    }
++    // The preview computes both branches of grammar-last when needed. A compact
++    // prefilter cannot represent its grammar-first retry, so use the raw row.
++    if (output.raw_logits) { output.sampled_logits = nullptr; output.sampled_probs = nullptr; output.candidates = nullptr; }
++    preview->set_logits(ctx, output);
++    auto & current = preview->cur_p;
++    llama_sampler_apply(preview->rbudget, &current);
++    const bool grammar = grammar_should_apply(preview) && !llama_sampler_grammar_awaiting_trigger(preview->grmr);
++    auto & chain = *static_cast<llama_sampler_chain *>(preview->chain->ctx);
++    const bool previous_guard = chain.guard_finite_sampling;
++    struct restore_guard { bool & value; bool previous; ~restore_guard() { value = previous; } } restore{chain.guard_finite_sampling, previous_guard};
++    chain.guard_finite_sampling |= grammar && grammar_first;
++    if (grammar_first && grammar) { llama_sampler_apply(preview->grmr, &current); }
++    GGML_ASSERT(llama_sampler_preview_distribution(preview->chain, &current));
++    if (!grammar || grammar_first) { return; }
++
++    // Grammar-last is a mixture, not a renormalized mask of the first draw:
++    // P(x) = P0(x)*valid(x) + P0(invalid)*P1(x), where P1 applies grammar
++    // BEFORE all deterministic filters. Preserve top-k/top-p ordering.
++    auto & unmasked = preview->block_unmasked;
++    unmasked.assign(current.data, current.data + current.size);
++    llama_token_data_array valid = {unmasked.data(), unmasked.size(), -1, current.sorted};
++    llama_sampler_apply(preview->grmr, &valid);
++    double all_mass = 0.0, invalid_mass = 0.0;
++    for (auto & token : unmasked) {
++        all_mass += token.p;
++        if (token.logit == -INFINITY) { invalid_mass += token.p; token.p = 0.0f; }
++    }
++    if (!(all_mass > 0.0) || !std::isfinite(all_mass)) {
++        throw common_sampler_constraint_error("Invalid unconstrained distribution in MTP block preview");
++    }
++    if (invalid_mass == 0.0) { return; }
++    std::sort(unmasked.begin(), unmasked.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
++    preview->set_logits(ctx, output);
++    llama_sampler_apply(preview->rbudget, &current);
++    llama_sampler_apply(preview->grmr, &current);
++    chain.guard_finite_sampling = true;
++    GGML_ASSERT(llama_sampler_preview_distribution(preview->chain, &current));
++    const double retry_mass = invalid_mass / all_mass;
++    double retry_total = 0.0;
++    for (size_t i = 0; i < current.size; ++i) { retry_total += current.data[i].p; }
++    if (!(retry_total > 0.0) || !std::isfinite(retry_total)) {
++        throw common_sampler_constraint_error("Invalid constrained distribution in MTP block preview");
++    }
++    for (auto & token : unmasked) { token.p /= all_mass; }
++    for (size_t i = 0; i < current.size; ++i) {
++        const auto token = current.data[i];
++        auto it = std::lower_bound(unmasked.begin(), unmasked.end(), token.id,
++            [](const llama_token_data & item, llama_token id) { return item.id < id; });
++        if (it != unmasked.end() && it->id == token.id) {
++            it->p += retry_mass * token.p / retry_total;
++        } else {
++            unmasked.insert(it, {token.id, token.logit, float(retry_mass * token.p / retry_total)});
++        }
++    }
++    preview->cur.assign(unmasked.begin(), unmasked.end());
++    current = {preview->cur.data(), preview->cur.size(), -1, false};
+ }
+ 
+ static std::vector<llama_token> common_sampler_verify_block(
+         common_sampler * sampler, llama_context * ctx, const std::vector<int> & indexes,
+         const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & proposals,
+-        bool grammar_first) {
++        bool grammar_first, common_mtp_proposal_feedback * feedback) {
+     if (draft.size() < 2 || draft.size() > 4 || !common_sampler_can_verify_block(sampler, grammar_first)) {
+         return {};
+     }
+@@ -1002,19 +1123,26 @@ static std::vector<llama_token> common_sampler_verify_block(
+         }
+     }
+ 
+-    common_sampler_ptr prefix_sampler(common_sampler_clone(sampler));
++    const bool use_preview = sampler->block_preview_enabled && llama_sampler_can_preview_distribution(sampler->chain);
++    common_sampler_ptr legacy_preview;
++    if (!use_preview) { legacy_preview.reset(common_sampler_clone(sampler)); }
++    auto * prefix_sampler = use_preview ? common_sampler_block_preview(sampler) : legacy_preview.get();
+     auto rng = sampler->rng;
+     std::uniform_real_distribution<double> uniform(0.0, 1.0);
+     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+     const std::vector<llama_token_data> bonus_q;
+-    std::vector<std::pair<llama_token, double>> residual;
++    std::vector<std::pair<llama_token, double>> legacy_residual;
++    auto & residual = use_preview ? sampler->block_residual : legacy_residual;
+     size_t kept = 0;
+     llama_token correction = LLAMA_TOKEN_NULL;
+     double prefix = 1.0;
++    common_mtp_proposal_feedback pending_feedback;
++    if (feedback) { pending_feedback.factor = feedback->factor; }
+     llama_synchronize_sampler_outputs(ctx);
+     for (size_t i = 0; i <= draft.size(); ++i) {
+-        common_sampler_sample_synchronized(prefix_sampler.get(), ctx, indexes[i], grammar_first);
+-        const auto * p = common_sampler_get_candidates(prefix_sampler.get(), false);
++        if (use_preview) { common_sampler_block_distribution(prefix_sampler, ctx, indexes[i], grammar_first); }
++        else { common_sampler_sample_synchronized(prefix_sampler, ctx, indexes[i], grammar_first); }
++        const auto * p = common_sampler_get_candidates(prefix_sampler, false);
+         const auto & q = i < draft.size() ? proposals[i] : bonus_q;
+         double p_sum = 0.0;
+         for (size_t k = 0; k < p->size; ++k) {
+@@ -1023,6 +1151,7 @@ static std::vector<llama_token> common_sampler_verify_block(
+         if (!std::isfinite(p_sum) || std::abs(p_sum - 1.0) > 1e-4) {
+             return {};
+         }
++        if (feedback && i < draft.size()) { pending_feedback.observe(*p, q, prefix); }
+         double q_sum = 0.0;
+         for (const auto & token : q) {
+             q_sum += token.p;
+@@ -1060,7 +1189,7 @@ static std::vector<llama_token> common_sampler_verify_block(
+         if (prefix == 0.0) {
+             break;
+         }
+-        common_sampler_accept(prefix_sampler.get(), draft[i], true);
++        common_sampler_accept(prefix_sampler, draft[i], true);
+         if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
+             // A drafter that supplies positions beyond EOG is not eligible.
+             return {};
+@@ -1070,6 +1199,8 @@ static std::vector<llama_token> common_sampler_verify_block(
+         return {};
+     }
+     sampler->rng = rng;
++    // A fallback must not tune from a partially verified hypothetical block.
++    if (feedback) { *feedback = pending_feedback; }
+     ++sampler->verified_blocks;
+     std::vector<llama_token> result(draft.begin(), draft.begin() + kept);
+     result.push_back(correction);
+@@ -1087,13 +1218,13 @@ uint64_t common_sampler_get_verified_blocks(const common_sampler * sampler) {
+ // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+ // Preserves the target distribution exactly, and accepts more often than matching does when the
+ // draft samples instead of taking its argmax.
+-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, bool block_verify) {
++std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, bool block_verify, common_mtp_proposal_feedback * feedback) {
+     grammar_first=grammar_first || gsmpl->params.grammar_first;
+     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+ 
+     if (block_verify) {
+-        auto verified = common_sampler_verify_block(gsmpl, ctx, idxs, draft, draft_q, grammar_first);
++        auto verified = common_sampler_verify_block(gsmpl, ctx, idxs, draft, draft_q, grammar_first, feedback);
+         if (!verified.empty()) {
+             return verified;
+         }
+diff --git a/common/sampling.h b/common/sampling.h
+index 4353a728ba8cbf341863e0d93f3fa9cd299dcbb4..dc5c4b0753cac15b2ca4d73dbc5d4e90f3ea542a 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -60,6 +60,7 @@ struct llama_sampler * common_sampler_get_backend(const struct common_sampler *
+ // Optional stateless GPU candidate extraction. Selection and state transitions stay in the host chain.
+ struct llama_sampler * common_sampler_get_thinking_prefilter(const struct common_sampler * gsmpl);
+ uint64_t common_sampler_get_thinking_prefilter_rows(const struct common_sampler * gsmpl);
++uint64_t common_sampler_get_gpu_distribution_rows(const struct common_sampler * gsmpl);
+ // params.grammar_first=true is an explicit grammar-order contract. With
+ // backend_sampling it permits a graph-owned GPU mask for one output/sequence.
+ // Default grammar-last, reasoning controllers and unsupported backends retain
+@@ -114,7 +115,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+ // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
+ bool common_sampler_can_verify_block(const struct common_sampler * sampler, bool grammar_first = false);
+ uint64_t common_sampler_get_verified_blocks(const struct common_sampler * sampler);
+-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool block_verify = false);
++struct common_mtp_proposal_feedback;
++std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool block_verify = false, common_mtp_proposal_feedback * feedback = nullptr);
+ 
+ // assume idxs == [ 0, 1, 2, ..., draft.size() ]
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index e96ce25ae9bf548e05532b2a82195782b703221b..4ea4c3ffce071eb6c77837ca2f999a10074b4af5 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -46,7 +46,7 @@ static void spec_retune(
+         const llama_model * model,
+         llama_seq_id seq_id,
+         float temp,
+-        uint32_t seed) {
++        uint32_t seed, bool preserve_rng = false) {
+     if (cfg.size() != smpls.size()) {
+         const size_t n_old = cfg.size();
+         cfg.resize(smpls.size());
+@@ -63,6 +63,7 @@ static void spec_retune(
+         return;
+     }
+ 
++    const bool same_seed = cur.seed == seed && std::isfinite(cur.temp);
+     cur.temp = temp;
+     cur.seed = seed;
+ 
+@@ -74,7 +75,14 @@ static void spec_retune(
+     sparams.seed     = cur.seed == LLAMA_DEFAULT_SEED ? cur.seed : cur.seed ^ 0x85ebca6bu;
+     sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+ 
+-    smpls[seq_id].reset(common_sampler_init(model, sparams));
++    common_sampler_ptr replacement(common_sampler_init(model, sparams));
++    if (preserve_rng && same_seed) {
++        auto * before = common_sampler_get(smpls[seq_id].get());
++        auto * after = common_sampler_get(replacement.get());
++        llama_sampler_copy(llama_sampler_chain_get(before, llama_sampler_chain_n(before) - 1),
++                           llama_sampler_chain_get(after, llama_sampler_chain_n(after) - 1));
++    }
++    smpls[seq_id] = std::move(replacement);
+ }
+ 
+ const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
+@@ -1549,6 +1557,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     bool    is_mem_shared = false;   // gemma4
+     int32_t draft_vocab_size = 0;
+     bool draft_vocab_active = false;
++    bool draft_vocab_contextual = false;
++    bool tune_proposals = false;
++    std::vector<common_mtp_proposal_policy> proposal_policy;
++    std::vector<common_mtp_proposal_feedback> proposal_feedback;
+     unsigned vocab_rounds = 0, vocab_accepted = 0;
+     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+ 
+@@ -1648,6 +1660,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // Greedy MTP with no confidence cutoff uses only the maximum logit.
+         // Preserve top-10 probabilities for rejection sampling and p_min.
+         const bool stochastic = this->params.probabilistic || this->params.block_verification;
++        const char * tuning = std::getenv("WILDLLAMA_MTP_PROPOSAL_TUNE");
++        tune_proposals = this->params.block_verification && tuning && std::strcmp(tuning, "1") == 0;
++        if (tune_proposals) { proposal_policy.resize(n_seq); proposal_feedback.resize(n_seq); }
+         const int draft_top_k = common_speculative_mtp_top_k(stochastic, this->params.p_min);
+         smpls.resize(n_seq);
+         for (auto & s : smpls) {
+@@ -1690,10 +1705,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+         this->n_max = this->params.n_max;
+ 
+-        // Optional proposal-only shortlist. Probabilistic rejection keeps its
+-        // complete-q path; this optimization uses target sample-and-match.
++        // The target always retains its full vocabulary. The contextual path
++        // records the exact restricted q, so p/q verification remains valid.
+         const char * shortlist = std::getenv("WILDLLAMA_MTP_DRAFT_VOCAB");
+-        if (shortlist && *shortlist && !stochastic && n_seq == 1 && !chain_heads && !is_mem_shared) {
++        const char * dynamic = std::getenv("WILDLLAMA_MTP_DYNAMIC_VOCAB");
++        const bool contextual = dynamic && std::strcmp(dynamic, "1") == 0;
++        draft_vocab_contextual = contextual;
++        if (contextual && (!shortlist || !*shortlist)) { shortlist = "4096"; }
++        if (shortlist && *shortlist && (!stochastic || contextual) && n_seq == 1 && !chain_heads && !is_mem_shared) {
+             char * end = nullptr;
+             const long count = std::strtol(shortlist, &end, 10);
+             if (end && !*end && count >= 256 && count <= 131072 && llama_set_mtp_draft_vocab(ctx_dft, int32_t(count))) {
+@@ -1758,6 +1777,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        if (tune_proposals) { proposal_policy[seq_id] = {}; proposal_feedback[seq_id] = {}; }
+         if (draft_vocab_size && seq_id == 0) {
+             draft_vocab_active = llama_set_mtp_draft_vocab(params.ctx_dft, draft_vocab_size);
+             if (!draft_vocab_active) { llama_set_mtp_draft_vocab(params.ctx_dft, 0); }
+@@ -2016,7 +2036,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             // result_q is only set when the caller wants rejection, so it also gates the retune
+             if (dp.result_q) {
+-                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
++                float factor = 1.f;
++                if (tune_proposals) {
++                    proposal_feedback[seq_id] = {};
++                    factor = common_mtp_proposal_feedback::factors[proposal_policy[seq_id].arm];
++                    proposal_feedback[seq_id].factor = factor;
++                    dp.proposal_feedback = &proposal_feedback[seq_id];
++                }
++                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp * factor, dp.seed, tune_proposals);
+             }
+ 
+             // a reset reseeds the chain, which breaks probabilistic drafting
+@@ -2161,9 +2188,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) { return; }
++        if (tune_proposals) {
++            const auto previous = proposal_policy[seq_id].arm;
++            proposal_policy[seq_id].update(proposal_feedback[seq_id]);
++            if (previous != proposal_policy[seq_id].arm) {
++                SPC_INF("proposal-only temperature factor %.2f after %zu rounds\n",
++                    common_mtp_proposal_feedback::factors[proposal_policy[seq_id].arm], proposal_policy[seq_id].rounds);
++            }
++        }
+         if (draft_vocab_active && seq_id == 0) {
+             ++vocab_rounds; vocab_accepted += n_accepted;
+-            if (vocab_rounds % 32 == 0) { refresh_draft_vocab(-1); }
++            if (draft_vocab_contextual && vocab_rounds % 8 == 0) {
++                // The final decoded row may belong to a rejected hypothetical
++                // suffix. Refresh from the actual accepted target prefix.
++                const int rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
++                if (rows > 0) { refresh_draft_vocab(i_batch_beg[seq_id] + std::min<int>(n_accepted, rows - 1)); }
++            } else if (!draft_vocab_contextual && vocab_rounds % 32 == 0) { refresh_draft_vocab(-1); }
+             if ((vocab_rounds == 8 && vocab_accepted == 0) ||
+                 (vocab_rounds == 32 && vocab_accepted < 8)) {
+                 llama_set_mtp_draft_vocab(params.ctx_dft, 0);
+diff --git a/common/speculative.h b/common/speculative.h
+index 2a9297821e5dd1c88e3e1b706ddc2f18ca78db1d..6fb3bde182b26e46b2766e888f8ca76360ca28c5 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -3,6 +3,7 @@
+ #include "llama.h"
+ #include "common.h"
+ #include <functional>
++#include "mtp-proposal-policy.h"
+ 
+ struct common_speculative;
+ 
+@@ -109,6 +110,7 @@ struct common_speculative_draft_params {
+     // the target's temp and seed, read only when the drafter samples probabilistically
+     float    temp = 1.0f;
+     uint32_t seed = LLAMA_DEFAULT_SEED;
++    common_mtp_proposal_feedback * proposal_feedback = nullptr;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 6a9b6b1eb207c238462dc7a9bc220c8018238917..73b051df58a0f6df26ab70daa9f409e228f77233 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -13,6 +13,26 @@ __device__ __forceinline__ float gdn_compact_replay_value(
+     return update[2 * ggml_gdn_compact_width] * oldest + update[row] * update[ggml_gdn_compact_width + column];
+ }
+ 
++__device__ __forceinline__ float gdn_extended_replay_value(
++        float oldest, const float * record, int head, int column, int row, int selected) {
++    const int steps = max(0, int(record[0]) - 1 - selected);
++    for (int step = 0; step < steps; ++step) {
++        oldest = gdn_compact_replay_value(oldest,
++            record + step * (ggml_gdn_compact_record - 1), head, column, row);
++    }
++    return oldest;
++}
++
++__global__ void gdn_extended_materialize(const float * states, const float * record,
++        const int32_t * index, int selected_row, float * output) {
++    constexpr int width = ggml_gdn_compact_width;
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    const int selected = index ? *index : selected_row;
++    const float value = states[(selected == 0 ? 0 : ggml_gdn_compact_state) + i];
++    output[i] = selected > 0 ? gdn_extended_replay_value(value, record,
++        i / (width * width), (i / width) % width, i % width, selected) : value;
++}
++
+ __global__ void gdn_compact_materialize(const float * states, const float * record,
+                                        const int32_t * index, float * output) {
+     constexpr int width = ggml_gdn_compact_width;
+@@ -26,7 +46,7 @@ __global__ void gdn_compact_materialize(const float * states, const float * reco
+ }
+ 
+ template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp,
+-          bool indexed_state = false, bool compact_snapshots = false>
++          bool indexed_state = false, bool compact_snapshots = false, bool extended_snapshots = false>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+ gated_delta_net_cuda(const float * q,
+                                      const float * k,
+@@ -86,7 +106,7 @@ gated_delta_net_cuda(const float * q,
+     // state is an exact rank-one update of the oldest.
+     [[maybe_unused]] float * compact_update = nullptr;
+     if constexpr (compact_snapshots) {
+-        if (K == 3) {
++        if (extended_snapshots ? K >= 3 : K == 3) {
+             float * update = record_output ? record_output + 1 : state + 2 * state_slot_stride;
+             compact_update = update + (sequence * H + h_idx) * (2 * S_v + 1);
+         }
+@@ -100,7 +120,7 @@ gated_delta_net_cuda(const float * q,
+     ggml_cuda_pdl_sync();
+     if constexpr (compact_snapshots) {
+         if (record_output && h_idx == 0 && col == 0 && lane_in_col == 0) {
+-            record_output[0] = K == 3 ? 1.0f : 0.0f;
++            record_output[0] = extended_snapshots ? float(K) : K == 3 ? 1.0f : 0.0f;
+         }
+     }
+     [[maybe_unused]] bool replay_middle = false;
+@@ -109,7 +129,7 @@ gated_delta_net_cuda(const float * q,
+         // is one of the cache rows written below.
+         const int logical_row = *state_row;
+         if constexpr (compact_snapshots) {
+-            replay_middle = logical_row == 1 && record_input[0] == 1.0f;
++            replay_middle = extended_snapshots ? logical_row > 0 : logical_row == 1 && record_input[0] == 1.0f;
+             curr_state += (int64_t(logical_row != 0) * H + h_idx) * S_v * S_v;
+         } else {
+             curr_state += (int64_t(logical_row) * H + h_idx) * S_v * S_v;
+@@ -124,7 +144,11 @@ gated_delta_net_cuda(const float * q,
+         s_shard[r]  = curr_state[i];
+         if constexpr (compact_snapshots && indexed_state) {
+             if (replay_middle) {
+-                s_shard[r] = gdn_compact_replay_value(s_shard[r], record_input, h_idx, col, i);
++                if constexpr (extended_snapshots) {
++                    s_shard[r] = gdn_extended_replay_value(s_shard[r], record_input, h_idx, col, i, *state_row);
++                } else {
++                    s_shard[r] = gdn_compact_replay_value(s_shard[r], record_input, h_idx, col, i);
++                }
+             }
+         }
+     }
+@@ -165,18 +189,19 @@ gated_delta_net_cuda(const float * q,
+             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+ 
+             if constexpr (compact_snapshots) {
+-                if (K == 3 && t == n_tokens - 2) {
++                if (extended_snapshots ? (K >= 3 && t >= n_tokens - K + 1 && t < n_tokens - 1) : (K == 3 && t == n_tokens - 2)) {
++                    float * step_update = compact_update + (extended_snapshots ? (t - (n_tokens - K + 1)) * H * (2 * S_v + 1) : 0);
+                     if (col == 0) {
+ #pragma unroll
+                         for (int r = 0; r < rows_per_lane; ++r) {
+-                            compact_update[r * lanes_per_col + lane_in_col] = k_reg[r];
++                            step_update[r * lanes_per_col + lane_in_col] = k_reg[r];
+                         }
+                         if (lane_in_col == 0) {
+-                            compact_update[2 * S_v] = g_val;
++                            step_update[2 * S_v] = g_val;
+                         }
+                     }
+                     if (lane_in_col == 0) {
+-                        compact_update[S_v + col] = delta_col;
++                        step_update[S_v + col] = delta_col;
+                     }
+                 }
+             }
+@@ -233,8 +258,8 @@ gated_delta_net_cuda(const float * q,
+             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+             int target_slot = (int) n_tokens - 1 - t;
+             if constexpr (compact_snapshots) {
+-                if (K == 3) {
+-                    target_slot = target_slot == 2 ? 1 : target_slot == 1 ? -1 : target_slot;
++                if (extended_snapshots ? K >= 3 : K == 3) {
++                    target_slot = target_slot == K - 1 ? 1 : target_slot == 0 ? 0 : -1;
+                 }
+             }
+             if (target_slot >= 0 && target_slot < K) {
+@@ -451,13 +476,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
+                     neqk1 == ggml_gdn_compact_key_heads && n_seqs == 1 && !kda);
+         const auto * index = static_cast<const int32_t *>(dst->src[6]->data);
+         const auto * record = static_cast<const float *>(dst->src[7]->data);
++        const bool extended = dst->op_params[1] == 2;
+         constexpr int elements = ggml_gdn_compact_state;
+         float * tail = dst_d + S_v * H * n_tokens;
+         if (n_tokens >= ggml_gdn_compact_prefill) {
+             // Preserve the prefill implementation and only publish its
+             // committed state. The second temporary row is the input scratch.
+             float * input = tail + elements;
+-            gdn_compact_materialize<<<elements / 256, 256, 0, stream>>>(s_d, record, index, input);
++            if (extended) { gdn_extended_materialize<<<elements / 256, 256, 0, stream>>>(s_d, record, index, 0, input); }
++            else { gdn_compact_materialize<<<elements / 256, 256, 0, stream>>>(s_d, record, index, input); }
+             ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+             args.state = input;
+             args.state_out = state_d;
+@@ -470,11 +497,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
+             const dim3 grid(H, 1, S_v / (4 * gdn_cols_per_warp));
+             const dim3 block(32, 4, 1);
+             const auto launch = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, true, gdn_cols_per_warp, true, true>, launch,
++            if (extended) {
++                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, true, gdn_cols_per_warp, true, true, true>, launch,
++                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
++                    init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, int64_t(elements), K, index,
++                    record, K > 1 ? tail + 2 * elements : nullptr);
++            } else {
++                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, true, gdn_cols_per_warp, true, true>, launch,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                 init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, int64_t(elements), K, index,
+                 record, K > 1 ? tail + 2 * elements : nullptr);
++            }
+         }
+         return;
+     }
+@@ -518,6 +553,30 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+ }
+ 
++bool ggml_cuda_gdn_extended_materialize(
++        int device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count, int row) {
++    if (row < 0 || row > 4) { return false; }
++    for (size_t i = 0; i < count; ++i) {
++        if (!states[i] && !records[i]) { continue; }
++        if (!states[i] || !records[i] || !states[i]->data || !records[i]->data ||
++            states[i]->type != GGML_TYPE_F32 || records[i]->type != GGML_TYPE_F32 ||
++            ggml_nelements(states[i]) != 2 * ggml_gdn_compact_state ||
++            (ggml_nelements(records[i]) != ggml_gdn_extended_record(4) && ggml_nelements(records[i]) != ggml_gdn_extended_record(5)) ||
++            !ggml_is_contiguous(states[i]) || !ggml_is_contiguous(records[i])) { return false; }
++    }
++    ggml_cuda_set_device(device);
++    for (size_t i = 0; i < count; ++i) {
++        if (states[i]) {
++            auto * state = static_cast<float *>(states[i]->data);
++            gdn_extended_materialize<<<ggml_gdn_compact_state / 256, 256, 0, cudaStreamPerThread>>>(
++                state, static_cast<const float *>(records[i]->data), nullptr, row, state);
++        }
++    }
++    const auto submitted = cudaGetLastError();
++    const auto completed = cudaStreamSynchronize(cudaStreamPerThread);
++    return submitted == cudaSuccess && completed == cudaSuccess;
++}
++
+ bool ggml_cuda_gdn_compact_materialize(
+         int device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count) {
+     for (size_t i = 0; i < count; ++i) {
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index 78b073b5765530da68dba7e738cc1ad2fe4f18ed..76aa723a1ecfbc96459472759e7278d1a8d75eb0 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -17,3 +17,5 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
+ 
+ bool ggml_cuda_gdn_compact_materialize(
+         int device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count);
++bool ggml_cuda_gdn_extended_materialize(
++        int device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count, int row);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 201953992561941595fd7e04b0ec45e4f076dc72..787866f459ced87f48abed968f7c52dc339f180d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6624,6 +6624,24 @@ static const ggml_backend_gdn_compact_v1 * ggml_cuda_gdn_compact_interface() {
+     return &api;
+ }
+ 
++static const ggml_backend_gdn_compact_v2 * ggml_cuda_gdn_extended_interface() {
++    static const ggml_backend_gdn_compact_v2 api = {
++        ggml_cuda_gdn_compact_supported,
++        +[](ggml_backend_dev_t device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count, int row) {
++            if (!ggml_cuda_gdn_compact_supported(device) || !states || !records) { return false; }
++            const auto buft = ggml_backend_dev_buffer_type(device);
++            for (size_t i = 0; i < count; ++i) {
++                for (const auto * tensor : {states[i], records[i]}) {
++                    if (tensor && (!tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft)) { return false; }
++                }
++            }
++            const auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(device->context);
++            return ggml_cuda_gdn_extended_materialize(ctx->device, states, records, count, row);
++        },
++    };
++    return &api;
++}
++
+ static int32_t ggml_cuda_moe_mmvq_batch_limit(ggml_backend_dev_t device, ggml_type type) {
+     if (!device || ggml_backend_dev_backend_reg(device)!=ggml_backend_cuda_reg() ||
+         int(type)<0 || int(type)>=GGML_TYPE_COUNT || !ggml_is_quantized(type)) { return 0; }
+@@ -7538,6 +7556,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ }
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_gdn_compact_v2") == 0) {
++        return (void *) ggml_cuda_gdn_extended_interface;
++    }
+     if (strcmp(name, "ggml_backend_gdn_compact_v1") == 0) {
+         return (void *) ggml_cuda_gdn_compact_interface;
+     }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6fcee5ff6d4bc37be7434a3c9c2f00276e5e2b48..f43fba637eeb5975add07e1a1d4b24b462b20f38 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1196,14 +1196,14 @@ static constexpr int mmvq_q4_head_width = 5120;
+ static constexpr int mmvq_q4_head_vocab = 248320;
+ 
+ static constexpr bool mmvq_q4_head_geometry(int64_t width, int64_t rows, int64_t tokens) {
+-    return width == mmvq_q4_head_width && rows == mmvq_q4_head_vocab && (tokens == 2 || tokens == 3);
++    return width == mmvq_q4_head_width && rows == mmvq_q4_head_vocab && (tokens >= 1 && tokens <= 3);
+ }
+ 
+ template<int tokens>
+ static __global__ __launch_bounds__(128, 1) void mul_mat_vec_q4_head_warp(
+         const block_q4_K * __restrict__ weights, const block_q8_1 * __restrict__ input,
+         float * __restrict__ output, int rows) {
+-    static_assert(tokens == 2 || tokens == 3, "only measured Q4_K head batches are supported");
++    static_assert(tokens >= 1 && tokens <= 3, "only short Q4_K head batches are supported");
+     constexpr int weight_stride = mmvq_q4_head_width / QK_K;
+     constexpr int input_stride = mmvq_q4_head_width / QK8_1;
+     constexpr int lanes_per_block = QI4_K / VDR_Q4_K_Q8_1_MMVQ;
+@@ -1812,12 +1812,18 @@ void ggml_cuda_mul_mat_vec_q(
+             const char * value = std::getenv("GGML_CUDA_Q4_HEAD_WARP");
+             return value && value[0] == '1' && value[1] == '\0';
+         }();
+-        if (enabled) {
++        static const bool single_enabled = [] {
++            const char * value = std::getenv("WILDLLAMA_CUDA_Q4_HEAD_SINGLE");
++            return value && std::strcmp(value, "1") == 0;
++        }();
++        if (ne11 == 1 ? single_enabled : enabled) {
+             const dim3 grid((ne01+3)/4), block(32,4);
+             const ggml_cuda_kernel_launch_params parameters(grid, block, 0, stream);
+             const auto * weights = static_cast<const block_q4_K *>(src0->data);
+             const auto * input = reinterpret_cast<const block_q8_1 *>(quantized);
+-            if (ne11 == 2) {
++            if (ne11 == 1) {
++                ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<1>, parameters, weights, input, dst_d, int(ne01));
++            } else if (ne11 == 2) {
+                 ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<2>, parameters, weights, input, dst_d, int(ne01));
+             } else {
+                 ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<3>, parameters, weights, input, dst_d, int(ne01));
+@@ -1828,7 +1834,7 @@ void ggml_cuda_mul_mat_vec_q(
+             }();
+             if (trace) {
+                 static std::atomic<unsigned> reported{0};
+-                const unsigned bit = 1u << (ne11-2);
++                const unsigned bit = 1u << (ne11-1);
+                 if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                     std::fprintf(stderr, "cuda_q4_head_warp: launched k=%lld rows=%lld tokens=%lld\n",
+                         (long long) ne00, (long long) ne01, (long long) ne11);
+diff --git a/ggml/src/ggml-gdn-compact.h b/ggml/src/ggml-gdn-compact.h
+index 041514d5de32621e390341fed2afec7d3984b660..8bf48561b615c5cda47895e9c8813fe1b5a343ab 100644
+--- a/ggml/src/ggml-gdn-compact.h
++++ b/ggml/src/ggml-gdn-compact.h
+@@ -10,8 +10,9 @@ constexpr int ggml_gdn_compact_record = 1 + ggml_gdn_compact_heads * (2 * ggml_g
+ constexpr int ggml_gdn_compact_prefill = 64;
+ 
+ inline bool ggml_gdn_is_compact(const ggml_tensor * op) {
+-    return op->op_params[1] == 1 && op->src[6] && op->src[7];
++    return (op->op_params[1] == 1 || op->op_params[1] == 2) && op->src[6] && op->src[7];
+ }
++constexpr int ggml_gdn_extended_record(int slots) { return 1 + (slots > 2 ? slots - 2 : 0) * (ggml_gdn_compact_record - 1); }
+ 
+ struct ggml_backend_gdn_compact_v1 {
+     bool (*supports)(ggml_backend_dev_t);
+@@ -21,3 +22,8 @@ struct ggml_backend_gdn_compact_v1 {
+ };
+ 
+ using ggml_backend_gdn_compact_proc = const ggml_backend_gdn_compact_v1 * (*)();
++struct ggml_backend_gdn_compact_v2 {
++    bool (*supports)(ggml_backend_dev_t);
++    bool (*materialize)(ggml_backend_dev_t, ggml_tensor * const *, ggml_tensor * const *, size_t, int);
++};
++using ggml_backend_gdn_compact_proc_v2 = const ggml_backend_gdn_compact_v2 * (*)();
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a60c25c92615d6c25ca8f53b76e04f0a31c52184..e7b400bb70197a2ce01673e446404ef21a17456d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2027,6 +2027,8 @@ bool llama_context::set_mtp_draft_vocab(int32_t count) {
+         buft != ggml_backend_dev_buffer_type(device)) { return false; }
+     try {
+         if (!mtp_draft_vocab.reset(model.vocab.n_tokens(), count)) { return false; }
++        const char * contextual = std::getenv("WILDLLAMA_MTP_DYNAMIC_VOCAB");
++        mtp_draft_vocab.contextual = contextual && std::strcmp(contextual, "1") == 0;
+     } catch (const std::bad_alloc &) { return false; }
+     mtp_draft_vocab_enabled = true;
+     LLAMA_LOG_INFO("mtp_draft_vocab: %d/%d indexed proposal rows, original quantized weights shared\n", count, model.vocab.n_tokens());
+diff --git a/src/llama-draft-vocab.h b/src/llama-draft-vocab.h
+index 90282d5d73d14bfcabd2821a7619119227c66636..2552fe9dac658b3adb82e031101ecf5db43ff561 100644
+--- a/src/llama-draft-vocab.h
++++ b/src/llama-draft-vocab.h
+@@ -14,6 +14,10 @@ struct llama_draft_vocab {
+     std::vector<int32_t> positions;
+     size_t cursor = 0;
+     size_t stable = 0;
++    bool contextual = false;
++    std::vector<int32_t> recent;
++    size_t recent_cursor = 0;
++    std::vector<int32_t> ranking;
+ 
+     bool reset(int32_t vocab, int32_t count) {
+         if (count < 256 || count > 131072 || count >= vocab || vocab > 1048576) { return false; }
+@@ -23,11 +27,18 @@ struct llama_draft_vocab {
+         std::iota(next_positions.begin(), next_positions.begin() + count, 0);
+         ids.swap(next_ids); positions.swap(next_positions);
+         stable = ids.size()*3/4; cursor = stable;
++        recent.clear(); recent_cursor = 0; ranking.clear();
+         return true;
+     }
+ 
+     void observe(int32_t token) {
+-        if (ids.empty() || token < 0 || size_t(token) >= positions.size() || positions[size_t(token)] >= 0) { return; }
++        if (ids.empty() || token < 0 || size_t(token) >= positions.size()) { return; }
++        if (contextual && std::find(recent.begin(), recent.end(), token) == recent.end()) {
++            const size_t capacity = ids.size() / 4;
++            if (recent.size() < capacity) { recent.push_back(token); }
++            else { recent[recent_cursor] = token; recent_cursor = (recent_cursor + 1) % capacity; }
++        }
++        if (positions[size_t(token)] >= 0) { return; }
+         positions[size_t(ids[cursor])] = -1;
+         ids[cursor] = token; positions[size_t(token)] = int32_t(cursor);
+         if (++cursor == ids.size()) { cursor = stable; }
+@@ -37,7 +48,7 @@ struct llama_draft_vocab {
+     // or downloads a full GPU output solely to choose proposal candidates.
+     bool seed(const float * scores, size_t count) {
+         if (!scores || ids.empty() || count != positions.size()) { return false; }
+-        std::vector<int32_t> ranking;
++        ranking.clear();
+         ranking.reserve(count);
+         for (size_t i = 0; i < count; ++i) {
+             if (std::isnan(scores[i]) || scores[i] == INFINITY) { return false; }
+@@ -51,9 +62,19 @@ struct llama_draft_vocab {
+         ranking.resize(ids.size());
+         std::sort(ranking.begin(), ranking.end(), better);
+         std::fill(positions.begin(), positions.end(), -1);
+-        ids.swap(ranking);
++        ids.assign(ranking.begin(), ranking.end());
+         for (size_t i = 0; i < ids.size(); ++i) { positions[size_t(ids[i])] = int32_t(i); }
+         cursor = stable;
++        if (contextual) {
++            // A contextual quarter survives each refresh. Keep all high-score
++            // rows that are also in the prompt; only replace absent tokens.
++            for (const auto token : recent) {
++                if (positions[size_t(token)] >= 0) { continue; }
++                positions[size_t(ids[cursor])] = -1;
++                ids[cursor] = token; positions[size_t(token)] = int32_t(cursor);
++                if (++cursor == ids.size()) { cursor = stable; }
++            }
++        }
+         return true;
+     }
+ };
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index b44cecb59c68286e8b7dc26add584d88f46dbf59..f9e020e8833d5fed2f07cef52ee36e9d6a92e37f 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -40,9 +40,11 @@ llama_memory_recurrent::llama_memory_recurrent(
+     cells.resize(mem_size);
+ 
+     const char * compact_enabled = std::getenv("WILDLLAMA_GDN_COMPACT_ROLLBACK");
++    const char * extended = std::getenv("WILDLLAMA_GDN_COMPACT_EXTENDED");
++    const bool extended_requested = (!extended || !*extended || std::strcmp(extended,"1") == 0) && n_rs_seq >= 3 && n_rs_seq <= 4;
+     if ((!compact_enabled || !*compact_enabled || std::strcmp(compact_enabled, "1") == 0) && offload &&
+         (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
+-        mem_size == 1 && n_seq_max == 1 && n_rs_seq == 2 &&
++        mem_size == 1 && n_seq_max == 1 && (n_rs_seq == 2 || extended_requested) &&
+         type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32 && hparams.ple_conv_state() == 0 &&
+         hparams.n_embd_s() == ggml_gdn_compact_state && hparams.ssm_d_state == ggml_gdn_compact_width &&
+         hparams.ssm_dt_rank == ggml_gdn_compact_heads && hparams.ssm_n_group == ggml_gdn_compact_key_heads) {
+@@ -65,6 +67,15 @@ llama_memory_recurrent::llama_memory_recurrent(
+                 const auto * interface = proc();
+                 if (interface && interface->supports(compact_device)) {
+                     compact = interface;
++                    if (extended_requested) {
++                        auto extended_proc = reinterpret_cast<ggml_backend_gdn_compact_proc_v2>(ggml_backend_reg_get_proc_address(
++                            ggml_backend_dev_backend_reg(compact_device), "ggml_backend_gdn_compact_v2"));
++                        if (extended_proc) {
++                            const auto * candidate = extended_proc();
++                            if (candidate && candidate->supports(compact_device)) { compact_extended = candidate; }
++                        }
++                        if (!compact_extended) { compact = nullptr; }
++                    }
+                 }
+             }
+         }
+@@ -141,7 +152,8 @@ llama_memory_recurrent::llama_memory_recurrent(
+         r_l[i] = r;
+         s_l[i] = s;
+         if (compact) {
+-            compact_records[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_gdn_compact_record);
++            compact_records[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
++                compact_extended ? ggml_gdn_extended_record(n_rs_seq + 1) : ggml_gdn_compact_record);
+             ggml_format_name(compact_records[i], "cache_gdn_update_l%d", i);
+         }
+ 
+@@ -1013,7 +1025,11 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+     }
+ 
+     if (!s_trans) {
+-        if (compact && !cell_ranges.empty() && cell_ranges.front().first == 1 && io.needs_tensor_data() &&
++        if (compact_extended && !cell_ranges.empty() && cell_ranges.front().first > 0 && io.needs_tensor_data() &&
++            !compact_extended->materialize(compact_device, s_l.data(), compact_records.data(), s_l.size(), cell_ranges.front().first)) {
++            throw std::runtime_error("failed to materialize extended compact GDN checkpoint");
++        }
++        if (compact && !compact_extended && !cell_ranges.empty() && cell_ranges.front().first == 1 && io.needs_tensor_data() &&
+             !compact->materialize(compact_device, s_l.data(), compact_records.data(), s_l.size())) {
+             throw std::runtime_error("failed to materialize compact GDN checkpoint");
+         }
+@@ -1034,7 +1050,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+             for (const auto & range : cell_ranges) {
+                 const size_t range_size = range.second - range.first;
+                 const size_t buf_size = range_size * s_size_row;
+-                const size_t physical_row = compact ? size_t(range.first == 2) : range.first;
++                const size_t physical_row = compact_extended ? 0 : compact ? size_t(range.first == 2) : range.first;
+                 io.write_tensor(s_l[il], physical_row * s_size_row, buf_size);
+             }
+         }
+@@ -1387,7 +1403,7 @@ bool llama_memory_recurrent_context::apply() {
+         const auto tokens = ubatches[i_next].n_seq_tokens;
+         // Long CUDA prefill publishes only the final recurrent state.
+         mem->compact_rollback_available = tokens < 2 || tokens >= ggml_gdn_compact_prefill ?
+-            0 : std::min<uint32_t>(2, tokens - 1);
++            0 : std::min<uint32_t>(mem->n_rs_seq, tokens - 1);
+     }
+ 
+     return true;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 55b5e24cb13977d828da53bfd63e26595bce11a6..2007b2aef7428c63bf13e0d081b782c3effabcbe 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -123,6 +123,7 @@ private:
+ 
+     const uint32_t n_seq_max = 1;
+     const ggml_backend_gdn_compact_v1 * compact = nullptr;
++    const ggml_backend_gdn_compact_v2 * compact_extended = nullptr;
+     ggml_backend_dev_t compact_device = nullptr;
+     uint32_t compact_rollback_available = 0;
+ 
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index c7fc1989880f9a7de7531ed8a1900655254204d9..b23230493af9000e6638e46263ac8e3fd250ae03 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -4829,6 +4829,107 @@ bool llama_sampler_draft_host_only(const llama_sampler * sampler) {
+         sampler->iface == &llama_sampler_dist_i || sampler->iface == &llama_sampler_greedy_i;
+ }
+ 
++// A stateless backend distribution, with no unused random draw. Full logits
++// remain available so grammar/reasoning transitions can use the CPU path.
++static llama_sampler_i llama_sampler_distribution_i = [] {
++    llama_sampler_i iface{};
++    iface.name = [](const llama_sampler *) { return "distribution-preview"; };
++    iface.apply = [](llama_sampler *, llama_token_data_array * cur) { llama_sampler_softmax_impl(cur, true); };
++    iface.backend_init = [](llama_sampler * sampler, ggml_backend_buffer_type_t buft, uint32_t) {
++        return llama_sampler_backend_support(sampler, buft);
++    };
++    iface.backend_apply = [](llama_sampler *, ggml_context * ctx, ggml_cgraph *, llama_sampler_data * data) {
++        auto * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
++        data->probs = ggml_soft_max(ctx, logits);
++        ggml_set_name(data->probs, "mtp_distribution_preview");
++    };
++    iface.copy_state = [](const llama_sampler *, llama_sampler *) {};
++    return iface;
++}();
++
++bool llama_sampler_is_gpu_distribution(const llama_sampler * sampler) {
++    if (!sampler || sampler->iface != &llama_sampler_chain_i) { return false; }
++    const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++    return !chain.samplers.empty() && chain.samplers.back().ptr->iface == &llama_sampler_distribution_i;
++}
++
++llama_sampler * llama_sampler_init_gpu_distribution(const llama_sampler * sampler, int32_t n_vocab) {
++    if (!sampler || sampler->iface != &llama_sampler_chain_i || n_vocab > 262144) { return nullptr; }
++    const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++    if (chain.samplers.empty() || chain.samplers.back().ptr->iface != &llama_sampler_dist_i) { return nullptr; }
++    llama_sampler_ptr result(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++    bool top_k = false;
++    for (size_t i = 0; i + 1 < chain.samplers.size(); ++i) {
++        const auto * child = chain.samplers[i].ptr;
++        if (child->iface == &llama_sampler_empty_i) { continue; }
++        if (!top_k) {
++            if (child->iface != &llama_sampler_top_k_i) { return nullptr; }
++            const int k = static_cast<const llama_sampler_top_k *>(child->ctx)->k;
++            if (k <= 0 || k >= 128 || k >= n_vocab) { return nullptr; }
++            top_k = true;
++        } else if (child->iface == &llama_sampler_temp_ext_i) {
++            const auto * temp = static_cast<const llama_sampler_temp_ext *>(child->ctx);
++            if (temp->delta > 0 || temp->temp <= 0) { return nullptr; }
++            llama_sampler_chain_add(result.get(), llama_sampler_init_temp(temp->temp));
++            continue;
++        } else if (child->iface != &llama_sampler_temp_i && child->iface != &llama_sampler_top_p_i &&
++                   child->iface != &llama_sampler_min_p_i) { return nullptr; }
++        llama_sampler_chain_add(result.get(), llama_sampler_clone(child));
++    }
++    if (!top_k) { return nullptr; }
++    llama_sampler_chain_add(result.get(), llama_sampler_init(&llama_sampler_distribution_i, nullptr));
++    static_cast<llama_sampler_chain *>(result->ctx)->thinking_prefilter = true;
++    return result.release();
++}
++
++bool llama_sampler_can_preview_distribution(const llama_sampler * sampler) {
++    if (!sampler || sampler->iface != &llama_sampler_chain_i) { return false; }
++    const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++    if (chain.samplers.empty() || chain.samplers.back().ptr->iface != &llama_sampler_dist_i) { return false; }
++    for (size_t i = 0; i < chain.samplers.size(); ++i) {
++        const auto & entry = chain.samplers[i];
++        if (chain.is_init && entry.is_backend) { return false; }
++        if (i + 1 == chain.samplers.size()) { continue; }
++        const auto * iface = entry.ptr->iface;
++        if (iface == &llama_sampler_empty_i || iface == &llama_sampler_top_k_i ||
++                iface == &llama_sampler_top_p_i || iface == &llama_sampler_min_p_i ||
++                iface == &llama_sampler_temp_i || iface == &llama_sampler_temp_ext_i ||
++                iface == &llama_sampler_penalties_i || iface == &llama_sampler_penalties_canonical_i ||
++                iface == &llama_sampler_logit_bias_i || iface == &llama_sampler_dry_i ||
++                iface == &llama_sampler_typical_i || iface == &llama_sampler_top_n_sigma_i) { continue; }
++        if (iface == &llama_sampler_xtc_i && static_cast<const llama_sampler_xtc *>(entry.ptr->ctx)->probability <= 0.0f) { continue; }
++        return false;
++    }
++    return true;
++}
++
++bool llama_sampler_preview_distribution(llama_sampler * sampler, llama_token_data_array * cur) {
++    if (!llama_sampler_can_preview_distribution(sampler)) { return false; }
++    auto & chain = *static_cast<llama_sampler_chain *>(sampler->ctx);
++    bool checked = false;
++    for (size_t i = 0; i + 1 < chain.samplers.size(); ++i) {
++        auto * filter = chain.samplers[i].ptr;
++        if (chain.guard_finite_sampling) { checked |= llama_sampler_mask_guard_before(filter, cur, !checked); }
++        llama_sampler_apply(filter, cur);
++    }
++    if (chain.guard_finite_sampling) { llama_sampler_mask_guard_before(chain.samplers.back().ptr, cur, !checked); }
++    cur->selected = -1;
++    if (cur->size == 0) { return true; }
++    if (cur->size == 1) { cur->data[0].p = 1.0f; return true; }
++    float maximum = cur->data[0].logit;
++    if (!cur->sorted) {
++        for (size_t i = 1; i < cur->size; ++i) { maximum = std::max(maximum, cur->data[i].logit); }
++    }
++    // Match dist's float exponential and serial double accumulation exactly.
++    double total = 0.0;
++    for (size_t i = 0; i < cur->size; ++i) {
++        cur->data[i].p = expf(cur->data[i].logit - maximum);
++        total += cur->data[i].p;
++    }
++    for (size_t i = 0; i < cur->size; ++i) { cur->data[i].p /= total; }
++    return true;
++}
++
+ // Owned dynamic allowed-token bitset. Logical words/versions survive arena
+ // changes; only inp_words belongs to a particular graph.
+ struct llama_sampler_token_mask : llama_sampler_backend {
+@@ -5090,7 +5191,7 @@ bool llama_sampler_backend_masked_ready(const llama_sampler * sampler) {
+ // input write to another graph's compute arena.
+ namespace {
+ bool graph_binding_leaf(const llama_sampler_i * iface) {
+-    return iface == &llama_sampler_empty_i     || iface == &llama_sampler_greedy_i ||
++    return iface == &llama_sampler_distribution_i || iface == &llama_sampler_empty_i || iface == &llama_sampler_greedy_i ||
+            iface == &llama_sampler_dist_i      || iface == &llama_sampler_top_k_i  ||
+            iface == &llama_sampler_top_p_i     || iface == &llama_sampler_min_p_i  ||
+            iface == &llama_sampler_temp_i      || iface == &llama_sampler_temp_ext_i ||
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+index e86ea6f643ce2ebac212cd68b11bbfcabaab7681..33387868721dba1bcef9debcdf6d2f4c210d8c96 100644
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -55,6 +55,10 @@ LLAMA_API bool llama_sampler_can_defer_candidates(const llama_sampler * sampler)
+ // Exact builtins whose apply/accept only touch host data. This is deliberately
+ // stricter than accept-only observers: a custom apply can submit backend work.
+ LLAMA_API bool llama_sampler_draft_host_only(const llama_sampler * sampler);
++// Exact CPU distribution preview for deterministic builtin filters followed by
++// dist. Does not draw or advance entropy; unsupported chains are not modified.
++LLAMA_API bool llama_sampler_can_preview_distribution(const llama_sampler * sampler);
++LLAMA_API bool llama_sampler_preview_distribution(llama_sampler * sampler, llama_token_data_array * candidates);
+ // Set before registering the sampler with a context. This mode is for clients
+ // that will not inspect candidates/probabilities; it never changes sampling.
+ LLAMA_API bool llama_sampler_backend_set_selected_only(llama_sampler * sampler);
+@@ -62,6 +66,8 @@ LLAMA_API bool llama_sampler_backend_selected_only(const llama_sampler * sampler
+ LLAMA_API bool llama_sampler_backend_selected_only_ready(const llama_sampler * sampler);
+ // Stateless top-k+1 with raw logits retained for grammar and budget fallback.
+ LLAMA_API llama_sampler * llama_sampler_init_thinking_prefilter(const llama_sampler * chain, int32_t n_vocab);
++LLAMA_API llama_sampler * llama_sampler_init_gpu_distribution(const llama_sampler * chain, int32_t n_vocab);
++LLAMA_API bool llama_sampler_is_gpu_distribution(const llama_sampler * sampler);
+ bool llama_sampler_backend_thinking_prefilter(const llama_sampler * sampler);
+ // Target-sample matching only. Stochastic selectors must commit entropy only
+ // for accepted rows; p/q rejection sampling keeps its host verification path.
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index b95b1a610fccbc613df142f805daa6aa2d8bcec4..3f9c1131b5c9f516de83064a296ad2db3801a263 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -543,16 +543,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         GGML_ASSERT(!s && mem_size == 1 && kv_head == 0 && v->ne[3] == 1 &&
+                     v->ne[0] == width && v->ne[1] == heads && g->ne[0] == 1);
+         const bool prefill = tokens >= ggml_gdn_compact_prefill;
+-        const int snapshots = prefill ? 1 : int(std::min<int64_t>(3, tokens));
++        const bool extended = record->ne[0] > ggml_gdn_compact_record;
++        const int max_snapshots = extended ? 2 + (record->ne[0] - 1) / (ggml_gdn_compact_record - 1) : 3;
++        const int snapshots = prefill ? 1 : int(std::min<int64_t>(max_snapshots, tokens));
+         const int stored = std::min(2, snapshots);
+         const int64_t score_elements = width * heads * tokens;
+-        const int64_t record_elements = snapshots == 3 ? ggml_gdn_compact_record : snapshots == 2 ? 1 : 0;
++        const int64_t record_elements = snapshots >= 2 ? ggml_gdn_extended_record(snapshots) : 0;
+         // Long prefill uses the original MMA path with a materialized input.
+         const int64_t state_scratch = (prefill ? 2 : stored) * state_elements;
+         auto * result = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, score_elements + state_scratch + record_elements);
+         result->op = GGML_OP_GATED_DELTA_NET;
+         result->op_params[0] = snapshots;
+-        result->op_params[1] = 1;
++        result->op_params[1] = extended ? 2 : 1;
+         result->src[0] = q;
+         result->src[1] = k;
+         result->src[2] = v;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 57bbc0052cf53cd3325c9720fb081544eb9c8251..bc16b1c66b2d565a8cc283bfe69867468d78099a 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -500,6 +500,10 @@ llama_test(test-mtp-carry-state LABEL "main behavior")
+ llama_build_and_test(test-sampler-output-view.cpp LABEL "main behavior" LINK llama-common)
+ add_dependencies(test-sampler-output-view ggml-cpu)
+ target_compile_definitions(test-sampler-output-view PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
++if (TARGET ggml-cuda)
++    add_dependencies(test-sampler-output-view ggml-cuda)
++    target_compile_definitions(test-sampler-output-view PRIVATE GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
++endif()
+ 
+ llama_build(test-device-attn-mask.cpp LINK llama ggml)
+ llama_test(test-device-attn-mask ARGS ${CMAKE_CURRENT_BINARY_DIR} LABEL "main behavior")
+diff --git a/tests/test-cuda-gdn-extended.cu b/tests/test-cuda-gdn-extended.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..25bf9a05a49dd73a0824b23dd7e02cc06e0bf76d
+--- /dev/null
++++ b/tests/test-cuda-gdn-extended.cu
+@@ -0,0 +1,95 @@
++// Exact rank-one rollback beyond two proposals; never changes weight/state precision.
++#define GGML_CUDA_GDN_KERNELS_ONLY
++#include "../ggml/src/ggml-cuda/gated_delta_net.cu"
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++[[noreturn]] void ggml_cuda_error(const char * statement, const char *, const char *, int, const char * message) {
++    throw std::runtime_error(std::string(statement) + ": " + message);
++}
++template<class T> struct buffer {
++    T * data = nullptr;
++    explicit buffer(size_t n) { CUDA_CHECK(cudaMalloc((void **)&data,n*sizeof(T))); }
++    ~buffer() {cudaFree(data);}
++};
++constexpr int D=ggml_gdn_compact_state,H=48,W=128,KH=16,R=ggml_gdn_extended_record(5);
++static void fill(float * data,size_t n,int seed,float amplitude,float bias=0) {
++    std::vector<float> host(n);uint32_t bits=seed+1;
++    for(auto & x:host){bits^=bits<<13;bits^=bits>>17;bits^=bits<<5;x=bias+amplitude*(float(bits>>8)*0x1p-23f-1.f);}
++    CUDA_CHECK(cudaMemcpy(data,host.data(),n*sizeof(float),cudaMemcpyHostToDevice));
++}
++static void equal(const float * a,const float * b,size_t n,const char * message) {
++    std::vector<float> x(n),y(n);
++    CUDA_CHECK(cudaMemcpy(x.data(),a,n*4,cudaMemcpyDeviceToHost));CUDA_CHECK(cudaMemcpy(y.data(),b,n*4,cudaMemcpyDeviceToHost));
++    if(std::memcmp(x.data(),y.data(),n*4)) {throw std::runtime_error(message);}
++}
++template<bool compact> static void run(const float * q,const float * k,const float * v,const float * g,const float * beta,
++        const float * input,float * output,float * states,const int * index,const float * records,float * next_records,int tokens,cudaStream_t stream=nullptr) {
++    gated_delta_net_cuda<128,false,true,4,compact,compact,compact><<<dim3(H,1,8),dim3(32,4),0,stream>>>(
++        q,k,v,g,beta,input,output,states,H,tokens,1,W,KH*W,tokens*KH*W,W,H*W,tokens*H*W,1,H,tokens*H,
++        init_fastdiv_values(KH),init_fastdiv_values(1),1.f/std::sqrt(float(W)),D,tokens,index,records,next_records);
++    CUDA_CHECK(cudaGetLastError());
++}
++template<class Fn> static float time_graph(Fn fn) {
++    cudaStream_t stream;cudaGraph_t graph;cudaGraphExec_t exec;cudaEvent_t begin,end;
++    CUDA_CHECK(cudaStreamCreate(&stream));CUDA_CHECK(cudaEventCreate(&begin));CUDA_CHECK(cudaEventCreate(&end));
++    CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
++    for(int i=0;i<32;++i){fn(stream);}
++    CUDA_CHECK(cudaStreamEndCapture(stream,&graph));CUDA_CHECK(cudaGraphInstantiate(&exec,graph,0));
++    for(int i=0;i<4;++i){CUDA_CHECK(cudaGraphLaunch(exec,stream));}
++    CUDA_CHECK(cudaEventRecord(begin,stream));for(int i=0;i<16;++i){CUDA_CHECK(cudaGraphLaunch(exec,stream));}
++    CUDA_CHECK(cudaEventRecord(end,stream));CUDA_CHECK(cudaEventSynchronize(end));float ms;
++    CUDA_CHECK(cudaEventElapsedTime(&ms,begin,end));cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);cudaEventDestroy(begin);cudaEventDestroy(end);cudaStreamDestroy(stream);
++    return ms*1000/(32*16);
++}
++int main() {
++ try {
++    buffer<float> q(W*KH*5),k(W*KH*5),v(W*H*5),g(H*5),beta(H*5),initial(D),full_initial(5*D),full(5*D),packed_initial(2*D),packed(2*D);
++    buffer<float> records_initial(R),records(R),scratch(D),a(W*H*5),b(W*H*5);buffer<int> index(1);
++    int cases=0;
++    for(int pattern=0;pattern<3;++pattern){
++        fill(q.data,W*KH*5,pattern*20+1,.1f);fill(k.data,W*KH*5,pattern*20+2,.1f);fill(v.data,W*H*5,pattern*20+3,.7f);
++        fill(g.data,H*5,pattern*20+4,.2f,-.3f);fill(beta.data,H*5,pattern*20+5,.3f,.5f);fill(initial.data,D,pattern*20+6,.2f);
++        CUDA_CHECK(cudaMemcpy(packed_initial.data,initial.data,D*4,cudaMemcpyDeviceToDevice));CUDA_CHECK(cudaMemset(index.data,0,4));CUDA_CHECK(cudaMemset(records_initial.data,0,R*4));
++        run<false>(q.data,k.data,v.data,g.data,beta.data,initial.data,a.data,full_initial.data,nullptr,nullptr,nullptr,5);
++        run<true>(q.data,k.data,v.data,g.data,beta.data,packed_initial.data,b.data,packed_initial.data,index.data,records_initial.data,records_initial.data,5);
++        equal(a.data,b.data,W*H*5,"initial extended scores changed");
++        for(int row=0;row<5;++row){
++            gdn_extended_materialize<<<D/256,256>>>(packed_initial.data,records_initial.data,nullptr,row,scratch.data);
++            equal(full_initial.data+row*D,scratch.data,D,"initial logical replay changed");
++            for(int tokens=1;tokens<=5;++tokens){
++                CUDA_CHECK(cudaMemcpy(packed.data,packed_initial.data,2*D*4,cudaMemcpyDeviceToDevice));CUDA_CHECK(cudaMemcpy(index.data,&row,4,cudaMemcpyHostToDevice));
++                run<false>(q.data,k.data,v.data,g.data,beta.data,full_initial.data+row*D,a.data,full.data,nullptr,nullptr,nullptr,tokens);
++                run<true>(q.data,k.data,v.data,g.data,beta.data,packed.data,b.data,packed.data,index.data,records_initial.data,records.data,tokens);
++                equal(a.data,b.data,W*H*tokens,"continued scores changed");
++                for(int selected=0;selected<tokens;++selected){
++                    gdn_extended_materialize<<<D/256,256>>>(packed.data,records.data,nullptr,selected,scratch.data);
++                    equal(full.data+selected*D,scratch.data,D,"continued logical replay changed");
++                }
++                if(tokens>1){
++                    gdn_extended_materialize<<<D/256,256>>>(packed.data,records.data,nullptr,1,packed.data);
++                    equal(full.data+D,packed.data,D,"checkpoint alias changed");
++                }
++                ++cases;
++            }
++        }
++    }
++    CUDA_CHECK(cudaMemset(index.data,0,4));
++    for(int tokens:{3,4,5}){
++        std::array<float,7> old,next;
++        for(int round=0;round<7;++round){
++            auto baseline=[&](cudaStream_t s){run<false>(q.data,k.data,v.data,g.data,beta.data,initial.data,a.data,full.data,nullptr,nullptr,nullptr,tokens,s);};
++            auto compact=[&](cudaStream_t s){run<true>(q.data,k.data,v.data,g.data,beta.data,packed_initial.data,b.data,packed.data,index.data,records_initial.data,records.data,tokens,s);};
++            if(round%2){next[round]=time_graph(compact);old[round]=time_graph(baseline);}else{old[round]=time_graph(baseline);next[round]=time_graph(compact);}
++        }
++        std::sort(old.begin(),old.end());std::sort(next.begin(),next.end());
++        std::printf("EXTENDED tokens=%d baseline_us=%.4f compact_us=%.4f ratio=%.4f state_saving_48layers_mib=%.3f\n",
++            tokens,old[3],next[3],old[3]/next[3],48.0*((tokens-2)*D-ggml_gdn_extended_record(tokens))*4/1048576.0);
++    }
++    std::printf("PASS %d extended rollback cases, all logical rows and checkpoint aliasing bitwise equal\n",cases);return 0;
++ }catch(const std::exception &e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
++}
+diff --git a/tests/test-cuda-q4-head.cu b/tests/test-cuda-q4-head.cu
+index ea813bc61c4e44eb0f4669a85986963255c1c1b8..6c778be7ebd0dc39c06d76c3d87ae8c67da6742a 100644
+--- a/tests/test-cuda-q4-head.cu
++++ b/tests/test-cuda-q4-head.cu
+@@ -16,7 +16,7 @@
+ 
+ static_assert(mmvq_q4_head_geometry(5120, 248320, 2));
+ static_assert(mmvq_q4_head_geometry(5120, 248320, 3));
+-static_assert(!mmvq_q4_head_geometry(5120, 248320, 1));
++static_assert(mmvq_q4_head_geometry(5120, 248320, 1));
+ static_assert(!mmvq_q4_head_geometry(5120, 248320, 4));
+ static_assert(!mmvq_q4_head_geometry(5120, 248319, 2));
+ static_assert(!mmvq_q4_head_geometry(4096, 248320, 2));
+@@ -198,13 +198,15 @@ int main(int argc, char ** argv) {
+         cudaStream_t stream = nullptr;
+         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+         std::printf("Q4_HEAD_FIXTURE gpu=%s L2_bytes=%d weight_bytes=%zu first_row=%zu\n", props.name, props.l2CacheSize, bytes, first_row);
+-        for (const void * kernel : { (const void *)mul_mat_vec_q4_head_warp<2>, (const void *)mul_mat_vec_q4_head_warp<3> }) {
++        for (const void * kernel : { (const void *)mul_mat_vec_q4_head_warp<1>, (const void *)mul_mat_vec_q4_head_warp<2>, (const void *)mul_mat_vec_q4_head_warp<3> }) {
+             cudaFuncAttributes attr{};
+             CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+             std::printf("Q4_HEAD_KERNEL registers=%d shared_bytes=%zu local_bytes=%zu\n", attr.numRegs, attr.sharedSizeBytes, attr.localSizeBytes);
+         }
++        check<1>(weights.data, input.data, output.data, rows, stream, true);
+         check<2>(weights.data, input.data, output.data, rows, stream, true);
+         check<3>(weights.data, input.data, output.data, rows, stream, true);
++        check<1>(weights.data, input.data, output.data, rows-1, stream, false);
+         check<2>(weights.data, input.data, output.data, rows-1, stream, false);
+         check<3>(weights.data, input.data, output.data, rows-1, stream, false);
+         CUDA_CHECK(cudaStreamDestroy(stream));
+diff --git a/tests/test-mtp-draft-vocab.cpp b/tests/test-mtp-draft-vocab.cpp
+index b6e18b33ec4c2b27623a582b2738a8c345603ca8..10376063ca331ecf1c57d398a7a7dabacfe9bb44 100644
+--- a/tests/test-mtp-draft-vocab.cpp
++++ b/tests/test-mtp-draft-vocab.cpp
+@@ -45,6 +45,25 @@ static void policy() {
+     require(!v.seed(scores.data(),scores.size()) && v.ids==seeded, "NaN changed valid selection");
+     scores.assign(1024,-INFINITY);
+     require(!v.seed(scores.data(),scores.size()) && v.ids==seeded, "empty target seed changed state");
++    require(v.reset(1024,256), "contextual reset"); v.contextual = true;
++    for (int i=1;i<=80;++i) { v.observe(i); }
++    require(v.recent.size()==64, "recent context is unbounded");
++    for (int i=0;i<1024;++i) { scores[i]=float(i); }
++    require(v.seed(scores.data(),scores.size()), "contextual seed rejected");
++    for (const auto id:v.recent) { require(v.positions[id]>=0, "context lost during target refresh"); }
++    for (size_t i=0;i<v.ids.size();++i) { require(v.positions[v.ids[i]]==int(i), "contextual inverse mapping"); }
++    require(v.reset(1024,256) && v.recent.empty(), "context leaked across requests");
++    for (const bool sharp : {false,true}) {
++        common_mtp_proposal_policy policy;
++        common_mtp_proposal_feedback feedback;
++        std::vector<llama_token_data> q{{1,0.f,.8f},{2,std::log(.25f),.2f}};
++        llama_token_data p[]={{1,0.f,sharp ? .99f : .5f},{2,0.f,sharp ? .01f : .5f}};
++        llama_token_data_array distribution{p,2,-1,false};
++        feedback.observe(distribution,q,1.0);
++        for(int i=0;i<8;++i){policy.update(feedback);}
++        require(policy.arm==(sharp ? 1u : 2u), "proposal temperature adaptation failed");
++        const auto before=policy.arm; policy.update({}); require(policy.arm==before,"empty feedback changed policy");
++    }
+     std::puts("PASS: bounded indices, deduplication, eviction, invalid input, request reset");
+ }
+ 
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+index 2daf6f36e948311fb89ed1cd6a17bd8de0c5d56d..5ec8f56f1ff5005921d485200c8d4c255e58444e 100644
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -44,7 +44,7 @@ static ggml_backend_t counted_init(ggml_backend_dev_t device, const char * param
+ 
+ static ggml_backend_dev_t fixture_gpu_device = nullptr;
+ constexpr int width = 32, n_vocab = 259;
+-static llama_model_ptr fixture_model(bool hybrid = false, int vocab_size = n_vocab) {
++static llama_model_ptr fixture_model(bool hybrid = false, int vocab_size = n_vocab, bool compact_gdn = false) {
+     const std::string architecture = hybrid ? "qwen35" : "llama";
+     gguf_context_ptr meta(gguf_init_empty());
+     gguf_set_val_str(meta.get(), "general.architecture", architecture.c_str());
+@@ -58,8 +58,8 @@ static llama_model_ptr fixture_model(bool hybrid = false, int vocab_size = n_voc
+     gguf_set_val_f32(meta.get(), (architecture + ".attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
+     if (hybrid) {
+         for (const auto & p : std::vector<std::pair<const char *, uint32_t>>{
+-                {"full_attention_interval", 2}, {"ssm.conv_kernel", 4}, {"ssm.inner_size", 128},
+-                {"ssm.state_size", 128}, {"ssm.time_step_rank", 1}, {"ssm.group_count", 1}}) {
++                {"full_attention_interval", 2}, {"ssm.conv_kernel", 4}, {"ssm.inner_size", compact_gdn ? 6144u : 128u},
++                {"ssm.state_size", 128}, {"ssm.time_step_rank", compact_gdn ? 48u : 1u}, {"ssm.group_count", compact_gdn ? 16u : 1u}}) {
+             gguf_set_val_u32(meta.get(), (architecture + "." + p.first).c_str(), p.second);
+         }
+         const uint32_t sections[] = {4, 4, 0, 0};
+@@ -105,7 +105,7 @@ static llama_model_ptr fixture_model(bool hybrid = false, int vocab_size = n_voc
+     params.use_extra_bufts = false; params.no_host = true;
+     llama_model_ptr model(llama_model_init_from_user(meta.get(), init, nullptr, params));
+     require(bool(model) && llama_model_size(model.get()) < 64 * 1024 * 1024 &&
+-            (vocab_size!=n_vocab || llama_model_size(model.get())<1024*1024), "small model unavailable/oversized");
++            (compact_gdn || vocab_size!=n_vocab || llama_model_size(model.get())<1024*1024), "small model unavailable/oversized");
+     require(!fixture_gpu_device || llama_model_n_devices(model.get()) > 0, "fixture model did not use GPU");
+     return model;
+ }
+@@ -769,6 +769,182 @@ static void block_verification(llama_model * model, common_params_sampling param
+     std::puts("PASS stochastic block verification: identical proposals and zero-probability prefix");
+ }
+ 
++static void extended_model_rollback() {
++    if (!fixture_gpu_device) { return; }
++    auto set_env=[](const char * key,const char * value){
++#ifdef _WIN32
++        _putenv_s(key,value);
++#else
++        if(*value){setenv(key,value,1);}else{unsetenv(key);}
++#endif
++    };
++    const char * key="WILDLLAMA_GDN_COMPACT_ROLLBACK", * ext="WILDLLAMA_GDN_COMPACT_EXTENDED";
++    const std::string old=std::getenv(key)?std::getenv(key):"",old_ext=std::getenv(ext)?std::getenv(ext):"";
++    auto model=fixture_model(true,n_vocab,true);
++    auto params=llama_context_default_params();params.n_ctx=128;params.n_batch=params.n_ubatch=16;
++    params.n_seq_max=1;params.n_rs_seq=4;params.n_outputs_max_per_seq=5;params.n_threads=params.n_threads_batch=1;
++    params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    set_env(key,"0");llama_context_ptr left(llama_init_from_model(model.get(),params));
++    set_env(key,"1");set_env(ext,"");llama_context_ptr right(llama_init_from_model(model.get(),params));
++    require(left && right,"extended rollback contexts failed");
++    auto bytes=[](const llama_context * ctx){size_t sum=0;for(const auto & item:llama_get_memory_breakdown(ctx)){sum+=item.second.context;}return sum;};
++    require(bytes(right.get())+16*1024*1024<bytes(left.get()),"extended compact allocation was not active");
++    set_env(ext,"0");
++    { llama_context_ptr disabled(llama_init_from_model(model.get(),params));
++      require(disabled && bytes(disabled.get())==bytes(left.get()),"explicit extended rollback disable was ignored"); }
++    set_env(key,old.c_str());set_env(ext,old_ext.c_str());
++    auto decode=[&](int position,int count){
++        common_batch a(left.get()),b(right.get());
++        for(int i=0;i<count;++i){a.add(3+'A'+(position+i)%24,position+i,0,true);b.add(3+'A'+(position+i)%24,position+i,0,true);}
++        require(llama_process(left.get(),LLAMA_PROCESS_TYPE_DECODE,a.get())==0 && llama_process(right.get(),LLAMA_PROCESS_TYPE_DECODE,b.get())==0,"extended model decode failed");
++        for(int i=0;i<count;++i){require(std::memcmp(llama_get_logits_ith(left.get(),i),llama_get_logits_ith(right.get(),i),n_vocab*sizeof(float))==0,"extended rollback changed model logits");}
++    };
++    decode(0,5);int position=5;
++    for(int round=0;round<12;++round){
++        decode(position,5);position+=5;
++        const int rollback=1+round%4;position-=rollback;
++        require(llama_memory_seq_rm(llama_get_memory(left.get()),0,position,-1) && llama_memory_seq_rm(llama_get_memory(right.get()),0,position,-1),"extended rollback range rejected");
++        std::array<std::vector<uint8_t>,2> saved;
++        int j=0;
++        for(auto * ctx:{left.get(),right.get()}){
++            auto & data=saved[j++];data.resize(llama_state_seq_get_size_ext(ctx,0,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++            require(llama_state_seq_get_data_ext(ctx,data.data(),data.size(),0,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)==data.size(),"extended checkpoint write failed");
++        }
++        require(saved[0]==saved[1],"extended canonical checkpoint differs");
++        if(round%2){
++            for(auto * ctx:{left.get(),right.get()}){require(llama_state_seq_set_data_ext(ctx,saved[0].data(),saved[0].size(),0,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)==saved[0].size(),"cross-layout restore failed");}
++        }
++    }
++    decode(position,1);
++    std::puts("PASS extended compact model: exact logits, 12 rollbacks, canonical checkpoints and cross-layout restore");
++}
++
++static void gpu_distribution_preview(llama_model * model, common_params_sampling params) {
++    if (!fixture_gpu_device) { return; }
++    params.min_p = 0; params.top_k = 20; params.top_p = .95f;
++    common_sampler_ptr reference(common_sampler_init(model, params));
++    llama_sampler_ptr distribution(llama_sampler_init_gpu_distribution(common_sampler_get(reference.get()), n_vocab));
++    require(distribution && llama_sampler_is_gpu_distribution(distribution.get()), "GPU distribution unavailable");
++    auto context = fixture_context(model);
++    require(llama_set_sampler(context.get(), 0, distribution.get()), "GPU distribution attachment failed");
++    float max_error = 0;
++    for (int round = 0; round < 8; ++round) {
++        common_batch batch(context.get());
++        for (int row = 0; row < 3; ++row) { batch.add(3 + 'x' + row + round, round * 3 + row, 0, true); }
++        require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "distribution decode failed");
++        for (int row = 0; row < 3; ++row) {
++            const auto output = llama_get_sampler_output_ith(context.get(), row);
++            require(output.raw_logits && output.sampled_probs && output.sampled_logits && output.candidates,
++                "GPU distribution lost original fallback or candidate outputs");
++            require(output.sampled_token == LLAMA_TOKEN_NULL, "distribution consumed an unused random draw");
++            std::vector<llama_token_data> data;
++            for (int id = 0; id < n_vocab; ++id) { data.push_back({id,output.raw_logits[id],0.f}); }
++            llama_token_data_array expected{data.data(),data.size(),-1,false};
++            require(llama_sampler_preview_distribution(common_sampler_get(reference.get()), &expected), "CPU probability preview failed");
++            double total = 0;
++            for (uint32_t i = 0; i < output.sampled_probs_count; ++i) {
++                float p = 0;
++                for(size_t j=0;j<expected.size;++j) { if(expected.data[j].id==output.candidates[i]) {p=expected.data[j].p;break;} }
++                const float error=std::abs(p-output.sampled_probs[i]); max_error=std::max(max_error,error);
++                require(std::isfinite(error) && error<3e-6f, "GPU distribution differs beyond FP32 tolerance");
++                total+=output.sampled_probs[i];
++            }
++            require(std::abs(total-1.0)<1e-5,"GPU distribution lost probability mass");
++        }
++    }
++    require(llama_set_sampler(context.get(),0,nullptr), "GPU distribution detach failed");
++    params.penalty_repeat=1.1f;
++    common_sampler_ptr stateful(common_sampler_init(model,params));
++    llama_sampler_ptr unsupported(llama_sampler_init_gpu_distribution(common_sampler_get(stateful.get()),n_vocab));
++    require(!unsupported,"stateful penalties were unsafely offloaded as independent rows");
++    std::printf("PASS 24 GPU distribution rows, no entropy draws, raw fallback, max absolute FP32 error %.9g\n",max_error);
++}
++
++static void block_preview_env(bool enabled) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_MTP_BLOCK_PREVIEW", enabled ? "1" : "0");
++#else
++    setenv("WILDLLAMA_MTP_BLOCK_PREVIEW", enabled ? "1" : "0", 1);
++#endif
++}
++
++static void block_preview_regression(llama_model * model, common_params_sampling params) {
++    int64_t baseline_us = 0, preview_us = 0;
++    auto context = fixture_context(model);
++    common_batch batch(context.get());
++    for (int i = 0; i < 3; ++i) { batch.add(3 + 'x' + i, i, 0, true); }
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "preview decode failed");
++    params.logit_bias = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}};
++    const std::vector<int> rows{0, 1, 2};
++    for (int mode = 0; mode < 3; ++mode) {
++        auto settings = params;
++        if (mode == 1) { settings.top_k = 0; settings.top_p = 1; settings.min_p = 0; }
++        if (mode == 2) { settings.penalty_repeat = 1.1f; settings.penalty_freq = .1f; settings.penalty_last_n = 32; }
++        for (uint32_t seed = 1; seed <= 24; ++seed) {
++            settings.seed = seed;
++            block_preview_env(false);
++            common_sampler_ptr baseline(common_sampler_init(model, settings));
++            block_preview_env(true);
++            common_sampler_ptr optimized(common_sampler_init(model, settings));
++            require(llama_sampler_can_preview_distribution(common_sampler_get(optimized.get())), "builtin preview declined");
++            for (int round = 0; round < 5; ++round) {
++                common_sampler_ptr drafter(common_sampler_clone(baseline.get()));
++                llama_tokens draft;
++                std::vector<std::vector<llama_token_data>> q;
++                for (int i = 0; i < 2; ++i) {
++                    const auto token = common_sampler_sample(drafter.get(), context.get(), i);
++                    draft.push_back(token);
++                    const auto * candidates = common_sampler_get_candidates(drafter.get(), false);
++                    q.emplace_back(candidates->data, candidates->data + candidates->size);
++                    common_sampler_accept(drafter.get(), token, true);
++                }
++                if (round % 3 == 1) { draft[0] = 0; q[0] = {{0, 0.f, 1.f}}; }
++                if (round % 3 == 2) { draft[1] = 0; q[1] = {{0, 0.f, 1.f}}; }
++                const auto begin = ggml_time_us();
++                auto expected = common_sampler_sample_and_accept_n_rejection(baseline.get(), context.get(), rows, draft, q, false, true);
++                const auto middle = ggml_time_us();
++                auto actual = common_sampler_sample_and_accept_n_rejection(optimized.get(), context.get(), rows, draft, q, false, true);
++                baseline_us += middle - begin;
++                preview_us += ggml_time_us() - middle;
++                require(expected == actual, "preview changed block results or continued entropy");
++                require(common_sampler_last(baseline.get()) == common_sampler_last(optimized.get()), "preview changed history");
++            }
++            require(common_sampler_get_verified_blocks(optimized.get()) == 5, "preview fell back");
++            require(common_sampler_sample(baseline.get(), context.get(), 2) == common_sampler_sample(optimized.get(), context.get(), 2),
++                    "preview advanced target RNG");
++        }
++    }
++    // Both active grammar and a lazy grammar becoming active INSIDE the block
++    // must constrain the committed suffix, not only the first position.
++    for (bool lazy : {false, true}) {
++        auto settings = params;
++        settings.top_k = 0; settings.top_p = 1; settings.min_p = 0;
++        settings.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, lazy ? "root ::= \"!\" [A-Z]+\n" : "root ::= [A-Z]+\n");
++        settings.grammar_lazy = lazy;
++        if (lazy) {
++            settings.grammar_triggers = {{COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN, "", 3 + '!'}};
++            settings.logit_bias.push_back({3 + '!', 100.f});
++        }
++        for (int seed = 1; seed <= 24; ++seed) {
++            settings.seed = seed;
++            common_sampler_ptr sampler(common_sampler_init(model, settings));
++            require(common_sampler_can_verify_block(sampler.get(), false), "grammar-last block declined");
++            llama_tokens draft{3 + (lazy ? '!' : 'A'), 3 + 'B'};
++            std::vector<std::vector<llama_token_data>> q{{{draft[0], 0.f, 1.f}}, {{draft[1], 0.f, 1.f}}};
++            const auto accepted = common_sampler_sample_and_accept_n_rejection(sampler.get(), context.get(), rows, draft, q, false, true);
++            require(common_sampler_get_verified_blocks(sampler.get()) == 1, "grammar verifier fell back");
++            if (lazy) { require(accepted[0] == 3 + '!', "lazy trigger was not accepted"); }
++            for (size_t i = lazy ? 1 : 0; i < accepted.size(); ++i) {
++                require(accepted[i] >= 3 + 'A' && accepted[i] <= 3 + 'Z', "grammar emitted invalid token");
++            }
++        }
++    }
++    block_preview_env(false);
++    std::puts("PASS block preview: 360 exact rounds, continued RNG, penalties, active/lazy grammar");
++    std::printf("BLOCK_PREVIEW_FIXTURE baseline_us=%lld preview_us=%lld rounds=360 (component only)\n",
++        (long long) baseline_us, (long long) preview_us);
++}
++
+ static void batch_eog(llama_model * model, common_params_sampling params) {
+     auto context = fixture_context(model);
+     const auto eog = llama_vocab_eos(llama_model_get_vocab(model));
+@@ -849,8 +1025,9 @@ static void selected_only_filter_chain(llama_model * model) {
+ 
+     if (fixture_gpu_device) {
+         auto compact_context = fixture_context(model);
++        common_batch compact_batch(compact_context.get()); compact_batch.add(3+'x',0,0,true);
+         require(llama_set_sampler(compact_context.get(), 0, prefilter), "CUDA prefilter attachment failed");
+-        require(llama_process(compact_context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "prefilter decode failed");
++        require(llama_process(compact_context.get(), LLAMA_PROCESS_TYPE_DECODE, compact_batch.get()) == 0, "prefilter decode failed");
+         const auto compact = llama_get_sampler_output_ith(compact_context.get(), -1);
+         require(compact.raw_logits && compact.sampled_logits_count == 21 && compact.candidates_count == 21,
+                 "CUDA prefilter must preserve raw logits and top-k+1");
+@@ -1529,6 +1706,9 @@ int main(int argc, char ** argv) {
+         sampler_candidate_ownership(model.get(), params);
+         batch_eog(model.get(), params);
+         block_verification(model.get(), params);
++        block_preview_regression(model.get(), params);
++        gpu_distribution_preview(model.get(), params);
++        extended_model_rollback();
+         backend_candidate_fallbacks(model.get(), params);
+         auto batch_params = params;
+         batch_params.logit_bias = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}};
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7f1e37f4e5b760c38020bbb91b8a94e0df81b13f..5b13201520952fb8c5e36cd7e21d2cab9f4caead 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -824,6 +824,10 @@ struct server_slot {
+                     common_sampler_get_thinking_prefilter_rows(smpl.get()));
+         }
+         const auto verified_blocks = common_sampler_get_verified_blocks(smpl.get());
++        const auto probability_rows = common_sampler_get_gpu_distribution_rows(smpl.get());
++        if (probability_rows > 0) {
++            SLT_INF(*this, "MTP GPU probability rows = %" PRIu64 "\n", probability_rows);
++        }
+         if (verified_blocks > 0) {
+             SLT_INF(*this, "MTP verified blocks = %" PRIu64 "\n", verified_blocks);
+         }
+@@ -5618,7 +5622,8 @@ private:
+                 } else if (use_rejection) {
+                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt,
+                             spec_i_batch, slot.spec_draft, slot.spec_draft_q, false,
+-                            params_base.speculative.draft.block_verification);
++                            params_base.speculative.draft.block_verification,
++                            common_speculative_get_draft_params(spec.get(), slot.id).proposal_feedback);
+                 } else {
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                 }

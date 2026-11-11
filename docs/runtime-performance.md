@@ -146,6 +146,10 @@ from manually saved slot files retains its existing parser and allocation policy
 
 ## Optional experiments
 
+Additional MTP verifier, proposal-head and compact recurrent-state controls are
+documented in [MTP decode efficiency](mtp-decode-efficiency.md), including their
+memory costs, compatibility checks and correctness fallbacks.
+
 These are exposed in Wildgoose profiles and remain disabled/omitted by default:
 
 - `backend_sampling: true` tries native backend token selection. Grammar, reasoning
