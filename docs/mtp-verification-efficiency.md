@@ -122,13 +122,32 @@ for reading and writing, and no conflicting aliases. Unsupported shapes,
 placements and dependencies keep the ordinary gather. Use
 `WILDLLAMA_CUDA_GDN_GATHER=1` to test this path.
 
-The separate compact-state fixture reconstructs the middle rollback state
-from a full state and an update record in the same FP32 operation order.
-All 36 state and alias cases matched bit for bit. For this 48-layer geometry,
-the two full states and record would save 141.74 MiB against three full states.
-This is a size calculation from the fixture, with no change to runtime cache
-allocation. Checkpoint serialization, prefill, context shifts, and restore
-would need to handle the compact representation before runtime activation.
+### Compact Gated DeltaNet rollback
+
+Patch `104` enables `WILDLLAMA_GDN_COMPACT_ROLLBACK=1` as a per-model VRAM
+savings option. It stores two full recurrent states and an FP32 update record
+that reconstructs the middle snapshot in the original operation order. A
+checkpoint still stores the usual full state and can be restored with the
+option enabled or disabled.
+
+The runtime checks for the Qwen3.5 or Qwen3.5-MoE recurrent graph, the
+128-wide FP32 Gated DeltaNet state with 48 value and 16 key heads, placement
+on one SM120 CUDA device, one sequence, and two rollback slots. Model names,
+weight quantization, and repository identities do not determine eligibility.
+Incompatible configurations keep the conventional cache. Long prefill uses
+the existing arithmetic and only publishes the final recurrent state. A
+rollback outside the published snapshots follows the server's checkpoint
+and replay path.
+
+The RTX 5060 Ti test with the Huihui IQ3_S model and a 40,960-token context
+reduced the CUDA recurrent allocation from 448.88 MiB to 307.14 MiB. The six
+paired responses and acceptance counts matched. Warm generation measured
+44.61 versus 44.86 tokens/s for Portuguese prose and 40.38 versus 39.79 tokens/s
+for Python. A one-layer GPU fixture also checked exact logits and serialized
+checkpoints through prefill, ten rollback and restore cases, and a sequence
+reset. The setting is off by default.
+
+### Adaptive depth and activation
 
 The existing `speculative_adaptive` option can use a request-local controller
 for single-sequence MTP with a ceiling of one, two, or three proposals.
@@ -139,10 +158,11 @@ It uses the previous controller where mixed speculation, unsupported rollback
 capacity, synthetic acceptance, a minimum draft length above one, or response
 overlap makes the comparison unsuitable. The policy adds no GPU storage.
 
-The WildLlama launcher selects the three verified CUDA paths for one SM120
-device, one sequence, Qwen35, Q8_0 KV and an MTP ceiling of one or two proposals.
-Explicit environment values take precedence. The native tensor and graph checks
-still control dispatch. The adaptive policy follows the existing profile option.
+The WildLlama launcher offers the three verified CUDA paths to MTP on one SM120
+device. Each native path checks its own tensor, cache and graph requirements
+before dispatch, so compatible future models can use it without a launcher
+change. Explicit environment values take precedence. The adaptive policy follows
+the existing profile option.
 
 ### Follow-up measurements
 

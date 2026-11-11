@@ -1330,6 +1330,14 @@ func TestMTPVerificationEnvironment(t *testing.T) {
 	if len(environment) != 2 || environment[names[2]] != "1" {
 		t.Fatalf("an explicit override was replaced: %v", environment)
 	}
+	launch.modelArch = "future-model"
+	launch.kvCacheType = "f16"
+	launch.opts.DraftNumPredict = 3
+	environment = map[string]string{}
+	setMTPVerificationEnvironment(environment, launch)
+	if environment[names[1]] != "1" || environment[names[2]] != "1" {
+		t.Fatalf("native kernel checks were bypassed for a new model: %v", environment)
+	}
 	launch.opts.SpeculativeType = "none"
 	environment = map[string]string{}
 	setMTPVerificationEnvironment(environment, launch)

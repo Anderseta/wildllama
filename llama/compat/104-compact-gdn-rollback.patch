@@ -1,0 +1,901 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index ea1310a..d9ec977 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 5a3fffb..6a9b6b1 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,11 +1,30 @@
+ #include "gated_delta_net.cuh"
+ #include "gated-delta-net-mma.cuh"
+ #include "ggml-cuda/common.cuh"
++#include "../ggml-gdn-compact.h"
+ 
+ #include <cstdint>
+ 
+ constexpr int gdn_cols_per_warp = 4;
+ 
++__device__ __forceinline__ float gdn_compact_replay_value(
++        float oldest, const float * record, int head, int column, int row) {
++    const float * update = record + 1 + head * (2 * ggml_gdn_compact_width + 1);
++    return update[2 * ggml_gdn_compact_width] * oldest + update[row] * update[ggml_gdn_compact_width + column];
++}
++
++__global__ void gdn_compact_materialize(const float * states, const float * record,
++                                       const int32_t * index, float * output) {
++    constexpr int width = ggml_gdn_compact_width;
++    constexpr int elements = ggml_gdn_compact_state;
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    const int selected = index ? *index : 1;
++    const float value = states[(selected == 0 ? 0 : elements) + i];
++    output[i] = selected == 1 && record[0] == 1.0f
++        ? gdn_compact_replay_value(value, record, i / (width * width), (i / width) % width, i % width)
++        : value;
++}
++
+ template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp,
+           bool indexed_state = false, bool compact_snapshots = false>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+@@ -34,7 +53,9 @@ gated_delta_net_cuda(const float * q,
+                                      float         scale,
+                                      int64_t       state_slot_stride,
+                                      int           K,
+-                                     const int32_t * state_row) {
++                                     const int32_t * state_row,
++                                     const float *   record_input = nullptr,
++                                     float *         record_output = nullptr) {
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+     static_assert(!compact_snapshots || (!KDA && keep_rs_t),
+@@ -61,11 +82,14 @@ gated_delta_net_cuda(const float * q,
+     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
+     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
+     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+-    // The compact fixture writes only two complete states, then a rank-one
+-    // update which reconstructs the middle state at the original FP32 precision.
++    // Compact snapshots retain the newest and oldest full states. The middle
++    // state is an exact rank-one update of the oldest.
+     [[maybe_unused]] float * compact_update = nullptr;
+     if constexpr (compact_snapshots) {
+-        compact_update = state + 2 * state_slot_stride + (sequence * H + h_idx) * (2 * S_v + 1);
++        if (K == 3) {
++            float * update = record_output ? record_output + 1 : state + 2 * state_slot_stride;
++            compact_update = update + (sequence * H + h_idx) * (2 * S_v + 1);
++        }
+     }
+     state += state_out_offset;
+     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+@@ -74,10 +98,22 @@ gated_delta_net_cuda(const float * q,
+     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+ 
+     ggml_cuda_pdl_sync();
++    if constexpr (compact_snapshots) {
++        if (record_output && h_idx == 0 && col == 0 && lane_in_col == 0) {
++            record_output[0] = K == 3 ? 1.0f : 0.0f;
++        }
++    }
++    [[maybe_unused]] bool replay_middle = false;
+     if constexpr (indexed_state) {
+         // Each block owns distinct columns even when the selected input row
+         // is one of the cache rows written below.
+-        curr_state += (int64_t(*state_row) * H + h_idx) * S_v * S_v;
++        const int logical_row = *state_row;
++        if constexpr (compact_snapshots) {
++            replay_middle = logical_row == 1 && record_input[0] == 1.0f;
++            curr_state += (int64_t(logical_row != 0) * H + h_idx) * S_v * S_v;
++        } else {
++            curr_state += (int64_t(logical_row) * H + h_idx) * S_v * S_v;
++        }
+     } else {
+         curr_state += state_out_offset;
+     }
+@@ -86,6 +122,11 @@ gated_delta_net_cuda(const float * q,
+     for (int r = 0; r < rows_per_lane; r++) {
+         const int i = r * lanes_per_col + lane_in_col;
+         s_shard[r]  = curr_state[i];
++        if constexpr (compact_snapshots && indexed_state) {
++            if (replay_middle) {
++                s_shard[r] = gdn_compact_replay_value(s_shard[r], record_input, h_idx, col, i);
++            }
++        }
+     }
+ 
+     for (int t = 0; t < n_tokens; t++) {
+@@ -124,7 +165,7 @@ gated_delta_net_cuda(const float * q,
+             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+ 
+             if constexpr (compact_snapshots) {
+-                if (t == n_tokens - 2) {
++                if (K == 3 && t == n_tokens - 2) {
+                     if (col == 0) {
+ #pragma unroll
+                         for (int r = 0; r < rows_per_lane; ++r) {
+@@ -192,9 +233,9 @@ gated_delta_net_cuda(const float * q,
+             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+             int target_slot = (int) n_tokens - 1 - t;
+             if constexpr (compact_snapshots) {
+-                // The fixture covers exactly three verification tokens.
+-                // Slots 0 and 1 carry the newest and oldest states.
+-                target_slot = target_slot == 2 ? 1 : target_slot == 1 ? -1 : target_slot;
++                if (K == 3) {
++                    target_slot = target_slot == 2 ? 1 : target_slot == 1 ? -1 : target_slot;
++                }
+             }
+             if (target_slot >= 0 && target_slot < K) {
+                 float * curr_state = state + target_slot * state_slot_stride;
+@@ -251,26 +292,26 @@ static void launch_gated_delta_net(
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr, nullptr, nullptr);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr, nullptr, nullptr);
+             break;
+         case 64: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr, nullptr, nullptr);
+             break;
+         }
+         case 128: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, nullptr, nullptr, nullptr);
+             break;
+         }
+         default:
+@@ -399,11 +440,45 @@ static void ggml_cuda_op_gated_delta_net_impl(
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, true, gdn_cols_per_warp, true>, launch,
+                 q_d, k_d, v_d, g_d, b_d, cache->input_rows, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+-                init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, state_slot_stride, K, cache->input_row);
++                init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, state_slot_stride, K, cache->input_row,
++                nullptr, nullptr);
+             return;
+         }
+     }
+ 
++    if (ggml_gdn_is_compact(dst)) {
++        GGML_ASSERT(S_v == ggml_gdn_compact_width && H == ggml_gdn_compact_heads &&
++                    neqk1 == ggml_gdn_compact_key_heads && n_seqs == 1 && !kda);
++        const auto * index = static_cast<const int32_t *>(dst->src[6]->data);
++        const auto * record = static_cast<const float *>(dst->src[7]->data);
++        constexpr int elements = ggml_gdn_compact_state;
++        float * tail = dst_d + S_v * H * n_tokens;
++        if (n_tokens >= ggml_gdn_compact_prefill) {
++            // Preserve the prefill implementation and only publish its
++            // committed state. The second temporary row is the input scratch.
++            float * input = tail + elements;
++            gdn_compact_materialize<<<elements / 256, 256, 0, stream>>>(s_d, record, index, input);
++            ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
++            args.state = input;
++            args.state_out = state_d;
++            if (!ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
++                launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, input, dst_d, state_d,
++                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                    sb1, sb2, sb3, neqk1, rq3, scale, elements, 1, stream);
++            }
++        } else {
++            const dim3 grid(H, 1, S_v / (4 * gdn_cols_per_warp));
++            const dim3 block(32, 4, 1);
++            const auto launch = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, true, gdn_cols_per_warp, true, true>, launch,
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
++                init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, int64_t(elements), K, index,
++                record, K > 1 ? tail + 2 * elements : nullptr);
++        }
++        return;
++    }
++
+     {
+         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+         args.state_out = state_d;
+@@ -442,4 +517,32 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+ }
++
++bool ggml_cuda_gdn_compact_materialize(
++        int device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count) {
++    for (size_t i = 0; i < count; ++i) {
++        if (!states[i] && !records[i]) {
++            continue;
++        }
++        if (!states[i] || !records[i] || !states[i]->data || !records[i]->data ||
++            states[i]->type != GGML_TYPE_F32 || records[i]->type != GGML_TYPE_F32 ||
++            ggml_nelements(states[i]) != 2 * ggml_gdn_compact_state ||
++            ggml_nelements(records[i]) != ggml_gdn_compact_record ||
++            !ggml_is_contiguous(states[i]) || !ggml_is_contiguous(records[i])) {
++            return false;
++        }
++    }
++    ggml_cuda_set_device(device);
++    for (size_t i = 0; i < count; ++i) {
++        if (states[i]) {
++            auto * state = static_cast<float *>(states[i]->data);
++            const auto * record = static_cast<const float *>(records[i]->data);
++            gdn_compact_materialize<<<ggml_gdn_compact_state / 256, 256, 0, cudaStreamPerThread>>>(
++                state, record, nullptr, state);
++        }
++    }
++    const auto submitted = cudaGetLastError();
++    const auto completed = cudaStreamSynchronize(cudaStreamPerThread);
++    return submitted == cudaSuccess && completed == cudaSuccess;
++}
+ #endif // GGML_CUDA_GDN_KERNELS_ONLY
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index afa4115..78b073b 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -14,3 +14,6 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
++
++bool ggml_cuda_gdn_compact_materialize(
++        int device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f077e00..2019539 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -79,6 +79,7 @@
+ #include "ggml-cuda/wkv.cuh"
+ #include "ggml-cuda/gla.cuh"
+ #include "ggml-cuda/gated_delta_net.cuh"
++#include "../ggml-gdn-compact.h"
+ #include "ggml-cuda/dsv4-hc.cuh"
+ #include "ggml-cuda/set.cuh"
+ #include "ggml-cuda/set-rows.cuh"
+@@ -3814,7 +3815,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
+     const int64_t       n_seqs    = src_v->ne[3];
+     const int64_t       D         = S_v * S_v * H;
+     const int64_t       K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
+-    const int64_t       n_written = std::min<int64_t>(n_tokens, K); // newest n_written slots are written
++    const int64_t       n_written = std::min<int64_t>(n_tokens, ggml_gdn_is_compact(gdn) ? std::min<int64_t>(2, K) : K);
+ 
+     // snapshot tail starts right after the attention scores
+     const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+@@ -6588,6 +6589,41 @@ struct ggml_backend_cuda_device_context {
+     int op_offload_min_batch_size;
+ };
+ 
++static bool ggml_cuda_gdn_compact_supported(ggml_backend_dev_t device) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    GGML_UNUSED(device);
++    return false;
++#else
++    if (!device || ggml_backend_dev_backend_reg(device) != ggml_backend_cuda_reg()) {
++        return false;
++    }
++    const auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(device->context);
++    return ggml_cuda_info().devices[ctx->device].cc == GGML_CUDA_CC_BLACKWELL;
++#endif
++}
++
++static const ggml_backend_gdn_compact_v1 * ggml_cuda_gdn_compact_interface() {
++    static const ggml_backend_gdn_compact_v1 api = {
++        ggml_cuda_gdn_compact_supported,
++        +[](ggml_backend_dev_t device, ggml_tensor * const * states, ggml_tensor * const * records, size_t count) {
++            if (!ggml_cuda_gdn_compact_supported(device) || !states || !records) {
++                return false;
++            }
++            const auto buft = ggml_backend_dev_buffer_type(device);
++            for (size_t i = 0; i < count; ++i) {
++                for (const auto * tensor : {states[i], records[i]}) {
++                    if (tensor && (!tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft)) {
++                        return false;
++                    }
++                }
++            }
++            const auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(device->context);
++            return ggml_cuda_gdn_compact_materialize(ctx->device, states, records, count);
++        },
++    };
++    return &api;
++}
++
+ static int32_t ggml_cuda_moe_mmvq_batch_limit(ggml_backend_dev_t device, ggml_type type) {
+     if (!device || ggml_backend_dev_backend_reg(device)!=ggml_backend_cuda_reg() ||
+         int(type)<0 || int(type)>=GGML_TYPE_COUNT || !ggml_is_quantized(type)) { return 0; }
+@@ -7311,7 +7347,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_RWKV_WKV7:
+             return true;
+         case GGML_OP_GATED_DELTA_NET:
+-            return true;
++            return !ggml_gdn_is_compact(op) || ggml_cuda_gdn_compact_supported(dev);
+         case GGML_OP_DSV4_HC_COMB:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+@@ -7502,6 +7538,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ }
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_gdn_compact_v1") == 0) {
++        return (void *) ggml_cuda_gdn_compact_interface;
++    }
+     if (strcmp(name, "ggml_backend_cuda_test_paged_attn_submissions") == 0) {
+         return (void *) ggml_cuda_paged_attn_submissions;
+     }
+diff --git a/ggml/src/ggml-gdn-compact.h b/ggml/src/ggml-gdn-compact.h
+new file mode 100644
+index 0000000..041514d
+--- /dev/null
++++ b/ggml/src/ggml-gdn-compact.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++constexpr int ggml_gdn_compact_width = 128;
++constexpr int ggml_gdn_compact_heads = 48;
++constexpr int ggml_gdn_compact_key_heads = 16;
++constexpr int ggml_gdn_compact_state = ggml_gdn_compact_width * ggml_gdn_compact_width * ggml_gdn_compact_heads;
++constexpr int ggml_gdn_compact_record = 1 + ggml_gdn_compact_heads * (2 * ggml_gdn_compact_width + 1);
++constexpr int ggml_gdn_compact_prefill = 64;
++
++inline bool ggml_gdn_is_compact(const ggml_tensor * op) {
++    return op->op_params[1] == 1 && op->src[6] && op->src[7];
++}
++
++struct ggml_backend_gdn_compact_v1 {
++    bool (*supports)(ggml_backend_dev_t);
++    // Inference has been drained. Materialize logical snapshot one in the
++    // rejected newest slot for the canonical checkpoint writer.
++    bool (*materialize)(ggml_backend_dev_t, ggml_tensor * const *, ggml_tensor * const *, size_t);
++};
++
++using ggml_backend_gdn_compact_proc = const ggml_backend_gdn_compact_v1 * (*)();
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 89aff54..5c27d95 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4208,6 +4208,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
+ class llama_io_write_dummy : public llama_io_write_i {
+ public:
+     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
++    bool needs_tensor_data() const override { return false; }
+ 
+     void write(const void * /* src */, size_t size) override {
+         size_written += size;
+diff --git a/src/llama-io.h b/src/llama-io.h
+index 0aca733..120da64 100644
+--- a/src/llama-io.h
++++ b/src/llama-io.h
+@@ -13,6 +13,7 @@ public:
+ 
+     virtual void write(const void * src, size_t size) = 0;
+     virtual void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
++    virtual bool needs_tensor_data() const { return true; }
+ 
+     // bytes written so far
+     virtual size_t n_bytes() = 0;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 79203e0..383edae 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
++#include <cstdlib>
+ #include <limits>
+ #include <map>
+ #include <stdexcept>
+@@ -38,6 +39,37 @@ llama_memory_recurrent::llama_memory_recurrent(
+     cells.clear();
+     cells.resize(mem_size);
+ 
++    const char * compact_enabled = std::getenv("WILDLLAMA_GDN_COMPACT_ROLLBACK");
++    if (compact_enabled && std::strcmp(compact_enabled, "1") == 0 && offload &&
++        (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
++        mem_size == 1 && n_seq_max == 1 && n_rs_seq == 2 &&
++        type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32 && hparams.ple_conv_state() == 0 &&
++        hparams.n_embd_s() == ggml_gdn_compact_state && hparams.ssm_d_state == ggml_gdn_compact_width &&
++        hparams.ssm_dt_rank == ggml_gdn_compact_heads && hparams.ssm_n_group == ggml_gdn_compact_key_heads) {
++        for (int i = 0; i < n_layer; ++i) {
++            if (filter && !filter(i)) {
++                continue;
++            }
++            auto * device = model.dev_layer(i);
++            if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
++                (compact_device && device != compact_device)) {
++                compact_device = nullptr;
++                break;
++            }
++            compact_device = device;
++        }
++        if (compact_device) {
++            auto proc = reinterpret_cast<ggml_backend_gdn_compact_proc>(ggml_backend_reg_get_proc_address(
++                ggml_backend_dev_backend_reg(compact_device), "ggml_backend_gdn_compact_v1"));
++            if (proc) {
++                const auto * interface = proc();
++                if (interface && interface->supports(compact_device)) {
++                    compact = interface;
++                }
++            }
++        }
++    }
++
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+     struct ggml_backend_buft_comparator {
+         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+@@ -52,7 +84,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+         if (it == ctx_map.end()) {
+             ggml_init_params params = {
+                 // r and s per layer, plus the separate PLE conv row where the model has one
+-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
++                /*.mem_size   =*/ size_t((compact || hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                 /*.mem_buffer =*/ NULL,
+                 /*.no_alloc   =*/ true,
+             };
+@@ -73,6 +105,9 @@ llama_memory_recurrent::llama_memory_recurrent(
+     r_l.resize(n_layer);
+     s_l.resize(n_layer);
+     p_l.resize(n_layer);
++    if (compact) {
++        compact_records.resize(n_layer);
++    }
+ 
+     for (int i = 0; i < n_layer; i++) {
+         if (filter && !filter(i)) {
+@@ -100,11 +135,15 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
++        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), compact ? 2 : n_rows);
+         ggml_format_name(r, "cache_r_l%d", i);
+         ggml_format_name(s, "cache_s_l%d", i);
+         r_l[i] = r;
+         s_l[i] = s;
++        if (compact) {
++            compact_records[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_gdn_compact_record);
++            ggml_format_name(compact_records[i], "cache_gdn_update_l%d", i);
++        }
+ 
+         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
+         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
+@@ -133,6 +172,9 @@ llama_memory_recurrent::llama_memory_recurrent(
+     }
+ 
+     {
++        if (compact) {
++            LLAMA_LOG_INFO("%s: compact GDN rollback enabled, two FP32 snapshots plus update records\n", __func__);
++        }
+         const size_t memory_size_r = size_r_bytes();
+         const size_t memory_size_s = size_s_bytes();
+         const size_t memory_size_p = size_p_bytes();
+@@ -163,6 +205,7 @@ void llama_memory_recurrent::clear(bool data) {
+     }
+ 
+     std::fill(rs_idx.begin(), rs_idx.end(), 0);
++    compact_rollback_available = 0;
+ }
+ 
+ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -184,6 +227,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
+     if (rm_all) {
+         set_rs_idx(seq_id, 0);
++        compact_rollback_available = 0;
+     }
+ 
+     // models like Mamba or RWKV can't have a state partially erased at the end
+@@ -211,7 +255,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+                 const llama_pos rollback = cell.pos - (p0 - 1);
+                 // pending rollback is single-use
+                 const bool pending = rs_idx[seq_id] != 0;
+-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
++                const uint32_t available = compact ? compact_rollback_available : n_rs_seq;
++                if (!pending && rollback >= 1 && rollback <= (llama_pos) available) {
+                     set_rs_idx(seq_id, (uint32_t) rollback);
+                     cell.pos = p0 - 1;
+                     return true;
+@@ -774,6 +819,11 @@ size_t llama_memory_recurrent::size_s_bytes() const {
+         }
+     }
+ 
++    for (const auto * record : compact_records) {
++        if (record) {
++            size_s_bytes += ggml_nbytes(record);
++        }
++    }
+     return size_s_bytes;
+ }
+ 
+@@ -899,6 +949,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+     if (n_rs_seq != 0) {
+         set_rs_idx(seq_id, 0);
+     }
++    compact_rollback_available = 0;
+ }
+ 
+ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
+@@ -962,6 +1013,10 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+     }
+ 
+     if (!s_trans) {
++        if (compact && !cell_ranges.empty() && cell_ranges.front().first == 1 && io.needs_tensor_data() &&
++            !compact->materialize(compact_device, s_l.data(), compact_records.data(), s_l.size())) {
++            throw std::runtime_error("failed to materialize compact GDN checkpoint");
++        }
+         for (uint32_t il = 0; il < n_layer; ++il) {
+             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
+             if (s_l[il] == nullptr) continue;
+@@ -979,7 +1034,8 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+             for (const auto & range : cell_ranges) {
+                 const size_t range_size = range.second - range.first;
+                 const size_t buf_size = range_size * s_size_row;
+-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
++                const size_t physical_row = compact ? size_t(range.first == 2) : range.first;
++                io.write_tensor(s_l[il], physical_row * s_size_row, buf_size);
+             }
+         }
+     } else {
+@@ -1327,6 +1383,12 @@ bool llama_memory_recurrent_context::apply() {
+     }
+ 
+     mem->find_slot(ubatches[i_next]);
++    if (mem->compact) {
++        const auto tokens = ubatches[i_next].n_seq_tokens;
++        // Long CUDA prefill publishes only the final recurrent state.
++        mem->compact_rollback_available = tokens < 2 || tokens >= ggml_gdn_compact_prefill ?
++            0 : std::min<uint32_t>(2, tokens - 1);
++    }
+ 
+     return true;
+ }
+@@ -1365,6 +1427,10 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
+     return mem->s_l[il];
+ }
+ 
++ggml_tensor * llama_memory_recurrent_context::get_compact_record(int32_t il) const {
++    return mem->compact_records.empty() ? nullptr : mem->compact_records[il];
++}
++
+ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+     return mem->p_l[il];
+ }
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 90959ca..55b5e24 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -4,6 +4,7 @@
+ #include "llama-batch.h"
+ #include "llama-graph.h"
+ #include "llama-memory.h"
++#include "../ggml/src/ggml-gdn-compact.h"
+ 
+ #include <map>
+ #include <set>
+@@ -112,6 +113,7 @@ public:
+     // per layer
+     std::vector<ggml_tensor *> r_l;
+     std::vector<ggml_tensor *> s_l;
++    std::vector<ggml_tensor *> compact_records;
+     // a second conv history that must stay replicated across devices, so it cannot share the r row
+     std::vector<ggml_tensor *> p_l;
+ 
+@@ -120,6 +122,11 @@ private:
+     const llama_hparams & hparams;
+ 
+     const uint32_t n_seq_max = 1;
++    const ggml_backend_gdn_compact_v1 * compact = nullptr;
++    ggml_backend_dev_t compact_device = nullptr;
++    uint32_t compact_rollback_available = 0;
++
++    friend class llama_memory_recurrent_context;
+ 
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+@@ -183,6 +190,7 @@ public:
+ 
+     ggml_tensor * get_r_l(int32_t il) const;
+     ggml_tensor * get_s_l(int32_t il) const;
++    ggml_tensor * get_compact_record(int32_t il) const;
+     ggml_tensor * get_p_l(int32_t il) const;
+ 
+     int32_t s_copy(int i) const;
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index fed160d..b95b1a6 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -535,6 +535,71 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const auto   kv_head    = mctx_cur->get_head();
+     const uint32_t mem_size = mctx_cur->get_size();
+ 
++    if (auto * record = mctx_cur->get_compact_record(il)) {
++        constexpr int64_t width = ggml_gdn_compact_width;
++        constexpr int64_t heads = ggml_gdn_compact_heads;
++        constexpr int64_t state_elements = ggml_gdn_compact_state;
++        const int64_t tokens = v->ne[2];
++        GGML_ASSERT(!s && mem_size == 1 && kv_head == 0 && v->ne[3] == 1 &&
++                    v->ne[0] == width && v->ne[1] == heads && g->ne[0] == 1);
++        const bool prefill = tokens >= ggml_gdn_compact_prefill;
++        const int snapshots = prefill ? 1 : int(std::min<int64_t>(3, tokens));
++        const int stored = std::min(2, snapshots);
++        const int64_t score_elements = width * heads * tokens;
++        const int64_t record_elements = snapshots == 3 ? ggml_gdn_compact_record : snapshots == 2 ? 1 : 0;
++        // Long prefill uses the original MMA path with a materialized input.
++        const int64_t state_scratch = (prefill ? 2 : stored) * state_elements;
++        auto * result = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, score_elements + state_scratch + record_elements);
++        result->op = GGML_OP_GATED_DELTA_NET;
++        result->op_params[0] = snapshots;
++        result->op_params[1] = 1;
++        result->src[0] = q;
++        result->src[1] = k;
++        result->src[2] = v;
++        result->src[3] = g;
++        result->src[4] = b;
++        result->src[5] = ssm_states_all;
++        result->src[6] = inp->s_copy_main;
++        result->src[7] = record;
++
++        const auto device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(ssm_states_all->buffer));
++        ggml_backend_t backend = nullptr;
++        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++            auto candidate = ggml_backend_sched_get_backend(sched, i);
++            if (ggml_backend_get_device(candidate) == device) {
++                backend = candidate;
++                break;
++            }
++        }
++        if (!backend || !ggml_backend_supports_op(backend, result)) {
++            throw std::runtime_error("compact GDN cache has no compatible execution backend");
++        }
++        ggml_backend_sched_set_tensor_backend(sched, result, backend);
++        res->add_fused_node({tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, result, il});
++
++        const size_t state_bytes = state_elements * sizeof(float);
++        const int zero_row = mctx_cur->get_rs_z();
++        if (zero_row >= 0) {
++            auto * zero = ggml_view_1d(ctx0, ssm_states_all, state_elements, zero_row * state_bytes);
++            ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, zero, 0));
++        }
++        auto * source = ggml_view_3d(ctx0, result, state_elements, 1, stored, state_bytes, state_bytes,
++                                   score_elements * sizeof(float));
++        auto * destination = ggml_view_3d(ctx0, ssm_states_all, state_elements, 1, stored,
++                                        state_bytes, state_bytes, 0);
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, source, destination));
++        if (record_elements) {
++            auto * update = ggml_view_1d(ctx0, result, record_elements, (score_elements + state_scratch) * sizeof(float));
++            auto * storage = ggml_view_1d(ctx0, record, record_elements, 0);
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0, update, storage));
++        }
++
++        auto * output = ggml_view_4d(ctx0, result, width, heads, tokens, 1,
++            width * sizeof(float), width * heads * sizeof(float), score_elements * sizeof(float), 0);
++        cb(output, "attn_output", il);
++        return output;
++    }
++
+     const int64_t S_v          = s->ne[0];
+     const int64_t H_v          = s->ne[2];
+     const int64_t n_seqs       = s->ne[3];
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index a988e4b..6a8d097 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -410,7 +410,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+         const char * value = std::getenv("WILDLLAMA_CUDA_GDN_GATHER");
+         return value && std::strcmp(value, "1") == 0;
+     }();
+-    const bool gather_after_projections = fuse_state_gather && n_seqs == 1 &&
++    const bool compact_state = mctx_cur->get_compact_record(il) != nullptr;
++    const bool gather_after_projections = !compact_state && fuse_state_gather && n_seqs == 1 &&
+         mctx_cur->get_size() == 1 && cparams.n_rs_seq == 2 &&
+         n_seq_tokens <= 3 && head_v_dim == 128 && num_v_heads == 48 && num_k_heads == 16;
+     auto build_state = [&] {
+@@ -419,7 +420,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+         cb(state, "state_predelta", il);
+         return state;
+     };
+-    ggml_tensor * state = gather_after_projections ? nullptr : build_state();
++    ggml_tensor * state = compact_state || gather_after_projections ? nullptr : build_state();
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+@@ -468,7 +469,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+ 
+     // if head keys and value keys are different, repeat to force tensors into matching shapes
+     // note: need explicit repeat only if we are not using the fused GDN.
+-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
++    if (!compact_state && num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+         GGML_ASSERT(num_v_heads % num_k_heads == 0);
+         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 24f4b98..b6efc2a 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -406,9 +406,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+-    cb(state, "state_predelta", il);
++    const bool compact_state = mctx_cur->get_compact_record(il) != nullptr;
++    ggml_tensor * state = nullptr;
++    if (!compact_state) {
++        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++        cb(state, "state_predelta", il);
++    }
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+@@ -457,7 +461,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     // if head keys and value keys are different, repeat to force tensors into matching shapes
+     // note: need explicit repeat only if we are not using the fused GDN.
+-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
++    if (!compact_state && num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+         GGML_ASSERT(num_v_heads % num_k_heads == 0);
+         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+index a9f7af7..6152542 100644
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -4,16 +4,19 @@
+ #include "ggml-cpp.h"
+ #include "gguf.h"
+ #include "../src/llama-ext.h"
++#include "../src/llama-memory.h"
+ #include <algorithm>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+ static void require(bool condition, const char * message) { if (!condition) { throw std::runtime_error(message); } }
+ static void step(const char * message) { std::fprintf(stderr, "mtp-state STEP %s\n", message); std::fflush(stderr); }
+-static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, uint64_t gpu_vram_limit_mib = 0, int32_t eos_token = -1) {
++static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, uint64_t gpu_vram_limit_mib = 0,
++                                 int32_t eos_token = -1, bool compact_geometry = false) {
+     const int dim=embedding_width, vocab=64;
+     require(eos_token >= -1 && eos_token < vocab,"tiny fixture EOS is outside the vocabulary");
+     gguf_context_ptr metadata(gguf_init_empty());
+@@ -26,8 +29,9 @@ static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, ui
+     u32("feed_forward_length",64); u32("attention.head_count",2);
+     u32("attention.head_count_kv",1); u32("rope.dimension_count",16);
+     u32("nextn_predict_layers",1); u32("full_attention_interval",2);
+-    u32("ssm.conv_kernel",4); u32("ssm.inner_size",128);
+-    u32("ssm.state_size",128); u32("ssm.time_step_rank",1); u32("ssm.group_count",1);
++    u32("ssm.conv_kernel",4); u32("ssm.inner_size",compact_geometry ? 6144 : 128);
++    u32("ssm.state_size",128); u32("ssm.time_step_rank",compact_geometry ? 48 : 1);
++    u32("ssm.group_count",compact_geometry ? 16 : 1);
+     gguf_set_val_f32(metadata.get(),"qwen35.attention.layer_norm_rms_epsilon",1e-6f);
+     const uint32_t sections[]={4,4,0,0};
+     gguf_set_arr_data(metadata.get(),"qwen35.rope.dimension_sections",GGUF_TYPE_UINT32,sections,4);
+@@ -282,7 +286,94 @@ static void equal(const common_state_data & a, const common_state_data & b, cons
+     require(a.main == b.main && a.drft == b.drft && a.spec == b.spec, message);
+ }
+ 
+-int main() {
++static void test_compact_rollback(const char * library) {
++    require(ggml_backend_load(library), "cannot load compact CUDA backend");
++    auto model = tiny_model(true, 32, 128, -1, true);
++    require(llama_model_size(model.get()) < 16 * 1024 * 1024, "compact fixture exceeded weight budget");
++    auto params = llama_context_default_params();
++    params.n_ctx = 128;
++    params.n_batch = params.n_ubatch = 64;
++    params.n_seq_max = 1;
++    params.n_rs_seq = 2;
++    params.n_threads = params.n_threads_batch = 1;
++    auto context = [&](const char * mode) {
++#ifdef _WIN32
++        require(_putenv_s("WILDLLAMA_GDN_COMPACT_ROLLBACK", mode) == 0, "cannot set compact mode");
++#else
++        require(setenv("WILDLLAMA_GDN_COMPACT_ROLLBACK", mode, 1) == 0, "cannot set compact mode");
++#endif
++        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
++        require(bool(ctx), "cannot create rollback fixture context");
++        return ctx;
++    };
++    auto reference = context("0");
++    auto compact = context("1");
++    auto bytes = [](llama_context * ctx) {
++        size_t total = 0;
++        for (const auto & item : llama_get_memory(ctx)->memory_breakdown()) {
++            total += item.second;
++        }
++        return total;
++    };
++    require(bytes(reference.get()) > bytes(compact.get()) + 3'000'000, "compact allocation did not replace a full state");
++    auto run = [](llama_context * ctx, int start, int n) {
++        common_batch batch(ctx);
++        for (int i = 0; i < n; ++i) {
++            batch.add(3 + (start + i) % 53, start + i, 0, true);
++        }
++        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "rollback decode failed");
++        const auto * logits = llama_get_logits_ith(ctx, -1);
++        require(logits != nullptr, "rollback logits unavailable");
++        return std::vector<float>(logits, logits + 64);
++    };
++    auto save = [](llama_context * ctx) {
++        std::vector<uint8_t> data(llama_state_seq_get_size(ctx, 0));
++        require(!data.empty() && llama_state_seq_get_data(ctx, data.data(), data.size(), 0) == data.size(),
++                "checkpoint write failed");
++        return data;
++    };
++    auto restore = [](llama_context * ctx, const std::vector<uint8_t> & data) {
++        require(llama_state_seq_set_data(ctx, data.data(), data.size(), 0) == data.size(), "checkpoint restore failed");
++    };
++    require(run(reference.get(), 0, 64) == run(compact.get(), 0, 64), "compact prefill changed logits");
++    const auto prefix = save(reference.get());
++    require(prefix == save(compact.get()), "compact prefill changed checkpoint bytes");
++    require(!llama_memory_seq_rm(llama_get_memory(compact.get()), 0, 63, -1),
++            "compact prefill accepted an unpublished snapshot");
++
++    for (int width : {2, 3}) {
++        for (int rejected = 0; rejected < width; ++rejected) {
++            for (bool checkpoint : {false, true}) {
++                restore(reference.get(), prefix);
++                restore(compact.get(), prefix);
++                require(run(reference.get(), 64, width) == run(compact.get(), 64, width), "verification logits changed");
++                const int next = 64 + width - rejected;
++                require(llama_memory_seq_rm(llama_get_memory(reference.get()), 0, next, -1) &&
++                        llama_memory_seq_rm(llama_get_memory(compact.get()), 0, next, -1), "rollback rejected valid suffix");
++                if (checkpoint) {
++                    const auto before = save(reference.get());
++                    const auto after = save(compact.get());
++                    require(before == after, "pending rollback changed canonical checkpoint bytes");
++                    restore(reference.get(), after);
++                    restore(compact.get(), before);
++                }
++                require(run(reference.get(), next, 3) == run(compact.get(), next, 3), "continuation after rollback changed");
++                require(save(reference.get()) == save(compact.get()), "continuation checkpoint changed");
++            }
++        }
++    }
++    // A stopped request can release the sequence without zeroing the buffers.
++    require(llama_memory_seq_rm(llama_get_memory(compact.get()), 0,
++                llama_memory_seq_pos_max(llama_get_memory(compact.get()), 0), -1), "cancel fixture rollback failed");
++    llama_memory_clear(llama_get_memory(compact.get()), false);
++    llama_memory_clear(llama_get_memory(reference.get()), false);
++    require(run(reference.get(), 0, 3) == run(compact.get(), 0, 3), "fresh request reused a rejected state");
++    require(save(reference.get()) == save(compact.get()), "fresh checkpoint kept old state");
++    std::printf("PASS compact GDN: exact prefill, 10 rollback/restore cases and cancelled sequence reset; saved %zu bytes\n",
++                bytes(reference.get()) - bytes(compact.get()));
++}
++
++int main(int argc, char ** argv) {
+     try {
+ #ifdef GGML_TEST_CPU_BACKEND_PATH
+         require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH) != nullptr, "cannot load CPU backend");
+@@ -290,6 +381,10 @@ int main() {
+         ggml_backend_load_all();
+ #endif
+         llama_backend_init();
++        if (argc == 3 && std::strcmp(argv[1], "--compact") == 0) {
++            test_compact_rollback(argv[2]);
++            return 0;
++        }
+         auto model = tiny_model();
+         require(llama_model_size(model.get()) < 4*1024*1024, "fixture exceeds 4 MiB");
+         const llama_tokens a = {3,4,5,6}, b = {17,18,19,20};

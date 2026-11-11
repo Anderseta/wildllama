@@ -522,16 +522,15 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	return cmd, port, nil
 }
 
-// Enable the measured kernels for the eligible Qwen MTP configuration.
-// The native backend still validates each tensor layout before dispatch.
+// Enable the measured MTP kernels on the supported CUDA capability.
+// The backend checks the actual weight, cache and graph layouts.
 func setMTPVerificationEnvironment(environment map[string]string, launch llamaServerLaunchConfig) {
 	draftType := launch.draftType
 	if launch.opts.SpeculativeType != "" && launch.opts.SpeculativeType != "auto" {
 		draftType = launch.opts.SpeculativeType
 	}
-	if draftType != draftTypeMTP || launch.modelArch != "qwen35" || launch.numParallel != 1 ||
-		launch.opts.DraftNumPredict < 1 || launch.opts.DraftNumPredict > 2 ||
-		launch.opts.NumGPU == 0 || launch.kvCacheType != "q8_0" || len(launch.gpus) != 1 {
+	if draftType != draftTypeMTP || launch.opts.DraftNumPredict < 1 ||
+		launch.opts.NumGPU == 0 || len(launch.gpus) != 1 {
 		return
 	}
 	gpu := launch.gpus[0]
