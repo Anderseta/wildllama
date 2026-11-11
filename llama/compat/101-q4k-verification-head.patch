@@ -1,0 +1,335 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 55cb922..f9711a7 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1162,6 +1162,60 @@ static __global__ void mul_mat_vec_q_moe(
+     }
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static constexpr int mmvq_q4_head_width = 5120;
++static constexpr int mmvq_q4_head_vocab = 248320;
++
++static constexpr bool mmvq_q4_head_geometry(int64_t width, int64_t rows, int64_t tokens) {
++    return width == mmvq_q4_head_width && rows == mmvq_q4_head_vocab && (tokens == 2 || tokens == 3);
++}
++
++template<int tokens>
++static __global__ __launch_bounds__(128, 1) void mul_mat_vec_q4_head_warp(
++        const block_q4_K * __restrict__ weights, const block_q8_1 * __restrict__ input,
++        float * __restrict__ output, int rows) {
++    static_assert(tokens == 2 || tokens == 3, "only measured Q4_K head batches are supported");
++    constexpr int weight_stride = mmvq_q4_head_width / QK_K;
++    constexpr int input_stride = mmvq_q4_head_width / QK8_1;
++    constexpr int lanes_per_block = QI4_K / VDR_Q4_K_Q8_1_MMVQ;
++    constexpr int blocks_per_warp = 32 / lanes_per_block;
++    static_assert(weight_stride % blocks_per_warp == 0, "head rows must fill the final warp");
++    const int row = 4 * blockIdx.x + threadIdx.y;
++    ggml_cuda_pdl_sync();
++    if (row >= rows) { return; }
++
++    const block_q4_K * row_weights = weights + size_t(row)*weight_stride;
++    const int lane = threadIdx.x;
++    const int kqs = (lane % lanes_per_block) * VDR_Q4_K_Q8_1_MMVQ;
++    float sums[tokens] = {};
++    // Reproduce the four original warps' partial sums in order, now within
++    // one warp for each row. No shared memory or block barrier is needed.
++#pragma unroll
++    for (int part = 0; part < 4; ++part) {
++        float partial[tokens] = {};
++#pragma unroll
++        for (int tile = part*blocks_per_warp; tile < weight_stride; tile += 4*blocks_per_warp) {
++            const int kbx = tile + lane/lanes_per_block;
++#pragma unroll
++            for (int j = 0; j < tokens; ++j) {
++                partial[j] += vec_dot_q4_K_q8_1(row_weights,
++                    input + j*input_stride + kbx*(QK_K/QK8_1), kbx, kqs);
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < tokens; ++j) {
++            sums[j] = part == 0 ? partial[j] : sums[j] + partial[j];
++        }
++    }
++
++#pragma unroll
++    for (int j = 0; j < tokens; ++j) {
++        const float value = warp_reduce_sum<32>(sums[j]);
++        if (lane == row % 2) { output[j*rows + row] = value; }
++    }
++}
++#endif
++
+ #ifndef GGML_CUDA_MMVQ_KERNELS_ONLY
+ template<ggml_type type>
+ static std::pair<dim3, dim3> calc_launch_params(
+@@ -1716,6 +1770,46 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    // Full Q4_K vocabulary projection on the measured SM120 geometry. Keep
++    // all logits and reuse the ordinary Q8_1 activation and output buffers.
++    if (src0->type == GGML_TYPE_Q4_K && !ids && !fusion && mmvq_q4_head_geometry(ne00, ne01, ne11) &&
++            ne10_padded == ne00 && ne0 == ne01 && ne1 == ne11 &&
++            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++            ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
++            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL) {
++        static const bool enabled = [] {
++            const char * value = std::getenv("GGML_CUDA_Q4_HEAD_WARP");
++            return value && value[0] == '1' && value[1] == '\0';
++        }();
++        if (enabled) {
++            const dim3 grid((ne01+3)/4), block(32,4);
++            const ggml_cuda_kernel_launch_params parameters(grid, block, 0, stream);
++            const auto * weights = static_cast<const block_q4_K *>(src0->data);
++            const auto * input = reinterpret_cast<const block_q8_1 *>(quantized);
++            if (ne11 == 2) {
++                ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<2>, parameters, weights, input, dst_d, int(ne01));
++            } else {
++                ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<3>, parameters, weights, input, dst_d, int(ne01));
++            }
++            static const bool trace = [] {
++                const char * value = std::getenv("GGML_CUDA_Q4_HEAD_WARP_TRACE");
++                return value && value[0] == '1' && value[1] == '\0';
++            }();
++            if (trace) {
++                static std::atomic<unsigned> reported{0};
++                const unsigned bit = 1u << (ne11-2);
++                if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
++                    std::fprintf(stderr, "cuda_q4_head_warp: launched k=%lld rows=%lld tokens=%lld\n",
++                        (long long) ne00, (long long) ne01, (long long) ne11);
++                }
++            }
++            return;
++        }
++    }
++#endif
++
+     // Plain dense IQ3_S only. K assignment and the four-warp reduction stay
+     // identical. One token uses two rows; two/three tokens use four rows per CTA.
+     if (src0->type == GGML_TYPE_IQ3_S && !ids && !fusion && ne01 % 2 == 0 &&
+diff --git a/tests/test-cuda-q4-head.cu b/tests/test-cuda-q4-head.cu
+new file mode 100644
+index 0000000..ea813bc
+--- /dev/null
++++ b/tests/test-cuda-q4-head.cu
+@@ -0,0 +1,217 @@
++// Standalone fixture for the production kernels. Load only a range of a
++// trained Q4_K head that is larger than the test GPU's L2 cache.
++#define GGML_CUDA_MMVQ_KERNELS_ONLY
++#include "../ggml/src/ggml-cuda/mmvq.cu"
++#include "gguf.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static_assert(mmvq_q4_head_geometry(5120, 248320, 2));
++static_assert(mmvq_q4_head_geometry(5120, 248320, 3));
++static_assert(!mmvq_q4_head_geometry(5120, 248320, 1));
++static_assert(!mmvq_q4_head_geometry(5120, 248320, 4));
++static_assert(!mmvq_q4_head_geometry(5120, 248319, 2));
++static_assert(!mmvq_q4_head_geometry(4096, 248320, 2));
++
++[[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
++    throw std::runtime_error(std::string(stmt) + " in " + func + " at " + file + ":" + std::to_string(line) + ": " + msg);
++}
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++template<class T> struct device_buffer {
++    T * data = nullptr;
++    explicit device_buffer(size_t count) { CUDA_CHECK(cudaMalloc((void **)&data, count*sizeof(T))); }
++    ~device_buffer() { if (data) { cudaFree(data); } }
++    device_buffer(const device_buffer &) = delete;
++    device_buffer & operator=(const device_buffer &) = delete;
++};
++
++struct timer {
++    cudaGraph_t graph = nullptr;
++    cudaGraphExec_t executable = nullptr;
++    cudaEvent_t begin = nullptr;
++    cudaEvent_t end = nullptr;
++    static constexpr int iterations = 24;
++
++    ~timer() {
++        if (executable) { cudaGraphExecDestroy(executable); }
++        if (graph) { cudaGraphDestroy(graph); }
++        if (begin) { cudaEventDestroy(begin); }
++        if (end) { cudaEventDestroy(end); }
++    }
++    template<class Launch> void capture(cudaStream_t stream, Launch launch) {
++        CUDA_CHECK(cudaEventCreate(&begin));
++        CUDA_CHECK(cudaEventCreate(&end));
++        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
++        CUDA_CHECK(cudaEventRecordWithFlags(begin, stream, cudaEventRecordExternal));
++        for (int i = 0; i < iterations; ++i) { launch(); }
++        CUDA_CHECK(cudaEventRecordWithFlags(end, stream, cudaEventRecordExternal));
++        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
++        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
++    }
++    float measure(cudaStream_t stream) const {
++        CUDA_CHECK(cudaGraphLaunch(executable, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        float ms = 0;
++        CUDA_CHECK(cudaEventElapsedTime(&ms, begin, end));
++        require(std::isfinite(ms) && ms > 0, "invalid CUDA event measurement");
++        return ms/iterations;
++    }
++};
++
++static constexpr int width = mmvq_q4_head_width;
++static constexpr int weight_stride = width/QK_K;
++static constexpr int input_stride = width/QK8_1;
++
++template<int tokens, bool candidate> static void launch(const block_q4_K * weights, const block_q8_1 * input,
++        float * output, int rows, cudaStream_t stream) {
++    if constexpr (candidate) {
++        mul_mat_vec_q4_head_warp<tokens><<<dim3((rows+3)/4), dim3(32,4), 0, stream>>>(weights, input, output, rows);
++    } else {
++        constexpr int rows_per_block = calc_rows_per_block(GGML_TYPE_Q4_K, tokens, MMVQ_PARAMETERS_GENERIC, false, 4);
++        const uint32_t weight_channel = rows*weight_stride;
++        const uint32_t input_channel = tokens*input_stride;
++        const uint3 one = init_fastdiv_values(1);
++        mul_mat_vec_q<GGML_TYPE_Q4_K,tokens,false><<<
++            dim3((rows+rows_per_block-1)/rows_per_block), dim3(32,4), 0, stream>>>(
++            weights, input, nullptr, ggml_cuda_mm_fusion_args_device{}, output,
++            width, one, weight_stride, input_stride, rows, one,
++            weight_channel, input_channel, rows*tokens, one, weight_channel, input_channel, rows*tokens, 0, rows);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++static float median(std::vector<float> values) {
++    std::sort(values.begin(), values.end());
++    return .5f*(values[values.size()/2-1] + values[values.size()/2]);
++}
++
++template<int tokens> static void benchmark(const block_q4_K * weights, const block_q8_1 * input,
++        float * output, int rows, cudaStream_t stream) {
++    timer baseline, candidate;
++    baseline.capture(stream, [&]{ launch<tokens,false>(weights, input, output, rows, stream); });
++    candidate.capture(stream, [&]{ launch<tokens,true>(weights, input, output, rows, stream); });
++    for (int i = 0; i < 3; ++i) { baseline.measure(stream); candidate.measure(stream); }
++    std::vector<float> before, after;
++    int wins = 0;
++    for (int i = 0; i < 12; ++i) {
++        float a, b;
++        if (i % 2) {
++            b = candidate.measure(stream);
++            a = baseline.measure(stream);
++        } else {
++            a = baseline.measure(stream);
++            b = candidate.measure(stream);
++        }
++        before.push_back(a);
++        after.push_back(b);
++        wins += b < a;
++    }
++    std::printf("Q4_HEAD_EVENTS tokens=%d rows=%d baseline_ms=%.6f candidate_ms=%.6f speedup=%.5f wins=%d/12\n",
++        tokens, rows, median(before), median(after), median(before)/median(after), wins);
++}
++
++static uint32_t random_next(uint32_t & value) {
++    value ^= value<<13;
++    value ^= value>>17;
++    value ^= value<<5;
++    return value;
++}
++
++template<int tokens> static void check(const block_q4_K * weights, block_q8_1 * input, float * output,
++        int rows, cudaStream_t stream, bool measure) {
++    std::vector<block_q8_1> activation(tokens*input_stride);
++    std::vector<float> expected(tokens*rows), actual(tokens*rows);
++    for (int pattern = 0; pattern < 3; ++pattern) {
++        uint32_t rng = 0x674329u + pattern;
++        for (auto & block : activation) {
++            int sum = 0;
++            for (int8_t & q : block.qs) {
++                q = pattern == 0 ? 0 : int8_t(int(random_next(rng)%255)-127);
++                sum += q;
++            }
++            const float scale = std::ldexp(1.0f, int(random_next(rng)%10)-12);
++            const half2 scale_sum = __floats2half2_rn(scale, scale*sum);
++            std::memcpy(&block.ds, &scale_sum, sizeof(scale_sum));
++        }
++        CUDA_CHECK(cudaMemcpyAsync(input, activation.data(), activation.size()*sizeof(block_q8_1), cudaMemcpyHostToDevice, stream));
++        CUDA_CHECK(cudaMemsetAsync(output, 0xff, expected.size()*sizeof(float), stream));
++        launch<tokens,false>(weights, input, output, rows, stream);
++        CUDA_CHECK(cudaMemcpyAsync(expected.data(), output, expected.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaMemsetAsync(output, 0xff, actual.size()*sizeof(float), stream));
++        launch<tokens,true>(weights, input, output, rows, stream);
++        CUDA_CHECK(cudaMemcpyAsync(actual.data(), output, actual.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        size_t differences = 0;
++        for (size_t i = 0; i < actual.size(); ++i) {
++            require(std::isfinite(expected[i]) && std::isfinite(actual[i]), "nonfinite head fixture output");
++            differences += std::memcmp(&expected[i], &actual[i], sizeof(float)) != 0;
++        }
++        std::printf("Q4_HEAD_CHECK tokens=%d rows=%d pattern=%d different_bits=%zu\n", tokens, rows, pattern, differences);
++        require(differences == 0, "head kernel changed output bits");
++    }
++    if (measure) { benchmark<tokens>(weights, input, output, rows, stream); }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        require(argc == 2, "Usage: test-cuda-q4-head MODEL.gguf");
++        int device = 0;
++        cudaDeviceProp props{};
++        CUDA_CHECK(cudaGetDevice(&device));
++        CUDA_CHECK(cudaGetDeviceProperties(&props, device));
++        if (props.major != 12 || props.minor != 0) { std::puts("SKIP: requires SM120"); return 77; }
++
++        std::unique_ptr<gguf_context,decltype(&gguf_free)> metadata(gguf_init_from_file(argv[1], {true,nullptr}), gguf_free);
++        require(bool(metadata), "cannot open GGUF metadata");
++        const int64_t index = gguf_find_tensor(metadata.get(), "output.weight");
++        require(index >= 0 && gguf_get_tensor_type(metadata.get(), index) == GGML_TYPE_Q4_K, "expected Q4_K output.weight");
++        const int64_t * shape = gguf_get_tensor_ne(metadata.get(), index);
++        require(shape[0] == width && shape[1] == mmvq_q4_head_vocab && shape[2] == 1 && shape[3] == 1, "unexpected head geometry");
++        constexpr int rows = 32768;
++        constexpr size_t bytes = rows*weight_stride*sizeof(block_q4_K);
++        static_assert(bytes + 3*rows*sizeof(float) + 3*input_stride*sizeof(block_q8_1) < 96*1024*1024, "GPU fixture exceeds budget");
++        require(bytes > 2*size_t(props.l2CacheSize), "range is too small for a streaming benchmark on this device");
++        constexpr size_t first_row = 119424;
++        static_assert(first_row+rows <= mmvq_q4_head_vocab, "head range outside vocabulary");
++        const uint64_t offset = gguf_get_data_offset(metadata.get()) + gguf_get_tensor_offset(metadata.get(), index) + first_row*weight_stride*sizeof(block_q4_K);
++        std::ifstream file(argv[1], std::ios::binary);
++        file.seekg(std::streamoff(offset));
++        std::vector<block_q4_K> host(rows*weight_stride);
++        file.read(reinterpret_cast<char *>(host.data()), bytes);
++        require(size_t(file.gcount()) == bytes, "short head range read");
++        device_buffer<block_q4_K> weights(host.size());
++        device_buffer<block_q8_1> input(3*input_stride);
++        device_buffer<float> output(3*rows);
++        CUDA_CHECK(cudaMemcpy(weights.data, host.data(), bytes, cudaMemcpyHostToDevice));
++        cudaStream_t stream = nullptr;
++        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++        std::printf("Q4_HEAD_FIXTURE gpu=%s L2_bytes=%d weight_bytes=%zu first_row=%zu\n", props.name, props.l2CacheSize, bytes, first_row);
++        for (const void * kernel : { (const void *)mul_mat_vec_q4_head_warp<2>, (const void *)mul_mat_vec_q4_head_warp<3> }) {
++            cudaFuncAttributes attr{};
++            CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
++            std::printf("Q4_HEAD_KERNEL registers=%d shared_bytes=%zu local_bytes=%zu\n", attr.numRegs, attr.sharedSizeBytes, attr.localSizeBytes);
++        }
++        check<2>(weights.data, input.data, output.data, rows, stream, true);
++        check<3>(weights.data, input.data, output.data, rows, stream, true);
++        check<2>(weights.data, input.data, output.data, rows-1, stream, false);
++        check<3>(weights.data, input.data, output.data, rows-1, stream, false);
++        CUDA_CHECK(cudaStreamDestroy(stream));
++        std::puts("PASS: Q4_K full-head kernels preserved every tested logit bit");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}

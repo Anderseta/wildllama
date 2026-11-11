@@ -1,0 +1,673 @@
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 77fd288..e0d5c88 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -40,9 +40,13 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
+     }
+ }
+ 
+-template <bool need_check>
+-static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
++template <bool need_check, bool paired = false>
++static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx_first, half * __restrict__ y_first, const int64_t k,
++        const void * __restrict__ vx_second, half * __restrict__ y_second) {
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
++    const bool second = paired && blockIdx.y != 0;
++    const void * vx = second ? vx_second : vx_first;
++    half * y = second ? y_second : y_first;
+     constexpr int nint = CUDA_Q8_0_NE_ALIGN/sizeof(int) + WARP_SIZE;
+ 
+     const int64_t   i0 = CUDA_Q8_0_NE_ALIGN*blockIdx.x;
+@@ -76,7 +80,7 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
+         y2[iy/2 + threadIdx.x] = __hmul2(make_half2(qs.x, qs.y), __half2half2(d));
+     }
+ #else
+-    GGML_UNUSED_VARS(vx, y, k);
++    GGML_UNUSED_VARS(vx_first, y_first, k, vx_second, y_second);
+     NO_DEVICE_CODE;
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+ }
+@@ -268,10 +272,20 @@ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half *
+     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
+     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
+         const bool need_check = false;
+-        dequantize_block_q8_0_f16<need_check><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, k);
++        dequantize_block_q8_0_f16<need_check><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, k, nullptr, nullptr);
+     } else {
+         const bool need_check = true;
+-        dequantize_block_q8_0_f16<need_check><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, k);
++        dequantize_block_q8_0_f16<need_check><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, k, nullptr, nullptr);
++    }
++}
++
++void ggml_cuda_convert_q8_pair_f16(const void * k, const void * v, half * keys, half * values,
++        int64_t elements, cudaStream_t stream) {
++    const dim3 blocks((elements + CUDA_Q8_0_NE_ALIGN - 1)/CUDA_Q8_0_NE_ALIGN, 2);
++    if (elements % CUDA_Q8_0_NE_ALIGN == 0) {
++        dequantize_block_q8_0_f16<false, true><<<blocks, WARP_SIZE, 0, stream>>>(k, keys, elements, v, values);
++    } else {
++        dequantize_block_q8_0_f16<true, true><<<blocks, WARP_SIZE, 0, stream>>>(k, keys, elements, v, values);
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/convert.cuh b/ggml/src/ggml-cuda/convert.cuh
+index 91255cc..101ffeb 100644
+--- a/ggml/src/ggml-cuda/convert.cuh
++++ b/ggml/src/ggml-cuda/convert.cuh
+@@ -12,6 +12,9 @@ typedef to_t_cuda_t<nv_bfloat16> to_bf16_cuda_t;
+ 
+ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type);
+ 
++void ggml_cuda_convert_q8_pair_f16(const void * k, const void * v, half * keys, half * values,
++        int64_t elements, cudaStream_t stream);
++
+ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
+ 
+ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index da15e2a..a797e83 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -6,6 +6,18 @@
+ #include "../ggml-attn-mask-compact.h"
+ 
+ #include <cstdint>
++#include <cstdlib>
++
++void ggml_cuda_fattn_q8_pair_to_f16(const ggml_tensor * K, const ggml_tensor * V,
++        half * keys, half * values, cudaStream_t stream);
++
++inline bool ggml_cuda_fattn_q8_verify_enabled() {
++    static const bool enabled = [] {
++        const char * value = std::getenv("WILDLLAMA_CUDA_GQA_Q8_VERIFY");
++        return value && value[0] == '1' && !value[1];
++    }();
++    return enabled;
++}
+ 
+ #define FATTN_KQ_STRIDE       256
+ #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
+@@ -339,6 +351,29 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
+     return sum;
+ }
+ 
++template <int D, int nthreads, int n>
++static __device__ __forceinline__ void vec_dot_fattn_vec_KQ_q8_0_shared(
++        const char * K, const int (&Q_q8)[n][D/(sizeof(int)*nthreads)],
++        const float2 (&Q_ds)[n][D/(sizeof(int)*nthreads)], float (&sums)[n]) {
++    const auto * blocks = reinterpret_cast<const block_q8_0 *>(K);
++#pragma unroll
++    for (int j = 0; j < n; ++j) {
++        sums[j] = 0.0f;
++    }
++#pragma unroll
++    for (int i = 0; i < D/(sizeof(int)*nthreads); ++i) {
++        const int k = i*nthreads + threadIdx.x % nthreads;
++        const auto & block = blocks[k/QI8_0];
++        int key;
++        ggml_cuda_memcpy_1<sizeof(key), 2>(&key, block.qs + sizeof(key)*(k % QI8_0));
++        const half scale = block.d;
++#pragma unroll
++        for (int j = 0; j < n; ++j) {
++            sums[j] += vec_dot_q8_0_q8_1_impl<float, 1>(&key, &Q_q8[j][i], scale, Q_ds[j][i].x);
++        }
++    }
++}
++
+ template <typename Tds, int ni>
+ static __device__ __forceinline__ void quantize_q8_1_to_shared(
+     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
+@@ -1083,7 +1118,38 @@ void launch_fattn(
+     size_t nb22 = V->nb[2];
+     size_t nb23 = V->nb[3];
+ 
+-    if (need_f16_K && K->type != GGML_TYPE_F16) {
++    const bool converted_pair = need_f16_K && need_f16_V && !V_is_K_view &&
++        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
++        Q->ne[1] == 3 && Q->ne[2] == 24 && Q->ne[3] == 1 &&
++        K->ne[0] == 256 && K->ne[1] > 0 && K->ne[1] <= 131072 && K->ne[2] == 4 && K->ne[3] == 1 &&
++        ggml_are_same_shape(K, V) && K->nb[0] == sizeof(block_q8_0) && V->nb[0] == sizeof(block_q8_0) &&
++        K->nb[1] % sizeof(block_q8_0) == 0 && K->nb[2] % sizeof(block_q8_0) == 0 &&
++        V->nb[1] % sizeof(block_q8_0) == 0 && V->nb[2] % sizeof(block_q8_0) == 0 &&
++        cc == GGML_CUDA_CC_BLACKWELL &&
++        ggml_cuda_fattn_q8_verify_enabled() &&
++        ggml_is_contiguously_allocated(K) == ggml_is_contiguously_allocated(V);
++    if (converted_pair) {
++        GGML_ASSERT(f16_extra.K && f16_extra.V);
++        ggml_cuda_fattn_q8_pair_to_f16(K, V, reinterpret_cast<half *>(f16_extra.K),
++            reinterpret_cast<half *>(f16_extra.V), main_stream);
++        const auto converted_stride = [](const ggml_tensor * src, size_t & row, size_t & head, size_t & seq) {
++            if (ggml_is_contiguously_allocated(src)) {
++                row = row*QK8_0*sizeof(half)/sizeof(block_q8_0);
++                head = head*QK8_0*sizeof(half)/sizeof(block_q8_0);
++                seq = seq*QK8_0*sizeof(half)/sizeof(block_q8_0);
++            } else {
++                row = src->ne[0]*sizeof(half);
++                head = src->ne[1]*row;
++                seq = src->ne[2]*head;
++            }
++        };
++        converted_stride(K, nb11, nb12, nb13);
++        converted_stride(V, nb21, nb22, nb23);
++        K_data = reinterpret_cast<const char *>(f16_extra.K);
++        V_data = reinterpret_cast<const char *>(f16_extra.V);
++    }
++
++    if (!converted_pair && need_f16_K && K->type != GGML_TYPE_F16) {
+         const size_t bs = ggml_blck_size(K->type);
+         const size_t ts = ggml_type_size(K->type);
+ 
+@@ -1111,7 +1177,7 @@ void launch_fattn(
+         K_data = (char *) K_f16;
+     }
+ 
+-    if (need_f16_V && V->type != GGML_TYPE_F16) {
++    if (!converted_pair && need_f16_V && V->type != GGML_TYPE_F16) {
+         if (V_is_K_view) {
+             V_data = K_data;
+             nb21   = nb11;
+diff --git a/ggml/src/ggml-cuda/fattn-q8-convert.cuh b/ggml/src/ggml-cuda/fattn-q8-convert.cuh
+new file mode 100644
+index 0000000..057cbff
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-q8-convert.cuh
+@@ -0,0 +1,50 @@
++#pragma once
++
++#include "common.cuh"
++#include "convert.cuh"
++
++struct fattn_q8_to_f16_view {
++    const block_q8_0 * source;
++    half2 * destination;
++    int64_t row_stride;
++    int64_t head_stride;
++};
++
++// The two streams of work occupy disjoint output arrays. A CTA handles either
++// K or V and never changes the half conversion used by the original launcher.
++static __global__ void fattn_q8_pair_to_f16(fattn_q8_to_f16_view k, fattn_q8_to_f16_view v,
++        uint3 row_count, int64_t pairs) {
++    constexpr int pairs_per_row = 256/2;
++    constexpr int pairs_per_quant = QK8_0/2;
++    const auto view = blockIdx.y == 0 ? k : v;
++    const int64_t index = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    if (index >= pairs) {
++        return;
++    }
++    const int64_t row = index/pairs_per_row;
++    const int64_t pair = index % pairs_per_row;
++    const uint2 pos = fast_div_modulo(uint32_t(row), row_count);
++    const int64_t block = int64_t(pos.x)*view.head_stride + int64_t(pos.y)*view.row_stride + pair/pairs_per_quant;
++    const block_q8_0 & source = view.source[block];
++    const int q = 2*int(pair % pairs_per_quant);
++    const float scale = __half2float(source.d);
++    view.destination[index] = __floats2half2_rn(float(source.qs[q])*scale, float(source.qs[q+1])*scale);
++}
++
++static inline void fattn_launch_q8_pair_to_f16(const ggml_tensor * K, const ggml_tensor * V,
++        half * keys, half * values, cudaStream_t stream) {
++    if (ggml_is_contiguously_allocated(K)) {
++        ggml_cuda_convert_q8_pair_f16(K->data, V->data, keys, values, ggml_nelements(K), stream);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++    auto view = [](const ggml_tensor * src, half * dst) {
++        return fattn_q8_to_f16_view{static_cast<const block_q8_0 *>(src->data), reinterpret_cast<half2 *>(dst),
++            int64_t(src->nb[1]/sizeof(block_q8_0)), int64_t(src->nb[2]/sizeof(block_q8_0))};
++    };
++    constexpr int threads = 256;
++    const int64_t pairs = ggml_nelements(K)/2;
++    fattn_q8_pair_to_f16<<<dim3((pairs + threads - 1)/threads, 2), threads, 0, stream>>>(
++        view(K, keys), view(V, values), init_fastdiv_values(K->ne[1]), pairs);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/fattn-vec-gqa.h b/ggml/src/ggml-cuda/fattn-vec-gqa.h
+index 40ccdb5..27525bc 100644
+--- a/ggml/src/ggml-cuda/fattn-vec-gqa.h
++++ b/ggml/src/ggml-cuda/fattn-vec-gqa.h
+@@ -12,8 +12,8 @@ struct ggml_cuda_fattn_vec_gqa_shape {
+     float max_bias, softcap;
+ };
+ 
+-inline bool ggml_cuda_fattn_vec_gqa_eligible(bool enabled, const ggml_cuda_fattn_vec_gqa_shape & s) {
+-    return enabled && s.dimension == 256 && s.queries == 1 && s.sequences == 1 &&
++inline bool ggml_cuda_fattn_vec_gqa_layout(const ggml_cuda_fattn_vec_gqa_shape & s) {
++    return s.dimension == 256 && s.sequences == 1 &&
+         s.query_heads > 0 && s.kv_heads > 0 && s.query_heads % s.kv_heads == 0 &&
+         (s.query_heads/s.kv_heads) % 2 == 0 && s.kv_tokens > 0 && s.kv_tokens % 256 == 0 &&
+         s.q_f32 && s.kv_q8 && s.dense_mask && !s.sinks && s.max_bias == 0.0f && s.softcap == 0.0f &&
+@@ -21,6 +21,16 @@ inline bool ggml_cuda_fattn_vec_gqa_eligible(bool enabled, const ggml_cuda_fattn
+         s.k_stride >= 8*34 && s.v_stride >= 8*34;
+ }
+ 
++inline bool ggml_cuda_fattn_vec_gqa_eligible(bool enabled, const ggml_cuda_fattn_vec_gqa_shape & s) {
++    return enabled && s.queries == 1 && ggml_cuda_fattn_vec_gqa_layout(s);
++}
++
++inline bool ggml_cuda_fattn_vec_gqa_two_queries(bool enabled, int cc,
++        const ggml_cuda_fattn_vec_gqa_shape & s) {
++    return enabled && cc == 1200 && s.queries == 2 &&
++        s.query_heads == 24 && s.kv_heads == 4 && ggml_cuda_fattn_vec_gqa_layout(s);
++}
++
+ enum class ggml_cuda_fattn_vec_gqa_mode { disabled, automatic, enabled };
+ 
+ inline ggml_cuda_fattn_vec_gqa_mode ggml_cuda_fattn_vec_gqa_parse(const char * value) {
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index fd54958..92e9e71 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -17,7 +17,7 @@ static void ggml_cuda_fattn_vec_gqa_trace(bool grouped, const ggml_tensor * Q, c
+     }();
+     if (!enabled) { return; }
+     static std::atomic<unsigned> seen{0};
+-    const unsigned bit = grouped ? 1u : 2u;
++    const unsigned bit = (grouped ? 1u : 2u) << (Q->ne[1] == 2 ? 2 : 0);
+     if (!(seen.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+         GGML_LOG_INFO("CUDA_GQA_Q8 path=%s D=%lld queries=%lld q_heads=%lld kv_heads=%lld kv=%lld\n",
+             grouped ? "pair" : "legacy", (long long)Q->ne[0], (long long)Q->ne[1],
+@@ -133,11 +133,11 @@ static __global__ void flash_attn_ext_vec(
+     int warp_id = threadIdx.y;
+     int parallel_head = 0;
+     if constexpr (parallel_head_groups > 1) {
+-        static_assert(parallel_head_groups == 2 && ncols1 == 1 && ncols2 == 1,
+-            "parallel head groups require single-head single-query math");
++        static_assert(parallel_head_groups == 2 && (ncols1 == 1 || ncols1 == 2) && ncols2 == 1,
++            "parallel head groups require single-head arithmetic");
+         parallel_head = threadIdx.y / nwarps;
+         warp_id = threadIdx.y % nwarps;
+-        // The host gate admits only one query/sequence, a dense nonnull mask,
++        // The host gate admits exactly one query tile, a dense nonnull mask,
+         // no sinks and zero ALiBi bias. Other specializations keep the generic
+         // indexing/branches and their existing floating-point operations.
+         __builtin_assume(mask != nullptr);
+@@ -313,9 +313,21 @@ static __global__ void flash_attn_ext_vec(
+         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+             const int i_KQ = warp_id*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+ 
++            constexpr bool shared_keys = parallel_head_groups == 2 && ncols1 == 2 && type_K == GGML_TYPE_Q8_0;
++            float shared_sums[ncols];
++            GGML_UNUSED(shared_sums);
++            if constexpr (shared_keys) {
++                // Each query keeps the same dot and reduction order.
++                vec_dot_fattn_vec_KQ_q8_0_shared<D, nthreads_KQ, ncols>(K + i_KQ*nb11, Q_i32, Q_ds, shared_sums);
++            }
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
+-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
++                float sum;
++                if constexpr (shared_keys) {
++                    sum = shared_sums[j];
++                } else {
++                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
++                }
+                 sum = warp_reduce_sum<nthreads_KQ>(sum);
+ 
+                 if (use_logit_softcap) {
+@@ -592,8 +604,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
+     if constexpr (heads_per_block*parallel_head_groups == 1) {
+         launch_fattn<D, cols_per_block, heads_per_block>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+     } else {
+-        static_assert(heads_per_block*parallel_head_groups == 2 && cols_per_block == 1,
+-            "paired vector decode requires single-query tiles");
++        static_assert(heads_per_block*parallel_head_groups == 2 && (cols_per_block == 1 || cols_per_block == 2),
++            "paired vector decode requires one- or two-query tiles");
+         fattn_kernel_t legacy_per_head_kernel = flash_attn_ext_vec<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>;
+         launch_fattn<D, cols_per_block, heads_per_block*parallel_head_groups>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D,
+             need_f16_K, need_f16_V, false, false, WARP_SIZE, false, legacy_per_head_kernel, nthreads);
+@@ -622,10 +634,17 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+                 V->ne[0] == D && V->ne[1] == K->ne[1] && V->ne[2] == K->ne[2] &&
+                 K->ne[3] == 1 && V->ne[3] == 1,
+             mask && mask->type == GGML_TYPE_F16 && !ggml_attn_mask_is_compact(mask) &&
+-                mask->ne[0] == K->ne[1] && mask->ne[1] >= 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
++                mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+                 mask->nb[0] == sizeof(half),
+             dst->src[4] != nullptr, max_bias, logit_softcap};
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        if (ggml_cuda_fattn_vec_gqa_mode_from_env() != ggml_cuda_fattn_vec_gqa_mode::disabled &&
++            ggml_cuda_fattn_vec_gqa_two_queries(ggml_cuda_fattn_q8_verify_enabled(), cc, shape) &&
++            Q->nb[1] % 16 == 0 && mask->nb[1] == size_t(K->ne[1])*sizeof(half)) {
++            ggml_cuda_fattn_vec_gqa_trace(true, Q, K);
++            ggml_cuda_flash_attn_ext_vec_case_impl<D, 2, type_K, type_V, false, 1, 2>(ctx, dst);
++            return;
++        }
+         const bool grouped = ggml_cuda_fattn_vec_gqa_select(
+             ggml_cuda_fattn_vec_gqa_mode_from_env(), cc, GGML_CUDA_CC_IS_NVIDIA(cc), shape);
+         ggml_cuda_fattn_vec_gqa_trace(grouped, Q, K);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 0159267..b6ff6b9 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -4,6 +4,20 @@
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
++#include "fattn-q8-convert.cuh"
++
++void ggml_cuda_fattn_q8_pair_to_f16(const ggml_tensor * K, const ggml_tensor * V,
++        half * keys, half * values, cudaStream_t stream) {
++    static const bool trace = [] {
++        const char * value = std::getenv("WILDLLAMA_CUDA_GQA_Q8_TRACE");
++        return value && value[0] == '1' && !value[1];
++    }();
++    static std::atomic<bool> reported{false};
++    if (trace && !reported.exchange(true, std::memory_order_relaxed)) {
++        GGML_LOG_INFO("CUDA_GQA_Q8 path=paired_mma_conversion queries=3 kv=%lld\n", (long long) K->ne[1]);
++    }
++    fattn_launch_q8_pair_to_f16(K, V, keys, values, stream);
++}
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ // one list per group of ncols1 queries: a column is selected if any query of the group can see it
+diff --git a/tests/test-cuda-fattn-gqa-launch.cu b/tests/test-cuda-fattn-gqa-launch.cu
+index dbf2099..54d3f1b 100644
+--- a/tests/test-cuda-fattn-gqa-launch.cu
++++ b/tests/test-cuda-fattn-gqa-launch.cu
+@@ -3,10 +3,32 @@
+ #define main fixed_split_fixture_main
+ #include "test-cuda-fattn-vec-gqa.cu"
+ #undef main
++#include "../ggml/src/ggml-cuda/fattn-q8-convert.cuh"
++#include "../ggml/src/ggml-cuda/convert.cu"
+ 
+ #include <cstdint>
+ #include <limits>
+ 
++// The lean fixture links no backend DLL. The production conversion dispatcher
++// needs the compute capability of the device on which the fixture runs.
++int ggml_cuda_get_device() {
++    int device;
++    CUDA_CHECK(cudaGetDevice(&device));
++    return device;
++}
++
++const ggml_cuda_device_info & ggml_cuda_info() {
++    static const ggml_cuda_device_info info = [] {
++        ggml_cuda_device_info result{};
++        const int device = ggml_cuda_get_device();
++        cudaDeviceProp properties{};
++        CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
++        result.devices[device].cc = 100*properties.major + 10*properties.minor;
++        return result;
++    }();
++    return info;
++}
++
+ static uint32_t next_random(uint32_t & state) {
+     state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+     return state;
+@@ -132,7 +154,7 @@ struct benchmark_graph {
+ 
+ struct benchmark_inputs {
+     static constexpr int heads = 24, kv_heads = 4, dimension = 256;
+-    int tokens, splits;
++    int tokens, splits, queries, q_stride, kv_stride, head_stride;
+     cudaStream_t stream = nullptr;
+     device_buffer<float> q, output, final;
+     device_buffer<block_q8_0> k, v;
+@@ -140,17 +162,20 @@ struct benchmark_inputs {
+     device_buffer<float2> meta;
+     device_buffer<int> max_rows;
+ 
+-    benchmark_inputs(int rows, int partitions) : tokens(rows), splits(partitions), q(heads*dimension),
+-        output(size_t(heads)*dimension*splits), final(heads*dimension),
+-        k(size_t(kv_heads)*tokens*(dimension/32)), v(size_t(kv_heads)*tokens*(dimension/32)),
+-        mask(tokens), meta(size_t(heads)*splits), max_rows(1) {
+-        const size_t input_bytes = size_t(heads)*dimension*sizeof(float) +
+-            2*size_t(kv_heads)*tokens*(dimension/32)*sizeof(block_q8_0) + size_t(tokens)*sizeof(half);
++    benchmark_inputs(int rows, int partitions, int query_count = 1, bool padded = false) :
++        tokens(rows), splits(partitions), queries(query_count),
++        q_stride(dimension + (padded ? 16 : 0)), kv_stride(dimension/32 + (padded ? 2 : 0)),
++        head_stride((tokens + (padded ? 7 : 0))*kv_stride), q(heads*queries*q_stride),
++        output(size_t(heads)*queries*dimension*splits), final(heads*queries*dimension),
++        k(size_t(kv_heads)*head_stride), v(size_t(kv_heads)*head_stride),
++        mask(tokens*queries), meta(size_t(heads)*queries*splits), max_rows(1) {
++        const size_t input_bytes = size_t(heads)*queries*q_stride*sizeof(float) +
++            2*size_t(kv_heads)*head_stride*sizeof(block_q8_0) + size_t(tokens)*queries*sizeof(half);
+         require(input_bytes < 256*1024*1024, "benchmark inputs exceed 256 MiB");
+         CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+-        std::vector<float> host_q(heads*dimension);
+-        std::vector<block_q8_0> host_k(size_t(kv_heads)*tokens*(dimension/32)), host_v(host_k.size());
+-        std::vector<half> host_mask(tokens);
++        std::vector<float> host_q(heads*queries*q_stride);
++        std::vector<block_q8_0> host_k(size_t(kv_heads)*head_stride), host_v(host_k.size());
++        std::vector<half> host_mask(tokens*queries);
+         uint32_t random = 7331;
+         for (auto & value : host_q) { value = (int(next_random(random)%20001)-10000)/10000.0f; }
+         for (size_t i = 0; i < host_k.size(); ++i) {
+@@ -161,8 +186,11 @@ struct benchmark_inputs {
+                 host_v[i].qs[d] = int8_t(int(next_random(random)%255)-127);
+             }
+         }
+-        for (int row = 0; row < tokens; ++row) {
+-            host_mask[row] = __float2half(row >= tokens-37 || (row > 0 && row%31 == 0) ? -INFINITY : 0.0f);
++        for (int query = 0; query < queries; ++query) {
++            for (int row = 0; row < tokens; ++row) {
++                host_mask[query*tokens+row] = __float2half(
++                    row >= tokens-37+query || (row > 0 && (row+query)%31 == 0) ? -INFINITY : 0.0f);
++            }
+         }
+         CUDA_CHECK(cudaMemcpy(q.data,host_q.data(),host_q.size()*sizeof(float),cudaMemcpyHostToDevice));
+         CUDA_CHECK(cudaMemcpy(k.data,host_k.data(),host_k.size()*sizeof(block_q8_0),cudaMemcpyHostToDevice));
+@@ -172,32 +200,35 @@ struct benchmark_inputs {
+     }
+     ~benchmark_inputs() { if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
+ 
+-    template<int group, int parallel_groups = 1> void launch() {
+-        const int row_bytes = (dimension/32)*sizeof(block_q8_0), head_bytes = tokens*row_bytes;
+-        flash_attn_ext_vec<dimension,1,group,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false,parallel_groups><<<dim3(1,splits,heads/(group*parallel_groups)),dim3(32,4*parallel_groups,1),0,stream>>>(
++    template<int group, int parallel_groups = 1, int query_tile = 1> void launch() {
++        const int row_bytes = kv_stride*sizeof(block_q8_0), head_bytes = head_stride*sizeof(block_q8_0);
++        require(queries == query_tile, "fixture expected one query tile");
++        flash_attn_ext_vec<dimension,query_tile,group,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false,parallel_groups><<<dim3(1,splits,heads/(group*parallel_groups)),dim3(32,4*parallel_groups,1),0,stream>>>(
+             (const char *)q.data,(const char *)k.data,(const char *)v.data,(const char *)mask.data,
+             nullptr,max_rows.data,output.data,meta.data,1.0f/16,0,1,1,1,0,
+-            dimension,init_fastdiv_values(1),heads,1,dimension*sizeof(float),dimension*sizeof(float),heads*dimension*sizeof(float),
++            dimension,init_fastdiv_values(queries),heads,1,q_stride*sizeof(float),queries*q_stride*sizeof(float),
++            heads*queries*q_stride*sizeof(float),
+             dimension,tokens,kv_heads,1,row_bytes,head_bytes,int64_t(kv_heads)*head_bytes,
+-            row_bytes,head_bytes,int64_t(kv_heads)*head_bytes,tokens,1,1,tokens*sizeof(half),tokens*sizeof(half),tokens*sizeof(half));
++            row_bytes,head_bytes,int64_t(kv_heads)*head_bytes,tokens,queries,1,tokens*sizeof(half),
++            tokens*sizeof(half),queries*tokens*sizeof(half));
+         CUDA_CHECK(cudaGetLastError());
+         if (splits > 1) {
+-            flash_attn_combine_results<dimension><<<dim3(1,heads,1),dim3(dimension,1,1),splits*sizeof(float2),stream>>>(
++            flash_attn_combine_results<dimension><<<dim3(queries,heads,1),dim3(dimension,1,1),splits*sizeof(float2),stream>>>(
+                 output.data,meta.data,final.data,splits);
+             CUDA_CHECK(cudaGetLastError());
+         }
+     }
+     std::vector<float> download() {
+         CUDA_CHECK(cudaStreamSynchronize(stream));
+-        std::vector<float> values(heads*dimension);
++        std::vector<float> values(heads*queries*dimension);
+         CUDA_CHECK(cudaMemcpy(values.data(),splits > 1 ? final.data : output.data,values.size()*sizeof(float),cudaMemcpyDeviceToHost));
+         return values;
+     }
+-    template<int group, int parallel_groups = 1> void capture(benchmark_graph & result, int repetitions) {
++    template<int group, int parallel_groups = 1, int query_tile = 1> void capture(benchmark_graph & result, int repetitions) {
+         CUDA_CHECK(cudaEventCreate(&result.begin)); CUDA_CHECK(cudaEventCreate(&result.end));
+         CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+         CUDA_CHECK(cudaEventRecordWithFlags(result.begin,stream,cudaEventRecordExternal));
+-        for (int i = 0; i < repetitions; ++i) { launch<group,parallel_groups>(); }
++        for (int i = 0; i < repetitions; ++i) { launch<group,parallel_groups,query_tile>(); }
+         CUDA_CHECK(cudaEventRecordWithFlags(result.end,stream,cudaEventRecordExternal));
+         CUDA_CHECK(cudaStreamEndCapture(stream,&result.graph));
+         CUDA_CHECK(cudaGraphInstantiate(&result.executable,result.graph,nullptr,nullptr,0));
+@@ -209,6 +240,139 @@ static float median(std::vector<float> values) {
+     return (values[values.size()/2-1]+values[values.size()/2])*.5f;
+ }
+ 
++template<class Launch>
++static void capture_component(benchmark_graph & graph, cudaStream_t stream, int repetitions, Launch launch) {
++    CUDA_CHECK(cudaEventCreate(&graph.begin));
++    CUDA_CHECK(cudaEventCreate(&graph.end));
++    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
++    CUDA_CHECK(cudaEventRecordWithFlags(graph.begin, stream, cudaEventRecordExternal));
++    for (int i = 0; i < repetitions; ++i) {
++        launch();
++    }
++    CUDA_CHECK(cudaEventRecordWithFlags(graph.end, stream, cudaEventRecordExternal));
++    CUDA_CHECK(cudaStreamEndCapture(stream, &graph.graph));
++    CUDA_CHECK(cudaGraphInstantiate(&graph.executable, graph.graph, nullptr, nullptr, 0));
++}
++
++template<class Before, class After>
++static void verify_benchmark(const char * path, int rows, int layout, cudaStream_t stream, Before before, After after) {
++    constexpr int repeats = 24, samples = 12;
++    benchmark_graph a, b;
++    capture_component(a, stream, repeats, before);
++    capture_component(b, stream, repeats, after);
++    for (int i = 0; i < 3; ++i) {
++        a.measure(stream, repeats);
++        b.measure(stream, repeats);
++    }
++    std::vector<float> a_times, b_times;
++    int wins = 0;
++    for (int i = 0; i < samples; ++i) {
++        float previous, candidate;
++        if (i % 2) {
++            candidate = b.measure(stream, repeats);
++            previous = a.measure(stream, repeats);
++        } else {
++            previous = a.measure(stream, repeats);
++            candidate = b.measure(stream, repeats);
++        }
++        a_times.push_back(previous);
++        b_times.push_back(candidate);
++        wins += candidate < previous;
++    }
++    std::printf("GQA_VERIFY_GPU_EVENTS path=%s kv=%d layout=%d baseline_ms=%.8g candidate_ms=%.8g speedup=%.6g wins=%d/%d\n",
++        path, rows, layout, double(median(a_times)), double(median(b_times)), double(median(a_times)/median(b_times)), wins, samples);
++}
++
++static void two_query_case(int tokens, bool padded, int nsm, int occupancy, bool measure) {
++    const int splits = ggml_cuda_fattn_parallel_blocks(tokens/256, 24, nsm, occupancy);
++    benchmark_inputs inputs(tokens, splits, 2, padded);
++    const auto previous = [&] { inputs.launch<1,1,2>(); };
++    const auto candidate = [&] { inputs.launch<1,2,2>(); };
++    previous();
++    const auto expected = inputs.download();
++    candidate();
++    require(compare_attention(expected, inputs.download()).different_bits == 0,
++        "two-query pairing changed the legacy attention output");
++    std::printf("PASS two-query attention kv=%d padded=%d splits=%d bitwise=1\n", tokens, int(padded), splits);
++    if (measure) {
++        verify_benchmark("two_query_attention", tokens, int(padded), inputs.stream, previous, candidate);
++    }
++}
++
++static void q8_pair_conversion_case(int rows, int layout, bool measure) {
++    constexpr int dim = 256, heads = 4;
++    constexpr size_t row_blocks = dim/QK8_0;
++    const size_t row_stride = layout == 1 ? heads*row_blocks : row_blocks;
++    const size_t head_stride = layout == 1 ? row_blocks : (rows + (layout == 2 ? 7 : 0))*row_stride;
++    const size_t allocation = (heads-1)*head_stride + (rows-1)*row_stride + row_blocks;
++    std::vector<block_q8_0> host_k(allocation), host_v(allocation);
++    uint32_t rng = 767821u;
++    for (size_t block = 0; block < allocation; ++block) {
++        const half k_scale = __float2half(std::ldexp(0.713f, int(next_random(rng)%19)-17));
++        const half v_scale = __float2half(std::ldexp(0.361f, int(next_random(rng)%19)-17));
++        std::memcpy(&host_k[block].d, &k_scale, sizeof(half));
++        std::memcpy(&host_v[block].d, &v_scale, sizeof(half));
++        for (int8_t & q : host_k[block].qs) {
++            q = int8_t(next_random(rng)%256);
++        }
++        for (int8_t & q : host_v[block].qs) {
++            q = int8_t(next_random(rng)%256);
++        }
++    }
++    device_buffer<block_q8_0> dk(allocation), dv(allocation);
++    const size_t elements = size_t(dim)*rows*heads;
++    device_buffer<half> keys(elements), values(elements);
++    CUDA_CHECK(cudaMemcpy(dk.data, host_k.data(), allocation*sizeof(block_q8_0), cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(dv.data, host_v.data(), allocation*sizeof(block_q8_0), cudaMemcpyHostToDevice));
++    ggml_tensor K{};
++    K.type = GGML_TYPE_Q8_0;
++    K.data = dk.data;
++    K.ne[0] = dim;
++    K.ne[1] = rows;
++    K.ne[2] = heads;
++    K.ne[3] = 1;
++    K.nb[0] = sizeof(block_q8_0);
++    K.nb[1] = row_stride*sizeof(block_q8_0);
++    K.nb[2] = head_stride*sizeof(block_q8_0);
++    K.nb[3] = allocation*sizeof(block_q8_0);
++    ggml_tensor V = K;
++    V.data = dv.data;
++    require(ggml_is_contiguously_allocated(&K) == (layout != 2), "unexpected conversion layout");
++    const auto previous = [&](cudaStream_t stream) {
++        if (ggml_is_contiguously_allocated(&K)) {
++            const auto convert = ggml_get_to_fp16_cuda(GGML_TYPE_Q8_0);
++            convert(K.data, keys.data, elements, stream);
++            convert(V.data, values.data, elements, stream);
++        } else {
++            const auto convert = ggml_get_to_fp16_nc_cuda(GGML_TYPE_Q8_0);
++            convert(K.data, keys.data, dim, rows, heads, 1, row_stride, head_stride, allocation, stream);
++            convert(V.data, values.data, dim, rows, heads, 1, row_stride, head_stride, allocation, stream);
++        }
++    };
++    const auto candidate = [&](cudaStream_t stream) {
++        fattn_launch_q8_pair_to_f16(&K, &V, keys.data, values.data, stream);
++    };
++    std::vector<half> expected(elements), actual(elements);
++    previous(nullptr);
++    CUDA_CHECK(cudaMemcpy(expected.data(), keys.data, elements*sizeof(half), cudaMemcpyDeviceToHost));
++    candidate(nullptr);
++    CUDA_CHECK(cudaMemcpy(actual.data(), keys.data, elements*sizeof(half), cudaMemcpyDeviceToHost));
++    require(std::memcmp(expected.data(), actual.data(), elements*sizeof(half)) == 0, "MMA key conversion changed bytes");
++    previous(nullptr);
++    CUDA_CHECK(cudaMemcpy(expected.data(), values.data, elements*sizeof(half), cudaMemcpyDeviceToHost));
++    candidate(nullptr);
++    CUDA_CHECK(cudaMemcpy(actual.data(), values.data, elements*sizeof(half), cudaMemcpyDeviceToHost));
++    require(std::memcmp(expected.data(), actual.data(), elements*sizeof(half)) == 0, "MMA value conversion changed bytes");
++    std::printf("PASS three-query MMA conversion kv=%d layout=%d half_values=%zu bitwise=1\n", rows, layout, 2*elements);
++    if (measure) {
++        cudaStream_t stream;
++        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++        verify_benchmark("three_query_mma_conversion", rows, layout, stream,
++            [&] { previous(stream); }, [&] { candidate(stream); });
++        CUDA_CHECK(cudaStreamDestroy(stream));
++    }
++}
++
+ static void benchmark(int tokens, int nsm, int legacy_occupancy) {
+     constexpr int batch = 32, pairs = 12, warmups = 3;
+     const int splits = ggml_cuda_fattn_parallel_blocks((tokens+255)/256,24,nsm,legacy_occupancy);
+@@ -307,6 +471,17 @@ int main(int argc, char ** argv) {
+             require(previous_drift_cases > 0, "negative control did not reproduce prior automatic-split drift on this GPU");
+         }
+         std::printf("PASS production GQA planner cases=%d previous_drift_cases=%d corrected_bitwise=1 require_drift=%d\n",cases,previous_drift_cases,int(require_drift));
++        int legacy_two_occupancy = 0;
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&legacy_two_occupancy,
++            flash_attn_ext_vec<256,2,1,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false>,128,0));
++        for (int rows : {256, 1280, 8192, 33024}) {
++            for (bool padded : {false, true}) {
++                two_query_case(rows, padded, properties.multiProcessorCount, legacy_two_occupancy, measure);
++            }
++            for (int layout : {0, 1, 2}) {
++                q8_pair_conversion_case(rows, layout, measure);
++            }
++        }
+         if (measure) { for (int tokens : {256,512,1024,1280,8192,33024,65536}) { benchmark(tokens,properties.multiProcessorCount,legacy_occupancy); } }
+         return 0;
+     } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
+diff --git a/tests/test-fattn-vec-gqa.cpp b/tests/test-fattn-vec-gqa.cpp
+index 8b8e120..05f4cef 100644
+--- a/tests/test-fattn-vec-gqa.cpp
++++ b/tests/test-fattn-vec-gqa.cpp
+@@ -34,6 +34,13 @@ int main() {
+             require(!use(value,1200,true,measured), "disabled or malformed policy enabled");
+         }
+         require(use("1",1200,true,measured), "explicit measured opt-in rejected");
++        auto two = measured;
++        two.queries = 2;
++        require(ggml_cuda_fattn_vec_gqa_two_queries(true, 1200, two), "eligible two-query tile rejected");
++        require(!ggml_cuda_fattn_vec_gqa_two_queries(false, 1200, two), "disabled two-query tile admitted");
++        require(!ggml_cuda_fattn_vec_gqa_two_queries(true, 890, two), "unmeasured two-query device admitted");
++        two.dense_mask = false;
++        require(!ggml_cuda_fattn_vec_gqa_two_queries(true, 1200, two), "unsupported two-query mask admitted");
+         require(use("1",890,true,good), "explicit eligible NVIDIA opt-in rejected");
+         require(!use("1",1200,false,measured), "explicit non-NVIDIA opt-in admitted");
+         for (int field = 0; field < 15; ++field) {

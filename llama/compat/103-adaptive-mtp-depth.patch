@@ -1,0 +1,282 @@
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 4910c8d..57bbc00 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -544,5 +544,9 @@ add_executable(test-server-checkpoint-budget test-server-checkpoint-budget.cpp)
+ target_compile_features(test-server-checkpoint-budget PRIVATE cxx_std_17)
+ llama_test(test-server-checkpoint-budget LABEL "main behavior")
+ 
++add_executable(test-server-mtp-depth test-server-mtp-depth.cpp)
++target_compile_features(test-server-mtp-depth PRIVATE cxx_std_17)
++llama_test(test-server-mtp-depth LABEL "main behavior")
++
+ llama_build_and_test(test-mtp-draft-vocab.cpp LABEL "main behavior" LINK ggml)
+ target_include_directories(test-mtp-draft-vocab PRIVATE ../include)
+diff --git a/tests/test-server-mtp-depth.cpp b/tests/test-server-mtp-depth.cpp
+new file mode 100644
+index 0000000..ac1be5a
+--- /dev/null
++++ b/tests/test-server-mtp-depth.cpp
+@@ -0,0 +1,47 @@
++#include "../tools/server/server-mtp-depth.h"
++
++#include <cstdio>
++#include <cstdlib>
++
++static void check(bool condition, const char * message) {
++    if (!condition) {
++        std::fprintf(stderr, "%s\n", message);
++        std::exit(1);
++    }
++}
++
++int main() {
++    server_mtp_depth depth;
++    check(depth.choose(800, 2) == 2, "short replies lost the configured depth");
++    for (int round = 0; round < 32; ++round) {
++        const int proposal_limit = depth.choose(800, 2);
++        check(proposal_limit >= 0 && proposal_limit <= 2, "profile ceiling exceeded");
++        // Depth two has better acceptance but a higher cost per output token.
++        const double costs[] = { 10, 12, 24 };
++        const uint64_t outputs[] = { 1, 2, 3 };
++        depth.observe(costs[proposal_limit], outputs[proposal_limit]);
++    }
++    check(depth.choose(800, 2) == 1, "used acceptance instead of total generation cost");
++    check(depth.choose(16000, 2) == 2, "long context reused short-context timing");
++    check(depth.choose(800, 2) == 1, "short context lost its learned preference");
++    // If the workload becomes easy for depth two, periodic probes must
++    // recover from the old preference instead of disabling it forever.
++    for (int round = 0; round < 1024; ++round) {
++        const int proposal_limit = depth.choose(800, 2);
++        const double costs[] = { 10, 12, 10 };
++        const uint64_t outputs[] = { 1, 2, 3 };
++        depth.observe(costs[proposal_limit], outputs[proposal_limit]);
++    }
++    check(depth.choose(800, 2) == 2, "periodic probes failed to recover a faster depth");
++    check(depth.choose(800, 1) <= 1, "lowered ceiling was ignored");
++    check(depth.choose(800, 4) == 0, "unsupported depth was admitted");
++
++    server_mtp_depth third;
++    for (int round = 0; round < 24; ++round) {
++        const int proposal_limit = third.choose(32000, 3);
++        check(proposal_limit >= 0 && proposal_limit <= 3, "three-draft profile ceiling exceeded");
++        third.observe(10, uint64_t(proposal_limit + 1));
++    }
++    check(third.choose(32000, 3) == 3, "fast third proposal was not selected");
++    std::puts("PASS adaptive MTP depth: request ceiling, cost, context isolation and recovery");
++}
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 07966b5..040947a 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -7,6 +7,7 @@
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+ #include "subproc.h"
++#include "server-mtp-depth.h"
+ 
+ #include "json.h"
+ 
+@@ -403,6 +404,8 @@ json format_response_rerank(
+ 
+ struct server_speculation_control {
+     bool enabled = false;
++    bool short_mtp = false;
++    server_mtp_depth mtp_depth;
+     int cap = 0;
+     int ceiling = 8;
+     int normal_samples = 0;
+@@ -420,8 +423,11 @@ struct server_speculation_control {
+     uint64_t window_tokens = 0;
+     uint64_t tokens_since_control = 0;
+ 
+-    void begin(int64_t now) {
++    void begin(int64_t now, uint64_t context_tokens = 0) {
+         if (enabled && started == 0) {
++            if (short_mtp) {
++                cap = mtp_depth.choose(context_tokens, ceiling);
++            }
+             started = now;
+             proposed = 0;
+         }
+@@ -440,6 +446,10 @@ struct server_speculation_control {
+         const double duration = double(now - started);
+         const int attempted = proposed;
+         discard_timing();
++        if (short_mtp) {
++            mtp_depth.observe(duration, produced);
++            return;
++        }
+         if (attempted == 0) {
+             const double sample = duration / produced;
+             normal_us = normal_us > 0 ? 0.75*normal_us + 0.25*sample : sample;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 442a7e3..8a389cc 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2109,6 +2109,17 @@ private:
+         if (slot.spec_control.enabled && slot.can_speculate()) {
+             // Short probes can lose solely to fixed recurrent-checkpoint costs.
+             slot.spec_control.ceiling = std::max(1, common_speculative_n_max(slot.spec));
++            const auto & types = params_base.speculative.types;
++            const auto depth = slot.spec_control.ceiling;
++            const auto can_rollback = [depth](llama_context * ctx, common_context_seq_rm_type type) {
++                return ctx && (type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
++                        (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx) >= uint32_t(depth)));
++            };
++            slot.spec_control.short_mtp = slots.size() == 1 && depth <= 3 && types.size() == 1 &&
++                types.front() == COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
++                params_base.speculative.draft.n_min <= 1 && !decode_overlap_enabled &&
++                common_speculative_get_synth_probs(slot.spec).empty() &&
++                can_rollback(ctx_tgt, ctx_tgt_seq_rm_type) && can_rollback(ctx_dft, ctx_dft_seq_rm_type);
+         }
+ 
+         if (task.type == SERVER_TASK_TYPE_TTS) {
+@@ -4144,7 +4155,9 @@ private:
+         for (auto * current : generating) {
+             auto & slot = *current;
+             if (!early && slot.spec_prepared.consume(slot.task->id, slot.prompt.tokens.pos_next(), slot.sampled)) { continue; }
+-            if (early && slot.spec_control.enabled) { slot.spec_control.begin(ggml_time_us()); }
++            if (early && slot.spec_control.enabled) {
++                slot.spec_control.begin(ggml_time_us(), slot.prompt.n_tokens());
++            }
+             if (spec) {
+                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+ 
+@@ -4152,6 +4165,11 @@ private:
+                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+ 
+                 const int n_draft_max = slot.get_n_draft_max();
++                if (slot.spec_control.short_mtp && n_draft_max != slot.spec_control.cap) {
++                    // End-of-request limits can shorten a round independently
++                    // of the selected policy. Keep those timings out of it.
++                    slot.spec_control.discard_timing();
++                }
+ 
+                 if (n_draft_max > 0) {
+                     slot.spec_control.proposed = n_draft_max;
+@@ -4376,7 +4394,7 @@ private:
+ 
+             generating.push_back(&slot);
+             if (slot.spec_control.enabled && !slot.spec_prepared.matches(slot.task->id,slot.prompt.tokens.pos_next(),slot.sampled)) {
+-                slot.spec_control.begin(ggml_time_us());
++                slot.spec_control.begin(ggml_time_us(), slot.prompt.n_tokens());
+             }
+ 
+         });
+@@ -5643,10 +5661,10 @@ private:
+             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+ 
+             slot.sampled = ids.back(); // last accepted token
+-            if (slot.spec_control.enabled) { slot.spec_control.observe(ggml_time_us(), ids.size()); }
+             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+ 
+             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
++            if (slot.spec_control.enabled) { slot.spec_control.observe(ggml_time_us(), ids.size()); }
+ 
+             for (size_t i = 0; i < ids.size(); ++i) {
+                 completion_token_output result;
+diff --git a/tools/server/server-mtp-depth.h b/tools/server/server-mtp-depth.h
+new file mode 100644
+index 0000000..43db1c6
+--- /dev/null
++++ b/tools/server/server-mtp-depth.h
+@@ -0,0 +1,98 @@
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++// Request-local measurements. A depth is the proposal limit, so a short or
++// empty proposal still pays its actual cost to the depth that requested it.
++class server_mtp_depth {
++    static constexpr int minimum_samples = 3;
++    static constexpr int refresh_interval = 128;
++
++    struct cost {
++        double time = 0;
++        double tokens = 0;
++        int samples = 0;
++
++        void add(double us, uint64_t committed) {
++            time = time * 0.8 + us;
++            tokens = tokens * 0.8 + double(committed);
++            if (samples < minimum_samples) {
++                ++samples;
++            }
++        }
++
++        double us_per_token() const { return time / tokens; }
++    };
++
++    struct history {
++        std::array<cost, 4> depths{};
++        int preferred = -1;
++        int until_refresh = refresh_interval;
++        int refresh_depth = 0;
++        int refresh_samples = 0;
++    };
++
++    std::array<history, 4> histories{};
++    int active_history = -1;
++    int active_depth = -1;
++    bool warmup = true;
++
++public:
++    int choose(uint64_t context_tokens, int ceiling) {
++        if (ceiling < 1 || ceiling > 3) {
++            active_depth = -1;
++            return 0;
++        }
++        const int bucket = int(context_tokens >= 2048) + int(context_tokens >= 8192) +
++                           int(context_tokens >= 24576);
++        auto & h = histories[bucket];
++        // Start with the configured depth before probing alternatives.
++        int selected = ceiling;
++        if (h.depths[ceiling].samples >= minimum_samples) {
++            selected = 0;
++            while (selected < ceiling && h.depths[selected].samples >= minimum_samples) {
++                ++selected;
++            }
++            if (h.depths[selected].samples >= minimum_samples) {
++                if (h.preferred < 0 || h.preferred > ceiling) {
++                    h.preferred = 0;
++                }
++                for (int depth = 0; depth <= ceiling; ++depth) {
++                    if (h.depths[depth].us_per_token() < 0.95 * h.depths[h.preferred].us_per_token()) {
++                        h.preferred = depth;
++                    }
++                }
++                selected = h.until_refresh > 0 ? h.preferred : h.refresh_depth % (ceiling + 1);
++            }
++        }
++        if (bucket != active_history || selected != active_depth) {
++            warmup = true; // discard the graph transition from the measurement
++        }
++        active_history = bucket;
++        active_depth = selected;
++        return selected;
++    }
++
++    void observe(double us, uint64_t committed) {
++        if (active_depth < 0 || us <= 0 || committed == 0) {
++            return;
++        }
++        if (warmup) {
++            warmup = false;
++            return;
++        }
++        auto & h = histories[active_history];
++        h.depths[active_depth].add(us, committed);
++        if (h.preferred < 0) {
++            return;
++        }
++        if (h.until_refresh > 0) {
++            --h.until_refresh;
++        } else if (++h.refresh_samples == minimum_samples) {
++            h.refresh_samples = 0;
++            h.refresh_depth = active_depth + 1;
++            h.until_refresh = refresh_interval;
++        }
++    }
++};

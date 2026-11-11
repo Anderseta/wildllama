@@ -504,6 +504,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	adaptivePrefixSupported := adaptivePrefixRequested && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, adaptivePrefixCacheEnvironment)
 	setAdaptivePrefixCacheEnvironment(childEnvs, adaptivePrefixRequested, adaptivePrefixSupported)
 	setCUDATuningEnvironment(childEnvs, exe, launch.gpus, launch.gpuLibs)
+	setMTPVerificationEnvironment(childEnvs, launch)
 	SetupLlamaServerCommandEnv(cmd, exe, launch.gpuLibs, childEnvs)
 
 	slog.Info("starting llama-server", "cmd", cmd)
@@ -519,6 +520,36 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		return nil, 0, fmt.Errorf("assign llama-server to runner job: %w", err)
 	}
 	return cmd, port, nil
+}
+
+// Enable the measured kernels for the eligible Qwen MTP configuration.
+// The native backend still validates each tensor layout before dispatch.
+func setMTPVerificationEnvironment(environment map[string]string, launch llamaServerLaunchConfig) {
+	draftType := launch.draftType
+	if launch.opts.SpeculativeType != "" && launch.opts.SpeculativeType != "auto" {
+		draftType = launch.opts.SpeculativeType
+	}
+	if draftType != draftTypeMTP || launch.modelArch != "qwen35" || launch.numParallel != 1 ||
+		launch.opts.DraftNumPredict < 1 || launch.opts.DraftNumPredict > 2 ||
+		launch.opts.NumGPU == 0 || launch.kvCacheType != "q8_0" || len(launch.gpus) != 1 {
+		return
+	}
+	gpu := launch.gpus[0]
+	if !strings.EqualFold(gpu.Library, "cuda") || gpu.ComputeMajor != 12 || gpu.ComputeMinor != 0 {
+		return
+	}
+	for _, name := range []string{"WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP", "WILDLLAMA_CUDA_GDN_GATHER"} {
+		_, configured := os.LookupEnv(name)
+		for key := range environment {
+			if strings.EqualFold(key, name) {
+				configured = true
+				break
+			}
+		}
+		if !configured {
+			environment[name] = "1"
+		}
+	}
 }
 
 // SetupLlamaServerCommandEnv configures the environment for a llama-server

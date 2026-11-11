@@ -1301,6 +1301,43 @@ func TestLlamaServerPreservedTokens(t *testing.T) {
 	}
 }
 
+func TestMTPVerificationEnvironment(t *testing.T) {
+	names := []string{"WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP", "WILDLLAMA_CUDA_GDN_GATHER"}
+	for _, name := range names {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts := api.DefaultOptions()
+	opts.DraftNumPredict = 2
+	opts.NumGPU = -1
+	launch := llamaServerLaunchConfig{
+		modelArch: "qwen35", draftType: draftTypeMTP, numParallel: 1,
+		kvCacheType: "q8_0", opts: opts,
+		gpus: []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "CUDA"}, ComputeMajor: 12}},
+	}
+	environment := map[string]string{}
+	setMTPVerificationEnvironment(environment, launch)
+	for _, name := range names {
+		if environment[name] != "1" {
+			t.Fatalf("missing default for %s", name)
+		}
+	}
+	t.Setenv(names[0], "0")
+	environment = map[string]string{"ggml_cuda_q4_head_warp": "0"}
+	setMTPVerificationEnvironment(environment, launch)
+	if len(environment) != 2 || environment[names[2]] != "1" {
+		t.Fatalf("an explicit override was replaced: %v", environment)
+	}
+	launch.opts.SpeculativeType = "none"
+	environment = map[string]string{}
+	setMTPVerificationEnvironment(environment, launch)
+	if len(environment) != 0 {
+		t.Fatalf("enabled MTP optimizations for ordinary decode: %v", environment)
+	}
+}
+
 func TestSetupLlamaServerCommandEnv(t *testing.T) {
 	exeDir := t.TempDir()
 	exe := filepath.Join(exeDir, "llama-server")

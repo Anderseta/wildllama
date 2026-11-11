@@ -97,3 +97,90 @@ The 32768-row head experiment reduced acceptance and was slower. At 131072 rows,
 there was no convincing overall gain. Both remain disabled in the installed
 profile. Earlier interrupted runs near the Windows commit limit were discarded;
 reaching that limit is not itself proof of disk swapping.
+
+## Short verification and recurrent-state follow-up
+
+The Q8 verification attention path in patch `100` handles two- and
+three-query batches on the measured Blackwell geometry. Two queries share
+key loads while keeping independent accumulations and the previous split-K
+layout. Three queries keep the previous MMA attention arithmetic and combine
+the Q8 K/V conversions into one launch using the existing scratch buffers.
+The grouped and conversion paths can be tested with
+`WILDLLAMA_CUDA_GQA_Q8_VERIFY=1`.
+
+Patch `101` adds a full-vocabulary Q4_K projection for two- and three-token
+verification on SM120 for the measured 5,120 by 248,320 matrix. A warp computes
+one output row and preserves the original four partial sums and final
+reduction. The kernel uses the original quantized weights and activation
+buffer. The production switch is `GGML_CUDA_Q4_HEAD_WARP=1`. Single-token
+projection retains its previous dispatch.
+
+Patch `102` lets an eligible Gated DeltaNet kernel read the indexed recurrent
+state row directly and use the existing fused cache write. The graph requires
+a private gather with the expected dimensions, the same recurrent allocation
+for reading and writing, and no conflicting aliases. Unsupported shapes,
+placements and dependencies keep the ordinary gather. Use
+`WILDLLAMA_CUDA_GDN_GATHER=1` to test this path.
+
+The separate compact-state fixture reconstructs the middle rollback state
+from a full state and an update record in the same FP32 operation order.
+All 36 state and alias cases matched bit for bit. For this 48-layer geometry,
+the two full states and record would save 141.74 MiB against three full states.
+This is a size calculation from the fixture, with no change to runtime cache
+allocation. Checkpoint serialization, prefill, context shifts, and restore
+would need to handle the compact representation before runtime activation.
+
+The existing `speculative_adaptive` option can use a request-local controller
+for single-sequence MTP with a ceiling of one, two, or three proposals.
+Patch `103` measures time per committed token across depths from zero through
+that ceiling, including rejection cleanup. It keeps separate observations for
+different context lengths and periodically retries an alternative depth.
+It uses the previous controller where mixed speculation, unsupported rollback
+capacity, synthetic acceptance, a minimum draft length above one, or response
+overlap makes the comparison unsuitable. The policy adds no GPU storage.
+
+The WildLlama launcher selects the three verified CUDA paths for one SM120
+device, one sequence, Qwen35, Q8_0 KV and an MTP ceiling of one or two proposals.
+Explicit environment values take precedence. The native tensor and graph checks
+still control dispatch. The adaptive policy follows the existing profile option.
+
+### Follow-up measurements
+
+The two-query Q8 attention fixture was 1.78–2.42 times as fast as the prior
+kernel. Three-query conversion was 1.10–1.36 times as fast on short contiguous
+inputs and 1.53–2.47 times as fast on padded inputs. Long contiguous conversion
+times were equivalent. All 128 compared attention and conversion cases matched
+bit for bit, including the 108 existing cases.
+
+The Q4_K fixture read 90 MiB of trained weights. Two- and three-token projections
+were 1.44 and 1.47 times as fast in the final paired trial. All 12 comparisons
+matched bit for bit, including ties and odd row counts. The GDN graph fixture
+matched states and scores in 27 replays and three fallback controls. Direct
+gather reduced the one- and two-token component times by about 20% and 16%.
+Three-token times were equivalent.
+
+The full Huihui comparison kept the 40,960-token capacity, Q8 KV, two proposals,
+temperature 0.6, seed 149 and 256 generated tokens per request. The first run
+was excluded from each generation-speed average.
+
+| Prompt | Installed tokens/s | Candidate tokens/s | Change |
+| --- | ---: | ---: | ---: |
+| Short Portuguese prose | 43.71 | 44.08 | +0.86% |
+| Short Python task | 39.06 | 39.49 | +1.10% |
+| Repetitive 16,384-token input | 53.67 | 54.85 | +2.20% |
+
+The short candidate measured attention and Q4_K. A localized MSVC include
+message caused Ninja to retain two stale Unity objects in that build. Rebuilding
+both objects resolved the issue. The long-input candidate traces confirmed all
+three CUDA paths, including GDN for one, two and three tokens. The nine paired
+fixed-depth responses and proposal counts matched. The comparisons detected no
+paging. The logged CUDA KV, recurrent-state and compute reservations matched
+between long-input runs. Whole-device peaks were 14,225 and 14,242 MiB, including
+desktop activity.
+
+The first short candidate run had slower prompt evaluation, 8.07 seconds
+versus 0.96 seconds. The later long-input cold prefill measured 19.12 seconds
+versus 19.17 seconds. The table measures warm generation. One adaptive request
+per prompt produced 39.94, 39.85 and 52.39 tokens/s respectively, so the default
+profile retains fixed depth. The tiny HTTP fixture exercised adaptive depth
+selection and matched all 96 reference token IDs.
