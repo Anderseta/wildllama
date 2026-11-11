@@ -391,7 +391,7 @@ index 0aca733..120da64 100644
      // bytes written so far
      virtual size_t n_bytes() = 0;
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 79203e0..383edae 100644
+index 79203e0..b44cecb 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -9,6 +9,7 @@
@@ -407,7 +407,7 @@ index 79203e0..383edae 100644
      cells.resize(mem_size);
  
 +    const char * compact_enabled = std::getenv("WILDLLAMA_GDN_COMPACT_ROLLBACK");
-+    if (compact_enabled && std::strcmp(compact_enabled, "1") == 0 && offload &&
++    if ((!compact_enabled || !*compact_enabled || std::strcmp(compact_enabled, "1") == 0) && offload &&
 +        (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
 +        mem_size == 1 && n_seq_max == 1 && n_rs_seq == 2 &&
 +        type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32 && hparams.ple_conv_state() == 0 &&
@@ -756,7 +756,7 @@ index 24f4b98..b6efc2a 100644
          q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
          k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
 diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
-index a9f7af7..6152542 100644
+index a9f7af7..ea11eae 100644
 --- a/tests/test-mtp-state.cpp
 +++ b/tests/test-mtp-state.cpp
 @@ -4,16 +4,19 @@
@@ -792,7 +792,7 @@ index a9f7af7..6152542 100644
      gguf_set_val_f32(metadata.get(),"qwen35.attention.layer_norm_rms_epsilon",1e-6f);
      const uint32_t sections[]={4,4,0,0};
      gguf_set_arr_data(metadata.get(),"qwen35.rope.dimension_sections",GGUF_TYPE_UINT32,sections,4);
-@@ -282,7 +286,94 @@ static void equal(const common_state_data & a, const common_state_data & b, cons
+@@ -282,7 +286,95 @@ static void equal(const common_state_data & a, const common_state_data & b, cons
      require(a.main == b.main && a.drft == b.drft && a.spec == b.spec, message);
  }
  
@@ -818,7 +818,7 @@ index a9f7af7..6152542 100644
 +        return ctx;
 +    };
 +    auto reference = context("0");
-+    auto compact = context("1");
++    auto compact = context("");
 +    auto bytes = [](llama_context * ctx) {
 +        size_t total = 0;
 +        for (const auto & item : llama_get_memory(ctx)->memory_breakdown()) {
@@ -826,7 +826,8 @@ index a9f7af7..6152542 100644
 +        }
 +        return total;
 +    };
-+    require(bytes(reference.get()) > bytes(compact.get()) + 3'000'000, "compact allocation did not replace a full state");
++    require(bytes(reference.get()) > bytes(compact.get()) + 3'000'000,
++            "default compact allocation did not replace a full state");
 +    auto run = [](llama_context * ctx, int start, int n) {
 +        common_batch batch(ctx);
 +        for (int i = 0; i < n; ++i) {
@@ -888,7 +889,7 @@ index a9f7af7..6152542 100644
      try {
  #ifdef GGML_TEST_CPU_BACKEND_PATH
          require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH) != nullptr, "cannot load CPU backend");
-@@ -290,6 +381,10 @@ int main() {
+@@ -290,6 +382,10 @@ int main() {
          ggml_backend_load_all();
  #endif
          llama_backend_init();

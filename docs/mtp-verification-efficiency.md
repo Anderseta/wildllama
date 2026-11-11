@@ -124,8 +124,9 @@ placements and dependencies keep the ordinary gather. Use
 
 ### Compact Gated DeltaNet rollback
 
-Patch `104` enables `WILDLLAMA_GDN_COMPACT_ROLLBACK=1` as a per-model VRAM
-savings option. It stores two full recurrent states and an FP32 update record
+Patch `104` enables compact rollback by default for eligible contexts.
+`WILDLLAMA_GDN_COMPACT_ROLLBACK=0` disables it per model. The compact cache
+stores two full recurrent states and an FP32 update record
 that reconstructs the middle snapshot in the original operation order. A
 checkpoint still stores the usual full state and can be restored with the
 option enabled or disabled.
@@ -145,7 +146,7 @@ paired responses and acceptance counts matched. Warm generation measured
 44.61 versus 44.86 tokens/s for Portuguese prose and 40.38 versus 39.79 tokens/s
 for Python. A one-layer GPU fixture also checked exact logits and serialized
 checkpoints through prefill, ten rollback and restore cases, and a sequence
-reset. The setting is off by default.
+reset.
 
 ### Adaptive depth and activation
 
