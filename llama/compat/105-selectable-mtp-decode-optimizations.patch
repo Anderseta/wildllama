@@ -1,0 +1,1455 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index d9ec977..7eb0871 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/common/common.h b/common/common.h
+index b2593a0..ee9a427 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -339,6 +339,7 @@ struct common_params_speculative_draft {
+     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+ 
+     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
++    bool block_verification = false; // stochastic MTP proposals for eligible target samplers
+ 
+     common_params_model mparams;
+ 
+diff --git a/common/sampling-block-verification.h b/common/sampling-block-verification.h
+new file mode 100644
+index 0000000..f638061
+--- /dev/null
++++ b/common/sampling-block-verification.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <algorithm>
++
++// Sun et al., Block Verification, Appendix A (arXiv:2403.10444v3).
++// At each position, a correction replaces any earlier result. Its complement
++// retains the earlier result. The final row has q = 0, so the same rule also
++// covers full acceptance followed by one token drawn from the target.
++inline double common_block_residual(double prefix, double target, double draft) {
++    return std::max(0.0, prefix * target - draft);
++}
++
++inline double common_block_extend(double prefix, double target, double draft) {
++    return std::min(1.0, prefix * target / draft);
++}
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 5ff991c..0226717 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,5 +1,6 @@
+ #include "sampling.h"
+ #include "sampling-probability.h"
++#include "sampling-block-verification.h"
+ #include "../src/llama-ext.h"
+ #include "../src/llama-sampler.h"
+ #include "../src/llama-device-verification.h"
+@@ -121,6 +122,7 @@ struct common_sampler {
+     struct llama_sampler * rbudget;
+     struct llama_sampler * chain;
+     struct llama_sampler * token_mask; // owned by chain, never by grammar
++    llama_sampler_ptr thinking_prefilter;
+ 
+     ring_buffer<llama_token> prev;
+ 
+@@ -188,9 +190,11 @@ struct common_sampler {
+ 
+     mutable int64_t t_total_us = 0;
+     uint64_t candidate_rows = 0;
++    uint64_t thinking_prefilter_rows = 0;
+ 
+     // Rejection-only workspace, not sampler state: do not clone/copy it.
+     std::vector<uint32_t> residual_order;
++    uint64_t verified_blocks = 0;
+ };
+ 
+ std::string common_params_sampling::print() const {
+@@ -468,12 +472,20 @@ struct common_sampler * common_sampler_init(
+         }
+     }
+ 
++    llama_sampler_ptr thinking_prefilter;
++    const char * thinking_prefilter_env = std::getenv("WILDLLAMA_GPU_THINKING_SAMPLE");
++    if ((!grmr || params.grammar_lazy) && params.n_probs == 0 && thinking_prefilter_env &&
++            std::strcmp(thinking_prefilter_env, "1") == 0) {
++        thinking_prefilter.reset(llama_sampler_init_thinking_prefilter(chain.get(), llama_vocab_n_tokens(vocab)));
++    }
++
+     auto * result = new common_sampler {
+         /* .params  = */ params,
+         /* .grmr    = */ grmr.get(),
+         /* .rbudget = */ rbudget.get(),
+         /* .chain   = */ chain.get(),
+         /* .token_mask = */ token_mask,
++        /* .thinking_prefilter = */ std::move(thinking_prefilter),
+         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+         /* .cur     = */ {},
+         /* .cur_p   = */ {},
+@@ -569,10 +581,14 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .rbudget = */ rbudget.get(),
+         /* .chain   = */ chain.get(),
+         /* .token_mask = */ gsmpl->token_mask ? llama_sampler_chain_get(chain.get(),0) : nullptr,
++        /* .thinking_prefilter = */ llama_sampler_ptr(llama_sampler_clone(gsmpl->thinking_prefilter.get())),
+         /* .prev    = */ gsmpl->prev,
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
+         /* .rng     = */ gsmpl->rng,
++        /* .t_total_us = */ 0,
++        /* .candidate_rows = */ 0,
++        /* .thinking_prefilter_rows = */ gsmpl->thinking_prefilter_rows,
+     };
+     result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
+     grmr.release();
+@@ -602,6 +618,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     dst->rng        = src->rng;
+     dst->t_total_us = src->t_total_us;
+     dst->candidate_rows = src->candidate_rows;
++    dst->thinking_prefilter_rows = src->thinking_prefilter_rows;
+ }
+ 
+ void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
+@@ -663,6 +680,14 @@ struct llama_sampler * common_sampler_get_backend(const struct common_sampler *
+         !gsmpl->rbudget ? gsmpl->chain : nullptr;
+ }
+ 
++struct llama_sampler * common_sampler_get_thinking_prefilter(const struct common_sampler * gsmpl) {
++    return gsmpl ? gsmpl->thinking_prefilter.get() : nullptr;
++}
++
++uint64_t common_sampler_get_thinking_prefilter_rows(const struct common_sampler * gsmpl) {
++    return gsmpl ? gsmpl->thinking_prefilter_rows : 0;
++}
++
+ struct llama_sampler * common_sampler_get_backend_speculative(const struct common_sampler * gsmpl) {
+     auto * backend = common_sampler_get_backend(gsmpl);
+     if (backend && gsmpl->params.n_probs == 0 && !gsmpl->grmr && !gsmpl->rbudget &&
+@@ -693,6 +718,46 @@ bool common_sampler_can_overlap_output(const common_sampler * gsmpl) {
+     return true;
+ }
+ 
++static bool use_thinking_prefilter(common_sampler * sampler, llama_context * ctx, const llama_sampler_output & output) {
++    if ((grammar_should_apply(sampler) && !llama_sampler_grammar_awaiting_trigger(sampler->grmr)) ||
++            common_reasoning_budget_get_state(sampler->rbudget) == REASONING_BUDGET_FORCING) {
++        return false;
++    }
++
++    const auto count = output.sampled_logits_count;
++    const auto * vocab = llama_model_get_vocab(llama_get_model(ctx));
++    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++    if (count != uint32_t(sampler->params.top_k) + 1 || output.candidates_count != count ||
++            !output.raw_logits || !output.candidates) {
++        return false;
++    }
++    for (uint32_t i = 0; i < count; ++i) {
++        const llama_token token = output.candidates[i];
++        if (token < 0 || token >= n_vocab || !std::isfinite(output.sampled_logits[i]) ||
++                output.sampled_logits[i] != output.raw_logits[token]) {
++            return false;
++        }
++    }
++    // The CPU comparator has no tie-break for NaNs or equal logits. Keep that
++    // exact behavior on the original row, including ties at the selection edge.
++    if (std::any_of(output.raw_logits, output.raw_logits + n_vocab, [](float logit) { return std::isnan(logit); })) {
++        return false;
++    }
++    sampler->set_logits(ctx, output);
++    auto & candidates = sampler->cur;
++    std::sort(candidates.begin(), candidates.end(),
++            [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
++    for (size_t i = 1; i < candidates.size(); ++i) {
++        if (candidates[i - 1].logit == candidates[i].logit) {
++            return false;
++        }
++    }
++    sampler->cur_p.size = count - 1;
++    sampler->cur_p.sorted = true;
++    ++sampler->thinking_prefilter_rows;
++    return true;
++}
++
+ static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first,
+         llama_sampler_output * deferred_backend = nullptr) {
+     grammar_first=grammar_first || gsmpl->params.grammar_first;
+@@ -709,7 +774,18 @@ static llama_token common_sampler_sample_synchronized(struct common_sampler * gs
+ 
+     // Borrow after the existing fence/timer boundary: output reordering remains
+     // included in sampler CPU time while GPU waits remain excluded.
+-    const auto output = llama_get_sampler_output_ith_synchronized(ctx, idx);
++    auto output = llama_get_sampler_output_ith_synchronized(ctx, idx);
++    bool compact_thinking_candidates = false;
++    // Only an attached prefilter publishes both original logits and a compact
++    // view. The MTP drafter's independently attached top-k output is complete.
++    if (output.raw_logits && output.sampled_logits && !output.sampled_probs &&
++            output.sampled_token == LLAMA_TOKEN_NULL) {
++        compact_thinking_candidates = gsmpl->thinking_prefilter && use_thinking_prefilter(gsmpl, ctx, output);
++        if (!compact_thinking_candidates) {
++            output.sampled_logits = nullptr;
++            output.candidates = nullptr;
++        }
++    }
+     if(output.sampled_token==LLAMA_TOKEN_NULL && llama_sampler_backend_masked_ready(gsmpl->chain)) {
+         throw common_sampler_constraint_error("Constrained sampling has no valid finite token; check grammar and logit biases");
+     }
+@@ -761,7 +837,9 @@ static llama_token common_sampler_sample_synchronized(struct common_sampler * gs
+     }
+ 
+     flush_backend();
+-    gsmpl->set_logits(ctx, output);
++    if (!compact_thinking_candidates) {
++        gsmpl->set_logits(ctx, output);
++    }
+ 
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
+@@ -893,14 +971,134 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+     return 0.0f;
+ }
+ 
++bool common_sampler_can_verify_block(const common_sampler * sampler, bool grammar_first) {
++    const auto & params = sampler->params;
++    // Grammar-last resampling is a mixture of two distributions. The compact
++    // candidate array describes only one of them. Stateful RNG-driven filters
++    // and per-token probability reporting retain the existing verifier too.
++    return params.temp > 0.0f && !params.backend_sampling && params.n_probs == 0 && params.mirostat == 0 &&
++           params.xtc_probability == 0.0f && params.adaptive_target < 0.0f &&
++           (!sampler->grmr || grammar_first || params.grammar_first) && !sampler->token_mask;
++}
++
++static std::vector<llama_token> common_sampler_verify_block(
++        common_sampler * sampler, llama_context * ctx, const std::vector<int> & indexes,
++        const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & proposals,
++        bool grammar_first) {
++    if (draft.size() < 2 || draft.size() > 4 || !common_sampler_can_verify_block(sampler, grammar_first)) {
++        return {};
++    }
++    for (size_t i = 0; i < draft.size(); ++i) {
++        const auto & q = proposals[i];
++        double sum = 0.0;
++        for (const auto & token : q) {
++            if (!std::isfinite(token.p) || token.p < 0.0f) {
++                return {};
++            }
++            sum += token.p;
++        }
++        if (std::abs(sum - 1.0) > 1e-4 || prob_of(q.data(), q.size(), draft[i]) <= 0.0f) {
++            return {};
++        }
++    }
++
++    common_sampler_ptr prefix_sampler(common_sampler_clone(sampler));
++    auto rng = sampler->rng;
++    std::uniform_real_distribution<double> uniform(0.0, 1.0);
++    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
++    const std::vector<llama_token_data> bonus_q;
++    std::vector<std::pair<llama_token, double>> residual;
++    size_t kept = 0;
++    llama_token correction = LLAMA_TOKEN_NULL;
++    double prefix = 1.0;
++    llama_synchronize_sampler_outputs(ctx);
++    for (size_t i = 0; i <= draft.size(); ++i) {
++        common_sampler_sample_synchronized(prefix_sampler.get(), ctx, indexes[i], grammar_first);
++        const auto * p = common_sampler_get_candidates(prefix_sampler.get(), false);
++        const auto & q = i < draft.size() ? proposals[i] : bonus_q;
++        double p_sum = 0.0;
++        for (size_t k = 0; k < p->size; ++k) {
++            p_sum += p->data[k].p;
++        }
++        if (!std::isfinite(p_sum) || std::abs(p_sum - 1.0) > 1e-4) {
++            return {};
++        }
++        double q_sum = 0.0;
++        for (const auto & token : q) {
++            q_sum += token.p;
++        }
++        const double q_scale = q_sum > 0.0 ? 1.0 / q_sum : 0.0;
++        const common_sampling_probability_index q_index(q.data(), q.size(), p->size, prefix_sampler->residual_order);
++        residual.clear();
++        double total = 1.0 - prefix;
++        double target_token = 0.0;
++        for (size_t k = 0; k < p->size; ++k) {
++            const auto & token = p->data[k];
++            const double probability = token.p / p_sum;
++            if (i < draft.size() && token.id == draft[i]) {
++                target_token = probability;
++            }
++            const double weight = common_block_residual(prefix, probability, q_index.probability(token.id) * q_scale);
++            if (weight > 0.0) {
++                total += weight;
++                residual.emplace_back(token.id, total);
++            }
++        }
++        if (!residual.empty()) {
++            const double draw = uniform(rng) * total;
++            if (draw >= 1.0 - prefix) {
++                const auto selected = std::upper_bound(residual.begin(), residual.end(), draw,
++                        [](double value, const auto & token) { return value < token.second; });
++                correction = (selected == residual.end() ? residual.back() : *selected).first;
++                kept = i;
++            }
++        }
++        if (i == draft.size()) {
++            break;
++        }
++        prefix = common_block_extend(prefix, target_token, q_index.probability(draft[i]) * q_scale);
++        if (prefix == 0.0) {
++            break;
++        }
++        common_sampler_accept(prefix_sampler.get(), draft[i], true);
++        if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
++            // A drafter that supplies positions beyond EOG is not eligible.
++            return {};
++        }
++    }
++    if (correction == LLAMA_TOKEN_NULL) {
++        return {};
++    }
++    sampler->rng = rng;
++    ++sampler->verified_blocks;
++    std::vector<llama_token> result(draft.begin(), draft.begin() + kept);
++    result.push_back(correction);
++    for (llama_token token : result) {
++        common_sampler_accept(sampler, token, true);
++    }
++    LOG_DBG("MTP block verification kept %zu/%zu proposals\n", kept, draft.size());
++    return result;
++}
++
++uint64_t common_sampler_get_verified_blocks(const common_sampler * sampler) {
++    return sampler ? sampler->verified_blocks : 0;
++}
++
+ // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+ // Preserves the target distribution exactly, and accepts more often than matching does when the
+ // draft samples instead of taking its argmax.
+-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
++std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, bool block_verify) {
+     grammar_first=grammar_first || gsmpl->params.grammar_first;
+     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+ 
++    if (block_verify) {
++        auto verified = common_sampler_verify_block(gsmpl, ctx, idxs, draft, draft_q, grammar_first);
++        if (!verified.empty()) {
++            return verified;
++        }
++    }
++
+     std::vector<llama_token> result;
+     result.reserve(idxs.size());
+ 
+diff --git a/common/sampling.h b/common/sampling.h
+index 396962a..4353a72 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -57,6 +57,9 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+ // get the underlying llama_sampler_chain
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl);
++// Optional stateless GPU candidate extraction. Selection and state transitions stay in the host chain.
++struct llama_sampler * common_sampler_get_thinking_prefilter(const struct common_sampler * gsmpl);
++uint64_t common_sampler_get_thinking_prefilter_rows(const struct common_sampler * gsmpl);
+ // params.grammar_first=true is an explicit grammar-order contract. With
+ // backend_sampling it permits a graph-owned GPU mask for one output/sequence.
+ // Default grammar-last, reasoning controllers and unsupported backends retain
+@@ -109,7 +112,9 @@ llama_token common_sampler_sample_draft_synchronized(common_sampler * gsmpl, lla
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+ 
+ // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
+-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
++bool common_sampler_can_verify_block(const struct common_sampler * sampler, bool grammar_first = false);
++uint64_t common_sampler_get_verified_blocks(const struct common_sampler * sampler);
++std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool block_verify = false);
+ 
+ // assume idxs == [ 0, 1, 2, ..., draft.size() ]
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 6d0caf7..e96ce25 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1556,6 +1556,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // The last h-row of one process() call needs the first token of the NEXT
+     // call to pair with, so it's stashed here until that next call fires.
+     std::vector<common_mtp_state> state; // positional carryover and verification history
++    bool selective_catchup_enabled = false;
+     bool device_state_enabled = false;
+     std::vector<common_mtp_device_state> device_state;
+     std::vector<llama_nextn_device_row> device_inputs;
+@@ -1646,7 +1647,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         // Greedy MTP with no confidence cutoff uses only the maximum logit.
+         // Preserve top-10 probabilities for rejection sampling and p_min.
+-        const int draft_top_k = common_speculative_mtp_top_k(this->params.probabilistic, this->params.p_min);
++        const bool stochastic = this->params.probabilistic || this->params.block_verification;
++        const int draft_top_k = common_speculative_mtp_top_k(stochastic, this->params.p_min);
+         smpls.resize(n_seq);
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+@@ -1691,7 +1693,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // Optional proposal-only shortlist. Probabilistic rejection keeps its
+         // complete-q path; this optimization uses target sample-and-match.
+         const char * shortlist = std::getenv("WILDLLAMA_MTP_DRAFT_VOCAB");
+-        if (shortlist && *shortlist && !this->params.probabilistic && n_seq == 1 && !chain_heads && !is_mem_shared) {
++        if (shortlist && *shortlist && !stochastic && n_seq == 1 && !chain_heads && !is_mem_shared) {
+             char * end = nullptr;
+             const long count = std::strtol(shortlist, &end, 10);
+             if (end && !*end && count >= 256 && count <= 131072 && llama_set_mtp_draft_vocab(ctx_dft, int32_t(count))) {
+@@ -1702,6 +1704,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+ 
+         state.assign(n_seq, common_mtp_state(uint32_t(n_embd)));
++        const char * selective_catchup = std::getenv("WILDLLAMA_MTP_SELECTIVE_CATCHUP");
++        selective_catchup_enabled = selective_catchup && std::strcmp(selective_catchup, "1") == 0 &&
++            n_seq == 1 && !chain_heads && !is_mem_shared && llama_model_n_swa(llama_get_model(ctx_dft)) == 0;
+         zero_h.assign(n_embd, 0.0f);
+         position_tracking.assign(n_seq, true);
+         start_zero.assign(n_seq, false);
+@@ -1780,8 +1785,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+     }
+ 
++    bool can_defer_catchup(const common_batch & batch_in) const {
++        if (!selective_catchup_enabled || device_state_enabled || draft_vocab_active ||
++            batch_in.size() < 2 || batch_in.size() > 4 || !position_tracking[0]) {
++            return false;
++        }
++
++        const int64_t first = batch_in.tokens.front().pos[0];
++        if (first <= 0 || state[0].pending_pos != first - 1) {
++            return false;
++        }
++        for (int32_t i = 0; i < batch_in.size(); ++i) {
++            const auto & token = batch_in.tokens[i];
++            if (token.id < 0 || !token.output || token.embd.data || token.state.data ||
++                token.seq_id != 0 || !token.seq_ids_extra.empty() || token.pos[0] != first + i) {
++                return false;
++            }
++        }
++        return true;
++    }
++
+     bool process(const common_batch & batch_in) override {
+-        if (batch_in.size() <= 0) {
++        return process_prefix(batch_in, batch_in.size());
++    }
++
++    bool process_prefix(const common_batch & batch_in, int32_t n_tokens) {
++        GGML_ASSERT(n_tokens >= 0 && n_tokens <= batch_in.size());
++        if (n_tokens == 0) {
+             return true;
+         }
+ 
+@@ -1789,8 +1819,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return true;
+         }
+ 
+-        const int32_t n_tokens = batch_in.size();
+-
+         target_rows.clear();
+         struct clear_target_rows {
+             std::vector<llama_nextn_device_row> & rows;
+@@ -1982,7 +2010,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             n_drafting++;
+             drafting[seq_id] = true;
+             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
+-            if (!params.probabilistic) {
++            if (!params.probabilistic && !params.block_verification) {
+                 dp.result_q = nullptr;
+             }
+ 
+@@ -3275,6 +3303,25 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
+     return result;
+ }
+ 
++static common_speculative_impl_draft_mtp * common_speculative_single_mtp(const common_speculative * spec) {
++    if (!spec || spec->impls.size() != 1 || spec->impls.front()->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
++        return nullptr;
++    }
++    return static_cast<common_speculative_impl_draft_mtp *>(spec->impls.front().get());
++}
++
++bool common_speculative_mtp_can_defer_catchup(const common_speculative * spec, const common_batch & batch) {
++    const auto * mtp = common_speculative_single_mtp(spec);
++    return mtp && mtp->can_defer_catchup(batch);
++}
++
++bool common_speculative_mtp_process_prefix(common_speculative * spec, const common_batch & batch, int32_t count) {
++    auto * mtp = common_speculative_single_mtp(spec);
++    GGML_ASSERT(mtp && count > 0 && mtp->can_defer_catchup(batch));
++    SPC_DBG("MTP selective catch-up: keeping %d of %d verification rows\n", count, batch.size());
++    return mtp->process_prefix(batch, count);
++}
++
+ void common_speculative_draft(common_speculative * spec) {
+     common_speculative_draft(spec, {});
+ }
+diff --git a/common/speculative.h b/common/speculative.h
+index b00fd94..2a92978 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -119,6 +119,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+ // process the batch and update the internal state of the speculative context
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+ 
++// Single-head MTP may wait until verification selects the committed prefix.
++// The caller must keep the target output rows available until prefix processing.
++bool common_speculative_mtp_can_defer_catchup(const common_speculative * spec, const common_batch & batch);
++bool common_speculative_mtp_process_prefix(common_speculative * spec, const common_batch & batch, int32_t count);
++
+ // generate drafts for the sequences specified with `common_speculative_get_draft_params`
+ void common_speculative_draft(common_speculative * spec);
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index f9711a7..6fcee5f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -33,6 +33,16 @@ static constexpr unsigned mmvq_iq3_row_pair_geometry(int64_t columns, int64_t ro
+     return mmvq_iq3_row_pair_geometry(columns, rows);
+ }
+ 
++static constexpr unsigned mmvq_iq3_column_reuse_geometry(int64_t columns, int64_t rows, int64_t tokens) {
++    if (tokens != 2 && tokens != 3) { return 0; }
++    if (columns == 17408 && rows == 5120) { return 64u; }
++    return mmvq_iq3_row_pair_geometry(columns, rows);
++}
++
++static constexpr bool mmvq_iq3_column_reuse_setting(const char * value) {
++    return value && value[0] == '1' && value[1] == '\0';
++}
++
+ #ifndef GGML_CUDA_MMVQ_KERNELS_ONLY
+ struct ggml_cuda_mmvq_reuse_scope::state {
+     struct input { char * quantized = nullptr; int last; };
+@@ -732,8 +742,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
+ }
+ 
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+-        bool iq3_row_tile = false>
+-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
++        bool iq3_row_tile = false, bool iq3_column_reuse = false>
++__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(),
++        iq3_column_reuse && ncols_dst == 2 ? (iq3_row_tile ? 4 : 5) : 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -753,10 +764,12 @@ static __global__ void mul_mat_vec_q(
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+     static_assert(!iq3_row_tile || (type == GGML_TYPE_IQ3_S && ncols_dst >= 1 && ncols_dst <= 3 && !has_fusion && !small_k && !halve_iters),
+         "IQ3 row tiling requires the unchanged plain one-to-three-token reduction");
++    static_assert(!iq3_column_reuse || (type == GGML_TYPE_IQ3_S && (ncols_dst == 2 || ncols_dst == 3) && !has_fusion && !small_k && !halve_iters),
++        "IQ3 column reuse requires a plain two- or three-token projection");
+     constexpr int rows_per_cuda_block = iq3_row_tile ? (ncols_dst == 1 ? 2 : 4) : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
++    [[maybe_unused]] constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+ 
+     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+     const     int row0 = rows_per_cuda_block*blockIdx.x;
+@@ -888,17 +901,33 @@ static __global__ void mul_mat_vec_q(
+             }
+ #endif
+ 
+-#pragma unroll
+-            for (int j = 0; j < ncols_dst; ++j) {
++            if constexpr (iq3_column_reuse) {
+ #pragma unroll
+                 for (int i = 0; i < rows_per_cuda_block; ++i) {
+                     if constexpr (check_tail) { if (uint32_t(row0 + i) >= nrows_x) { continue; } }
+-                    tmp[j][i] += vec_dot_q_cuda(
+-                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+-                    if constexpr (has_fusion) {
+-                        if (use_gate) {
+-                            tmp_gate[j][i] += vec_dot_q_cuda(
+-                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                    const auto * weight = static_cast<const block_iq3_s *>(vx) + kbx_offset + i*stride_row_x + kbx;
++                    float dots[ncols_dst];
++                    // Decode each packed weight once, keeping each column's
++                    // dot-product and floating-point reduction order intact.
++                    vec_dot_iq3_s_q8_1_columns(weight, y + kby, stride_col_y, kqs, dots);
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        tmp[j][i] += dots[j];
++                    }
++                }
++            } else {
++#pragma unroll
++                for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++                    for (int i = 0; i < rows_per_cuda_block; ++i) {
++                        if constexpr (check_tail) { if (uint32_t(row0 + i) >= nrows_x) { continue; } }
++                        tmp[j][i] += vec_dot_q_cuda(
++                            vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                        if constexpr (has_fusion) {
++                            if (use_gate) {
++                                tmp_gate[j][i] += vec_dot_q_cuda(
++                                    vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                            }
+                         }
+                     }
+                 }
+@@ -1810,45 +1839,71 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ #endif
+ 
+-    // Plain dense IQ3_S only. K assignment and the four-warp reduction stay
+-    // identical. One token uses two rows; two/three tokens use four rows per CTA.
++    // Plain dense IQ3_S only. Preserve the original row-tiling choice when
++    // reusing weight decode across columns.
+     if (src0->type == GGML_TYPE_IQ3_S && !ids && !fusion && ne01 % 2 == 0 &&
+-            mmvq_iq3_row_pair_geometry(ne00, ne01, ne11) &&
++            (mmvq_iq3_row_pair_geometry(ne00, ne01, ne11) || mmvq_iq3_column_reuse_geometry(ne00, ne01, ne11)) &&
++            ne10_padded == ne00 && ne0 == ne01 && ne1 == ne11 &&
+             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+             ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
+             ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+             ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL) {
+         static const bool enabled = mmvq_iq3_row_pair_setting(std::getenv("GGML_CUDA_IQ3_ROW_PAIR"));
+         static const bool batch_enabled = mmvq_iq3_row_pair_setting(std::getenv("GGML_CUDA_IQ3_ROW_PAIR_BATCH"));
+-        if (enabled && (ne11 == 1 || batch_enabled)) {
+-            const int rows_per_block = ne11 == 1 ? 2 : 4;
++        static const bool column_reuse_enabled = mmvq_iq3_column_reuse_setting(std::getenv("WILDLLAMA_CUDA_IQ3_COLUMN_REUSE"));
++        const unsigned tile_geometry = mmvq_iq3_row_pair_geometry(ne00, ne01, ne11);
++        const unsigned reuse_geometry = mmvq_iq3_column_reuse_geometry(ne00, ne01, ne11);
++        const bool row_tile = enabled && (ne11 == 1 || batch_enabled) && tile_geometry;
++        const bool column_reuse = column_reuse_enabled && reuse_geometry;
++        if (row_tile || column_reuse) {
++            const int rows_per_block = row_tile && ne11 > 1 ? 4 : 2;
+             const dim3 grid((ne01 + rows_per_block - 1)/rows_per_block, 1, 1), block(WARP_SIZE, 4, 1);
+             const ggml_cuda_kernel_launch_params parameters = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+-            const auto launch = [&](auto token_tag) {
++            const auto launch = [&](auto token_tag, auto tile_tag, auto reuse_tag) {
+                 constexpr int tokens = decltype(token_tag)::value;
+-                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,tokens,false,false,false,true>, parameters,
++                constexpr bool tiled = decltype(tile_tag)::value;
++                constexpr bool reuse = decltype(reuse_tag)::value;
++                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,tokens,false,false,false,tiled,reuse>, parameters,
+                     src0->data, quantized, nullptr, ggml_cuda_mm_fusion_args_device{}, dst_d,
+                     uint32_t(ne00), init_fastdiv_values(1), uint32_t(s01), uint32_t(s11), uint32_t(s1),
+                     init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+                     init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), 0u, uint32_t(ne01));
+             };
++            const auto launch_batch = [&](auto token_tag) {
++                if (column_reuse && row_tile) {
++                    launch(token_tag, std::true_type{}, std::true_type{});
++                } else if (column_reuse) {
++                    launch(token_tag, std::false_type{}, std::true_type{});
++                } else {
++                    launch(token_tag, std::true_type{}, std::false_type{});
++                }
++            };
+             switch (ne11) {
+-                case 1: launch(std::integral_constant<int, 1>{}); break;
+-                case 2: launch(std::integral_constant<int, 2>{}); break;
+-                case 3: launch(std::integral_constant<int, 3>{}); break;
++                case 1: launch(std::integral_constant<int, 1>{}, std::true_type{}, std::false_type{}); break;
++                case 2: launch_batch(std::integral_constant<int, 2>{}); break;
++                case 3: launch_batch(std::integral_constant<int, 3>{}); break;
+             }
+             static const bool trace = [] {
+                 const char * value = std::getenv("GGML_CUDA_IQ3_ROW_PAIR_TRACE");
+                 return value && value[0] == '1' && value[1] == '\0';
+             }();
+-            if (trace) {
++            if (trace && row_tile) {
+                 static std::atomic<unsigned> reported{0};
+-                const unsigned bit = mmvq_iq3_row_pair_geometry(ne00, ne01, ne11) << (7*(ne11-1));
++                const unsigned bit = tile_geometry << (7*(ne11-1));
+                 if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                     std::fprintf(stderr, "cuda_iq3_row_pair: launched k=%lld rows=%lld tokens=%lld threads=128 rows_per_cta=%d\n",
+                         (long long) ne00, (long long) ne01, (long long) ne11, rows_per_block);
+                 }
+             }
++            static const bool reuse_trace = mmvq_iq3_column_reuse_setting(std::getenv("WILDLLAMA_CUDA_IQ3_COLUMN_REUSE_TRACE"));
++            if (reuse_trace && column_reuse) {
++                static std::atomic<unsigned> reported{0};
++                const unsigned bit = reuse_geometry << (7*(ne11-2));
++                if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
++                    std::fprintf(stderr, "cuda_iq3_column_reuse: launched k=%lld rows=%lld tokens=%lld rows_per_cta=%d\n",
++                        (long long) ne00, (long long) ne01, (long long) ne11, rows_per_block);
++                }
++            }
+             return;
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index c7acdac..58df33d 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1270,11 +1270,10 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+ #define VDR_IQ3_S_Q8_1_MMVQ 2
+ #define VDR_IQ3_S_Q8_1_MMQ  2
+ 
+-// TODO: don't use lookup table for signs
+-static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+-
+-    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
++template<int columns>
++static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_columns(
++    const block_iq3_s * __restrict__ bq3, const block_q8_1 * __restrict__ bq8_1,
++    uint32_t stride_col_y, int iqs, float (&dots)[columns]) {
+ 
+     const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+     const uint8_t * qs        = (const uint8_t *) &qs_packed;
+@@ -1284,7 +1283,7 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+     const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+     const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+ 
+-    int sumi = 0;
++    int sums[columns] = {};
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int2 grid_pos = make_int2(
+@@ -1297,17 +1296,30 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+ 
+-        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+-        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
++#pragma unroll
++        for (int col = 0; col < columns; ++col) {
++            const block_q8_1 & input = bq8_1[col*stride_col_y + iqs/2];
++            const int u0 = get_int_b4(input.qs, l0 + 0);
++            const int u1 = get_int_b4(input.qs, l0 + 1);
+ 
+-        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+-        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
++            sums[col] = ggml_cuda_dp4a(grid_l, u0, sums[col]);
++            sums[col] = ggml_cuda_dp4a(grid_h, u1, sums[col]);
++        }
+     }
+ 
+-    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
++    const int scale = 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
++#pragma unroll
++    for (int col = 0; col < columns; ++col) {
++        const float d = __half2float(bq3->d) * __low2float(bq8_1[col*stride_col_y + iqs/2].ds);
++        dots[col] = d * (sums[col] * scale);
++    }
++}
+ 
+-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+-    return d * sumi;
++static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++    float dot[1];
++    vec_dot_iq3_s_q8_1_columns((const block_iq3_s *) vbq + kbx, bq8_1, 0, iqs, dot);
++    return dot[0];
+ }
+ 
+ #define VDR_IQ1_S_Q8_1_MMVQ 1
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5c27d95..a60c25c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2114,7 +2114,30 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (sampler && can_offload) {
+         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
+ 
+-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
++        const bool initialized = sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
++        const bool thinking_prefilter = llama_sampler_backend_thinking_prefilter(sampler);
++        constexpr size_t prefilter_headroom = 32ull << 20;
++        auto prefilter_has_space = [&] {
++            size_t free = 0, total = 0;
++            ggml_backend_dev_memory(model.dev_output(), &free, &total);
++            if (free < prefilter_headroom) {
++                return false;
++            }
++            if (model.gpu_vram_limit_mib() == 0) {
++                return true;
++            }
++            llama_gpu_memory_stats stats{};
++            return llama_model_get_gpu_memory_stats(&model, &stats) && stats.enabled &&
++                stats.limit_bytes >= stats.managed_used_bytes &&
++                stats.limit_bytes - stats.managed_used_bytes >= prefilter_headroom;
++        };
++        if (thinking_prefilter && (!initialized || model.n_devices() != 1 || cparams.n_seq_max != 1 ||
++                !prefilter_has_space())) {
++            if (sampling.samplers.erase(seq_id) > 0) {
++                sched_need_reserve = true;
++            }
++            return false;
++        }
+ 
+         sampling.samplers[seq_id] = sampler;
+ 
+@@ -2952,7 +2975,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+         // Check if the output token has at least one sequence without a backend sampler.
+         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+             llama_seq_id seq_id = ubatch.seq_id[i][j];
+-            if (samplers.find(seq_id) == samplers.end()) {
++            auto sampler = samplers.find(seq_id);
++            if (sampler == samplers.end() || llama_sampler_backend_thinking_prefilter(sampler->second)) {
+                 return true;
+             }
+         }
+@@ -5979,6 +6003,10 @@ void llama_synchronize_sampler_outputs(llama_context * ctx) {
+     ctx->synchronize_sampler_outputs();
+ }
+ 
++bool llama_context::has_thinking_prefilter() const {
++    return sampling.samplers.size() == 1 && llama_sampler_backend_thinking_prefilter(sampling.samplers.begin()->second);
++}
++
+ llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i) {
+     llama_sampler_output output {};
+     // Preserve the individual getter order used by common_sampler::set_logits.
+@@ -5994,7 +6022,8 @@ llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * c
+         output.sampled_logits_count = static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
+     }
+     output.sampled_token = ctx->get_sampled_token_ith(i);
+-    if (!output.sampled_probs && !output.sampled_logits && output.sampled_token == LLAMA_TOKEN_NULL) {
++    if (ctx->has_thinking_prefilter() ||
++            (!output.sampled_probs && !output.sampled_logits && output.sampled_token == LLAMA_TOKEN_NULL)) {
+         output.raw_logits = ctx->get_logits_ith(i);
+     }
+     output.candidates_count = static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0f89d81..0456f79 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -196,6 +196,7 @@ struct llama_context {
+     float * get_embeddings_layer_inp(uint32_t lid);
+ 
+     llama_token * get_sampled_tokens() const;
++    bool has_thinking_prefilter() const;
+     void synchronize_sampler_outputs();
+     bool verify_draft_device(const std::vector<int> & indexes, const std::vector<llama_token> & draft,
+             std::vector<llama_token> & accepted);
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 2d2b60c..c7fc198 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -736,6 +736,7 @@ static struct llama_sampler * llama_sampler_chain_clone(const struct llama_sampl
+     llama_sampler_ptr result(llama_sampler_chain_init(chain_src->params));
+     auto * chain_dst = (llama_sampler_chain *) result->ctx;
+     chain_dst->selected_only = chain_src->selected_only;
++    chain_dst->thinking_prefilter = chain_src->thinking_prefilter;
+     chain_dst->device_verify = chain_src->device_verify;
+     chain_dst->guard_finite_sampling = chain_src->guard_finite_sampling;
+     chain_dst->samplers.reserve(chain_src->samplers.size());
+@@ -768,6 +769,16 @@ static bool llama_sampler_chain_backend_init(
+ 
+     chain->is_init = true;
+ 
++    if (chain->thinking_prefilter) {
++        auto * device = ggml_backend_buft_get_device(buft);
++        auto * registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++        // Limit graph padding and top-k workspace to a short CUDA verification batch.
++        if (!registry || std::strcmp(ggml_backend_reg_name(registry), "CUDA") != 0 ||
++                n_outputs_max_per_seq > 4) {
++            return false;
++        }
++    }
++
+     bool res = true;
+     bool backend_prefix = true;
+ 
+@@ -923,6 +934,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
+             /* .is_init              = */ false,
+             /* .selected_only        = */ false,
+             /* .backend_selects_token = */ false,
++            /* .thinking_prefilter   = */ false,
+             /* .graph_binding_id       = */ next_graph_binding_id.fetch_add(1, std::memory_order_relaxed),
+             /* .graph_binding_revision = */ 0,
+             /* .guard_finite_sampling  = */ false,
+@@ -1654,6 +1666,36 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
+     );
+ }
+ 
++llama_sampler * llama_sampler_init_thinking_prefilter(const llama_sampler * sampler, int32_t n_vocab) {
++    if (!sampler || !llama_sampler_is_chain(sampler) || n_vocab > 262144) {
++        return nullptr;
++    }
++    const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
++    for (const auto & entry : chain->samplers) {
++        if (entry.ptr->iface == &llama_sampler_empty_i) {
++            continue;
++        }
++        // Any active sampler before top-k could change which candidates survive.
++        if (entry.ptr->iface != &llama_sampler_top_k_i) {
++            return nullptr;
++        }
++        const int32_t k = static_cast<const llama_sampler_top_k *>(entry.ptr->ctx)->k;
++        if (k <= 0 || k >= 128 || k >= n_vocab) {
++            return nullptr;
++        }
++        llama_sampler_ptr prefilter(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        llama_sampler_chain_add(prefilter.get(), llama_sampler_init_top_k(k + 1));
++        static_cast<llama_sampler_chain *>(prefilter->ctx)->thinking_prefilter = true;
++        return prefilter.release();
++    }
++    return nullptr;
++}
++
++bool llama_sampler_backend_thinking_prefilter(const llama_sampler * sampler) {
++    return sampler && llama_sampler_is_chain(sampler) &&
++        static_cast<const llama_sampler_chain *>(sampler->ctx)->thinking_prefilter;
++}
++
+ // top-p
+ 
+ struct llama_sampler_top_p : public llama_sampler_backend {
+@@ -4894,6 +4936,14 @@ bool llama_sampler_set_token_mask(llama_sampler * sampler,const uint32_t * words
+     }
+     return true;
+ }
++bool llama_sampler_grammar_awaiting_trigger(const llama_sampler * sampler) {
++    if (!sampler || sampler->iface != &llama_sampler_grammar_i) {
++        return false;
++    }
++    const auto & ctx = *static_cast<const llama_sampler_grammar *>(sampler->ctx);
++    return ctx.grammar && ctx.grammar->awaiting_trigger;
++}
++
+ bool llama_sampler_grammar_token_mask(const llama_sampler * sampler,uint32_t * words,size_t n_words) {
+     if (!sampler || sampler->iface!=&llama_sampler_grammar_i || !words) { return false; }
+     const auto & ctx=*static_cast<const llama_sampler_grammar *>(sampler->ctx);
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+index 80a779c..e86ea6f 100644
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -21,6 +21,7 @@ struct llama_sampler_chain {
+     // chain produced a selected token. Partial/unsupported chains keep outputs.
+     bool selected_only = false;
+     bool backend_selects_token = false;
++    bool thinking_prefilter = false;
+ 
+     // Lifetime/topology identity for graph bindings, never copied as RNG state.
+     uint64_t graph_binding_id = 0;
+@@ -59,6 +60,9 @@ LLAMA_API bool llama_sampler_draft_host_only(const llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_set_selected_only(llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only(const llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only_ready(const llama_sampler * sampler);
++// Stateless top-k+1 with raw logits retained for grammar and budget fallback.
++LLAMA_API llama_sampler * llama_sampler_init_thinking_prefilter(const llama_sampler * chain, int32_t n_vocab);
++bool llama_sampler_backend_thinking_prefilter(const llama_sampler * sampler);
+ // Target-sample matching only. Stochastic selectors must commit entropy only
+ // for accepted rows; p/q rejection sampling keeps its host verification path.
+ LLAMA_API bool llama_sampler_backend_enable_device_verify(llama_sampler * sampler);
+@@ -107,6 +111,7 @@ static_assert(sizeof(llama_sampler_overlap_checkpoint) <= 16*1024, "overlap entr
+ LLAMA_API llama_sampler * llama_sampler_init_token_mask(int32_t n_vocab);
+ LLAMA_API bool llama_sampler_set_token_mask(llama_sampler * sampler, const uint32_t * words, size_t n_words);
+ LLAMA_API bool llama_sampler_grammar_token_mask(const llama_sampler * sampler, uint32_t * words, size_t n_words);
++LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_set_grammar_token_mask(llama_sampler * mask, const llama_sampler * grammar);
+ struct llama_grammar_mask_cache_stats {
+     uint64_t hits = 0, misses = 0;
+diff --git a/tests/test-cuda-iq3-row-pair.cu b/tests/test-cuda-iq3-row-pair.cu
+index f04df6b..763a7d1 100644
+--- a/tests/test-cuda-iq3-row-pair.cu
++++ b/tests/test-cuda-iq3-row-pair.cu
+@@ -42,6 +42,15 @@ static_assert(!mmvq_iq3_row_pair_setting("10"), "malformed numeric value enabled
+ static_assert(!mmvq_iq3_row_pair_setting("01"), "malformed numeric prefix enabled");
+ static_assert(!mmvq_iq3_row_pair_setting("true"), "malformed text value enabled");
+ static_assert(!mmvq_iq3_row_pair_setting(" "), "whitespace value enabled");
++static_assert(mmvq_iq3_column_reuse_geometry(5120,5120,2), "two-token square projection excluded");
++static_assert(mmvq_iq3_column_reuse_geometry(17408,5120,2), "two-token down projection excluded");
++static_assert(mmvq_iq3_column_reuse_geometry(17408,5120,3), "three-token down projection excluded");
++static_assert(!mmvq_iq3_column_reuse_geometry(5120,5120,1), "single token must retain the original kernel");
++static_assert(!mmvq_iq3_column_reuse_geometry(5120,5120,4), "unsupported batch admitted");
++static_assert(!mmvq_iq3_column_reuse_geometry(5120,1023,3), "unverified geometry admitted");
++static_assert(!mmvq_iq3_column_reuse_setting(nullptr), "column reuse must be opt-in");
++static_assert(mmvq_iq3_column_reuse_setting("1"), "column reuse opt-in rejected");
++static_assert(!mmvq_iq3_column_reuse_setting("0"), "column reuse disable ignored");
+ 
+ [[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
+     throw std::runtime_error(std::string("CUDA fixture: ")+stmt+" in "+func+" at "+file+":"+
+@@ -109,10 +118,10 @@ template<int cols> struct fixture {
+         }
+         CUDA_CHECK(cudaMemcpy(input.data,value.data(),value.size()*sizeof(block_q8_1),cudaMemcpyHostToDevice));
+     }
+-    template<bool pair> void launch() {
++    template<bool pair, bool reuse = false> void launch() {
+         const uint32_t weight_channel = uint32_t(rows*(k/256)), input_channel = uint32_t(k/32);
+         constexpr int rpb = pair ? (cols == 1 ? 2 : 4) : calc_rows_per_block(GGML_TYPE_IQ3_S, cols, MMVQ_PARAMETERS_GENERIC, false, 4);
+-        mul_mat_vec_q<GGML_TYPE_IQ3_S,cols,false,false,false,pair><<<dim3((rows+rpb-1)/rpb,1,1),dim3(32,4,1),0,stream>>>(
++        mul_mat_vec_q<GGML_TYPE_IQ3_S,cols,false,false,false,pair,reuse><<<dim3((rows+rpb-1)/rpb,1,1),dim3(32,4,1),0,stream>>>(
+             weights.data,input.data,(const int32_t *)nullptr,ggml_cuda_mm_fusion_args_device{},output.data,
+             uint32_t(k),init_fastdiv_values(1),uint32_t(k/256),input_channel,uint32_t(rows),init_fastdiv_values(1),
+             weight_channel,input_channel,uint32_t(rows),init_fastdiv_values(1),weight_channel,input_channel,uint32_t(rows),0u,uint32_t(rows));
+@@ -136,11 +145,11 @@ struct graph_timing {
+         if (begin) { cudaEventDestroy(begin); }
+         if (end) { cudaEventDestroy(end); }
+     }
+-    template<bool pair,int cols> void capture(fixture<cols> & data,int batch) {
++    template<bool pair, bool reuse, int cols> void capture(fixture<cols> & data,int batch) {
+         CUDA_CHECK(cudaEventCreate(&begin)); CUDA_CHECK(cudaEventCreate(&end));
+         CUDA_CHECK(cudaStreamBeginCapture(data.stream,cudaStreamCaptureModeThreadLocal));
+         CUDA_CHECK(cudaEventRecordWithFlags(begin,data.stream,cudaEventRecordExternal));
+-        for (int i=0;i<batch;++i) { data.template launch<pair>(); }
++        for (int i=0;i<batch;++i) { data.template launch<pair,reuse>(); }
+         CUDA_CHECK(cudaEventRecordWithFlags(end,data.stream,cudaEventRecordExternal));
+         CUDA_CHECK(cudaStreamEndCapture(data.stream,&graph));
+         CUDA_CHECK(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+@@ -154,9 +163,12 @@ struct graph_timing {
+ static float median(std::vector<float> values) {
+     std::sort(values.begin(),values.end()); return (values[values.size()/2-1]+values[values.size()/2])*.5f;
+ }
+-template<int cols> static void benchmark(fixture<cols> & data) {
++template<bool baseline_tile = false, bool candidate_tile = true, bool reuse = false, int cols>
++static void benchmark(fixture<cols> & data) {
+     constexpr int batch=32,pairs=12,warmups=3;
+-    graph_timing legacy,pair; legacy.capture<false>(data,batch); pair.capture<true>(data,batch);
++    graph_timing legacy,pair;
++    legacy.capture<baseline_tile,false>(data,batch);
++    pair.capture<candidate_tile,reuse>(data,batch);
+     for (int i=0;i<warmups;++i) { legacy.measure(data,batch); pair.measure(data,batch); }
+     std::vector<float> a,b; int wins=0;
+     for (int i=0;i<pairs;++i) {
+@@ -165,7 +177,8 @@ template<int cols> static void benchmark(fixture<cols> & data) {
+         else { x=legacy.measure(data,batch); y=pair.measure(data,batch); }
+         a.push_back(x); b.push_back(y); wins += y<x;
+     }
+-    std::printf("IQ3_GPU_EVENTS cols=%d k=%d rows=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g timing_scope=actual_kernel excludes=allocation_copy_capture_host_scheduling\n",
++    std::printf("%s cols=%d k=%d rows=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g timing_scope=actual_kernel excludes=allocation_copy_capture_host_scheduling\n",
++        reuse ? "IQ3_COLUMN_REUSE_GPU_EVENTS" : "IQ3_GPU_EVENTS",
+         cols,data.k,data.rows,batch,pairs,warmups,double(median(a)),double(median(b)),double(median(a)/median(b)),wins,
+         double(*std::min_element(a.begin(),a.end())),double(*std::max_element(a.begin(),a.end())),
+         double(*std::min_element(b.begin(),b.end())),double(*std::max_element(b.begin(),b.end())));
+@@ -191,8 +204,33 @@ const std::pair<int,int> shapes[]={{5120,5120},{5120,17408},{17408,5120},{5120,1
+                 std::printf("IQ3_EQUIVALENCE cols=%d k=%d rows=%d pattern=%d policy_eligible=%d different_bits=%zu max_abs=%.9g max_rel=%.9g changed_argmax=%d\n",
+                     cols,data.k,data.rows,pattern,int(mmvq_iq3_row_pair_geometry(data.k,data.rows,cols)),bits,double(max_abs),double(max_rel),int(changed));
+                 require(bits==0,"IQ3 row pairing changed a trained-weight result bitwise"); ++cases;
++                if constexpr (cols > 1) {
++                    const auto check_reuse = [&](auto tile_tag, const std::vector<float> & baseline) {
++                        constexpr bool tile = decltype(tile_tag)::value;
++                        data.template launch<tile,true>();
++                        const auto actual = data.download();
++                        const bool identical = std::memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)) == 0;
++                        std::printf("IQ3_COLUMN_REUSE_EQUIVALENCE cols=%d k=%d rows=%d pattern=%d tiled=%d exact=%d\n",
++                            cols, data.k, data.rows, pattern, int(tile), int(identical));
++                        require(identical, "IQ3 column reuse changed a trained-weight result bitwise");
++                        ++cases;
++                    };
++                    check_reuse(std::false_type{}, a);
++                    check_reuse(std::true_type{}, b);
++                }
++            }
++            if (measure) {
++                benchmark(data);
++                if constexpr (cols > 1) {
++                    if (mmvq_iq3_column_reuse_geometry(data.k, data.rows, cols)) {
++                        if (mmvq_iq3_row_pair_geometry(data.k, data.rows, cols)) {
++                            benchmark<true,true,true>(data);
++                        } else {
++                            benchmark<false,false,true>(data);
++                        }
++                    }
++                }
+             }
+-            if (measure) { benchmark(data); }
+         }
+ return cases;
+ }
+@@ -227,9 +265,13 @@ int main(int argc,char ** argv) {
+         attributes("tiled2",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,2,false,false,false,true>);
+         attributes("legacy3",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,3,false,false,false,false>);
+         attributes("tiled3",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,3,false,false,false,true>);
++        attributes("reuse2",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,2,false,false,false,false,true>);
++        attributes("tiled_reuse2",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,2,false,false,false,true,true>);
++        attributes("reuse3",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,3,false,false,false,false,true>);
++        attributes("tiled_reuse3",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,3,false,false,false,true,true>);
+         std::unique_ptr<gguf_context,decltype(&gguf_free)> metadata(gguf_init_from_file(path,{true,nullptr}),gguf_free);
+         require(bool(metadata),"cannot read GGUF metadata without allocating weights");
+         int cases=check<1>(path,metadata.get(),measure)+check<2>(path,metadata.get(),measure)+check<3>(path,metadata.get(),measure);
+-        std::printf("PASS: %d trained-weight IQ3 row-pair cases bitwise equal\n",cases); return 0;
++        std::printf("PASS: %d trained-weight IQ3 row-pair and column-reuse cases bitwise equal\n",cases); return 0;
+     } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
+ }
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+index ea11eae..a9e797c 100644
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -286,6 +286,70 @@ static void equal(const common_state_data & a, const common_state_data & b, cons
+     require(a.main == b.main && a.drft == b.drft && a.spec == b.spec, message);
+ }
+ 
++static void test_selective_catchup(llama_model * model) {
++    const auto set_mode = [](const char * mode) {
++#ifdef _WIN32
++        require(_putenv_s("WILDLLAMA_MTP_SELECTIVE_CATCHUP", mode) == 0, "cannot set selective catch-up mode");
++#else
++        require(setenv("WILDLLAMA_MTP_SELECTIVE_CATCHUP", mode, 1) == 0, "cannot set selective catch-up mode");
++#endif
++    };
++    const llama_tokens prompt = {3, 4, 5, 6};
++    const auto draft = [](session & current, llama_token last, llama_pos pos) {
++        llama_tokens proposals;
++        auto & params = common_speculative_get_draft_params(current.spec.get(), 0);
++        params.drafting = true;
++        params.pos0 = pos;
++        params.id_last = last;
++        params.result = &proposals;
++        common_speculative_draft(current.spec.get());
++        params.result = nullptr;
++        require(proposals.size() == 2, "unexpected selective catch-up proposal width");
++        return proposals;
++    };
++
++    for (int32_t keep = 1; keep <= 3; ++keep) {
++        set_mode("0");
++        session eager(model);
++        set_mode("1");
++        session selective(model);
++        eager.prefill(prompt);
++        selective.prefill(prompt);
++        const auto proposals = draft(eager, 7, 4);
++        require(draft(selective, 7, 4) == proposals, "selective mode changed the initial draft");
++
++        for (auto * current : {&eager, &selective}) {
++            auto * draft_memory = llama_get_memory(current->draft.get());
++            require(llama_memory_seq_rm(draft_memory, 0, 4, -1), "cannot discard speculative KV");
++            common_batch verify(current->target.get());
++            verify.add(7, 4, 0, true);
++            verify.add(proposals[0], 5, 0, true);
++            verify.add(proposals[1], 6, 0, true);
++            require(llama_process(current->target.get(), LLAMA_PROCESS_TYPE_DECODE, verify.get()) == 0,
++                    "selective catch-up target verification failed");
++            const bool deferred = current == &selective;
++            require(common_speculative_mtp_can_defer_catchup(current->spec.get(), verify) == deferred,
++                    "selective catch-up ignored its option or rejected an eligible batch");
++            require(deferred ? common_speculative_mtp_process_prefix(current->spec.get(), verify, keep) :
++                               common_speculative_process(current->spec.get(), verify), "MTP prefix processing failed");
++            if (deferred) {
++                require(llama_memory_seq_pos_max(draft_memory, 0) == 3 + keep,
++                        "selective catch-up evaluated rejected tokens");
++            }
++            common_speculative_accept(current->spec.get(), 0, keep - 1);
++            current->rewind(4 + keep);
++        }
++
++        std::vector<uint8_t> eager_carry, selective_carry;
++        require(common_speculative_get_state(eager.spec.get(), 0, eager_carry) &&
++                common_speculative_get_state(selective.spec.get(), 0, selective_carry) &&
++                eager_carry == selective_carry, "accepted MTP carry differs between catch-up modes");
++        require(draft(eager, 8, 4 + keep) == draft(selective, 8, 4 + keep),
++                "selective catch-up changed proposals after rollback");
++    }
++    set_mode("0");
++}
++
+ static void test_compact_rollback(const char * library) {
+     require(ggml_backend_load(library), "cannot load compact CUDA backend");
+     auto model = tiny_model(true, 32, 128, -1, true);
+@@ -388,6 +452,8 @@ int main(int argc, char ** argv) {
+         }
+         auto model = tiny_model();
+         require(llama_model_size(model.get()) < 4*1024*1024, "fixture exceeds 4 MiB");
++        step("selective MTP catch-up: accept none, part, or all");
++        test_selective_catchup(model.get());
+         const llama_tokens a = {3,4,5,6}, b = {17,18,19,20};
+         step("construct reference and switching sessions");
+         session reference(model.get()), switching(model.get());
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+index 9bc708c..2daf6f3 100644
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -735,6 +735,40 @@ static void run_batch(llama_model * model, const char * name, common_params_samp
+     }
+ }
+ 
++static void block_verification(llama_model * model, common_params_sampling params) {
++    params.logit_bias = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}};
++    auto context = fixture_context(model);
++    common_batch batch(context.get());
++    batch.add(3 + 'x', 0, 0, true);
++    batch.add(3 + 'y', 1, 0, true);
++    batch.add(3 + 'z', 2, 0, true);
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "block decode failed");
++    common_sampler_ptr sampler(common_sampler_init(model, params));
++    common_sampler_ptr preview(common_sampler_clone(sampler.get()));
++    llama_tokens draft;
++    std::vector<std::vector<llama_token_data>> q;
++    for (int i = 0; i < 2; ++i) {
++        draft.push_back(common_sampler_sample(preview.get(), context.get(), i));
++        const auto * row = common_sampler_get_candidates(preview.get(), false);
++        q.emplace_back(row->data, row->data + row->size);
++        common_sampler_accept(preview.get(), draft.back(), true);
++    }
++    const std::vector<int> rows{0, 1, 2};
++    auto accepted = common_sampler_sample_and_accept_n_rejection(sampler.get(), context.get(), rows, draft, q, false, true);
++    require(accepted.size() == 3 && std::equal(draft.begin(), draft.end(), accepted.begin()),
++            "identical distributions must accept the complete block");
++    require(common_sampler_get_verified_blocks(sampler.get()) == 1, "complete block verifier did not run");
++    require(common_sampler_last(sampler.get()) == accepted.back(), "bonus token was not committed");
++    common_sampler_ptr mismatch(common_sampler_init(model, params));
++    draft[0] = 0;
++    q[0] = {{0, 0.0f, 1.0f}};
++    accepted = common_sampler_sample_and_accept_n_rejection(mismatch.get(), context.get(), rows, draft, q, false, true);
++    require(accepted.size() == 1 && accepted.front() > 2 && common_sampler_last(mismatch.get()) == accepted.front(),
++            "a zero-probability prefix must commit only the correction");
++    require(common_sampler_get_verified_blocks(mismatch.get()) == 1, "correction verifier did not run");
++    std::puts("PASS stochastic block verification: identical proposals and zero-probability prefix");
++}
++
+ static void batch_eog(llama_model * model, common_params_sampling params) {
+     auto context = fixture_context(model);
+     const auto eog = llama_vocab_eos(llama_model_get_vocab(model));
+@@ -782,7 +816,48 @@ static void selected_only_filter_chain(llama_model * model) {
+     const auto out=llama_get_sampler_output_ith(context.get(),-1);
+     require(out.sampled_token==LLAMA_TOKEN_NULL && out.sampled_logits && out.sampled_logits_count==20 && out.candidates_count==20,
+         "filter-only chain lost CPU continuation output");
++
++    // The MTP drafter publishes an independent top-k view. Enabling target
++    // prefilter eligibility must not reinterpret the draft view as truncated.
++    common_params_sampling params;
++    params.seed = 8473;
++    params.top_k = 20;
++    params.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
++    common_sampler_ptr reference(common_sampler_init(model, params));
++    const char * name = "WILDLLAMA_GPU_THINKING_SAMPLE";
++    const char * previous = std::getenv(name);
++    const std::string saved = previous ? previous : "";
++#ifdef _WIN32
++    require(_putenv_s(name, "1") == 0, "cannot enable prefilter fixture");
++#else
++    require(setenv(name, "1", 1) == 0, "cannot enable prefilter fixture");
++#endif
++    common_sampler_ptr eligible(common_sampler_init(model, params));
++#ifdef _WIN32
++    require(_putenv_s(name, saved.c_str()) == 0, "cannot restore prefilter setting");
++#else
++    require((saved.empty() ? unsetenv(name) : setenv(name, saved.c_str(), 1)) == 0, "cannot restore prefilter setting");
++#endif
++    auto * prefilter = common_sampler_get_thinking_prefilter(eligible.get());
++    require(prefilter != nullptr && !out.raw_logits, "independent top-k has the wrong output contract");
++    require(common_sampler_sample(reference.get(), context.get(), -1) ==
++            common_sampler_sample(eligible.get(), context.get(), -1), "target prefilter changed draft selection");
++    same_candidates(*common_sampler_get_candidates(reference.get(), false),
++            *common_sampler_get_candidates(eligible.get(), false));
++    require(common_sampler_get_thinking_prefilter_rows(eligible.get()) == 0, "draft candidates were treated as target prefilter");
+     require(llama_set_sampler(context.get(),0,nullptr), "filter-only detach failed");
++
++    if (fixture_gpu_device) {
++        auto compact_context = fixture_context(model);
++        require(llama_set_sampler(compact_context.get(), 0, prefilter), "CUDA prefilter attachment failed");
++        require(llama_process(compact_context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "prefilter decode failed");
++        const auto compact = llama_get_sampler_output_ith(compact_context.get(), -1);
++        require(compact.raw_logits && compact.sampled_logits_count == 21 && compact.candidates_count == 21,
++                "CUDA prefilter must preserve raw logits and top-k+1");
++        require(llama_set_sampler(compact_context.get(), 0, nullptr), "CUDA prefilter detach failed");
++    } else {
++        require(!llama_set_sampler(context.get(), 0, prefilter), "CUDA prefilter attached to CPU");
++    }
+     std::puts("PASS selected-only: filter-only chains retain their CPU continuation outputs");
+ }
+ 
+@@ -1453,6 +1528,7 @@ int main(int argc, char ** argv) {
+         speculative_checkpoint_requirements();
+         sampler_candidate_ownership(model.get(), params);
+         batch_eog(model.get(), params);
++        block_verification(model.get(), params);
+         backend_candidate_fallbacks(model.get(), params);
+         auto batch_params = params;
+         batch_params.logit_bias = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}};
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 040947a..809febe 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -244,6 +244,8 @@ public:
+ 
+     bool empty() const { return tokens.empty(); }
+ 
++    bool has_media() const { return !map_idx_to_media.empty(); }
++
+     void clear() {
+         map_idx_to_media.clear();
+         tokens.clear();
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8a389cc..7f1e37f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -819,6 +819,15 @@ struct server_slot {
+                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+         }
+ 
++        if (common_sampler_get_thinking_prefilter(smpl.get())) {
++            SLT_INF(*this, "GPU thinking prefilter rows = %" PRIu64 "\n",
++                    common_sampler_get_thinking_prefilter_rows(smpl.get()));
++        }
++        const auto verified_blocks = common_sampler_get_verified_blocks(smpl.get());
++        if (verified_blocks > 0) {
++            SLT_INF(*this, "MTP verified blocks = %" PRIu64 "\n", verified_blocks);
++        }
++
+         common_speculative_print_stats(spec);
+     }
+ 
+@@ -2164,7 +2173,12 @@ private:
+             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
+ 
+             // TODO: tmp until backend sampling is fully implemented
+-            if (use_backend_sampling) {
++            auto * thinking_prefilter = !need_pre_sample_logits && task.type != SERVER_TASK_TYPE_TTS
++                ? common_sampler_get_thinking_prefilter(slot.smpl.get())
++                : nullptr;
++            if (thinking_prefilter && llama_set_sampler(ctx_tgt, slot.id, thinking_prefilter)) {
++                SLT_DBG(slot, "%s\n", "GPU thinking candidate prefilter attached");
++            } else if (use_backend_sampling) {
+                 // Ordinary generation with no requested probabilities can keep
+                 // full backend candidates on device. Draft/rejection consumers
+                 // retain their original candidate views and output contract.
+@@ -4037,12 +4051,13 @@ private:
+         int32_t n_batch = llama_n_batch(ctx_tgt);
+         for (int32_t off = 0; off < batch.size(); off = off_next) {
+             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
++            bool defer_mtp_catchup = false;
+             try {
+                 scoped_timer t(t_decode, n_decode);
+                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
+ 
+                 batch.render(off, n_tokens);
+-                bool ok = decode(n_batch, off);
++                bool ok = decode(n_batch, off, defer_mtp_catchup);
+ #ifdef DEBUG_TIMINGS
+                 llama_synchronize(ctx_tgt);
+ #endif
+@@ -4065,7 +4080,7 @@ private:
+ 
+             try {
+                 scoped_timer t(t_post_decode, n_post_decode);
+-                post_decode(n_tokens, off);
++                post_decode(n_tokens, off, defer_mtp_catchup);
+             } catch (const std::exception & e) {
+                 SRV_ERR("post_decode() failed: %s\n", e.what());
+                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
+@@ -4201,7 +4216,12 @@ private:
+                         const llama_tokens * draft_prompt = common_speculative_prepare_prompt(spec.get(), slot.spec_prompt,
+                                 [&] { return slot.prompt.tokens.get_text_tokens(); });
+ 
+-                        const bool spec_reject = slot.use_spec_rejection();
++                        const auto & draft_params = params_base.speculative.draft;
++                        const int block_depth = std::min(draft_params.n_max, n_draft_max);
++                        const bool block_eligible = draft_params.block_verification && block_depth >= 2 &&
++                            block_depth <= 4 && common_sampler_can_verify_block(slot.smpl.get());
++                        const bool spec_reject = slot.use_spec_rejection() &&
++                            (!draft_params.block_verification || draft_params.probabilistic || block_eligible);
+ 
+                         common_speculative_get_draft_params(spec.get(), slot.id) = {
+                             /* .drafting = */ true,
+@@ -5177,7 +5197,26 @@ private:
+ 
+     // returns true = success ; false = retry with smaller batch size
+     // throw std::runtime_error on fatal error
+-    bool decode(int32_t & n_batch, int32_t off) {
++    bool can_defer_mtp_catchup(int32_t off) const {
++        if (slots.size() != 1 || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
++            prefill_round_reuse_only || prefill_memory_trace) {
++            return false;
++        }
++        const auto & slot = slots.front();
++        if (slot.state != SLOT_STATE_GENERATING || slot.spec_is_replay || slot.prompt.tokens.has_media() ||
++            slot.spec_draft.empty() || slot.spec_i_batch.size() != slot.spec_draft.size() + 1 ||
++            slot.spec_i_batch.size() != size_t(batch.view.size()) || slot.spec_i_batch.front() != off) {
++            return false;
++        }
++        const uint32_t rollback = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ? llama_n_rs_seq(ctx_tgt) : 0;
++        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
++            (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || slot.spec_draft.size() > rollback)) {
++            return false;
++        }
++        return common_speculative_mtp_can_defer_catchup(spec.get(), batch.view);
++    }
++
++    bool decode(int32_t & n_batch, int32_t off, bool & defer_mtp_catchup) {
+         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
+ 
+         metrics_pre_decode();
+@@ -5311,10 +5350,10 @@ private:
+             metrics_post_decode(has_output);
+         }
+ 
+-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+-        //       for now, always re-evaluate for simplicity
+-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+-        if (spec) {
++        // A complete single-slot verification batch can update its draft
++        // state once the sampler knows which prefix will survive rollback.
++        defer_mtp_catchup = spec && can_defer_mtp_catchup(off);
++        if (spec && !defer_mtp_catchup) {
+             bool ok = true;
+             queue_tasks.yield_to_queue([&]() {
+                 const bool observe_memory = ctx_dft && (prefill_round_reuse_only || prefill_memory_trace);
+@@ -5380,7 +5419,7 @@ private:
+         return true;
+     }
+ 
+-    void post_decode(int32_t n_batch_tokens, int32_t off) {
++    void post_decode(int32_t n_batch_tokens, int32_t off, bool defer_mtp_catchup = false) {
+         response_overlap_ready = decode_overlap_enabled && !decode_overlap_failed &&
+             (spec && ctx_dft ? !common_speculative_needs_prompt_tokens(spec.get()) &&
+                 llama_draft_response_overlap_supported(ctx_tgt) && llama_draft_response_overlap_supported(ctx_dft) :
+@@ -5577,7 +5616,9 @@ private:
+                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                 } else if (use_rejection) {
+-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
++                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt,
++                            spec_i_batch, slot.spec_draft, slot.spec_draft_q, false,
++                            params_base.speculative.draft.block_verification);
+                 } else {
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                 }
+@@ -5628,6 +5669,17 @@ private:
+                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                 }
+ 
++                if (defer_mtp_catchup) {
++                    // Inputs are the initial token and accepted proposals.
++                    // The final sampled token has not been evaluated yet.
++                    bool ok = true;
++                    queue_tasks.yield_to_queue([&]() {
++                        ok = common_speculative_mtp_process_prefix(spec.get(), batch.view, int32_t(accepted.size()));
++                    });
++                    if (!ok) {
++                        throw std::runtime_error("failed to process the accepted MTP prefix");
++                    }
++                }
+                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+ 
+                 slot.spec_draft = std::move(accepted);
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index ce44405..080fa84 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -13,7 +13,10 @@
+ #include "llama.h"
+ #include "log.h"
+ 
++#include <algorithm>
+ #include <atomic>
++#include <cstdlib>
++#include <cstring>
+ #include <clocale>
+ #include <exception>
+ #include <signal.h>
+@@ -114,6 +117,16 @@ int llama_server(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    const char * block_verify = std::getenv("WILDLLAMA_MTP_BLOCK_VERIFY");
++    const auto & spec_types = params.speculative.types;
++    if (block_verify && std::strcmp(block_verify, "1") == 0 &&
++            std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec_types.end() &&
++            std::all_of(spec_types.begin(), spec_types.end(), [](auto type) {
++                return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
++            })) {
++        params.speculative.draft.block_verification = true;
++    }
++
+     SRV_INF("%s", "initializing ...\n");
+ 
+     llama_backend_init();
