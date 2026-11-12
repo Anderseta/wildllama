@@ -1,0 +1,432 @@
+{
+  "native_revision": "6b85a649ca207ae821297e5819ff762d4024e01e",
+  "go_revision": "80af7e9ea5931e1569abb6dc88ca3b6550ac0a4d",
+  "runs": 36,
+  "requests": 210,
+  "timed_requests": 132,
+  "all_passed": true,
+  "timed_paging_detected": false,
+  "selected_speed_change_percent": -1.5080573525056984,
+  "before_memory": {
+    "process_private_mib": 19630.62109375,
+    "process_working_set_mib": 12362.2421875,
+    "whole_board_peak_mib": 13835.22265625
+  },
+  "selected_memory": {
+    "process_private_mib": 14600.75,
+    "process_working_set_mib": 12080.72265625,
+    "whole_board_peak_mib": 13585.16015625
+  },
+  "selected_profile": {
+    "compute_growth": true,
+    "compact_mask": true,
+    "graph_cache_mib": 0,
+    "mtp_depth": 2,
+    "adaptive": false,
+    "logical_context": 40960
+  },
+  "results": {
+    "d2-ctx16384-retest-balanced@longchat": {
+      "tokens_per_second": {
+        "historico": 41.281033016570206
+      },
+      "resources": {
+        "process_private_mib": 15270.57421875,
+        "process_working_set_mib": 12257.10546875,
+        "whole_board_peak_mib": 14024.91015625
+      }
+    },
+    "d2-ctx16384-retest-current": {
+      "tokens_per_second": {
+        "contexto": 54.88587612064045
+      },
+      "resources": {
+        "process_private_mib": 17182.9375,
+        "process_working_set_mib": 12360.70703125,
+        "whole_board_peak_mib": 14162.97265625
+      }
+    },
+    "d2-ctx16384-retest-current@longchat": {
+      "tokens_per_second": {
+        "historico": 41.4144244004044
+      },
+      "resources": {
+        "process_private_mib": 19045.95703125,
+        "process_working_set_mib": 12445.609375,
+        "whole_board_peak_mib": 14218.53515625
+      }
+    },
+    "d2-ctx16384-retest-growth-mask": {
+      "tokens_per_second": {
+        "contexto": 54.81459125726616
+      },
+      "resources": {
+        "process_private_mib": 17025.7578125,
+        "process_working_set_mib": 12288.703125,
+        "whole_board_peak_mib": 14069.53515625
+      }
+    },
+    "d2-ctx16384-retest-growth": {
+      "tokens_per_second": {
+        "contexto": 54.76814710337713
+      },
+      "resources": {
+        "process_private_mib": 17097.69140625,
+        "process_working_set_mib": 12320.40234375,
+        "whole_board_peak_mib": 14113.97265625
+      }
+    },
+    "d2-ctx16384-retest-mask": {
+      "tokens_per_second": {
+        "contexto": 54.99458680733779
+      },
+      "resources": {
+        "process_private_mib": 17086.06640625,
+        "process_working_set_mib": 12315.69140625,
+        "whole_board_peak_mib": 14106.09765625
+      }
+    },
+    "d2-device": {
+      "tokens_per_second": {
+        "prosa": 46.5297180575795,
+        "codigo": 46.041002696812555
+      },
+      "resources": {
+        "process_private_mib": 18964.890625,
+        "process_working_set_mib": 12305.48046875,
+        "whole_board_peak_mib": 13774.37890625
+      }
+    },
+    "d2-indexed": {
+      "tokens_per_second": {
+        "prosa": 41.58452678122323,
+        "codigo": 46.78059262053392
+      },
+      "resources": {
+        "process_private_mib": 19605.046875,
+        "process_working_set_mib": 12359.703125,
+        "whole_board_peak_mib": 13805.62890625
+      }
+    },
+    "d2-packed": {
+      "tokens_per_second": {
+        "prosa": 41.568634925786796,
+        "codigo": 46.77450784648806
+      },
+      "resources": {
+        "process_private_mib": 19617.84765625,
+        "process_working_set_mib": 12358.31640625,
+        "whole_board_peak_mib": 13830.31640625
+      }
+    },
+    "d2-reference-repeat": {
+      "tokens_per_second": {
+        "prosa": 46.34166329315483,
+        "codigo": 45.77363374769254
+      },
+      "resources": {
+        "process_private_mib": 18989.23828125,
+        "process_working_set_mib": 12318.3125,
+        "whole_board_peak_mib": 13787.78515625
+      }
+    },
+    "d2-reference": {
+      "tokens_per_second": {
+        "prosa": 46.30696713883859,
+        "codigo": 45.77930391984734
+      },
+      "resources": {
+        "process_private_mib": 18995.72265625,
+        "process_working_set_mib": 12325.984375,
+        "whole_board_peak_mib": 13792.87890625
+      }
+    },
+    "d2-retest-adaptive": {
+      "tokens_per_second": {
+        "prosa": 46.83977754849228,
+        "codigo": 49.900261172868326
+      },
+      "resources": {
+        "process_private_mib": 19613.72265625,
+        "process_working_set_mib": 12359.046875,
+        "whole_board_peak_mib": 13811.97265625
+      }
+    },
+    "d2-retest-balanced-adaptive@seeds": {
+      "tokens_per_second": {
+        "prosa-7": 46.043270221915954,
+        "codigo-7": 45.87201671429067,
+        "prosa-149": 43.92995484757165,
+        "codigo-149": 48.3591348087065,
+        "prosa-987": 50.618812506432604,
+        "codigo-987": 45.84822353835236
+      },
+      "resources": {
+        "process_private_mib": 14596.54296875,
+        "process_working_set_mib": 12083.52734375,
+        "whole_board_peak_mib": 13570.78515625
+      }
+    },
+    "d2-retest-balanced@seeds": {
+      "tokens_per_second": {
+        "prosa-7": 46.0576208778204,
+        "codigo-7": 47.8437451372123,
+        "prosa-149": 46.30778345936723,
+        "codigo-149": 45.51219882792283,
+        "prosa-987": 51.01320103843311,
+        "codigo-987": 45.13435729735115
+      },
+      "resources": {
+        "process_private_mib": 14600.75,
+        "process_working_set_mib": 12080.72265625,
+        "whole_board_peak_mib": 13585.16015625
+      }
+    },
+    "d2-retest-catchup": {
+      "tokens_per_second": {
+        "prosa": 45.626956487246126,
+        "codigo": 45.01120241030353
+      },
+      "resources": {
+        "process_private_mib": 18988.4296875,
+        "process_working_set_mib": 12319.93359375,
+        "whole_board_peak_mib": 13795.59765625
+      }
+    },
+    "d2-retest-columns": {
+      "tokens_per_second": {
+        "prosa": 44.98794988821929,
+        "codigo": 44.309675738296704
+      },
+      "resources": {
+        "process_private_mib": 18989.875,
+        "process_working_set_mib": 12317.65625,
+        "whole_board_peak_mib": 13790.22265625
+      }
+    },
+    "d2-retest-current-repeat": {
+      "tokens_per_second": {
+        "prosa": 46.27909271175055,
+        "codigo": 45.68286039404369
+      },
+      "resources": {
+        "process_private_mib": 18992.9453125,
+        "process_working_set_mib": 12320.0859375,
+        "whole_board_peak_mib": 13787.53515625
+      }
+    },
+    "d2-retest-current": {
+      "tokens_per_second": {
+        "prosa": 46.321039059295295,
+        "codigo": 45.760841830016844
+      },
+      "resources": {
+        "process_private_mib": 18989.29296875,
+        "process_working_set_mib": 12320.27734375,
+        "whole_board_peak_mib": 13793.78515625
+      }
+    },
+    "d2-retest-current@seeds": {
+      "tokens_per_second": {
+        "prosa-7": 46.89659704158645,
+        "codigo-7": 48.61505599721895,
+        "prosa-149": 47.01766318349513,
+        "codigo-149": 46.17274479799876,
+        "prosa-987": 51.7510960649216,
+        "codigo-987": 45.73152587308061
+      },
+      "resources": {
+        "process_private_mib": 19630.62109375,
+        "process_working_set_mib": 12362.2421875,
+        "whole_board_peak_mib": 13835.22265625
+      }
+    },
+    "d2-retest-distribution": {
+      "tokens_per_second": {
+        "prosa": 45.94705162284258,
+        "codigo": 45.38046949869346
+      },
+      "resources": {
+        "process_private_mib": 18967.04296875,
+        "process_working_set_mib": 12305.921875,
+        "whole_board_peak_mib": 13789.66015625
+      }
+    },
+    "d2-retest-growth": {
+      "tokens_per_second": {
+        "prosa": 46.28550305893447,
+        "codigo": 45.46485619322954
+      },
+      "resources": {
+        "process_private_mib": 18790.1171875,
+        "process_working_set_mib": 12285.73046875,
+        "whole_board_peak_mib": 13631.69140625
+      }
+    },
+    "d2-retest-kv-paging": {
+      "tokens_per_second": {
+        "prosa": 46.21797118226152,
+        "codigo": 45.74065804664522
+      },
+      "resources": {
+        "process_private_mib": 18988.765625,
+        "process_working_set_mib": 12318.40625,
+        "whole_board_peak_mib": 13801.66015625
+      }
+    },
+    "d2-retest-mask": {
+      "tokens_per_second": {
+        "prosa": 46.281868186793005,
+        "codigo": 45.74018122032041
+      },
+      "resources": {
+        "process_private_mib": 18892.12890625,
+        "process_working_set_mib": 12278.55078125,
+        "whole_board_peak_mib": 13733.91015625
+      }
+    },
+    "d2-retest-no-compact": {
+      "tokens_per_second": {
+        "prosa": 46.203438206357475,
+        "codigo": 45.47795576146122
+      },
+      "resources": {
+        "process_private_mib": 19149.2265625,
+        "process_working_set_mib": 12317.5859375,
+        "whole_board_peak_mib": 13953.41015625
+      }
+    },
+    "d2-retest-no-graphs": {
+      "tokens_per_second": {
+        "prosa": 45.66528382301805,
+        "codigo": 45.04247961220356
+      },
+      "resources": {
+        "process_private_mib": 14818.97265625,
+        "process_working_set_mib": 12118.86328125,
+        "whole_board_peak_mib": 13741.84765625
+      }
+    },
+    "d2-retest-no-preview": {
+      "tokens_per_second": {
+        "prosa": 45.69636165965725,
+        "codigo": 45.13611588905978
+      },
+      "resources": {
+        "process_private_mib": 18992.4296875,
+        "process_working_set_mib": 12318.64453125,
+        "whole_board_peak_mib": 13803.72265625
+      }
+    },
+    "d2-retest-paged-draft": {
+      "tokens_per_second": {
+        "prosa": 43.37375481633059,
+        "codigo": 45.956266552376164
+      },
+      "resources": {
+        "process_private_mib": 19552.8203125,
+        "process_working_set_mib": 12366.55859375,
+        "whole_board_peak_mib": 13687.28515625
+      }
+    },
+    "d2-retest-paged": {
+      "tokens_per_second": {
+        "prosa": 39.15215668709693,
+        "codigo": 44.73829082239763
+      },
+      "resources": {
+        "process_private_mib": 19513.8359375,
+        "process_working_set_mib": 12378.6875,
+        "whole_board_peak_mib": 13682.16015625
+      }
+    },
+    "d2-retest-prefilter": {
+      "tokens_per_second": {
+        "prosa": 45.68883022878235,
+        "codigo": 45.103001734785735
+      },
+      "resources": {
+        "process_private_mib": 18954.17578125,
+        "process_working_set_mib": 12295.86328125,
+        "whole_board_peak_mib": 13776.47265625
+      }
+    },
+    "d2-retest-q4-single": {
+      "tokens_per_second": {
+        "prosa": 46.33302618153618,
+        "codigo": 45.7575629265104
+      },
+      "resources": {
+        "process_private_mib": 18990.3125,
+        "process_working_set_mib": 12320.125,
+        "whole_board_peak_mib": 13809.50390625
+      }
+    },
+    "d2-retest-state": {
+      "tokens_per_second": {
+        "prosa": 46.22934876963633,
+        "codigo": 45.639257854743654
+      },
+      "resources": {
+        "process_private_mib": 18981.28515625,
+        "process_working_set_mib": 12306.8125,
+        "whole_board_peak_mib": 13787.66015625
+      }
+    },
+    "d2-retest-trim": {
+      "tokens_per_second": {
+        "prosa": 46.03078348749098,
+        "codigo": 45.4023559690215
+      },
+      "resources": {
+        "process_private_mib": 19088.2890625,
+        "process_working_set_mib": 12294.84765625,
+        "whole_board_peak_mib": 13775.66015625
+      }
+    },
+    "d2-retest-tune": {
+      "tokens_per_second": {
+        "prosa": 46.2097169213837,
+        "codigo": 45.63243297723462
+      },
+      "resources": {
+        "process_private_mib": 18994.66796875,
+        "process_working_set_mib": 12321.1953125,
+        "whole_board_peak_mib": 13789.97265625
+      }
+    },
+    "d2-sign": {
+      "tokens_per_second": {
+        "prosa": 46.22864950481754,
+        "codigo": 45.84559780412961
+      },
+      "resources": {
+        "process_private_mib": 18992.140625,
+        "process_working_set_mib": 12322.828125,
+        "whole_board_peak_mib": 13791.19140625
+      }
+    },
+    "d4-compact-reference": {
+      "tokens_per_second": {
+        "prosa": 41.75447056716945,
+        "codigo": 40.459998364643404
+      },
+      "resources": {
+        "process_private_mib": 19629.0546875,
+        "process_working_set_mib": 12362.984375,
+        "whole_board_peak_mib": 13823.56640625
+      }
+    },
+    "d4-replay": {
+      "tokens_per_second": {
+        "prosa": 42.22735122073698,
+        "codigo": 40.91187566814203
+      },
+      "resources": {
+        "process_private_mib": 19608.8359375,
+        "process_working_set_mib": 12346.16796875,
+        "whole_board_peak_mib": 13817.78515625
+      }
+    }
+  }
+}

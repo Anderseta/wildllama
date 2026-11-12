@@ -60,8 +60,13 @@ does not promise immediate process-RAM reclamation.
 `WILDLLAMA_GRAPH_VARIANTS_MIB` opts into bounded extra graph arenas, from 0 to
 1024 MiB; the default is 0. The original worst-case scheduler remains available.
 Up to four secondary arenas retain their own scheduler, graph metadata and
-compute allocation. Retained metadata and compute storage share the extra-cache
-budget; backend allocations remain subject to the existing allocation quota.
+compute allocation. Retained graph-result metadata and compute storage share the
+extra-cache budget; backend allocations remain subject to the existing allocation
+quota. Scheduler-owned host reservations are not fully charged to this allowance.
+The [Huihui retest](benchmarks/2026-11-11-huihui-feature-retest.md) measured roughly
+4–5 GiB of additional Windows private/committed memory with the 128 MiB setting,
+mostly outside the resident working set. The selected local profile disables
+the optional arenas. This allowance is not a complete process-RAM overhead cap.
 
 Only eligible short batches, up to eight tokens, enter this cache. Reuse checks
 the complete existing topology/input contract, including warmup state. Layout,

@@ -17,6 +17,14 @@ Compact GDN replay keeps the original FP32 arithmetic order for each state eleme
 
 The launcher keeps the configured proposal count. A profile with two proposals continues to use the two-proposal rollback path. When running the native executable directly for a benchmark, set the two launcher defaults explicitly to reproduce normal server dispatch.
 
+The [full-model retest](benchmarks/2026-11-11-huihui-feature-retest.md) covers 36
+sequential configurations and a wider seed check. The selected local profile
+keeps fixed depth two, enables compute growth and compact attention masks, and
+disables additional graph arenas. It saves 174.19 MiB in initial compute buffers
+and substantially reduces Windows committed memory, at about a 1.5% short-prompt
+throughput cost in the confirmation set. Optional adaptive depth, proposal
+shortlists, packed heads and GPU verification did not establish consistent gains.
+
 ## Component measurements
 
 The RTX 5060 Ti measurements use CUDA 12.8. They compare real Huihui quantized matrix slices or small deterministic fixtures. They do not measure total tokens per second.

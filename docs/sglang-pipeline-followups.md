@@ -63,6 +63,13 @@ Target/draft inference can have two contexts: 128 MiB each permits up to
 independent budgets. Metadata and CPU compute buffers can consume RAM; eligible
 CUDA compute buffers consume VRAM. Weights, active KV capacity, the primary
 scheduler, driver allocations, and other library allocations are separate.
+
+The current accounting also omits scheduler-owned host reservations for retained
+arenas. Those reservations can be much larger than the selected allowance:
+the [Huihui retest](benchmarks/2026-11-11-huihui-feature-retest.md) observed roughly
+4–5 GiB of extra Windows private/committed memory at a 128 MiB setting. This is
+distinct from resident RAM and GPU allocation. The measured local profile keeps
+the additional arenas disabled; the normal scheduler and CUDA graphs remain active.
 The managed CUDA allocation quota remains independent and authoritative for the
 allocations it tracks. Optional arenas do not reduce context to fit.
 
