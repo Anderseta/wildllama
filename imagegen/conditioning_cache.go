@@ -27,9 +27,12 @@ var conditioningDigests = struct {
 }{entries: make(map[string]conditioningDigestEntry)}
 
 // Cache fingerprints include the filesystem's change time and file identity,
-// not access time. Hash encoder weights once per unchanged file per server
-// lifetime; modifying weights invalidates even when mtime is restored manually.
+// so modifying weights invalidates them even when mtime is restored manually.
 func conditioningFileIdentity(ctx context.Context, path string, content bool, reports ...func(int64, int64)) (string, error) {
+	return (*conditioningDigestMemo)(nil).fileIdentity(ctx, path, content, reports...)
+}
+
+func (memo *conditioningDigestMemo) fileIdentity(ctx context.Context, path string, content bool, reports ...func(int64, int64)) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -54,6 +57,9 @@ func conditioningFileIdentity(ctx context.Context, path string, content bool, re
 			return entry.hash, nil
 		}
 		conditioningDigests.Unlock()
+		if digest := memo.get(path, stamp); digest != "" {
+			return digest, nil
+		}
 	}
 	hash := sha256.New()
 	buffer := make([]byte, 1<<20)
@@ -105,6 +111,7 @@ func conditioningFileIdentity(ctx context.Context, path string, content bool, re
 			delete(conditioningDigests.entries, oldest)
 		}
 		conditioningDigests.Unlock()
+		memo.put(path, stamp, digest)
 	}
 	return digest, nil
 }
@@ -126,6 +133,8 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 	if err != nil || !within(root, resolved) {
 		return nil, errors.New("conditioning cache resolves outside the work directory")
 	}
+	memo := openConditioningDigestMemo(root)
+	defer memo.close(ctx)
 	components := make(map[string]string)
 	if config.RunnerPath != "" {
 		// The pinned manifest contains the native DLL, patch and header hashes.
@@ -150,14 +159,14 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 		reports[0](Progress{Phase: "conditioning_cache_prepare", Message: "Checking prompt cache model signatures", Current: now, Total: end})
 	}
 	for role, path := range map[string]string{"diffusion": profile.DiffusionModel, "encoder": profile.TextEncoder, "vae": profile.VAE} {
-		identity, err := conditioningFileIdentity(ctx, path, role == "encoder", report)
+		identity, err := memo.fileIdentity(ctx, path, role == "encoder", report)
 		if err != nil {
 			return nil, err
 		}
 		components[role] = identity
 	}
 	if len(request.ReferenceImages) > 0 && !sameComponentPath(profile.VisionEncoder, profile.TextEncoder) {
-		identity, err := conditioningFileIdentity(ctx, profile.VisionEncoder, true, report)
+		identity, err := memo.fileIdentity(ctx, profile.VisionEncoder, true, report)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +176,7 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 		if lora.Scale == 0 {
 			continue
 		}
-		identity, err := conditioningFileIdentity(ctx, lora.Path, true, report)
+		identity, err := memo.fileIdentity(ctx, lora.Path, true, report)
 		if err != nil {
 			return nil, err
 		}
@@ -189,6 +198,7 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 	conditioningProfile.Sampler = ""
 	conditioningProfile.Sigmas = ""
 	conditioningProfile.Scheduler = ""
+	conditioningProfile.SageAttention = false // Applies only to the diffusion model.
 	encoded, err := json.Marshal(struct {
 		Schema     int               `json:"schema"`
 		Runtime    string            `json:"runtime"`

@@ -152,6 +152,50 @@ func TestRAMWeightOffloadKeepsGPUComputeWhenItFits(t *testing.T) {
 	}
 }
 
+func TestBatchSkipsOnlyAConfirmedResidentFailureAtAnEqualOrLowerLimit(t *testing.T) {
+	dir := t.TempDir()
+	profile := testProfile(t, dir)
+	profile.MaxVRAMMiB = 8000
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputs := filepath.Join(dir, "outputs")
+	engine, err := NewEngine(Config{RunnerPath: exe, WorkDir: filepath.Join(dir, "work"), ModelsDir: filepath.Join(dir, "models"), OutputDir: outputs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	attemptPath := filepath.Join(dir, "attempts.jsonl")
+	t.Setenv("WILDIMAGE_FAKE_ATTEMPTS", attemptPath)
+	t.Setenv("WILDIMAGE_FAKE_CHILD", "gpu-oom-then-ram")
+	request := Request{Prompt: "literal --prompt ; &", Seed: 42, OutputPath: filepath.Join(outputs, "first.png")}
+	first, err := engine.Run(t.Context(), profile, request, nil)
+	if err != nil || first.GPUResidentFailedAtMiB != 8000 {
+		t.Fatalf("missing confirmed GPU failure: %#v, %v", first, err)
+	}
+
+	request.GPUResidentFailedAtMiB = first.GPUResidentFailedAtMiB
+	request.OutputPath = filepath.Join(outputs, "second.png")
+	request.Seed++
+	profile.MaxVRAMMiB = 7900
+	second, err := engine.Run(t.Context(), profile, request, nil)
+	attempts := imageAttempts(t, attemptPath)
+	if err != nil || second.GPUResidentFailedAtMiB != 8000 || len(attempts) != 3 ||
+		imageArgument(t, attempts[2], "--backend") != "cuda0" || imageArgument(t, attempts[2], "--params-backend") != "cpu" {
+		t.Fatalf("confirmed fallback was not reused: %#v, %v (%d attempts)", second, err, len(attempts))
+	}
+
+	request.OutputPath = filepath.Join(outputs, "third.png")
+	profile.MaxVRAMMiB = 8100
+	third, err := engine.Run(t.Context(), profile, request, nil)
+	attempts = imageAttempts(t, attemptPath)
+	if err != nil || third.GPUResidentFailedAtMiB != 8100 || len(attempts) != 5 ||
+		imageArgument(t, attempts[3], "--params-backend") != "cuda0,te=disk,vae=disk" {
+		t.Fatalf("higher budget did not retry resident GPU: %#v, %v (%d attempts)", third, err, len(attempts))
+	}
+}
+
 func TestGPUResidentPlacementPreservesExplicitCPUComponents(t *testing.T) {
 	for _, pair := range []struct{ encoder, vae bool }{{true, false}, {false, true}, {true, true}} {
 		profile := DefaultProfile(DefaultRecipeID)
@@ -159,7 +203,9 @@ func TestGPUResidentPlacementPreservesExplicitCPUComponents(t *testing.T) {
 		args := buildArguments(profile, Request{}, "job", "output.png", 42)
 		compute := imageArgument(t, args, "--backend")
 		params := imageArgument(t, args, "--params-backend")
-		if compute != params || strings.Contains(params, "te=cpu") != pair.encoder || strings.Contains(params, "vae=cpu") != pair.vae {
+		if !strings.HasPrefix(compute, "cuda0") || !strings.HasPrefix(params, "cuda0") ||
+			strings.Contains(params, "te=cpu") != pair.encoder || strings.Contains(params, "vae=cpu") != pair.vae ||
+			strings.Contains(params, "te=disk") == pair.encoder || strings.Contains(params, "vae=disk") == pair.vae {
 			t.Fatal("GPU-first placement changed a selected CPU component", pair, args)
 		}
 	}

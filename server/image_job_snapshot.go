@@ -1,11 +1,18 @@
 package server
 
+import "time"
+
 // cloneImageJobLocked detaches every public mutable reference. Network writes
 // can then run without holding the service mutex or racing live progress.
 func cloneImageJobLocked(job *imageJob) *imageJob {
 	copy := *job
 	copy.Results = append([]imageAsset(nil), job.Results...)
 	copy.RestoreErrors = append([]string(nil), job.RestoreErrors...)
+	copy.Timings = job.imageTimingSnapshot(time.Now())
+	if job.Memory != nil {
+		value := *job.Memory
+		copy.Memory = &value
+	}
 	if job.Result != nil {
 		value := *job.Result
 		copy.Result = &value

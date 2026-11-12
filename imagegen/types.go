@@ -55,6 +55,7 @@ type Profile struct {
 	CPUThreads     int  `json:"cpu_threads"`
 	OffloadToCPU   bool `json:"offload_to_cpu"`
 	FlashAttention bool `json:"flash_attention"`
+	SageAttention  bool `json:"sage_attention,omitempty"`
 	VAETiling      bool `json:"vae_tiling"`
 	VAEOnCPU       bool `json:"vae_on_cpu"`
 	EncoderOnCPU   bool `json:"encoder_on_cpu"`
@@ -98,6 +99,8 @@ type Request struct {
 	OutputPath      string   `json:"output_path"`
 	// CPUOnly is an internal admission decision, never a client override.
 	CPUOnly bool `json:"-"`
+	// GPUResidentFailedAtMiB is a confirmed failure for the same batch inputs.
+	GPUResidentFailedAtMiB int `json:"-"`
 }
 
 type Progress struct {
@@ -106,17 +109,19 @@ type Progress struct {
 	Current        int     `json:"current,omitempty"`
 	Total          int     `json:"total,omitempty"`
 	PID            int     `json:"pid,omitempty"`
+	PeakRSSBytes   uint64  `json:"peak_rss_bytes,omitempty"`
 	ElapsedSeconds float64 `json:"elapsed_seconds"`
 }
 
 type Result struct {
-	Path            string  `json:"path"`
-	MIMEType        string  `json:"mime_type"`
-	Width           int     `json:"width"`
-	Height          int     `json:"height"`
-	Seed            int64   `json:"seed"`
-	DurationSeconds float64 `json:"duration_seconds"`
-	RunnerRevision  string  `json:"runner_revision"`
+	Path                   string  `json:"path"`
+	MIMEType               string  `json:"mime_type"`
+	Width                  int     `json:"width"`
+	Height                 int     `json:"height"`
+	Seed                   int64   `json:"seed"`
+	DurationSeconds        float64 `json:"duration_seconds"`
+	RunnerRevision         string  `json:"runner_revision"`
+	GPUResidentFailedAtMiB int     `json:"-"`
 }
 
 type RunnerStatus struct {

@@ -125,6 +125,8 @@ type imageJob struct {
 	EffectiveMode       string                  `json:"effective_mode,omitempty"`
 	ComputeBackend      string                  `json:"compute_backend,omitempty"`
 	RAMOffload          bool                    `json:"ram_offload,omitempty"`
+	Timings             *imageJobTimings        `json:"timings,omitempty"`
+	Memory              *imageJobMemory         `json:"memory,omitempty"`
 	Progress            imageProgress           `json:"progress"`
 	CreatedAt           time.Time               `json:"created_at"`
 	StartedAt           *time.Time              `json:"started_at,omitempty"`
@@ -149,6 +151,8 @@ type imageJob struct {
 	cancel              context.CancelFunc
 	ctx                 context.Context
 	executing           bool
+	timingPhase         string
+	timingPhaseStarted  time.Time
 }
 
 type imageService struct {

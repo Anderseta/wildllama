@@ -75,7 +75,7 @@ func (e *imageTestRunner) Run(ctx context.Context, profile imagegen.Profile, req
 			return imagegen.Result{}, ctx.Err()
 		}
 	}
-	progress(imagegen.Progress{Phase: "generation", Message: "Denoising", Current: 1, Total: 8})
+	progress(imagegen.Progress{Phase: "generation", Message: "Denoising", Current: 1, Total: 8, PeakRSSBytes: 1024})
 	if err := os.MkdirAll(filepath.Dir(request.OutputPath), 0700); err != nil {
 		return imagegen.Result{}, err
 	}
@@ -194,6 +194,9 @@ func TestImageWorkerStartTimestampRemainsStableAfterCompletion(t *testing.T) {
 	require.Equal(t, "running", running.Job.Status)
 	require.NotNil(t, running.Job.StartedAt)
 	require.Nil(t, running.Job.FinishedAt)
+	require.NotNil(t, running.Job.Timings)
+	require.Positive(t, running.Job.Timings.RunSeconds)
+	require.Nil(t, running.Job.Timings.FirstSamplingSeconds)
 	observedStart := *running.Job.StartedAt
 	// Completion is impossible until this external handoff, after the running
 	// timestamp has already been observed through the public API.
@@ -215,6 +218,13 @@ func TestImageWorkerStartTimestampRemainsStableAfterCompletion(t *testing.T) {
 	require.True(t, completed.Job.StartedAt.Equal(observedStart), "completion must preserve the previously observed start")
 	require.True(t, completed.Job.FinishedAt.After(observedStart))
 	require.False(t, completed.Job.FinishedAt.Before(handoff), "finish must follow the external release")
+	require.NotNil(t, completed.Job.Timings)
+	require.NotNil(t, completed.Job.Timings.FirstSamplingSeconds)
+	require.Greater(t, completed.Job.Timings.RunSeconds, running.Job.Timings.RunSeconds)
+	require.Contains(t, completed.Job.Timings.PhaseSeconds, "generation")
+	require.Contains(t, completed.Job.Timings.PhaseSeconds, "restoring_text")
+	require.NotNil(t, completed.Job.Memory)
+	require.Equal(t, uint64(1024), completed.Job.Memory.PeakRSSBytes)
 }
 
 func mustImageRouter(t *testing.T, server *Server) *gin.Engine {

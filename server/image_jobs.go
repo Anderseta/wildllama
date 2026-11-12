@@ -51,8 +51,19 @@ func (v *imageService) persistJobsLocked() error {
 }
 
 func (v *imageService) update(job *imageJob, phase, message string, current, total int64) {
+	v.updateImageProgress(job, phase, message, current, total, 0)
+}
+
+func (v *imageService) updateImageProgress(job *imageJob, phase, message string, current, total int64, peakRSSBytes uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if peakRSSBytes > 0 {
+		if job.Memory == nil {
+			job.Memory = &imageJobMemory{}
+		}
+		job.Memory.PeakRSSBytes = max(job.Memory.PeakRSSBytes, peakRSSBytes)
+	}
+	job.trackImagePhase(phase, time.Now())
 	job.Phase = phase
 	job.Progress = imageProgress{Current: current, Total: total, Message: message, BatchIndex: job.Progress.BatchIndex, BatchCount: job.Progress.BatchCount}
 	backendChanged := false
@@ -264,11 +275,15 @@ func (v *imageService) workQueue(transfer bool) {
 		job.StartedAt = &started
 		job.Status = "running"
 		job.executing = true
+		if job.Kind == "generate" {
+			job.startImageTiming(started)
+		}
 		if err := v.persistJobsLocked(); err != nil {
 			job.executing = false
 			job.Status, job.Phase = "failed", "failed"
 			finished := time.Now().UTC()
 			job.FinishedAt = &finished
+			job.finishImageTiming(finished)
 			job.Error = "Cannot durably start image task: " + err.Error()
 			v.persistImageJobStateLocked(job)
 			job.cancel()
@@ -297,6 +312,7 @@ func (v *imageService) workQueue(transfer bool) {
 		}
 		finished := time.Now().UTC()
 		job.FinishedAt = &finished
+		job.finishImageTiming(finished)
 		switch {
 		case job.ctx.Err() != nil:
 			job.Status = "cancelled"
@@ -485,12 +501,15 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		restoreDeferred := false
 		if job.Config.RestoreTextModels && needsRestore && !shuttingDown && request.DeferTextRestore && runErr == nil && job.ctx.Err() == nil && len(job.Results) == generation.Count {
 			oldStatus, oldPhase, oldFinished := job.Status, job.Phase, job.FinishedAt
+			oldTimings, oldTimingPhase, oldTimingPhaseStarted := job.Timings, job.timingPhase, job.timingPhaseStarted
 			finished := time.Now().UTC()
 			job.Status, job.Phase = "completed", "completed"
 			job.FinishedAt = &finished
+			job.finishImageTiming(finished)
 			job.TextRestoreDeferred = true
 			if err := v.persistJobsLocked(); err != nil {
 				job.Status, job.Phase, job.FinishedAt = oldStatus, oldPhase, oldFinished
+				job.Timings, job.timingPhase, job.timingPhaseStarted = oldTimings, oldTimingPhase, oldTimingPhaseStarted
 				job.TextRestoreDeferred = false
 				runErr = errors.Join(runErr, fmt.Errorf("images saved but deferred completion could not be persisted: %w", err))
 			} else {
@@ -581,7 +600,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
 		imageStarted = true
 		result, generationErr := engine.Run(job.ctx, runtimeProfile, input, func(progress imagegen.Progress) {
-			v.update(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total))
+			v.updateImageProgress(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total), progress.PeakRSSBytes)
 		})
 		if result.Path != "" {
 			if err := v.registerImageResult(job, result, filename, index, generation.Count); err != nil {
@@ -593,6 +612,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		if generationErr != nil {
 			return generationErr
 		}
+		input.GPUResidentFailedAtMiB = result.GPUResidentFailedAtMiB
 	}
 	return nil
 }

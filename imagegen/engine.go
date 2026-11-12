@@ -468,10 +468,16 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	start := time.Now()
 	log := &progressLog{callback: progress, start: start}
 	mode := imageGPUResident
+	residentFailedAt := 0
 	if r.CPUOnly {
 		mode = imageRAMCPU
+	} else if p.OffloadToCPU && p.MaxVRAMMiB > 0 && p.MaxVRAMMiB <= r.GPUResidentFailedAtMiB {
+		mode = imageRAMGPU
+		residentFailedAt = r.GPUResidentFailedAtMiB
+		log.emit(Progress{Phase: "ram_offload", Message: "Reutilizando a execução em GPU com apoio da RAM, validada neste lote."}, true)
 	}
 	var runErr error
+	outputValidated := false
 	for {
 		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, runnerStatus, log)
 		select {
@@ -481,7 +487,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		}
 		var exit *exec.ExitError
 		if runErr != nil || ctx.Err() != nil || !p.OffloadToCPU || mode == imageRAMCPU || !errors.As(err, &exit) ||
-			exit.ExitCode() != GPUOutOfMemoryExitCode || validateOutputPNG(output, p.Width, p.Height) == nil {
+			exit.ExitCode() != GPUOutOfMemoryExitCode {
+			break
+		}
+		outputValidated = validateOutputPNG(output, p.Width, p.Height) == nil
+		if outputValidated {
 			break
 		}
 		// The failed process and its CPU/GPU resources have been fully closed.
@@ -492,6 +502,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			return Result{}, fmt.Errorf("remove incomplete GPU attempt: %w", removeErr)
 		}
 		if mode == imageGPUResident {
+			residentFailedAt = p.MaxVRAMMiB
 			mode = imageRAMGPU
 			log.emit(Progress{Phase: "ram_offload", Message: "Os pesos não couberam na GPU; usando RAM dentro do orçamento e mantendo o cálculo na GPU."}, true)
 		} else {
@@ -506,12 +517,15 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	} else if err != nil {
 		runErr = err
 	}
-	if err := validateOutputPNG(output, p.Width, p.Height); err != nil {
-		_ = os.Remove(output)
-		if runErr != nil {
-			return Result{}, runErr
+	if !outputValidated {
+		log.emit(Progress{Phase: "validating_output", Message: "Verificando o PNG salvo"}, true)
+		if err := validateOutputPNG(output, p.Width, p.Height); err != nil {
+			_ = os.Remove(output)
+			if runErr != nil {
+				return Result{}, runErr
+			}
+			return Result{}, fmt.Errorf("runner did not produce a complete PNG with the requested dimensions: %w", err)
 		}
-		return Result{}, fmt.Errorf("runner did not produce a complete PNG with the requested dimensions: %w", err)
 	}
 	result := Result{Path: output, MIMEType: "image/png", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}
 	// A process can fail, or cancellation can arrive, immediately after it saves
@@ -519,6 +533,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	// while still reporting cancellation/failure and restoring the chat model.
 	if runErr != nil {
 		return result, runErr
+	}
+	if mode == imageRAMGPU {
+		result.GPUResidentFailedAtMiB = residentFailedAt
 	}
 	log.emit(Progress{Phase: "completed", Message: "Image saved", Current: p.Steps, Total: p.Steps}, true)
 	return result, nil
@@ -567,17 +584,24 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start image runner: %w", err)
 	}
+	peak, closePeak := newImageWorkingSet(cmd.Process.Pid)
+	if closePeak != nil {
+		defer closePeak()
+	}
 	e.mu.Lock()
 	e.pid = cmd.Process.Pid
 	e.mu.Unlock()
 	log.mu.Lock()
 	log.pid = cmd.Process.Pid
+	log.peakWorkingSet = peak
 	log.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
 		e.pid = 0
 		e.mu.Unlock()
 		log.mu.Lock()
+		log.sampleWorkingSet()
+		log.peakWorkingSet = nil
 		log.pid = 0
 		log.mu.Unlock()
 	}()
@@ -626,7 +650,23 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 	if mode != imageGPUResident {
 		args = append(args, "--params-backend", "cpu", "--offload-to-cpu", "--auto-fit", "off")
 	} else if p.OffloadToCPU {
-		args = append(args, "--params-backend", backend, "--auto-fit", "off", "--disable-segmented-compute")
+		placement := backend
+		if p.StageComponents {
+			// Keep the denoiser resident across steps and free inactive GPU
+			// copies of the encoder and VAE between phases.
+			placement = "cuda0"
+			if p.EncoderOnCPU {
+				placement += ",te=cpu"
+			} else {
+				placement += ",te=disk"
+			}
+			if p.VAEOnCPU {
+				placement += ",vae=cpu"
+			} else {
+				placement += ",vae=disk"
+			}
+		}
+		args = append(args, "--params-backend", placement, "--auto-fit", "off", "--disable-segmented-compute")
 	} else if p.StageComponents {
 		args = append(args, "--params-backend", "disk", "--auto-fit", "off")
 	} else {
@@ -649,6 +689,9 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 		args = append(args, "--flash-attn", "on")
 	} else {
 		args = append(args, "--flash-attn", "off")
+	}
+	if p.SageAttention && mode != imageRAMCPU {
+		args = append(args, "--sage-attn")
 	}
 	if p.VAETiling {
 		args = append(args, "--vae-tiling")
@@ -773,16 +816,18 @@ var stepPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,3})/([0-9]{1,3})(?:[^
 var byteRatePattern = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:[kmgt]i?)?b/s\b`)
 
 type progressLog struct {
-	mu           sync.Mutex
-	pending      string
-	lines        []string
-	callback     func(Progress)
-	start        time.Time
-	pid          int
-	lastPhase    string
-	lastCurrent  int
-	lastEmit     time.Time
-	counterPhase string
+	mu             sync.Mutex
+	pending        string
+	lines          []string
+	callback       func(Progress)
+	start          time.Time
+	pid            int
+	peakWorkingSet func() uint64
+	peakRSSBytes   uint64
+	lastPhase      string
+	lastCurrent    int
+	lastEmit       time.Time
+	counterPhase   string
 }
 
 func (p *progressLog) Write(data []byte) (int, error) {
@@ -887,8 +932,16 @@ func (p *progressLog) emit(v Progress, force bool) {
 	p.lastCurrent = v.Current
 	p.lastEmit = time.Now()
 	v.PID = p.pid
+	p.sampleWorkingSet()
+	v.PeakRSSBytes = p.peakRSSBytes
 	v.ElapsedSeconds = time.Since(p.start).Seconds()
 	p.callback(v)
+}
+
+func (p *progressLog) sampleWorkingSet() {
+	if p.peakWorkingSet != nil {
+		p.peakRSSBytes = max(p.peakRSSBytes, p.peakWorkingSet())
+	}
 }
 func (p *progressLog) flush() { p.mu.Lock(); defer p.mu.Unlock(); p.line(p.pending); p.pending = "" }
 func (p *progressLog) tail() string {

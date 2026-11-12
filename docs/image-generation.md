@@ -30,7 +30,9 @@ choices.
 ## RAM backing and sequential components
 
 New image profiles enable `offload_to_cpu` as a fallback policy. A GPU-resident
-attempt runs first. Only a classified GPU memory failure moves weights to RAM
+attempt runs first. With `stage_components`, the encoder and VAE load on demand
+and release their GPU copies between phases while the denoiser stays on the GPU
+across sampling steps. Only a classified GPU memory failure moves weights to RAM
 backing while retaining GPU computation. Inactive host weights can be evicted and
 loaded again from their original files under pressure. `stage_components` also
 releases an inactive component's weights at the phase boundary; it can remain
@@ -84,6 +86,12 @@ deterministic conditioning; model, adapter, encoder and backend changes still do
 The supported lazy
 disk parameter backend can avoid encoder computation on a hit; actual loading
 time and peak memory still depend on the selected model and backend.
+
+`sage_attention` is an optional diffusion kernel. It uses reduced-precision
+attention on supported CUDA devices and can produce different pixels at the
+same seed. Existing profiles default to Flash Attention without Sage.
+`scripts/benchmark-wildimage.py` compares fixed-seed jobs, timings, sampled
+device memory and decoded pixels before enabling a kernel.
 
 `scripts/build-wildimage.ps1` applies the maintained patch to the pinned source and
 uses the released GGML DLLs after an ABI/name-length probe. Only image-core/CLI

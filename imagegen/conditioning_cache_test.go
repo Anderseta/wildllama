@@ -2,6 +2,7 @@ package imagegen
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,7 @@ func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesIn
 		"sampler":   func(p *Profile) { p.Sampler = "heun" },
 		"sigmas":    func(p *Profile) { p.Sigmas = "1,0.5,0" },
 		"scheduler": func(p *Profile) { p.Scheduler = "karras" },
+		"sage":      func(p *Profile) { p.SageAttention = true },
 	} {
 		t.Run("sampling-"+name, func(t *testing.T) {
 			next := profile
@@ -118,6 +120,72 @@ func TestConditioningDigestDetectsSameSizeChangesWithRestoredMtime(t *testing.T)
 	second, err := conditioningFileIdentity(context.Background(), path, true)
 	if err != nil || first == second {
 		t.Fatal("stale encoder digest survived content change with identical size/mtime", err)
+	}
+}
+
+func TestConditioningDigestMemoReusesVerifiedStampAcrossCacheInstances(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "encoder.gguf")
+	putModel(t, path, modelBytes())
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	stamp, reliable := conditioningFileStamp(file, info)
+	file.Close()
+	if !reliable {
+		t.Skip("filesystem does not provide reliable file identities")
+	}
+	ctx := context.Background()
+	first := openConditioningDigestMemo(dir)
+	digest, err := first.fileIdentity(ctx, path, true)
+	first.close(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := openConditioningDigestMemo(dir)
+	defer second.close(ctx)
+	if got := second.get(path, stamp); got != digest {
+		t.Fatalf("persistent digest = %q, want %q", got, digest)
+	}
+	data := modelBytes()
+	data[1024] ^= 1
+	putModel(t, path, data)
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := second.fileIdentity(ctx, path, true)
+	if err != nil || changed == digest {
+		t.Fatalf("memo reused a stale digest after a same-size change with restored mtime: %v", err)
+	}
+}
+
+func TestConditioningDigestMemoBoundsStorageAndIgnoresCorruption(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	memo := openConditioningDigestMemo(dir)
+	digest := conditioningDigestString([]byte("digest"))
+	for index := 0; index <= conditioningDigestLimit; index++ {
+		memo.put(fmt.Sprint(index), "stamp", digest)
+	}
+	memo.close(ctx)
+	reopened := openConditioningDigestMemo(dir)
+	if len(reopened.entries) != conditioningDigestLimit || reopened.get("0", "stamp") != "" || reopened.get("1", "stamp") != digest {
+		t.Fatal("persistent digest memo did not retain only the bounded latest entries")
+	}
+	reopened.close(ctx)
+	if err := os.WriteFile(filepath.Join(dir, conditioningDigestMemoName), []byte(`{"checksum":"invalid","entries":[{}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := openConditioningDigestMemo(dir)
+	defer corrupt.close(ctx)
+	if len(corrupt.entries) != 0 {
+		t.Fatal("persistent digest memo accepted a corrupt entry")
 	}
 }
 
