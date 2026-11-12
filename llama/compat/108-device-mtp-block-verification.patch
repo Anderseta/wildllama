@@ -1,0 +1,913 @@
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+index 4884299f3011fa9ecf99d684bb332fbe7d223ee9..ce8521af597b20dfc229cabfa41c066e7645e849 100644
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -275,6 +275,29 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
+     return ((const common_reasoning_budget_ctx *)smpl->ctx)->state;
+ }
+ 
++bool common_reasoning_budget_is_passthrough(const struct llama_sampler * smpl, size_t draft_tokens) {
++    if (!smpl) {
++        return true;
++    }
++    const auto * ctx = static_cast<const common_reasoning_budget_ctx *>(smpl->ctx);
++    // IDLE and DONE may activate a new reasoning block. COUNTING may end
++    // naturally and re-arm within the same proposed span.
++    if (ctx->budget <= 0 || size_t(ctx->budget) <= draft_tokens) {
++        return false;
++    }
++    switch (ctx->state) {
++        case REASONING_BUDGET_IDLE:
++        case REASONING_BUDGET_DONE:
++            return true;
++        case REASONING_BUDGET_COUNTING:
++            return ctx->remaining > 0 && size_t(ctx->remaining) > draft_tokens;
++        case REASONING_BUDGET_FORCING:
++        case REASONING_BUDGET_WAITING_UTF8:
++            return false;
++    }
++    return false;
++}
++
+ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl) {
+     if (!smpl) {
+         return nullptr;
+diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
+index 1b89a04c42e8056d6450d3266e4f0c1e2a561d2e..8e394a96a2eb072971ac68749e166380d450280a 100644
+--- a/common/reasoning-budget.h
++++ b/common/reasoning-budget.h
+@@ -43,6 +43,10 @@ struct llama_sampler * common_reasoning_budget_init(
+ 
+ common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+ 
++// The controller can be ignored when constructing candidate probabilities
++// for these hypothetical accepted tokens and the following bonus row.
++bool common_reasoning_budget_is_passthrough(const struct llama_sampler * smpl, size_t draft_tokens);
++
+ // The end sequence that transitioned the sampler to DONE, or nullptr if none
+ // was recorded. Cleared when a new start sequence re-arms the sampler.
+ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index f99df16c757804dfd8851b8bc2b263cd23b3221d..147c76a983212a52192ad2d0bc7a130760e9b2fb 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -5,6 +5,7 @@
+ #include "../src/llama-ext.h"
+ #include "../src/llama-sampler.h"
+ #include "../src/llama-device-verification.h"
++#include "ggml-cuda-verify.h"
+ 
+ #include "common.h"
+ #include "fit.h"
+@@ -205,6 +206,7 @@ struct common_sampler {
+         const char * value = std::getenv("WILDLLAMA_MTP_BLOCK_PREVIEW");
+         return !value || !*value || std::strcmp(value, "1") == 0;
+     }();
++    bool device_block_enabled = false;
+ };
+ 
+ std::string common_params_sampling::print() const {
+@@ -485,8 +487,12 @@ struct common_sampler * common_sampler_init(
+     llama_sampler_ptr thinking_prefilter;
+     const char * thinking_prefilter_env = std::getenv("WILDLLAMA_GPU_THINKING_SAMPLE");
+     const char * distribution_env = std::getenv("WILDLLAMA_MTP_GPU_DISTRIBUTION");
+-    if ((!grmr || params.grammar_lazy) && params.n_probs == 0 && distribution_env &&
+-            std::strcmp(distribution_env, "1") == 0) {
++    const bool device_block = !grmr && (!rbudget || params.reasoning_budget_tokens < 0) &&
++        !params.backend_sampling && params.n_probs == 0 &&
++        llama_device_verification_policy::block_enabled(std::getenv("WILDLLAMA_MTP_GPU_VERIFY")) &&
++        llama_device_verification_policy::budget(std::getenv("WILDLLAMA_VERIFY_DEVICE_MIB")) > 0;
++    if ((!grmr || params.grammar_lazy) && params.n_probs == 0 &&
++            (device_block || (distribution_env && std::strcmp(distribution_env, "1") == 0))) {
+         thinking_prefilter.reset(llama_sampler_init_gpu_distribution(chain.get(), llama_vocab_n_tokens(vocab)));
+     }
+     if (!thinking_prefilter && (!grmr || params.grammar_lazy) && params.n_probs == 0 && thinking_prefilter_env &&
+@@ -507,6 +513,7 @@ struct common_sampler * common_sampler_init(
+         // mix it, the chain and the draft are seeded from this one too
+         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain.get()) ^ 0x9e3779b9u),
+     };
++    result->device_block_enabled = device_block && llama_sampler_is_gpu_distribution(result->thinking_prefilter.get());
+ 
+     grmr.release();
+     rbudget.release();
+@@ -607,6 +614,7 @@ static common_sampler * common_sampler_clone_impl(common_sampler * gsmpl, bool c
+     };
+     result->cur_p.data = candidates && gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
+     result->block_preview_enabled = gsmpl->block_preview_enabled;
++    result->device_block_enabled = gsmpl->device_block_enabled;
+     grmr.release();
+     rbudget.release();
+     chain.release();
+@@ -655,6 +663,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     dst->candidate_rows = src->candidate_rows;
+     dst->thinking_prefilter_rows = src->thinking_prefilter_rows;
+     dst->block_preview_enabled = src->block_preview_enabled;
++    dst->device_block_enabled = src->device_block_enabled;
+ }
+ 
+ void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
+@@ -1102,6 +1111,54 @@ static void common_sampler_block_distribution(common_sampler * preview, llama_co
+     current = {preview->cur.data(), preview->cur.size(), -1, false};
+ }
+ 
++static std::vector<llama_token> common_sampler_verify_block_device(
++        common_sampler * sampler, llama_context * ctx, const std::vector<int> & indexes,
++        const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & proposals) {
++    ggml_cuda_verify_block_input input{};
++    input.draft_count = draft.size();
++    const auto * vocab = llama_model_get_vocab(llama_get_model(ctx));
++    for (size_t i = 0; i < draft.size(); ++i) {
++        const auto & source = proposals[i];
++        if (source.empty() || source.size() > GGML_CUDA_VERIFY_BLOCK_PROPOSAL_MAX ||
++                (i + 1 < draft.size() && llama_vocab_is_eog(vocab, draft[i]))) {
++            return {};
++        }
++        auto & row = input.proposals[i];
++        row.size = source.size();
++        row.token = draft[i];
++        double sum = 0.0;
++        for (const auto & token : source) {
++            sum += token.p;
++        }
++        // The caller validated q. Match the CPU path's multiply-by-reciprocal.
++        const double scale = 1.0 / sum;
++        for (size_t j = 0; j < source.size(); ++j) {
++            row.ids[j] = source[j].id;
++            row.probabilities[j] = source[j].p * scale;
++        }
++    }
++    auto trial = sampler->rng;
++    std::uniform_real_distribution<double> uniform(0.0, 1.0);
++    for (size_t i = 0; i <= draft.size(); ++i) {
++        input.draws[i] = uniform(trial);
++    }
++    ggml_cuda_verify_block_result decision{};
++    if (!llama_verify_draft_block_device(ctx, indexes, input, decision)) {
++        return {};
++    }
++    std::vector<llama_token> result(draft.begin(), draft.begin() + decision.kept);
++    result.push_back(decision.correction);
++    for (int i = 0; i < decision.draws_used; ++i) {
++        (void) uniform(sampler->rng);
++    }
++    for (const auto token : result) {
++        common_sampler_accept(sampler, token, true);
++    }
++    ++sampler->verified_blocks;
++    LOG_DBG("MTP device block verification kept %d/%zu proposals\n", decision.kept, draft.size());
++    return result;
++}
++
+ static std::vector<llama_token> common_sampler_verify_block(
+         common_sampler * sampler, llama_context * ctx, const std::vector<int> & indexes,
+         const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & proposals,
+@@ -1123,6 +1180,13 @@ static std::vector<llama_token> common_sampler_verify_block(
+         }
+     }
+ 
++    if (sampler->device_block_enabled && !feedback && common_reasoning_budget_is_passthrough(sampler->rbudget, draft.size())) {
++        auto verified = common_sampler_verify_block_device(sampler, ctx, indexes, draft, proposals);
++        if (!verified.empty()) {
++            return verified;
++        }
++    }
++
+     const bool use_preview = sampler->block_preview_enabled && llama_sampler_can_preview_distribution(sampler->chain);
+     common_sampler_ptr legacy_preview;
+     if (!use_preview) { legacy_preview.reset(common_sampler_clone(sampler)); }
+diff --git a/ggml/include/ggml-cuda-verify.h b/ggml/include/ggml-cuda-verify.h
+index 275203bb7ebb09d6efda6a3544e134915cba9fc5..cbca6b3647b6ed484bd20a0a4826030a2863fa40 100644
+--- a/ggml/include/ggml-cuda-verify.h
++++ b/ggml/include/ggml-cuda-verify.h
+@@ -17,6 +17,42 @@ struct ggml_backend_cuda_verify_api {
+     size_t (*bytes)(const void * state);
+ };
+ 
++enum {
++    GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX = 4,
++    GGML_CUDA_VERIFY_BLOCK_PROPOSAL_MAX = 10,
++    GGML_CUDA_VERIFY_BLOCK_TARGET_MAX = 128,
++};
++
++struct ggml_cuda_verify_proposal_row {
++    uint32_t size;
++    int32_t token;
++    int32_t ids[GGML_CUDA_VERIFY_BLOCK_PROPOSAL_MAX];
++    double probabilities[GGML_CUDA_VERIFY_BLOCK_PROPOSAL_MAX];
++};
++
++struct ggml_cuda_verify_block_input {
++    uint32_t draft_count;
++    struct ggml_cuda_verify_proposal_row proposals[GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX];
++    double draws[GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1];
++};
++
++struct ggml_cuda_verify_block_result {
++    int32_t kept; // -1 if the device rejects the input; host fallback remains available
++    int32_t correction;
++    int32_t draws_used;
++};
++
++// Separate extension of the verifier ABI. Uses the same backend-owned state
++// and budget, but consumes distributions instead of preselected token IDs.
++struct ggml_backend_cuda_verify_block_api {
++    uint32_t version;
++    bool (*enqueue)(void * state,
++                    const struct ggml_tensor * const * probabilities,
++                    const struct ggml_tensor * const * candidates,
++                    const struct ggml_cuda_verify_block_input * input,
++                    struct ggml_cuda_verify_block_result * result);
++};
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 787866f459ced87f48abed968f7c52dc339f180d..14e4b4205883146e0582db66ad10d4d46d8c1750 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7609,6 +7609,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_cuda_verify_api") == 0) {
+         return const_cast<ggml_backend_cuda_verify_api *>(&wildllama_cuda_verify::api);
+     }
++    if (strcmp(name, "ggml_backend_cuda_verify_block_api") == 0) {
++        return const_cast<ggml_backend_cuda_verify_block_api *>(&wildllama_cuda_verify::block_api);
++    }
+     if (strcmp(name, "ggml_backend_cuda_upload_api") == 0) {
+         return const_cast<ggml_backend_cuda_upload_api *>(&ggml_cuda_upload_api);
+     }
+diff --git a/ggml/src/ggml-cuda/verify.cuh b/ggml/src/ggml-cuda/verify.cuh
+index 63172ae8652c9770be640cec9a0cbc1c89a2ae3b..ead01cc59412ff02189bb7e963d0d23ab7ec580a 100644
+--- a/ggml/src/ggml-cuda/verify.cuh
++++ b/ggml/src/ggml-cuda/verify.cuh
+@@ -3,6 +3,7 @@
+ #include "common.cuh"
+ 
+ #include <array>
++#include <cmath>
+ #include <memory>
+ 
+ namespace wildllama_cuda_verify {
+@@ -89,6 +90,164 @@ inline bool enqueue(void * opaque, const ggml_tensor * const * selected,
+         cudaMemcpyAsync(result, saved->result, (count + 2) * sizeof(int32_t), cudaMemcpyDeviceToHost, ctx->stream()) == cudaSuccess;
+ }
+ 
++struct block_targets {
++    const float * probabilities[GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1];
++    const int32_t * candidates[GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1];
++    uint32_t counts[GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1];
++};
++
++__global__ void verify_block(block_targets targets, ggml_cuda_verify_block_input input,
++        uint32_t vocabulary, ggml_cuda_verify_block_result * result) {
++    constexpr uint32_t width = GGML_CUDA_VERIFY_BLOCK_TARGET_MAX;
++    __shared__ double matching_proposal[GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1][width];
++
++    const uint32_t row = threadIdx.y;
++    if (row <= input.draft_count) {
++        for (uint32_t k = threadIdx.x; k < targets.counts[row]; k += blockDim.x) {
++            double q = 0.0;
++            if (row < input.draft_count) {
++                const auto & proposal = input.proposals[row];
++                const int32_t id = targets.candidates[row][k];
++                for (uint32_t j = 0; j < proposal.size; ++j) {
++                    if (id == proposal.ids[j]) {
++                        q = proposal.probabilities[j];
++                        break;
++                    }
++                }
++            }
++            matching_proposal[row][k] = q;
++        }
++    }
++    __syncthreads();
++    if (threadIdx.x || threadIdx.y) {
++        return;
++    }
++
++    // Keep the CPU verifier's serial accumulation and explicit rounding at
++    // the p/q residual boundary. The source p can differ by softmax rounding.
++    *result = {-1, -1, 0};
++    ggml_cuda_verify_block_result decision{-1, -1, 0};
++    double prefix = 1.0;
++    for (uint32_t i = 0; i <= input.draft_count; ++i) {
++        const auto * p = targets.probabilities[i];
++        const auto * ids = targets.candidates[i];
++        const auto count = targets.counts[i];
++        double sum = 0.0;
++        for (uint32_t k = 0; k < count; ++k) {
++            if (!isfinite(p[k]) || p[k] < 0 || (p[k] > 0 && (ids[k] < 0 || uint32_t(ids[k]) >= vocabulary))) {
++                return;
++            }
++            sum += p[k];
++        }
++        if (fabs(sum - 1.0) > 1e-4) {
++            return;
++        }
++        const double retain = 1.0 - prefix;
++        double total = retain;
++        double target_token = 0.0;
++        double draft_token = 0.0;
++        int32_t last_positive = -1;
++        for (uint32_t k = 0; k < count; ++k) {
++            const double probability = __ddiv_rn(double(p[k]), sum);
++            const double q = matching_proposal[i][k];
++            if (i < input.draft_count && ids[k] == input.proposals[i].token) {
++                target_token = probability;
++                draft_token = q;
++            }
++            const double weight = __dsub_rn(__dmul_rn(prefix, probability), q);
++            if (weight > 0.0) {
++                total += weight;
++                last_positive = ids[k];
++            }
++        }
++        if (last_positive >= 0) {
++            const double draw = __dmul_rn(input.draws[decision.draws_used++], total);
++            if (draw >= retain) {
++                double cumulative = retain;
++                decision.kept = i;
++                decision.correction = last_positive;
++                for (uint32_t k = 0; k < count; ++k) {
++                    const double probability = __ddiv_rn(double(p[k]), sum);
++                    const double weight = __dsub_rn(__dmul_rn(prefix, probability), matching_proposal[i][k]);
++                    if (weight > 0.0) {
++                        cumulative += weight;
++                        if (draw < cumulative) {
++                            decision.correction = ids[k];
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++        if (i < input.draft_count) {
++            prefix = target_token > 0.0 ? fmin(1.0, __ddiv_rn(__dmul_rn(prefix, target_token), draft_token)) : 0.0;
++            if (prefix == 0.0) {
++                break;
++            }
++        }
++    }
++    *result = decision;
++}
++
++inline bool enqueue_block(void * opaque, const ggml_tensor * const * probabilities,
++        const ggml_tensor * const * candidates, const ggml_cuda_verify_block_input * input,
++        ggml_cuda_verify_block_result * result) {
++    auto * saved = static_cast<state *>(opaque);
++    if (!saved || !probabilities || !candidates || !input || !result ||
++            input->draft_count < 2 || input->draft_count > GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX) {
++        return false;
++    }
++    const auto buft = ggml_backend_get_default_buffer_type(saved->backend);
++    auto valid_tensor = [buft](const ggml_tensor * tensor, ggml_type type) {
++        return tensor && tensor->type == type && tensor->data && tensor->buffer &&
++            ggml_backend_buffer_get_type(tensor->buffer) == buft && ggml_is_contiguous(tensor) &&
++            ggml_nelements(tensor) > 0 && ggml_nelements(tensor) <= GGML_CUDA_VERIFY_BLOCK_TARGET_MAX;
++    };
++    block_targets targets{};
++    for (uint32_t i = 0; i <= input->draft_count; ++i) {
++        if (!valid_tensor(probabilities[i], GGML_TYPE_F32) || !valid_tensor(candidates[i], GGML_TYPE_I32) ||
++                ggml_nelements(probabilities[i]) != ggml_nelements(candidates[i]) ||
++                !std::isfinite(input->draws[i]) || input->draws[i] < 0.0 || input->draws[i] >= 1.0) {
++            return false;
++        }
++        if (i < input->draft_count) {
++            const auto & q = input->proposals[i];
++            if (!q.size || q.size > GGML_CUDA_VERIFY_BLOCK_PROPOSAL_MAX ||
++                    q.token < 0 || uint32_t(q.token) >= saved->vocabulary) {
++                return false;
++            }
++            double sum = 0.0;
++            bool found = false;
++            for (uint32_t j = 0; j < q.size; ++j) {
++                if (q.ids[j] < 0 || uint32_t(q.ids[j]) >= saved->vocabulary ||
++                        !std::isfinite(q.probabilities[j]) || q.probabilities[j] < 0.0) {
++                    return false;
++                }
++                for (uint32_t k = 0; k < j; ++k) {
++                    if (q.ids[k] == q.ids[j]) {
++                        return false;
++                    }
++                }
++                found |= q.ids[j] == q.token && q.probabilities[j] > 0.0;
++                sum += q.probabilities[j];
++            }
++            if (!found || std::abs(sum - 1.0) > 1e-4) {
++                return false;
++            }
++        }
++        targets.probabilities[i] = static_cast<const float *>(probabilities[i]->data);
++        targets.candidates[i] = static_cast<const int32_t *>(candidates[i]->data);
++        targets.counts[i] = ggml_nelements(probabilities[i]);
++    }
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(saved->backend->context);
++    ggml_cuda_set_device(ctx->device);
++    auto * device_result = reinterpret_cast<ggml_cuda_verify_block_result *>(saved->result);
++    verify_block<<<1, dim3(32, input->draft_count + 1), 0, ctx->stream()>>>(
++        targets, *input, saved->vocabulary, device_result);
++    return cudaGetLastError() == cudaSuccess &&
++        cudaMemcpyAsync(result, device_result, sizeof(*result), cudaMemcpyDeviceToHost, ctx->stream()) == cudaSuccess;
++}
++
+ inline void destroy(void * opaque) {
+     auto * saved = static_cast<state *>(opaque);
+     if (saved) { ggml_backend_synchronize(saved->backend); delete saved; }
+@@ -98,4 +257,5 @@ inline size_t bytes(const void * opaque) {
+     return saved && saved->buffer ? ggml_backend_buffer_get_size(saved->buffer) : 0;
+ }
+ inline const ggml_backend_cuda_verify_api api = {1, allocation_size, create, destroy, enqueue, bytes};
++inline const ggml_backend_cuda_verify_block_api block_api = {1, enqueue_block};
+ }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e7b400bb70197a2ce01673e446404ef21a17456d..f845836820120dfeb9bba502e47550384b05e3c3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1468,6 +1468,9 @@ enum llama_pooling_type llama_context::pooling_type() const {
+ 
+ float * llama_context::get_logits() {
+     output_reorder();
++    if (materialize_block_logits()) {
++        synchronize();
++    }
+ 
+     return logits.data;
+ }
+@@ -1503,6 +1506,9 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
+ 
+ float * llama_context::get_logits_ith(int32_t i) {
+     output_reorder();
++    if (materialize_block_logits()) {
++        synchronize();
++    }
+ 
+     try {
+         if (logits.data == nullptr) {
+@@ -1539,7 +1545,8 @@ llama_device_verification_stats llama_context::get_device_verification_stats() c
+     return result;
+ }
+ 
+-bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint32_t row_offset, uint32_t total_rows) {
++bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint32_t row_offset, uint32_t total_rows,
++        ggml_tensor * raw_logits) {
+     if (!device_verify_allowance || device_verify_draft_child || !device_verify_preflight_known ||
+             (!device_verify_conventional_kv && !device_verify_cooperative) ||
+             row_offset || !total_rows || total_rows > llama_device_verification_policy::max_rows ||
+@@ -1547,13 +1554,35 @@ bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint3
+             result->t_sampled_probs.size() != total_rows || result->t_candidates.size() != total_rows ||
+             !sampling.sampled.has_data() || !sampling.logits.has_data() || !sampling.probs.has_data() ||
+             !sampling.candidates.has_data() || sampling.samplers.size() != 1 ||
+-            !llama_sampler_backend_device_verify_ready(sampling.samplers.begin()->second) ||
+             moe_cache || model.ram_cache || model.n_devices() > 1 || cparams.training || cparams.pipeline_parallel) { return false; }
++    const auto * sampler = sampling.samplers.begin()->second;
++    const bool block = device_verify_block_enabled && llama_sampler_is_gpu_distribution(sampler);
++    if (block) {
++        if (total_rows < 3 || total_rows > GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1 ||
++                !logits.data || !raw_logits || raw_logits->type != GGML_TYPE_F32 ||
++                !ggml_is_contiguous(raw_logits) ||
++                ggml_nelements(raw_logits) != int64_t(total_rows) * model.vocab.n_tokens() ||
++                ggml_nelements(raw_logits) > int64_t(logits.size)) {
++            return false;
++        }
++    } else if (!llama_sampler_backend_device_verify_ready(sampler)) {
++        return false;
++    }
+     ggml_backend_t backend = nullptr;
+     uint64_t bytes = 0;
+     for (size_t row = 0; row < total_rows; ++row) {
+         auto * selected = result->t_sampled[row];
+-        if (!selected || selected->type != GGML_TYPE_I32 || ggml_nelements(selected) != 1) { return false; }
++        if (block) {
++            auto * p = result->t_sampled_probs[row];
++            auto * ids = result->t_candidates[row];
++            if (selected || !p || !ids || p->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
++                    ggml_nelements(p) != ggml_nelements(ids) ||
++                    ggml_nelements(p) < 1 || ggml_nelements(p) > GGML_CUDA_VERIFY_BLOCK_TARGET_MAX) {
++                return false;
++            }
++        } else if (!selected || selected->type != GGML_TYPE_I32 || ggml_nelements(selected) != 1) {
++            return false;
++        }
+         for (auto * tensor : { selected, result->t_sampled_logits[row], result->t_sampled_probs[row], result->t_candidates[row] }) {
+             if (!tensor) { continue; }
+             auto * current = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+@@ -1572,6 +1601,16 @@ bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint3
+     }
+     if (!device_verify_api || device_verify_api->version != 1 ||
+             device_verify_api->allocation_size(model.vocab.n_tokens()) > device_verify_allowance) { return false; }
++    if (block) {
++        if (!device_verify_block_api) {
++            device_verify_block_api = static_cast<const ggml_backend_cuda_verify_block_api *>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_verify_block_api"));
++        }
++        if (!device_verify_block_api || device_verify_block_api->version != 1 ||
++                ggml_backend_sched_get_tensor_backend(sched.get(), raw_logits) != backend) {
++            return false;
++        }
++    }
+     if (!device_verify_admission.eligible()) { return false; }
+     try {
+         if (!device_verify_state) {
+@@ -1591,6 +1630,10 @@ bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint3
+             if (result->t_sampled_probs[row]) { sampling.probs_count[row] = ggml_nelements(result->t_sampled_probs[row]); }
+             if (result->t_candidates[row]) { sampling.candidates_count[row] = ggml_nelements(result->t_candidates[row]); }
+         }
++        if (block) {
++            deferred_block_logits = raw_logits;
++            bytes += ggml_nbytes(raw_logits);
++        }
+         device_verify_stats.deferred_bytes += bytes;
+         device_verify_ordered = true;
+         return true;
+@@ -1599,6 +1642,17 @@ bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint3
+     }
+ }
+ 
++bool llama_context::materialize_block_logits() {
++    auto * tensor = deferred_block_logits;
++    if (!tensor) {
++        return false;
++    }
++    deferred_block_logits = nullptr;
++    ggml_backend_tensor_get_async(device_verify_backend, tensor, logits.data, 0, ggml_nbytes(tensor));
++    device_verify_stats.materialized_bytes += ggml_nbytes(tensor);
++    return true;
++}
++
+ void llama_context::materialize_sampler_row(size_t row, bool fence) {
+     if (row >= deferred_sampler_rows.size() || deferred_sampler_rows[row].materialized) { return; }
+     auto & saved = deferred_sampler_rows[row];
+@@ -1617,7 +1671,7 @@ void llama_context::materialize_sampler_row(size_t row, bool fence) {
+ }
+ 
+ void llama_context::materialize_sampler_outputs(bool always_fence) {
+-    bool copied = false;
++    bool copied = materialize_block_logits();
+     for (size_t row = 0; row < deferred_sampler_rows.size(); ++row) {
+         copied |= !deferred_sampler_rows[row].materialized;
+         materialize_sampler_row(row, false);
+@@ -1719,6 +1773,36 @@ bool llama_context::verify_draft_device(const std::vector<int> & indexes, const
+     return true;
+ }
+ 
++bool llama_context::verify_draft_block_device(const std::vector<int> & indexes,
++        const ggml_cuda_verify_block_input & input, ggml_cuda_verify_block_result & result) {
++    if (!device_verify_block_enabled || !device_verify_block_api || !device_verify_state ||
++            !device_verify_ordered || !output_swaps.empty() || indexes.size() != input.draft_count + 1 ||
++            indexes.size() != deferred_sampler_rows.size() || indexes.size() > GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1) {
++        return false;
++    }
++    std::array<const ggml_tensor *, GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1> p{};
++    std::array<const ggml_tensor *, GGML_CUDA_VERIFY_BLOCK_DRAFT_MAX + 1> ids{};
++    for (size_t i = 0; i < indexes.size(); ++i) {
++        // The stateless probabilities must be from the exact rows of this block.
++        if (output_resolve_row(indexes[i]) != int64_t(i) || deferred_sampler_rows[i].selected) {
++            return false;
++        }
++        p[i] = deferred_sampler_rows[i].probabilities;
++        ids[i] = deferred_sampler_rows[i].candidates;
++    }
++    result = {-1, -1, 0};
++    const bool enqueued = device_verify_block_api->enqueue(device_verify_state, p.data(), ids.data(), &input, &result);
++    synchronize();
++    if (!enqueued || result.kept < 0 || uint32_t(result.kept) > input.draft_count ||
++            result.correction < 0 || result.correction >= model.vocab.n_tokens() ||
++            result.draws_used < 1 || size_t(result.draws_used) > indexes.size()) {
++        ++device_verify_stats.fallbacks;
++        return false;
++    }
++    ++device_verify_stats.verified_batches;
++    return true;
++}
++
+ float * llama_context::get_embeddings_ith(int32_t i) {
+     output_reorder();
+ 
+@@ -2767,6 +2851,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
+ 
+     // reserve output buffer
+     deferred_sampler_rows.clear(); device_verify_ordered = false;
++    deferred_block_logits = nullptr;
+     if (output_reserve(n_tokens) < n_tokens) {
+         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
+         return -2;
+@@ -3159,6 +3244,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+     // reserve output buffer
+     deferred_sampler_rows.clear(); device_verify_ordered = false;
++    deferred_block_logits = nullptr;
+     if (output_reserve(n_outputs_all) < n_outputs_all) {
+         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+         return -2;
+@@ -3239,8 +3325,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             t_embd = res->get_embd_pooled();
+         }
+ 
+-        // extract logits
+-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
++        const bool deferred_sampling = has_samplers && ubatch.n_tokens == batch_inp.tokens.size() &&
++            defer_sampler_outputs(res, n_outputs_prev, n_outputs_all, t_logits);
++
++        // extract logits; a verified device block copies these only if a host
++        // consumer or a fallback asks for them before the next decode.
++        if (!deferred_block_logits && logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+             GGML_ASSERT(backend_res != nullptr);
+             GGML_ASSERT(logits.data != nullptr);
+@@ -3357,7 +3447,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             const auto stride = n_vocab;
+ 
+             // async copy the sampling data from the backend to the host
+-            if (ubatch.n_tokens != batch_inp.tokens.size() || !defer_sampler_outputs(res, n_outputs_prev, n_outputs_all)) {
++            if (!deferred_sampling) {
+                 copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+                 copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+                 copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+@@ -6456,6 +6546,11 @@ bool llama_verify_draft_device(llama_context * ctx, const std::vector<int> & ind
+     return ctx && ctx->verify_draft_device(indexes, draft, accepted);
+ }
+ 
++bool llama_verify_draft_block_device(llama_context * ctx, const std::vector<int> & indexes,
++        const ggml_cuda_verify_block_input & input, ggml_cuda_verify_block_result & result) {
++    return ctx && ctx->verify_draft_block_device(indexes, input, result);
++}
++
+ llama_device_verification_stats llama_get_device_verification_stats(llama_context * ctx) {
+     return ctx ? ctx->get_device_verification_stats() : llama_device_verification_stats{};
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0456f79b5c5c8416bf3603551f0467bf5ba27514..59c7a4e9f1bca436c40446ba5c9815e54b536237 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -200,6 +200,8 @@ struct llama_context {
+     void synchronize_sampler_outputs();
+     bool verify_draft_device(const std::vector<int> & indexes, const std::vector<llama_token> & draft,
+             std::vector<llama_token> & accepted);
++    bool verify_draft_block_device(const std::vector<int> & indexes,
++            const ggml_cuda_verify_block_input & input, ggml_cuda_verify_block_result & result);
+     llama_device_verification_stats get_device_verification_stats() const;
+     bool link_device_verification_resources(llama_context * draft);
+     llama_token   get_sampled_token_ith(int32_t idx);
+@@ -491,9 +493,11 @@ private:
+         bool materialized = false;
+     };
+     const ggml_backend_cuda_verify_api * device_verify_api = nullptr;
++    const ggml_backend_cuda_verify_block_api * device_verify_block_api = nullptr;
+     void * device_verify_state = nullptr;
+     ggml_backend_t device_verify_backend = nullptr;
+     std::vector<deferred_sampler_row> deferred_sampler_rows;
++    ggml_tensor * deferred_block_logits = nullptr;
+     bool device_verify_ordered = false;
+     bool device_verify_preflight_known = false;
+     bool device_verify_cooperative = false;
+@@ -503,9 +507,13 @@ private:
+     llama_device_verification_stats device_verify_stats;
+     llama_device_verification_admission device_verify_admission;
+     const size_t device_verify_allowance = llama_device_verification_policy::budget(std::getenv("WILDLLAMA_VERIFY_DEVICE_MIB"));
++    const bool device_verify_block_enabled = llama_device_verification_policy::block_enabled(
++        std::getenv("WILDLLAMA_MTP_GPU_VERIFY"));
+     const bool device_verify_conventional_kv = llama_device_verification_policy::conventional_kv(
+         std::getenv("WILDLLAMA_KV_CACHE_INITIAL_TOKENS"));
+-    bool defer_sampler_outputs(const llm_graph_result * result, uint32_t row_offset, uint32_t total_rows);
++    bool defer_sampler_outputs(const llm_graph_result * result, uint32_t row_offset, uint32_t total_rows,
++            ggml_tensor * raw_logits);
++    bool materialize_block_logits();
+     void materialize_sampler_row(size_t row, bool fence = true);
+     void materialize_sampler_outputs(bool always_fence = false);
+     void release_device_verifier_local(bool preflight = false);
+diff --git a/src/llama-device-verification.h b/src/llama-device-verification.h
+index 9d2f88d37306b468ccd1cdc954aabfbf0345e328..bb131eb354b2352046a92d518d6b93d91ffad9f5 100644
+--- a/src/llama-device-verification.h
++++ b/src/llama-device-verification.h
+@@ -4,6 +4,9 @@
+ 
+ struct llama_device_verification_policy {
+     static constexpr uint32_t max_rows = 513;
++    static bool block_enabled(const char * value) {
++        return value && value[0] == '1' && value[1] == '\0';
++    }
+     static bool conventional_kv(const char * initial_tokens) {
+         return !initial_tokens || !*initial_tokens || (initial_tokens[0] == '0' && initial_tokens[1] == '\0');
+     }
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 21dacce636c58d135c884ab2fe7be3e2f395665e..382ddab88faceea27b219c4c6365c428e6b9ddf5 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -234,8 +234,12 @@ struct llama_device_verification_stats {
+     uint64_t verified_batches = 0, deferred_bytes = 0, materialized_bytes = 0, fallbacks = 0;
+     uint64_t allocations = 0, preflight_releases = 0, mandatory_releases = 0;
+ };
++struct ggml_cuda_verify_block_input;
++struct ggml_cuda_verify_block_result;
+ LLAMA_API bool llama_verify_draft_device(struct llama_context * ctx, const std::vector<int> & indexes,
+         const std::vector<llama_token> & draft, std::vector<llama_token> & accepted);
++LLAMA_API bool llama_verify_draft_block_device(struct llama_context * ctx, const std::vector<int> & indexes,
++        const ggml_cuda_verify_block_input & input, ggml_cuda_verify_block_result & result);
+ LLAMA_API llama_device_verification_stats llama_get_device_verification_stats(struct llama_context * ctx);
+ // Call only for nonconcurrent target/draft operations on the same inference worker.
+ // A null draft explicitly declares a standalone cooperative target.
+diff --git a/tests/test-device-verification.cpp b/tests/test-device-verification.cpp
+index c36c1040656bda6c401b62e9c2edb751d3e9a271..354916d365744f9b5d94384666d7237968fc5677 100644
+--- a/tests/test-device-verification.cpp
++++ b/tests/test-device-verification.cpp
+@@ -29,6 +29,16 @@ static void initial_kv(const char * value) {
+ #endif
+ }
+ 
++static void block_verification_env(bool device) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_MTP_GPU_VERIFY", device ? "1" : "0") == 0, "cannot set device block mode");
++    require(_putenv_s("WILDLLAMA_MTP_GPU_DISTRIBUTION", "1") == 0, "cannot set GPU distribution preview");
++#else
++    require(setenv("WILDLLAMA_MTP_GPU_VERIFY", device ? "1" : "0", 1) == 0, "cannot set device block mode");
++    require(setenv("WILDLLAMA_MTP_GPU_DISTRIBUTION", "1", 1) == 0, "cannot set GPU distribution preview");
++#endif
++}
++
+ static void policy() {
+     using policy = llama_device_verification_policy;
+     using allocation = llama_memory_allocation;
+@@ -340,6 +350,160 @@ static void stochastic_pipeline() {
+     }
+ }
+ 
++static void probabilistic_operators(ggml_backend_t gpu, const ggml_backend_cuda_verify_api * api) {
++    auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
++    const auto * block_api = static_cast<const ggml_backend_cuda_verify_block_api *>(
++        ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_verify_block_api"));
++    require(block_api && block_api->version == 1, "probability verifier extension missing");
++    ggml_context_ptr ctx(ggml_init({16 * ggml_tensor_overhead(), nullptr, true}));
++    std::array<ggml_tensor *, 3> p{}, ids{};
++    for (size_t i = 0; i < p.size(); ++i) {
++        p[i] = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 3);
++        ids[i] = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 3);
++    }
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), gpu));
++    require(bool(buffer), "cannot allocate tiny probability rows");
++    const std::array<int32_t, 3> candidates{3, 4, 5};
++    for (auto * row : ids) {
++        ggml_backend_tensor_set(row, candidates.data(), 0, sizeof(candidates));
++    }
++    std::array<uint8_t, 64> eog{};
++    const auto required = api->allocation_size(eog.size());
++    std::unique_ptr<void, void (*)(void *)> state(api->create(gpu, required, eog.size(), eog.data()), api->destroy);
++    require(bool(state) && api->bytes(state.get()) <= required, "block verifier needed extra scratch");
++
++    ggml_cuda_verify_block_input input{};
++    input.draft_count = 2;
++    input.proposals[0] = {2, 3, {3, 4}, {.6, .4}};
++    input.proposals[1] = {2, 4, {4, 5}, {.5, .5}};
++    const auto set_p = [&](size_t row, std::array<float, 3> values) {
++        ggml_backend_tensor_set(p[row], values.data(), 0, sizeof(values));
++    };
++    const auto check = [&](int kept, int correction, int draws_used) {
++        ggml_cuda_verify_block_result result{};
++        require(block_api->enqueue(state.get(), p.data(), ids.data(), &input, &result), "probability launch failed");
++        ggml_backend_synchronize(gpu);
++        require(result.kept == kept && result.correction == correction && result.draws_used == draws_used,
++                "unexpected block correction or entropy consumption");
++    };
++    set_p(0, {.3f, .7f, 0.f});
++    set_p(1, {.5f, .5f, 0.f});
++    set_p(2, {0.f, 0.f, 1.f});
++    input.draws[0] = .25;
++    input.draws[1] = .25;
++    input.draws[2] = .25;
++    check(0, 4, 3); // retain the first correction
++    input.draws[1] = .95;
++    check(1, 3, 3); // second correction replaces it
++    input.draws[2] = .95;
++    check(2, 5, 3); // bonus draw replaces both corrections
++    set_p(0, {0.f, 1.f, 0.f});
++    check(0, 4, 1); // zero prefix avoids later draws
++    set_p(0, {0.f, .5f, 0.f});
++    check(-1, -1, 0); // malformed target mass
++    set_p(0, {.5f, .5f, 0.f});
++    set_p(1, {0.f, .5f, .5f});
++    input.proposals[0].probabilities[0] = .5;
++    input.proposals[0].probabilities[1] = .5;
++    check(2, 5, 1); // identical p and q only need a bonus draw
++    input.proposals[0].ids[1] = input.proposals[0].ids[0];
++    ggml_cuda_verify_block_result invalid{};
++    require(!block_api->enqueue(state.get(), p.data(), ids.data(), &input, &invalid),
++            "duplicate proposal token bypassed validation");
++    std::puts("PASS: CUDA probability verifier corrections, accepted prefix, entropy and invalid distributions");
++}
++
++static void probabilistic_pipeline() {
++    initial_kv("0");
++    budget("1");
++    auto model = tiny_model(true, 32);
++    common_params_sampling parameters;
++    parameters.samplers = {COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE};
++    parameters.temp = .8f;
++    parameters.top_k = 16;
++    parameters.seed = 149;
++    parameters.n_probs = 0;
++    parameters.backend_sampling = false;
++    parameters.reasoning_control = true;
++    parameters.reasoning_budget_tokens = -1;
++    parameters.reasoning_budget_start = {7};
++    parameters.reasoning_budget_end = {{8}};
++    parameters.reasoning_budget_forced = {8};
++    auto config = llama_context_default_params();
++    config.n_ctx = 128;
++    config.n_batch = config.n_ubatch = 64;
++    config.n_seq_max = 1;
++    config.n_threads = config.n_threads_batch = 1;
++    config.n_outputs_max = config.n_outputs_max_per_seq = 4;
++    config.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++
++    // Compare identical CUDA probability preparation with verification on the
++    // host and device. Keep each sampler alive across rounds to check RNG commit.
++    std::array<common_sampler_ptr, 2> samplers;
++    std::array<llama_context_ptr, 2> contexts;
++    for (size_t i = 0; i < contexts.size(); ++i) {
++        block_verification_env(i == 1);
++        samplers[i].reset(common_sampler_init(model.get(), parameters));
++        contexts[i].reset(llama_init_from_model(model.get(), config));
++        require(bool(contexts[i]) && bool(samplers[i]), "probability block fixture setup failed");
++        auto * distribution = common_sampler_get_thinking_prefilter(samplers[i].get());
++        require(llama_sampler_is_gpu_distribution(distribution) &&
++                llama_set_sampler(contexts[i].get(), 0, distribution), "GPU distribution attachment failed");
++        common_sampler_accept(samplers[i].get(), 7, true);
++    }
++    const llama_tokens draft{3, 4};
++    const std::vector<int> indexes{0, 1, 2};
++    const std::vector<std::vector<llama_token_data>> q{{{3, 0.f, .7f}, {5, 0.f, .3f}},
++                                                     {{4, 0.f, .8f}, {6, 0.f, .2f}}};
++    size_t raw_bytes = 0;
++    const int vocabulary = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++    constexpr int verification_rounds = 12;
++    for (int round = 0; round <= verification_rounds; ++round) {
++        const bool forced = round == verification_rounds;
++        if (forced) {
++            for (auto & sampler : samplers) {
++                common_sampler_accept(sampler.get(), 7, true);
++                require(common_sampler_reasoning_budget_force(sampler.get()), "could not force unlimited reasoning budget");
++            }
++        }
++        for (auto & context : contexts) {
++            common_batch batch(context.get());
++            batch.add(7, round * 3, 0, true);
++            batch.add(draft[0], round * 3 + 1, 0, true);
++            batch.add(draft[1], round * 3 + 2, 0, true);
++            require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
++                    "probability block fixture decode failed");
++        }
++        const auto reference = common_sampler_sample_and_accept_n_rejection(
++            samplers[0].get(), contexts[0].get(), indexes, draft, q, false, true);
++        const auto actual = common_sampler_sample_and_accept_n_rejection(
++            samplers[1].get(), contexts[1].get(), indexes, draft, q, false, true);
++        require(actual == reference && !actual.empty(), "CUDA block changed correction or subsequent RNG");
++        const auto stats = llama_get_device_verification_stats(contexts[1].get());
++        require(stats.verified_batches == uint64_t(std::min(round + 1, verification_rounds)) && stats.deferred_bytes > 0 &&
++                stats.scratch_bytes > 0 && stats.scratch_bytes <= stats.allowance_bytes,
++                "probabilistic block never reached the bounded device path");
++        if (forced) {
++            require(actual == llama_tokens{8} && stats.materialized_bytes > raw_bytes,
++                    "manual reasoning stop bypassed the forced CPU path");
++        } else {
++            require(stats.materialized_bytes == raw_bytes, "GPU verification copied deferred rows to the host");
++        }
++        if (round == 0) {
++            const float * expected = llama_get_logits_ith(contexts[0].get(), 0);
++            const float * materialized = llama_get_logits_ith(contexts[1].get(), 0);
++            require(expected && materialized &&
++                    std::memcmp(expected, materialized, vocabulary * sizeof(float)) == 0,
++                    "lazy raw logits getter changed the original logits");
++            raw_bytes = indexes.size() * vocabulary * sizeof(float);
++        }
++    }
++    const auto stats = llama_get_device_verification_stats(contexts[1].get());
++    std::printf("PROBABILISTIC_BLOCK hits=%llu scratch=%zu deferred=%llu materialized=%llu\n",
++        (unsigned long long) stats.verified_batches, stats.scratch_bytes,
++        (unsigned long long) stats.deferred_bytes, (unsigned long long) stats.materialized_bytes);
++}
++
+ static void pipeline() {
+     initial_kv("0");
+     auto model = tiny_model(true);
+@@ -545,7 +709,8 @@ int main(int argc, char ** argv) {
+         policy();
+         const bool benchmark=argc>1 && std::strcmp(argv[1],"--bench")==0;
+         const bool growth=argc>1 && std::strcmp(argv[1],"--growth")==0;
+-        if (!benchmark && !growth && (argc == 1 || std::strcmp(argv[1], "--cuda") != 0)) { return 0; }
++        const bool block=argc>1 && std::strcmp(argv[1],"--block")==0;
++        if (!benchmark && !growth && !block && (argc == 1 || std::strcmp(argv[1], "--cuda") != 0)) { return 0; }
+         ggml_backend_load_all(); llama_backend_init();
+         auto * registry = ggml_backend_reg_by_name("CUDA");
+         if (!registry || !ggml_backend_reg_dev_count(registry)) { std::puts("SKIP: CUDA required"); return 77; }
+@@ -558,9 +723,11 @@ int main(int argc, char ** argv) {
+         {
+             ggml_backend_ptr gpu(ggml_backend_dev_init(device,nullptr)); require(bool(gpu),"CUDA backend missing");
+             if (benchmark) { driver_benchmark(gpu.get(),api); }
+-            else if (!growth) { operators(gpu.get(),api); }
++            else if (block) { probabilistic_operators(gpu.get(),api); }
++            else if (!growth && !block) { operators(gpu.get(),api); }
+         }
+         if (growth) { growth_pipeline(); }
++        else if (block) { probabilistic_pipeline(); }
+         else if (!benchmark) { pipeline(); stochastic_pipeline(); }
+         ggml_backend_cuda_memory_stats memory{};
+         require(get_stats(device,&memory) && memory.managed_peak_bytes <= memory.limit_bytes,"test exceeded managed quota");

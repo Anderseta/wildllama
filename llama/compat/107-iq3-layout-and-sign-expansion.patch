@@ -1,0 +1,440 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index f43fba6..aa46d11 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -39,6 +39,11 @@ static constexpr unsigned mmvq_iq3_column_reuse_geometry(int64_t columns, int64_
+     return mmvq_iq3_row_pair_geometry(columns, rows);
+ }
+ 
++// The up and down projections did not give a repeatable one-token win.
++static constexpr bool mmvq_iq3_fast_sign_geometry(int64_t columns, int64_t rows, int64_t tokens) {
++    return tokens == 1 && mmvq_iq3_row_pair_geometry(columns, rows) && !(columns == 5120 && rows == 17408);
++}
++
+ static constexpr bool mmvq_iq3_column_reuse_setting(const char * value) {
+     return value && value[0] == '1' && value[1] == '\0';
+ }
+@@ -741,8 +746,15 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
+     return 1;
+ }
+ 
++enum class mmvq_iq3_layout {
++    canonical,
++    packed,
++    fast_sign,
++    packed_reuse,
++};
++
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+-        bool iq3_row_tile = false, bool iq3_column_reuse = false>
++        bool iq3_row_tile = false, bool iq3_column_reuse = false, mmvq_iq3_layout layout = mmvq_iq3_layout::canonical>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(),
+         iq3_column_reuse && ncols_dst == 2 ? (iq3_row_tile ? 4 : 5) : 1)
+ static __global__ void mul_mat_vec_q(
+@@ -766,6 +778,9 @@ static __global__ void mul_mat_vec_q(
+         "IQ3 row tiling requires the unchanged plain one-to-three-token reduction");
+     static_assert(!iq3_column_reuse || (type == GGML_TYPE_IQ3_S && (ncols_dst == 2 || ncols_dst == 3) && !has_fusion && !small_k && !halve_iters),
+         "IQ3 column reuse requires a plain two- or three-token projection");
++    static_assert(layout == mmvq_iq3_layout::canonical ||
++        (type == GGML_TYPE_IQ3_S && ncols_dst >= 1 && ncols_dst <= 3 && !has_fusion && !small_k && !halve_iters),
++        "IQ3 layout experiments require a plain short projection");
+     constexpr int rows_per_cuda_block = iq3_row_tile ? (ncols_dst == 1 ? 2 : 4) : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+@@ -901,7 +916,31 @@ static __global__ void mul_mat_vec_q(
+             }
+ #endif
+ 
+-            if constexpr (iq3_column_reuse) {
++            if constexpr (layout != mmvq_iq3_layout::canonical) {
++#pragma unroll
++                for (int i = 0; i < rows_per_cuda_block; ++i) {
++                    if constexpr (check_tail) { if (uint32_t(row0 + i) >= nrows_x) { continue; } }
++                    const int row_offset = kbx_offset + i * stride_row_x;
++                    if constexpr (layout == mmvq_iq3_layout::packed_reuse) {
++                        const auto * row = static_cast<const block_iq3_s *>(vx) + row_offset;
++                        float dots[ncols_dst];
++                        vec_dot_iq3_s_q8_1_layout<ncols_dst, true, true>(row, y + kby, stride_col_y, kqs, dots, kbx);
++#pragma unroll
++                        for (int j = 0; j < ncols_dst; ++j) {
++                            tmp[j][i] += dots[j];
++                        }
++                    } else {
++#pragma unroll
++                        for (int j = 0; j < ncols_dst; ++j) {
++                            constexpr bool packed = layout == mmvq_iq3_layout::packed;
++                            const auto * weight = static_cast<const block_iq3_s *>(vx) + row_offset + (packed ? 0 : kbx);
++                            float dot[1];
++                            vec_dot_iq3_s_q8_1_layout<1, packed, !packed>(weight, y + j * stride_col_y + kby, 0, kqs, dot, kbx);
++                            tmp[j][i] += dot[0];
++                        }
++                    }
++                }
++            } else if constexpr (iq3_column_reuse) {
+ #pragma unroll
+                 for (int i = 0; i < rows_per_cuda_block; ++i) {
+                     if constexpr (check_tail) { if (uint32_t(row0 + i) >= nrows_x) { continue; } }
+@@ -1865,27 +1904,38 @@ void ggml_cuda_mul_mat_vec_q(
+             const int rows_per_block = row_tile && ne11 > 1 ? 4 : 2;
+             const dim3 grid((ne01 + rows_per_block - 1)/rows_per_block, 1, 1), block(WARP_SIZE, 4, 1);
+             const ggml_cuda_kernel_launch_params parameters = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+-            const auto launch = [&](auto token_tag, auto tile_tag, auto reuse_tag) {
++            const auto launch = [&](auto token_tag, auto tile_tag, auto reuse_tag, auto layout_tag) {
+                 constexpr int tokens = decltype(token_tag)::value;
+                 constexpr bool tiled = decltype(tile_tag)::value;
+                 constexpr bool reuse = decltype(reuse_tag)::value;
+-                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,tokens,false,false,false,tiled,reuse>, parameters,
++                constexpr auto layout = decltype(layout_tag)::value;
++                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,tokens,false,false,false,tiled,reuse,layout>, parameters,
+                     src0->data, quantized, nullptr, ggml_cuda_mm_fusion_args_device{}, dst_d,
+                     uint32_t(ne00), init_fastdiv_values(1), uint32_t(s01), uint32_t(s11), uint32_t(s1),
+                     init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+                     init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), 0u, uint32_t(ne01));
+             };
++            using canonical = std::integral_constant<mmvq_iq3_layout, mmvq_iq3_layout::canonical>;
++            using fast_signs = std::integral_constant<mmvq_iq3_layout, mmvq_iq3_layout::fast_sign>;
++            static const bool fast_sign_enabled = mmvq_iq3_column_reuse_setting(std::getenv("WILDLLAMA_CUDA_IQ3_FAST_SIGN"));
++            const bool fast_sign = fast_sign_enabled && mmvq_iq3_fast_sign_geometry(ne00, ne01, ne11);
+             const auto launch_batch = [&](auto token_tag) {
+                 if (column_reuse && row_tile) {
+-                    launch(token_tag, std::true_type{}, std::true_type{});
++                    launch(token_tag, std::true_type{}, std::true_type{}, canonical{});
+                 } else if (column_reuse) {
+-                    launch(token_tag, std::false_type{}, std::true_type{});
++                    launch(token_tag, std::false_type{}, std::true_type{}, canonical{});
+                 } else {
+-                    launch(token_tag, std::true_type{}, std::false_type{});
++                    launch(token_tag, std::true_type{}, std::false_type{}, canonical{});
+                 }
+             };
+             switch (ne11) {
+-                case 1: launch(std::integral_constant<int, 1>{}, std::true_type{}, std::false_type{}); break;
++                case 1:
++                    if (fast_sign) {
++                        launch(std::integral_constant<int, 1>{}, std::true_type{}, std::false_type{}, fast_signs{});
++                    } else {
++                        launch(std::integral_constant<int, 1>{}, std::true_type{}, std::false_type{}, canonical{});
++                    }
++                    break;
+                 case 2: launch_batch(std::integral_constant<int, 2>{}); break;
+                 case 3: launch_batch(std::integral_constant<int, 3>{}); break;
+             }
+@@ -1897,8 +1947,8 @@ void ggml_cuda_mul_mat_vec_q(
+                 static std::atomic<unsigned> reported{0};
+                 const unsigned bit = tile_geometry << (7*(ne11-1));
+                 if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+-                    std::fprintf(stderr, "cuda_iq3_row_pair: launched k=%lld rows=%lld tokens=%lld threads=128 rows_per_cta=%d\n",
+-                        (long long) ne00, (long long) ne01, (long long) ne11, rows_per_block);
++                    std::fprintf(stderr, "cuda_iq3_row_pair: launched k=%lld rows=%lld tokens=%lld threads=128 rows_per_cta=%d fast_sign=%d\n",
++                        (long long) ne00, (long long) ne01, (long long) ne11, rows_per_block, int(fast_sign));
+                 }
+             }
+             static const bool reuse_trace = mmvq_iq3_column_reuse_setting(std::getenv("WILDLLAMA_CUDA_IQ3_COLUMN_REUSE_TRACE"));
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 58df33d..45f1453 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1315,6 +1315,88 @@ static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_columns(
+     }
+ }
+ 
++// One warp reads eight 32-element fragments from each of four original blocks.
++struct alignas(8) iq3_s_warp_block {
++    int2 qs[4][8];
++    int32_t signs[4][8];
++    uint8_t qh[4][8];
++    uint8_t scales[4][4];
++    half d[4];
++};
++static_assert(sizeof(iq3_s_warp_block) == 4 * sizeof(block_iq3_s), "IQ3 repack must preserve byte size");
++
++static constexpr __host__ __device__ uint32_t iq3_s_expand_signs(uint32_t nibble) {
++    // Move bits 0,1,2,3 to bits 0,8,16,24, then broadcast each into its byte.
++    return ((nibble * 0x00204081u) & 0x01010101u) * 255u;
++}
++
++template<int columns, bool repacked = false, bool fast_sign = false>
++static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_layout(
++    const block_iq3_s * __restrict__ bq3, const block_q8_1 * __restrict__ bq8_1,
++    uint32_t stride_col_y, int iqs, float (&dots)[columns], int block_index = 0) {
++
++    const int group = iqs / 2;
++    int2 qs_packed;
++    int qh;
++    int signs_packed_32;
++    half weight_scale;
++    int scale;
++    if constexpr (repacked) {
++        const auto & tile = reinterpret_cast<const iq3_s_warp_block *>(bq3)[block_index / 4];
++        const int slot = block_index % 4;
++        qs_packed = tile.qs[slot][group];
++        signs_packed_32 = tile.signs[slot][group];
++        qh = tile.qh[slot][group];
++        weight_scale = tile.d[slot];
++        scale = tile.scales[slot][group / 2];
++    } else {
++        qs_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
++        qh = bq3->qh[group];
++        signs_packed_32 = get_int_b2(bq3->signs, group);
++        weight_scale = bq3->d;
++        scale = bq3->scales[group / 2];
++    }
++    const auto * qs = reinterpret_cast<const uint8_t *>(&qs_packed);
++    const auto * signs_packed_8 = reinterpret_cast<const uint8_t *>(&signs_packed_32);
++    int sums[columns] = {};
++#pragma unroll
++    for (int l0 = 0; l0 < 8; l0 += 2) {
++        const int2 grid_pos = make_int2(
++            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
++            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
++
++        int signs0, signs1;
++        if constexpr (fast_sign) {
++            const uint32_t sign = signs_packed_8[l0 / 2];
++            signs0 = iq3_s_expand_signs(sign & 0xfu);
++            signs1 = iq3_s_expand_signs(sign >> 4);
++        } else {
++            signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
++            signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
++        }
++
++        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++
++#pragma unroll
++        for (int col = 0; col < columns; ++col) {
++            const block_q8_1 & input = bq8_1[col*stride_col_y + iqs/2];
++            const int u0 = get_int_b4(input.qs, l0 + 0);
++            const int u1 = get_int_b4(input.qs, l0 + 1);
++
++            sums[col] = ggml_cuda_dp4a(grid_l, u0, sums[col]);
++            sums[col] = ggml_cuda_dp4a(grid_h, u1, sums[col]);
++        }
++    }
++
++    scale = 1 + 2 * ((scale >> ((group & 1) * 4)) & 0x0f);
++#pragma unroll
++    for (int col = 0; col < columns; ++col) {
++        const float d = __half2float(weight_scale) * __low2float(bq8_1[col*stride_col_y + iqs/2].ds);
++        dots[col] = d * (sums[col] * scale);
++    }
++}
++
+ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+     float dot[1];
+diff --git a/tests/test-cuda-iq3-row-pair.cu b/tests/test-cuda-iq3-row-pair.cu
+index 763a7d1..ed08f8f 100644
+--- a/tests/test-cuda-iq3-row-pair.cu
++++ b/tests/test-cuda-iq3-row-pair.cu
+@@ -15,6 +15,10 @@
+ 
+ // Host launch policy uses this same pure helper. In particular, the measured
+ // slower down projection and unmeasured neighboring shapes must stay legacy.
++static_assert(mmvq_iq3_fast_sign_geometry(5120, 5120, 1));
++static_assert(!mmvq_iq3_fast_sign_geometry(5120, 17408, 1));
++static_assert(!mmvq_iq3_fast_sign_geometry(17408, 5120, 1));
++static_assert(!mmvq_iq3_fast_sign_geometry(5120, 5120, 2));
+ static_assert(mmvq_iq3_row_pair_geometry(5120,5120), "measured square geometry excluded");
+ static_assert(mmvq_iq3_row_pair_geometry(5120,17408), "measured up geometry excluded");
+ static_assert(mmvq_iq3_row_pair_geometry(5120,10240), "measured recurrent QKV excluded");
+@@ -59,7 +63,9 @@ static_assert(!mmvq_iq3_column_reuse_setting("0"), "column reuse disable ignored
+ static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
+ template<class T> struct device_buffer {
+     T * data = nullptr;
+-    explicit device_buffer(size_t count) { CUDA_CHECK(cudaMalloc((void **)&data,count*sizeof(T))); }
++    explicit device_buffer(size_t count) {
++        if (count) { CUDA_CHECK(cudaMalloc((void **)&data,count*sizeof(T))); }
++    }
+     ~device_buffer() { if (data) { cudaFree(data); } }
+     device_buffer(const device_buffer &) = delete;
+     device_buffer & operator=(const device_buffer &) = delete;
+@@ -91,14 +97,45 @@ static std::vector<block_iq3_s> read_weights(const char * path, const gguf_conte
+     return result;
+ }
+ 
++static std::vector<iq3_s_warp_block> repack_weights(const std::vector<block_iq3_s> & weights) {
++    require(weights.size() % 4 == 0, "four IQ3 blocks per packed tile are required");
++    std::vector<iq3_s_warp_block> packed(weights.size() / 4);
++    for (size_t i = 0; i < weights.size(); ++i) {
++        auto & tile = packed[i / 4];
++        const auto & input = weights[i];
++        const size_t slot = i % 4;
++        std::memcpy(tile.qs[slot], input.qs, sizeof(input.qs));
++        std::memcpy(tile.signs[slot], input.signs, sizeof(input.signs));
++        std::memcpy(tile.qh[slot], input.qh, sizeof(input.qh));
++        std::memcpy(tile.scales[slot], input.scales, sizeof(input.scales));
++        std::memcpy(&tile.d[slot], &input.d, sizeof(input.d));
++
++        block_iq3_s restored;
++        std::memcpy(restored.qs, tile.qs[slot], sizeof(restored.qs));
++        std::memcpy(restored.signs, tile.signs[slot], sizeof(restored.signs));
++        std::memcpy(restored.qh, tile.qh[slot], sizeof(restored.qh));
++        std::memcpy(restored.scales, tile.scales[slot], sizeof(restored.scales));
++        std::memcpy(&restored.d, &tile.d[slot], sizeof(restored.d));
++        require(std::memcmp(&restored, &input, sizeof(input)) == 0, "IQ3 byte round trip failed");
++    }
++    return packed;
++}
++
+ template<int cols> struct fixture {
+     int k, rows;
+     cudaStream_t stream = nullptr;
+     device_buffer<block_iq3_s> weights;
++    device_buffer<iq3_s_warp_block> packed;
+     device_buffer<block_q8_1> input;
+     device_buffer<float> output;
+-    fixture(int columns,int output_rows,const std::vector<block_iq3_s> & values) : k(columns),rows(output_rows),
+-        weights(values.size()),input(cols*columns/32),output(cols*output_rows) {
++    fixture(int columns, int output_rows, const std::vector<block_iq3_s> & values, bool repack = false)
++        : k(columns), rows(output_rows), weights(values.size()), packed(repack ? values.size() / 4 : 0),
++          input(cols * columns / 32), output(cols * output_rows) {
++        if (repack) {
++            require((k / 256) % 4 == 0, "fixture K must have whole packed groups per row");
++            const auto reordered = repack_weights(values);
++            CUDA_CHECK(cudaMemcpy(packed.data, reordered.data(), values.size() * sizeof(block_iq3_s), cudaMemcpyHostToDevice));
++        }
+         CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+         CUDA_CHECK(cudaMemcpy(weights.data,values.data(),values.size()*sizeof(block_iq3_s),cudaMemcpyHostToDevice));
+     }
+@@ -118,11 +155,13 @@ template<int cols> struct fixture {
+         }
+         CUDA_CHECK(cudaMemcpy(input.data,value.data(),value.size()*sizeof(block_q8_1),cudaMemcpyHostToDevice));
+     }
+-    template<bool pair, bool reuse = false> void launch() {
++    template<bool pair, bool reuse = false, mmvq_iq3_layout layout = mmvq_iq3_layout::canonical>
++    void launch() {
+         const uint32_t weight_channel = uint32_t(rows*(k/256)), input_channel = uint32_t(k/32);
+         constexpr int rpb = pair ? (cols == 1 ? 2 : 4) : calc_rows_per_block(GGML_TYPE_IQ3_S, cols, MMVQ_PARAMETERS_GENERIC, false, 4);
+-        mul_mat_vec_q<GGML_TYPE_IQ3_S,cols,false,false,false,pair,reuse><<<dim3((rows+rpb-1)/rpb,1,1),dim3(32,4,1),0,stream>>>(
+-            weights.data,input.data,(const int32_t *)nullptr,ggml_cuda_mm_fusion_args_device{},output.data,
++        mul_mat_vec_q<GGML_TYPE_IQ3_S,cols,false,false,false,pair,reuse,layout><<<dim3((rows+rpb-1)/rpb,1,1),dim3(32,4,1),0,stream>>>(
++            layout == mmvq_iq3_layout::packed || layout == mmvq_iq3_layout::packed_reuse
++                ? static_cast<const void *>(packed.data) : weights.data, input.data,(const int32_t *)nullptr,ggml_cuda_mm_fusion_args_device{},output.data,
+             uint32_t(k),init_fastdiv_values(1),uint32_t(k/256),input_channel,uint32_t(rows),init_fastdiv_values(1),
+             weight_channel,input_channel,uint32_t(rows),init_fastdiv_values(1),weight_channel,input_channel,uint32_t(rows),0u,uint32_t(rows));
+         CUDA_CHECK(cudaGetLastError());
+@@ -145,11 +184,12 @@ struct graph_timing {
+         if (begin) { cudaEventDestroy(begin); }
+         if (end) { cudaEventDestroy(end); }
+     }
+-    template<bool pair, bool reuse, int cols> void capture(fixture<cols> & data,int batch) {
++    template<bool pair, bool reuse, mmvq_iq3_layout layout = mmvq_iq3_layout::canonical, int cols>
++    void capture(fixture<cols> & data,int batch) {
+         CUDA_CHECK(cudaEventCreate(&begin)); CUDA_CHECK(cudaEventCreate(&end));
+         CUDA_CHECK(cudaStreamBeginCapture(data.stream,cudaStreamCaptureModeThreadLocal));
+         CUDA_CHECK(cudaEventRecordWithFlags(begin,data.stream,cudaEventRecordExternal));
+-        for (int i=0;i<batch;++i) { data.template launch<pair,reuse>(); }
++        for (int i=0;i<batch;++i) { data.template launch<pair,reuse,layout>(); }
+         CUDA_CHECK(cudaEventRecordWithFlags(end,data.stream,cudaEventRecordExternal));
+         CUDA_CHECK(cudaStreamEndCapture(data.stream,&graph));
+         CUDA_CHECK(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+@@ -163,12 +203,13 @@ struct graph_timing {
+ static float median(std::vector<float> values) {
+     std::sort(values.begin(),values.end()); return (values[values.size()/2-1]+values[values.size()/2])*.5f;
+ }
+-template<bool baseline_tile = false, bool candidate_tile = true, bool reuse = false, int cols>
++template<bool baseline_tile = false, bool candidate_tile = true, bool reuse = false,
++    mmvq_iq3_layout layout = mmvq_iq3_layout::canonical, int cols>
+ static void benchmark(fixture<cols> & data) {
+     constexpr int batch=32,pairs=12,warmups=3;
+     graph_timing legacy,pair;
+     legacy.capture<baseline_tile,false>(data,batch);
+-    pair.capture<candidate_tile,reuse>(data,batch);
++    pair.capture<candidate_tile,reuse,layout>(data,batch);
+     for (int i=0;i<warmups;++i) { legacy.measure(data,batch); pair.measure(data,batch); }
+     std::vector<float> a,b; int wins=0;
+     for (int i=0;i<pairs;++i) {
+@@ -177,8 +218,9 @@ static void benchmark(fixture<cols> & data) {
+         else { x=legacy.measure(data,batch); y=pair.measure(data,batch); }
+         a.push_back(x); b.push_back(y); wins += y<x;
+     }
+-    std::printf("%s cols=%d k=%d rows=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g timing_scope=actual_kernel excludes=allocation_copy_capture_host_scheduling\n",
+-        reuse ? "IQ3_COLUMN_REUSE_GPU_EVENTS" : "IQ3_GPU_EVENTS",
++    std::printf("%s layout=%d cols=%d k=%d rows=%d batch=%d pairs=%d warmups=%d legacy_ms=%.9g pair_ms=%.9g speedup=%.6g pair_wins=%d legacy_min_ms=%.9g legacy_max_ms=%.9g pair_min_ms=%.9g pair_max_ms=%.9g timing_scope=actual_kernel excludes=allocation_copy_capture_host_scheduling\n",
++        layout != mmvq_iq3_layout::canonical ? "IQ3_LAYOUT_GPU_EVENTS" :
++        reuse ? "IQ3_COLUMN_REUSE_GPU_EVENTS" : "IQ3_GPU_EVENTS", int(layout),
+         cols,data.k,data.rows,batch,pairs,warmups,double(median(a)),double(median(b)),double(median(a)/median(b)),wins,
+         double(*std::min_element(a.begin(),a.end())),double(*std::max_element(a.begin(),a.end())),
+         double(*std::min_element(b.begin(),b.end())),double(*std::max_element(b.begin(),b.end())));
+@@ -235,14 +277,64 @@ const std::pair<int,int> shapes[]={{5120,5120},{5120,17408},{17408,5120},{5120,1
+ return cases;
+ }
+ 
++template<int cols, bool tile, mmvq_iq3_layout layout>
++static void check_variant(fixture<cols> & data, const std::vector<float> & reference) {
++    data.template launch<tile, false, layout>();
++    const auto actual = data.download();
++    require(std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); }),
++        "nonfinite IQ3 projection");
++    require(std::memcmp(actual.data(), reference.data(), actual.size()*sizeof(float)) == 0,
++        "IQ3 layout changed the reference projection");
++}
++
++template<int cols, bool tile>
++static int check_shape(fixture<cols> & data, bool measure) {
++    int cases = 0;
++    for (int pattern : {0, 1, 2}) {
++        data.set_input(pattern);
++        data.template launch<tile>();
++        const auto reference = data.download();
++        check_variant<cols, tile, mmvq_iq3_layout::packed>(data, reference);
++        check_variant<cols, tile, mmvq_iq3_layout::fast_sign>(data, reference);
++        check_variant<cols, tile, mmvq_iq3_layout::packed_reuse>(data, reference);
++        cases += 3;
++    }
++    if (measure) {
++        benchmark<tile, tile, false, mmvq_iq3_layout::packed>(data);
++        benchmark<tile, tile, false, mmvq_iq3_layout::fast_sign>(data);
++        benchmark<tile, tile, false, mmvq_iq3_layout::packed_reuse>(data);
++    }
++    return cases;
++}
++
++template<int cols>
++static int check_layout(const char * path, const gguf_context * metadata, bool measure) {
++    int cases = 0;
++    const std::pair<int,int> shapes[] = {
++        {5120, 5120}, {5120, 17408}, {17408, 5120}, {5120, 10240},
++        {5120, 12288}, {6144, 5120}, {5120, 1024},
++    };
++    for (const auto & shape : shapes) {
++        const auto weights = read_weights(path, metadata, shape.first, shape.second);
++        fixture<cols> data(shape.first, shape.second, weights, true);
++        if (mmvq_iq3_row_pair_geometry(data.k, data.rows, cols)) {
++            cases += check_shape<cols, true>(data, measure);
++        } else {
++            cases += check_shape<cols, false>(data, measure);
++        }
++    }
++    return cases;
++}
++
+ int main(int argc,char ** argv) {
+     try {
+-        const char * path=nullptr; bool measure=false;
++        const char * path=nullptr; bool measure=false, layout=false;
+         for (int i=1;i<argc;++i) {
+             const std::string arg=argv[i];
+             if (arg=="--weights" && !path && i+1<argc) { path=argv[++i]; }
+             else if (arg=="--benchmark" && !measure) { measure=true; }
+-            else { throw std::runtime_error("Usage: test-cuda-iq3-row-pair --weights GGUF [--benchmark]"); }
++            else if (arg=="--layout" && !layout) { layout=true; }
++            else { throw std::runtime_error("Usage: test-cuda-iq3-row-pair --weights GGUF [--benchmark] [--layout]"); }
+         }
+         require(path,"--weights GGUF is required; fixture reads only small selected trained ranges");
+         int devices=0; const auto status=cudaGetDeviceCount(&devices);
+@@ -271,6 +363,13 @@ int main(int argc,char ** argv) {
+         attributes("tiled_reuse3",(const void *)mul_mat_vec_q<GGML_TYPE_IQ3_S,3,false,false,false,true,true>);
+         std::unique_ptr<gguf_context,decltype(&gguf_free)> metadata(gguf_init_from_file(path,{true,nullptr}),gguf_free);
+         require(bool(metadata),"cannot read GGUF metadata without allocating weights");
++        if (layout) {
++            const int cases = check_layout<1>(path, metadata.get(), measure)
++                + check_layout<2>(path, metadata.get(), measure)
++                + check_layout<3>(path, metadata.get(), measure);
++            std::printf("PASS: %d trained-weight IQ3 layout and sign expansion cases bitwise equal\n", cases);
++            return 0;
++        }
+         int cases=check<1>(path,metadata.get(),measure)+check<2>(path,metadata.get(),measure)+check<3>(path,metadata.get(),measure);
+         std::printf("PASS: %d trained-weight IQ3 row-pair and column-reuse cases bitwise equal\n",cases); return 0;
+     } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }

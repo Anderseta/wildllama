@@ -338,6 +338,8 @@ target_compile_definitions(test-device-verification PRIVATE GGML_TEST_CPU_BACKEN
 add_test(NAME device-verification COMMAND test-device-verification)
 if(TARGET ggml-cuda)
     add_dependencies(test-device-verification ggml-cuda)
+    add_test(NAME device-block-verification-cuda COMMAND test-device-verification --block)
+    set_tests_properties(device-block-verification-cuda PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
     add_dependencies(test-host-output-copy ggml-cuda)
     add_dependencies(test-neural-output ggml-cuda)
     add_dependencies(test-moe-normal-upload ggml-cuda)

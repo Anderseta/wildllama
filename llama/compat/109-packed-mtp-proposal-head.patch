@@ -1,0 +1,655 @@
+diff --git a/ggml/include/ggml-cuda-mtp-pack.h b/ggml/include/ggml-cuda-mtp-pack.h
+new file mode 100644
+index 0000000..aa412c2
+--- /dev/null
++++ b/ggml/include/ggml-cuda-mtp-pack.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++struct ggml_cuda_mtp_pack_row {
++    int32_t position;
++    int32_t token;
++};
++static_assert(sizeof(ggml_cuda_mtp_pack_row) == 2*sizeof(int32_t));
++
++using ggml_backend_cuda_mtp_pack_rows_t = bool (*)(
++        ggml_backend_t backend, const ggml_tensor * source, ggml_tensor * weights, ggml_tensor * ids,
++        ggml_tensor * changes, ggml_backend_buffer_t host_stage, ggml_backend_event_t upload_done,
++        const ggml_cuda_mtp_pack_row * update, size_t count, bool pending);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 787866f..b287988 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7555,7 +7555,87 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+     GGML_UNUSED(reg);
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#include "ggml-cuda-mtp-pack.h"
++
++static __global__ void ggml_cuda_mtp_pack_rows(
++        const uint4 * __restrict__ source, uint4 * __restrict__ packed, int32_t * __restrict__ ids,
++        const ggml_cuda_mtp_pack_row * __restrict__ changes, int stride) {
++    const auto row = changes[blockIdx.x];
++    for (int i = threadIdx.x; i < stride; i += blockDim.x) {
++        packed[size_t(row.position)*stride + i] = source[size_t(row.token)*stride + i];
++    }
++    if (threadIdx.x == 0) {
++        ids[row.position] = row.token;
++    }
++}
++
++static bool ggml_backend_cuda_mtp_pack_rows(
++        ggml_backend_t backend, const ggml_tensor * source, ggml_tensor * weights, ggml_tensor * ids,
++        ggml_tensor * changes, ggml_backend_buffer_t host_stage, ggml_backend_event_t upload_done,
++        const ggml_cuda_mtp_pack_row * update, size_t count, bool pending) {
++    if (!ggml_backend_is_cuda(backend) || !source || !weights || !ids || !changes || !host_stage ||
++            !upload_done || upload_done->device != ggml_backend_get_device(backend) || !update ||
++            !count || count > 32768 || !ggml_backend_buft_is_cuda_host(host_stage->buft) ||
++            count*sizeof(*update) > ggml_backend_buffer_get_size(host_stage) ||
++            count*sizeof(*update) > ggml_nbytes(changes) ||
++            source->type != GGML_TYPE_Q4_K || weights->type != GGML_TYPE_Q4_K ||
++            ids->type != GGML_TYPE_I32 || !ggml_is_matrix(source) || !ggml_is_matrix(weights) ||
++            ids->ne[0] != weights->ne[1] || source->ne[0] != weights->ne[0] ||
++            !ggml_is_contiguous(source) || !ggml_is_contiguous(weights) ||
++            source->nb[1] % sizeof(uint4) != 0 ||
++            reinterpret_cast<uintptr_t>(source->data) % alignof(uint4) != 0 ||
++            reinterpret_cast<uintptr_t>(weights->data) % alignof(uint4) != 0) {
++        return false;
++    }
++
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    const auto buft = ggml_backend_cuda_buffer_type(ctx->device);
++    for (const auto * tensor : {source, static_cast<const ggml_tensor *>(weights),
++            static_cast<const ggml_tensor *>(ids), static_cast<const ggml_tensor *>(changes)}) {
++        if (!tensor->data || !tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft) {
++            return false;
++        }
++    }
++    for (size_t i = 0; i < count; ++i) {
++        if (update[i].position < 0 || update[i].position >= weights->ne[1] ||
++                update[i].token < 0 || update[i].token >= source->ne[1]) {
++            return false;
++        }
++    }
++
++    ggml_cuda_set_device(ctx->device);
++    auto stream = ctx->stream();
++    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
++    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone) {
++        return false;
++    }
++    auto event = static_cast<cudaEvent_t>(upload_done->context);
++    if (pending && cudaEventQuery(event) != cudaSuccess) {
++        return false;
++    }
++
++    // The event protects the pinned host copy. The next upload and this gather
++    // use the same stream as the consuming graph, including replay.
++    void * staging = ggml_backend_buffer_get_base(host_stage);
++    std::memcpy(staging, update, count*sizeof(*update));
++    CUDA_CHECK(cudaMemcpyAsync(changes->data, staging, count*sizeof(*update), cudaMemcpyHostToDevice, stream));
++    CUDA_CHECK(cudaEventRecord(event, stream));
++    ggml_cuda_mtp_pack_rows<<<unsigned(count), 128, 0, stream>>>(
++            static_cast<const uint4 *>(source->data), static_cast<uint4 *>(weights->data),
++            static_cast<int32_t *>(ids->data), static_cast<const ggml_cuda_mtp_pack_row *>(changes->data),
++            int(source->nb[1]/sizeof(uint4)));
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++#endif
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_cuda_mtp_pack_rows") == 0) {
++        return (void *) ggml_backend_cuda_mtp_pack_rows;
++    }
++#endif
+     if (strcmp(name, "ggml_backend_gdn_compact_v2") == 0) {
+         return (void *) ggml_cuda_gdn_extended_interface;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e7b400b..d3b09b0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-draft-head.h"
+ #include "llama-model-ram.h"
+ #include "llama-gpu-layer-diagnostics.h"
+ #include "llama-runtime-activity.h"
+@@ -2009,8 +2010,69 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+     sched_need_reserve = true;
+ }
+ 
++void llama_context::clear_mtp_packed_head() {
++    mtp_pack_ready = false;
++    mtp_pack_attempted = false;
++    if (!mtp_packed_head) {
++        return;
++    }
++    // Cached graph nodes reference the resident tensor and ID buffer. Release
++    // every reference after draining the shared stream before freeing either.
++    synchronize();
++    graph_variants_clear();
++    ggml_backend_sched_reset(sched.get());
++    gf_res_prev_active = nullptr;
++    for (auto & result : gf_res_prev) {
++        if (result) {
++            result->reset();
++        }
++    }
++    mtp_packed_head.reset();
++}
++
++bool llama_context::refresh_mtp_packed_head() {
++    if (!mtp_pack_source || !loras->empty()) {
++        return false;
++    }
++    if (!mtp_packed_head && !mtp_pack_attempted) {
++        mtp_pack_attempted = true;
++        const auto device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(mtp_pack_source->buffer));
++        for (const auto & backend : backends) {
++            if (ggml_backend_get_device(backend.get()) != device) {
++                continue;
++            }
++            try {
++                mtp_packed_head = llama_packed_draft_head::create(backend.get(), mtp_pack_source, mtp_draft_vocab.ids.size());
++            } catch (const std::bad_alloc &) {
++                // This is optional memory. Keep the existing indexed path.
++            }
++            if (mtp_packed_head) {
++                LLAMA_LOG_INFO("mtp_draft_vocab: packed %zu Q4_K rows, %.2f MiB device storage\n",
++                        mtp_draft_vocab.ids.size(), ggml_backend_buffer_get_size(mtp_packed_head->storage.get()) / 1048576.0);
++            }
++            break;
++        }
++    }
++    if (!mtp_packed_head) {
++        return false;
++    }
++    if (mtp_packed_head->submitted && mtp_pack_revision == mtp_draft_vocab.revision) {
++        return true;
++    }
++    if (!mtp_packed_head->refresh(mtp_draft_vocab.ids)) {
++        return false;
++    }
++    mtp_pack_revision = mtp_draft_vocab.revision;
++    return true;
++}
++
+ bool llama_context::set_mtp_draft_vocab(int32_t count) {
+-    if (!count) { mtp_draft_vocab_enabled = false; return true; }
++    if (!count) {
++        mtp_draft_vocab_enabled = false;
++        mtp_pack_source = nullptr;
++        clear_mtp_packed_head();
++        return true;
++    }
+     // Measured implementation: a single CUDA-resident, unscaled Q4_K head.
+     // Preserve all other architectures, tensor splits and adapter semantics.
+     if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || cparams.n_seq_max != 1 ||
+@@ -2030,8 +2092,16 @@ bool llama_context::set_mtp_draft_vocab(int32_t count) {
+         const char * contextual = std::getenv("WILDLLAMA_MTP_DYNAMIC_VOCAB");
+         mtp_draft_vocab.contextual = contextual && std::strcmp(contextual, "1") == 0;
+     } catch (const std::bad_alloc &) { return false; }
++    const char * packed = std::getenv("WILDLLAMA_MTP_PACKED_HEAD");
++    const bool pack_requested = packed && std::strcmp(packed, "1") == 0 &&
++        model.n_devices() == 1 && !cparams.training && !cparams.pipeline_parallel;
++    if (mtp_pack_source != w || !pack_requested ||
++            (mtp_packed_head && mtp_packed_head->ids->ne[0] != count)) {
++        clear_mtp_packed_head();
++    }
++    mtp_pack_source = pack_requested ? w : nullptr;
+     mtp_draft_vocab_enabled = true;
+-    LLAMA_LOG_INFO("mtp_draft_vocab: %d/%d indexed proposal rows, original quantized weights shared\n", count, model.vocab.n_tokens());
++    LLAMA_LOG_INFO("mtp_draft_vocab: %d/%d indexed proposal rows\n", count, model.vocab.n_tokens());
+     return true;
+ }
+ 
+@@ -2585,6 +2655,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         graph_execution_plan.observe(plan_shape);
+     }
+ 
++    mtp_pack_ready = mtp_draft_vocab_enabled && !cparams.warmup &&
++        ubatch.n_tokens == 1 && n_outputs == 1 && ubatch.n_seqs_unq == 1 && refresh_mtp_packed_head();
++
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     auto gparams = graph_params(res, ubatch, mctx, gtype);
+@@ -3945,6 +4018,7 @@ llm_graph_params llama_context::graph_params(
+         /*.sampler_bindings_limit =*/ graph_variant_budget,
+         /*.draft_vocab =*/ mtp_draft_vocab_enabled ? &mtp_draft_vocab : nullptr,
+         /*.draft_vocab_size =*/ mtp_draft_vocab_enabled ? mtp_draft_vocab.ids.size() : 0,
++        /*.packed_draft_head =*/ mtp_pack_ready && res != gf_res_reserve.get() ? mtp_packed_head.get() : nullptr,
+     };
+ }
+ 
+@@ -5200,6 +5274,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+             ret[buft].context += size;
+         }
+     }
++    if (mtp_packed_head) {
++        const auto & cache = *mtp_packed_head;
++        for (const auto buffer : {cache.storage.get(), cache.host_stage.get()}) {
++            ret[ggml_backend_buffer_get_type(buffer)].context += ggml_backend_buffer_get_size(buffer);
++        }
++    }
+     if (model.hparams.no_alloc) {
+         for (size_t i = 0; i < backends.size(); ++i) {
+             ggml_backend_t             backend = backends[i].get();
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0456f79..de9140c 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -232,6 +232,14 @@ struct llama_context {
+     bool set_mtp_draft_vocab(int32_t count);
+     llama_draft_vocab mtp_draft_vocab;
+     bool mtp_draft_vocab_enabled = false;
++    std::unique_ptr<llama_packed_draft_head> mtp_packed_head;
++    const ggml_tensor * mtp_pack_source = nullptr;
++    bool mtp_pack_attempted = false;
++    bool mtp_pack_ready = false;
++    uint64_t mtp_pack_revision = 0;
++
++    void clear_mtp_packed_head();
++    bool refresh_mtp_packed_head();
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
+diff --git a/src/llama-draft-head.h b/src/llama-draft-head.h
+index 23d803f..75bbc4c 100644
+--- a/src/llama-draft-head.h
++++ b/src/llama-draft-head.h
+@@ -1,6 +1,11 @@
+ #pragma once
+ 
++#include "ggml-alloc.h"
++#include "ggml-cpp.h"
++#include "ggml-cuda-mtp-pack.h"
+ #include "ggml.h"
++
++#include <memory>
+ #include <algorithm>
+ #include <cmath>
+ #include <vector>
+@@ -38,3 +43,114 @@ inline llama_indexed_head_graph llama_build_indexed_head(
+     result.logits = ggml_reshape_2d(ctx, scattered, w->ne[1], 1);
+     return result;
+ }
++
++
++struct llama_packed_draft_head {
++    static constexpr int64_t max_rows = 32768;
++    static constexpr size_t max_bytes = size_t{128} << 20;
++    static constexpr size_t headroom = size_t{256} << 20;
++
++    ggml_backend_t backend;
++    const ggml_tensor * source;
++    ggml_context_ptr ctx;
++    ggml_backend_buffer_ptr storage;
++    ggml_backend_buffer_ptr host_stage;
++    ggml_backend_event_ptr upload_done;
++    ggml_tensor * weights = nullptr;
++    ggml_tensor * ids = nullptr;
++    ggml_tensor * changes = nullptr;
++    ggml_backend_cuda_mtp_pack_rows_t pack;
++    std::vector<int32_t> current;
++    std::vector<ggml_cuda_mtp_pack_row> pending;
++    bool submitted = false;
++
++    llama_packed_draft_head(ggml_backend_t backend, const ggml_tensor * source,
++            ggml_backend_cuda_mtp_pack_rows_t pack, int64_t count) :
++        backend(backend), source(source), pack(pack), current(size_t(count), -1) {
++        pending.reserve(size_t(count));
++    }
++
++    static std::unique_ptr<llama_packed_draft_head> create(
++            ggml_backend_t backend, const ggml_tensor * source, int64_t count) {
++        if (!backend || !source || source->type != GGML_TYPE_Q4_K || !source->buffer ||
++                !ggml_is_matrix(source) || !ggml_is_contiguous(source) ||
++                count <= 0 || count >= source->ne[1] || count > max_rows ||
++                source->nb[1] > max_bytes/size_t(count)) {
++            return nullptr;
++        }
++        const auto device = ggml_backend_get_device(backend);
++        const auto buft = ggml_backend_dev_buffer_type(device);
++        if (ggml_backend_buffer_get_type(source->buffer) != buft) {
++            return nullptr;
++        }
++        const auto pack = reinterpret_cast<ggml_backend_cuda_mtp_pack_rows_t>(
++                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device),
++                    "ggml_backend_cuda_mtp_pack_rows"));
++        const auto host_buft = ggml_backend_dev_host_buffer_type(device);
++        if (!pack || !host_buft) {
++            return nullptr;
++        }
++
++        auto result = std::make_unique<llama_packed_draft_head>(backend, source, pack, count);
++        result->ctx.reset(ggml_init({3*ggml_tensor_overhead(), nullptr, true}));
++        if (!result->ctx) {
++            return nullptr;
++        }
++        result->weights = ggml_new_tensor_2d(result->ctx.get(), GGML_TYPE_Q4_K, source->ne[0], count);
++        result->ids = ggml_new_tensor_2d(result->ctx.get(), GGML_TYPE_I32, count, 1);
++        result->changes = ggml_new_tensor_2d(result->ctx.get(), GGML_TYPE_I32, 2, count);
++        const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(result->ctx.get(), buft);
++        size_t free = 0, total = 0;
++        ggml_backend_dev_memory(device, &free, &total);
++        if (!bytes || bytes > max_bytes || free < bytes + headroom) {
++            return nullptr;
++        }
++        result->storage.reset(ggml_backend_alloc_ctx_tensors_from_buft(result->ctx.get(), buft));
++        if (!result->storage || ggml_backend_buffer_get_size(result->storage.get()) > max_bytes) {
++            return nullptr;
++        }
++        result->host_stage.reset(ggml_backend_buft_alloc_buffer(host_buft, size_t(count)*sizeof(ggml_cuda_mtp_pack_row)));
++        if (!result->host_stage || ggml_backend_buffer_get_type(result->host_stage.get()) != host_buft) {
++            return nullptr;
++        }
++        result->upload_done.reset(ggml_backend_event_new(device));
++        if (!result->upload_done) {
++            return nullptr;
++        }
++        return result;
++    }
++
++    bool refresh(const std::vector<int32_t> & wanted) {
++        if (wanted.size() != current.size()) {
++            return false;
++        }
++        pending.clear();
++        for (size_t i = 0; i < wanted.size(); ++i) {
++            if (wanted[i] < 0 || wanted[i] >= source->ne[1]) {
++                return false;
++            }
++            if (wanted[i] != current[i]) {
++                pending.push_back({int32_t(i), wanted[i]});
++            }
++        }
++        if (pending.empty()) {
++            return submitted;
++        }
++        if (!pack(backend, source, weights, ids, changes, host_stage.get(), upload_done.get(),
++                pending.data(), pending.size(), submitted)) {
++            return false;
++        }
++        std::copy(wanted.begin(), wanted.end(), current.begin());
++        submitted = true;
++        return true;
++    }
++};
++
++inline llama_indexed_head_graph llama_build_packed_head(
++        ggml_context * ctx, const llama_packed_draft_head & cache, ggml_tensor * input) {
++    auto * logits = ggml_mul_mat(ctx, cache.weights, input);
++    auto * compact = ggml_reshape_3d(ctx, logits, 1, cache.ids->ne[0], 1);
++    auto * base = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, cache.source->ne[1], 1), -INFINITY);
++    auto * scattered = ggml_set_rows(ctx, base, compact, cache.ids);
++    return {ggml_reshape_2d(ctx, scattered, cache.source->ne[1], 1), {logits, base, scattered}};
++}
+diff --git a/src/llama-draft-vocab.h b/src/llama-draft-vocab.h
+index 2552fe9..78ea8e0 100644
+--- a/src/llama-draft-vocab.h
++++ b/src/llama-draft-vocab.h
+@@ -14,6 +14,7 @@ struct llama_draft_vocab {
+     std::vector<int32_t> positions;
+     size_t cursor = 0;
+     size_t stable = 0;
++    uint64_t revision = 0;
+     bool contextual = false;
+     std::vector<int32_t> recent;
+     size_t recent_cursor = 0;
+@@ -28,6 +29,7 @@ struct llama_draft_vocab {
+         ids.swap(next_ids); positions.swap(next_positions);
+         stable = ids.size()*3/4; cursor = stable;
+         recent.clear(); recent_cursor = 0; ranking.clear();
++        ++revision;
+         return true;
+     }
+ 
+@@ -42,6 +44,7 @@ struct llama_draft_vocab {
+         positions[size_t(ids[cursor])] = -1;
+         ids[cursor] = token; positions[size_t(token)] = int32_t(cursor);
+         if (++cursor == ids.size()) { cursor = stable; }
++        ++revision;
+     }
+ 
+     // Reuse already materialized target logits; this never runs another head
+@@ -75,6 +78,7 @@ struct llama_draft_vocab {
+                 if (++cursor == ids.size()) { cursor = stable; }
+             }
+         }
++        ++revision;
+         return true;
+     }
+ };
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f3b02aa..bec9733 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1898,6 +1898,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     cb_func          (params.cb),
+     res              (params.res),
+     draft_vocab      (params.draft_vocab),
++    packed_draft_head(params.packed_draft_head),
+     ctx0             (res->get_ctx()),
+     gf               (res->get_gf()) {
+         if (moe_cache) { moe_cache->begin_graph(); }
+@@ -1975,13 +1976,20 @@ ggml_tensor * llm_graph_context::build_mtp_head(ggml_tensor * w, ggml_tensor * c
+         return build_lora_mm(w, cur, scale);
+     }
+     const int64_t selected = int64_t(draft_vocab->ids.size());
+-    auto * ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, selected, 1);
+-    ggml_set_input(ids); ggml_set_name(ids, "mtp_draft_vocab_ids");
++    const bool packed = packed_draft_head && packed_draft_head->source == w &&
++        packed_draft_head->ids->ne[0] == selected;
++    auto * ids = packed ? packed_draft_head->ids : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, selected, 1);
++    if (!packed) {
++        ggml_set_input(ids);
++        ggml_set_name(ids, "mtp_draft_vocab_ids");
++    }
+ 
+-    auto head = llama_build_indexed_head(ctx0, w, cur, ids);
++    auto head = packed ? llama_build_packed_head(ctx0, *packed_draft_head, cur) : llama_build_indexed_head(ctx0, w, cur, ids);
+     if (prec_policy) {
+         for (auto * operation : head.operations) {
+-            if (operation->op == GGML_OP_MUL_MAT_ID) { prec_policy->apply(operation); }
++            if (operation->op == GGML_OP_MUL_MAT_ID || operation->op == GGML_OP_MUL_MAT) {
++                prec_policy->apply(operation);
++            }
+         }
+     }
+ 
+@@ -1997,7 +2005,9 @@ ggml_tensor * llm_graph_context::build_mtp_head(ggml_tensor * w, ggml_tensor * c
+     }
+     for (auto * operation : head.operations) { ggml_backend_sched_set_tensor_backend(sched, operation, backend); }
+     ggml_backend_sched_set_tensor_backend(sched, ids, backend);
+-    res->add_input(std::make_unique<llm_graph_input_draft_vocab>(draft_vocab, ids));
++    if (!packed) {
++        res->add_input(std::make_unique<llm_graph_input_draft_vocab>(draft_vocab, ids));
++    }
+     return head.logits;
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 197a4be..4b27d95 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -2,6 +2,8 @@
+ 
+ #include "llama-arch.h"
+ #include "llama-draft-vocab.h"
++
++struct llama_packed_draft_head;
+ #include "llama-batch.h"
+ #include "llama-hparams.h"
+ #include "llama-adapter.h"
+@@ -861,6 +863,7 @@ struct llm_graph_params {
+     size_t sampler_bindings_limit = 0;
+     const llama_draft_vocab * draft_vocab = nullptr;
+     size_t draft_vocab_size = 0;
++    const llama_packed_draft_head * packed_draft_head = nullptr;
+ 
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+@@ -927,6 +930,7 @@ struct llm_graph_params {
+ 
+         return
+             draft_vocab_size               == other.draft_vocab_size               &&
++            packed_draft_head              == other.packed_draft_head              &&
+             sampler_bindings               == other.sampler_bindings               &&
+             sampler_bindings_limit         == other.sampler_bindings_limit         &&
+             nextn_input_backend             == other.nextn_input_backend             &&
+@@ -1122,6 +1126,8 @@ struct llm_graph_context {
+ 
+     const llama_draft_vocab * draft_vocab = nullptr;
+ 
++    const llama_packed_draft_head * packed_draft_head = nullptr;
++
+     ggml_tensor * build_mtp_head(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * scale) const;
+ 
+     ggml_context * ctx0 = nullptr;
+diff --git a/tests/test-mtp-draft-vocab.cpp b/tests/test-mtp-draft-vocab.cpp
+index 1037606..b71c32a 100644
+--- a/tests/test-mtp-draft-vocab.cpp
++++ b/tests/test-mtp-draft-vocab.cpp
+@@ -22,8 +22,11 @@ static void policy() {
+     require(!v.reset(248320,131073) && !v.reset(1048577,65536), "memory bounds ignored");
+     require(v.reset(248320,32768), "valid shortlist rejected");
+     const auto original = v.ids;
++    const auto revision = v.revision;
+     v.observe(-1); v.observe(248320); v.observe(0);
+-    require(v.ids == original, "invalid/duplicate token changed shortlist");
++    require(v.ids == original && v.revision == revision, "invalid/duplicate token changed shortlist");
++    v.observe(248319);
++    require(v.revision == revision + 1, "a newly selected token did not invalidate packed rows");
+     for (int i = 0; i < 40000; ++i) { v.observe(140000+i); }
+     std::vector<int32_t> ids = v.ids; std::sort(ids.begin(),ids.end());
+     require(std::adjacent_find(ids.begin(),ids.end()) == ids.end(), "duplicate token mapping");
+@@ -37,15 +40,19 @@ static void policy() {
+     require(v.reset(1024,256), "small valid selection rejected");
+     std::vector<float> scores(1024, -INFINITY);
+     for (int i=500;i<900;++i) { scores[size_t(i)] = float(i%97); }
+-    require(v.seed(scores.data(),scores.size()), "finite target seed rejected");
++    const auto before_seed = v.revision;
++    require(v.seed(scores.data(),scores.size()) && v.revision == before_seed + 1, "seed did not invalidate packed rows");
+     const auto seeded=v.ids;
++    const auto seeded_revision = v.revision;
+     for (int id:seeded) { require(id>=500 && id<900, "excluded target token included"); }
+     for (size_t i=1;i<seeded.size();++i) { require(scores[seeded[i-1]]>=scores[seeded[i]], "target rank lost"); }
+     scores[12]=NAN;
+     require(!v.seed(scores.data(),scores.size()) && v.ids==seeded, "NaN changed valid selection");
+     scores.assign(1024,-INFINITY);
+-    require(!v.seed(scores.data(),scores.size()) && v.ids==seeded, "empty target seed changed state");
+-    require(v.reset(1024,256), "contextual reset"); v.contextual = true;
++    require(!v.seed(scores.data(),scores.size()) && v.ids==seeded && v.revision==seeded_revision,
++            "failed seed changed packed revision");
++    require(v.reset(1024,256) && v.revision==seeded_revision + 1, "request reset reused old packed revision");
++    v.contextual = true;
+     for (int i=1;i<=80;++i) { v.observe(i); }
+     require(v.recent.size()==64, "recent context is unbounded");
+     for (int i=0;i<1024;++i) { scores[i]=float(i); }
+@@ -67,7 +74,7 @@ static void policy() {
+     std::puts("PASS: bounded indices, deduplication, eviction, invalid input, request reset");
+ }
+ 
+-static void graph_case(ggml_backend_t backend, const char * path, bool large) {
++static void graph_case(ggml_backend_t backend, const char * path, bool large, bool test_packed = false) {
+     gguf_context_ptr metadata(gguf_init_from_file(path,{true,nullptr}));
+     require(bool(metadata), "cannot read GGUF metadata");
+     const int64_t index = gguf_find_tensor(metadata.get(),"output.weight");
+@@ -95,11 +102,43 @@ static void graph_case(ggml_backend_t backend, const char * path, bool large) {
+     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend));
+     require(bool(buffer),"cannot allocate bounded fixture");
+     ggml_backend_tensor_set(w,weights.data(),0,bytes);
++
++    auto cache = test_packed ? llama_packed_draft_head::create(backend, w, selected) : nullptr;
++    if (test_packed) {
++        require(bool(cache), "packed CUDA head unavailable");
++        require(!llama_packed_draft_head::create(backend, w, llama_packed_draft_head::max_rows + 1),
++                "oversized packed head accepted");
++        require(ggml_backend_buffer_get_size(cache->storage.get()) <= llama_packed_draft_head::max_bytes,
++                "packed head exceeded device budget");
++    }
++    ggml_context_ptr packed_ctx;
++    ggml_backend_buffer_ptr packed_buffer;
++    ggml_cgraph * packed_graph = nullptr;
++    ggml_tensor * packed_logits = nullptr;
++    if (cache) {
++        packed_ctx.reset(ggml_init({ggml_graph_overhead_custom(32,false)+32*ggml_tensor_overhead(),nullptr,true}));
++        auto packed = llama_build_packed_head(packed_ctx.get(), *cache, input);
++        packed_graph = ggml_new_graph_custom(packed_ctx.get(), 32, false);
++        ggml_build_forward_expand(packed_graph, packed.logits);
++        packed_buffer.reset(ggml_backend_alloc_ctx_tensors(packed_ctx.get(), backend));
++        require(bool(packed_buffer), "cannot allocate packed graph outputs");
++        packed_logits = packed.logits;
++    }
++
+     std::vector<float> x(size_t(k),0),a(size_t(rows),0),b(size_t(rows),0);
+     std::vector<int32_t> mapping(size_t(selected),0);
++    std::vector<float> packed_output(cache ? size_t(rows) : 0);
+     for (int replay=0;replay<8;++replay) {
+         for(int64_t i=0;i<k;++i) { x[size_t(i)] = std::sin(float(i+replay*37)*.073f)*(replay+1); }
+-        for(int64_t i=0;i<selected;++i) { mapping[size_t(i)] = int32_t((i*17+replay*131)%rows); }
++        if (!cache || replay % 3 == 0) {
++            for (int64_t i = 0; i < selected; ++i) {
++                mapping[size_t(i)] = int32_t((i*17 + replay*131) % rows);
++            }
++        } else if (replay % 3 == 1) {
++            // Swapping two positions preserves unique IDs and changes only two
++            // packed rows. The next replay uses exactly the same mapping.
++            std::swap(mapping.front(), mapping.back());
++        }
+         ggml_backend_tensor_set(input,x.data(),0,x.size()*sizeof(float));
+         ggml_backend_tensor_set(ids,mapping.data(),0,mapping.size()*sizeof(int32_t));
+         require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"indexed graph failed");
+@@ -112,19 +151,44 @@ static void graph_case(ggml_backend_t backend, const char * path, bool large) {
+             require(std::memcmp(&a[size_t(id)],&b[size_t(id)],sizeof(float))==0,"indexed head changed selected logit bits");
+         }
+         for(int64_t i=0;i<rows;++i) { if(!seen[size_t(i)]) { require(b[size_t(i)]==-INFINITY,"stale/unselected proposal logit"); } }
++        if (cache) {
++            const int32_t first = mapping.front();
++            mapping.front() = -1;
++            require(!cache->refresh(mapping), "invalid packed row accepted");
++            mapping.front() = first;
++            require(cache->refresh(mapping), "packed refresh rejected valid rows");
++            require(ggml_backend_graph_compute(backend, packed_graph) == GGML_STATUS_SUCCESS,
++                    "packed graph failed");
++            ggml_backend_tensor_get(packed_logits, packed_output.data(), 0, packed_output.size()*sizeof(float));
++            require(std::memcmp(b.data(), packed_output.data(), b.size()*sizeof(float)) == 0,
++                    "packed projection changed logits or global ID mapping");
++        }
+     }
+     std::printf("PASS: 8 CUDA graph replays, selected=%lld logits bitwise equal, excluded logits -inf; weights=%zu bytes\n",(long long)selected,bytes);
++    if (cache) {
++        const size_t row_size = w->nb[1];
++        std::vector<unsigned char> copied(size_t(selected)*row_size);
++        ggml_backend_tensor_get(cache->weights, copied.data(), 0, copied.size());
++        for (size_t i = 0; i < mapping.size(); ++i) {
++            require(std::memcmp(copied.data() + i*row_size, weights.data() + mapping[i]*row_size, row_size) == 0,
++                    "packed row changed Q4_K bytes");
++        }
++        std::printf("PASS: packed full refresh, incremental updates and reuse; device storage=%zu bytes\n",
++                ggml_backend_buffer_get_size(cache->storage.get()));
++    }
+ }
+ 
+ int main(int argc,char **argv) {
+     try {
+         policy();
+         if(argc==1) { return 0; }
+-        require(argc==3,"Usage: test-mtp-draft-vocab [CUDA_BACKEND GGUF]");
++        const bool test_packed = argc == 4 && std::strcmp(argv[3], "--packed") == 0;
++        require(argc == 3 || test_packed, "Usage: test-mtp-draft-vocab [CUDA_BACKEND GGUF [--packed]]");
+         auto * reg=ggml_backend_load(argv[1]); require(reg,"cannot load CUDA backend");
+         auto * device=ggml_backend_reg_dev_get(reg,0);
+         ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr)); require(bool(backend),"cannot initialize CUDA");
+-        graph_case(backend.get(),argv[2],false); graph_case(backend.get(),argv[2],true);
++        graph_case(backend.get(),argv[2],false,test_packed);
++        graph_case(backend.get(),argv[2],true);
+         return 0;
+     } catch(const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
+ }
