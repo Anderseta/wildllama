@@ -1,0 +1,240 @@
+{
+  "completed_generations": 82,
+  "accepted_windows_without_paging": true,
+  "profile_unchanged": true,
+  "new_defaults_enabled": [],
+  "rows": [
+    {
+      "name": "d2-baseline-repeat",
+      "measurements": 4,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 33.15850031625759,
+          "minimum": 32.956377000791335,
+          "maximum": 33.36062363172383
+        },
+        "codigo": {
+          "median": 32.90912971980911,
+          "minimum": 32.862057069408145,
+          "maximum": 32.95620237021007
+        }
+      },
+      "peak_gpu_mib": 13356.921875,
+      "min_ram_mib": 12093.8359375,
+      "min_commit_mib": 8919.359375,
+      "idle_gpu_mib": 2038.171875
+    },
+    {
+      "name": "d2-baseline",
+      "measurements": 4,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 34.960375548116275,
+          "minimum": 34.254998778238374,
+          "maximum": 35.66575231799417
+        },
+        "codigo": {
+          "median": 38.42467426785633,
+          "minimum": 37.042600152295925,
+          "maximum": 39.80674838341673
+        }
+      },
+      "peak_gpu_mib": 13360.921875,
+      "min_ram_mib": 12104.421875,
+      "min_commit_mib": 8911.4609375,
+      "idle_gpu_mib": 1030.921875
+    },
+    {
+      "name": "d2-baseline@confirm",
+      "measurements": 8,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 40.40102421290817,
+          "minimum": 35.256513952039526,
+          "maximum": 43.60327178432282
+        },
+        "codigo": {
+          "median": 43.337931811952366,
+          "minimum": 41.95230565758923,
+          "maximum": 43.620292707559464
+        }
+      },
+      "peak_gpu_mib": 13360.484375,
+      "min_ram_mib": 12141.28125,
+      "min_commit_mib": 9054.16796875,
+      "idle_gpu_mib": 1022.171875
+    },
+    {
+      "name": "d2-both",
+      "measurements": 4,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 41.19062996068728,
+          "minimum": 39.29537082039796,
+          "maximum": 43.0858891009766
+        },
+        "codigo": {
+          "median": 36.5062426264616,
+          "minimum": 33.83042836088391,
+          "maximum": 39.1820568920393
+        }
+      },
+      "peak_gpu_mib": 13365.859375,
+      "min_ram_mib": 12092.93359375,
+      "min_commit_mib": 8869.8046875,
+      "idle_gpu_mib": 927.359375
+    },
+    {
+      "name": "d2-installed",
+      "measurements": 8,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 43.29482056174557,
+          "minimum": 37.40315333518051,
+          "maximum": 43.913857887523
+        },
+        "codigo": {
+          "median": 43.210983979023894,
+          "minimum": 42.16592639284389,
+          "maximum": 43.324067079927296
+        }
+      },
+      "peak_gpu_mib": 13361.359375,
+      "min_ram_mib": 12115.22265625,
+      "min_commit_mib": 8990.72265625,
+      "idle_gpu_mib": 922.609375
+    },
+    {
+      "name": "d2-l2",
+      "measurements": 4,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 39.79900875938109,
+          "minimum": 36.768602209144134,
+          "maximum": 42.82941530961804
+        },
+        "codigo": {
+          "median": 43.03095178942007,
+          "minimum": 43.000301339366644,
+          "maximum": 43.06160223947351
+        }
+      },
+      "peak_gpu_mib": 13362.296875,
+      "min_ram_mib": 12145.3046875,
+      "min_commit_mib": 8888.25,
+      "idle_gpu_mib": 1028.046875
+    },
+    {
+      "name": "d2-l2@confirm",
+      "measurements": 8,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 44.19055156262119,
+          "minimum": 43.50918094905297,
+          "maximum": 44.68011403766832
+        },
+        "codigo": {
+          "median": 43.2741167841709,
+          "minimum": 42.073535630592374,
+          "maximum": 44.00501553635902
+        }
+      },
+      "peak_gpu_mib": 13354.921875,
+      "min_ram_mib": 12144.671875,
+      "min_commit_mib": 9061.66015625,
+      "idle_gpu_mib": 2036.296875
+    },
+    {
+      "name": "d2-reuse",
+      "measurements": 4,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 44.61351996743086,
+          "minimum": 44.451510200837156,
+          "maximum": 44.77552973402457
+        },
+        "codigo": {
+          "median": 38.56115703089313,
+          "minimum": 34.80629002893973,
+          "maximum": 42.31602403284652
+        }
+      },
+      "peak_gpu_mib": 13362.609375,
+      "min_ram_mib": 12126.55859375,
+      "min_commit_mib": 8901.0859375,
+      "idle_gpu_mib": 1862.921875
+    },
+    {
+      "name": "d2-reuse@confirm",
+      "measurements": 8,
+      "same_mtp_output": true,
+      "speed": {
+        "prosa": {
+          "median": 43.04856078779116,
+          "minimum": 42.57078101857354,
+          "maximum": 43.443779915514625
+        },
+        "codigo": {
+          "median": 42.65178202320382,
+          "minimum": 41.21600467567287,
+          "maximum": 43.42526205868438
+        }
+      },
+      "peak_gpu_mib": 13376.421875,
+      "min_ram_mib": 12053.42578125,
+      "min_commit_mib": 8900.3515625,
+      "idle_gpu_mib": 1026.671875
+    },
+    {
+      "name": "d4-feedback",
+      "measurements": 4,
+      "same_mtp_output": null,
+      "speed": {
+        "prosa": {
+          "median": 28.30378484559727,
+          "minimum": 28.267617404560486,
+          "maximum": 28.33995228663406
+        },
+        "codigo": {
+          "median": 27.522442808237436,
+          "minimum": 26.810545018427252,
+          "maximum": 28.234340598047623
+        }
+      },
+      "peak_gpu_mib": 12711.484375,
+      "min_ram_mib": 12305.125,
+      "min_commit_mib": 10151.359375,
+      "idle_gpu_mib": 1029.234375
+    },
+    {
+      "name": "d4-ngram",
+      "measurements": 4,
+      "same_mtp_output": null,
+      "speed": {
+        "prosa": {
+          "median": 29.2616137886318,
+          "minimum": 29.18817386765624,
+          "maximum": 29.335053709607354
+        },
+        "codigo": {
+          "median": 29.58521976310329,
+          "minimum": 29.269801106536224,
+          "maximum": 29.900638419670358
+        }
+      },
+      "peak_gpu_mib": 12723.046875,
+      "min_ram_mib": 12335.55859375,
+      "min_commit_mib": 10130.84765625,
+      "idle_gpu_mib": 1029.171875
+    }
+  ],
+  "note": "Report all timed observations; startup/warm-up drift prevents claiming a universal model speedup."
+}

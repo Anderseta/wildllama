@@ -1,0 +1,806 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 499ff3bc1d98bf5ff1611b334dbf7700dab3e6c6..684390c6ae5e1d55f6df1c73a7cae25cc20f91c3 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/common/ngram-feedback.h b/common/ngram-feedback.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3aa6350c0857074a5b859c2b683861b33f4f571
+--- /dev/null
++++ b/common/ngram-feedback.h
+@@ -0,0 +1,110 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// A request-owned, bounded proposer. Hash collisions are checked against the
++// complete suffix. Only the target's accepted history trains the table; every
++// proposal still goes through the existing target sampler and rollback path.
++class common_ngram_feedback {
++    static constexpr size_t slots = 2048;
++    static constexpr size_t max_draft = 8;
++    struct entry {
++        std::array<int32_t, 5> key{};
++        int32_t token[2] = {-1, -1};
++        uint8_t count[2] = {};
++        int16_t score[2] = {};
++        uint8_t length = 0;
++    };
++    struct pending { size_t slot; int32_t token; std::array<int32_t, 5> key; uint8_t length; };
++    std::array<entry, slots> table{};
++    std::array<pending, max_draft> proposed{};
++    size_t observed = 0;
++    size_t proposed_count = 0;
++
++    static size_t hash(const int32_t * key, size_t n) {
++        uint64_t h = 1469598103934665603ULL ^ n;
++        for (size_t i = 0; i < n; ++i) { h = (h ^ uint32_t(key[i])) * 1099511628211ULL; }
++        return size_t(h ^ (h >> 32)) & (slots - 1);
++    }
++    static bool matches(const entry & e, const int32_t * key, size_t n) {
++        return e.length == n && std::equal(key, key + n, e.key.begin());
++    }
++    void learn(const int32_t * key, size_t n, int32_t token) {
++        auto & e = table[hash(key, n)];
++        if (!matches(e, key, n)) {
++            e = {}; e.length = uint8_t(n);
++            std::copy(key, key + n, e.key.begin());
++        }
++        if (e.count[0] >= 128 || e.count[1] >= 128) {
++            for (auto & c : e.count) { c = uint8_t((c + 1) / 2); }
++            for (auto & s : e.score) { s /= 2; }
++        }
++        int k = e.token[0] == token ? 0 : e.token[1] == token ? 1 : -1;
++        if (k < 0) {
++            k = e.count[0] <= e.count[1] ? 0 : 1;
++            e.token[k] = token; e.count[k] = 0; e.score[k] = 0;
++        }
++        ++e.count[k];
++        // New target-confirmed occurrences can rehabilitate a rejected guess.
++        if (e.score[k] < 0) { e.score[k] = int16_t(std::min(0, int(e.score[k]) + 2)); }
++    }
++public:
++    void reset() { table = {}; observed = proposed_count = 0; }
++
++    std::vector<int32_t> draft(const std::vector<int32_t> & history, int32_t sampled, size_t limit) {
++        proposed_count = 0;
++        if (!limit || history.size() < 5) { return {}; }
++        if (history.size() < observed) { reset(); }
++        // No history copy or unbounded dictionary. Initial ingestion is O(n).
++        for (size_t i = std::max<size_t>(2, observed); i < history.size(); ++i) {
++            for (size_t n = 2; n <= std::min<size_t>(5, i); ++n) {
++                learn(history.data() + i - n, n, history[i]);
++            }
++        }
++        observed = history.size() + 1; // sampled is the next committed history token
++        for (size_t n = 2; n <= 5; ++n) { learn(history.data() + history.size() - n, n, sampled); }
++        std::array<int32_t, 5 + max_draft> tail{};
++        std::copy(history.end() - 4, history.end(), tail.begin()); tail[4] = sampled;
++        std::vector<int32_t> result;
++        limit = std::min(limit, max_draft);
++        result.reserve(limit);
++        for (size_t d = 0; d < limit; ++d) {
++            bool found = false;
++            for (size_t n = 5; n >= 2; --n) {
++                const int32_t * key = tail.data() + 5 + d - n;
++                const size_t idx = hash(key, n);
++                const auto & e = table[idx];
++                if (!matches(e, key, n)) { continue; }
++                const int k = int(e.count[1]) * 4 + e.score[1] > int(e.count[0]) * 4 + e.score[0] ? 1 : 0;
++                // Rejected alternatives are retried only after new observations
++                // change the balance. Short contexts need stronger consensus.
++                if (e.score[k] < -8) { proposed_count = result.size(); return result; }
++                if (e.token[k] < 0 || e.count[k] < (n < 4 ? 3 : 1) ||
++                    e.count[k] < 2 * e.count[1-k]) { continue; }
++                proposed[d] = {idx, e.token[k], e.key, e.length};
++                result.push_back(e.token[k]); tail[5+d] = e.token[k];
++                found = true; break;
++            }
++            if (!found) { break; }
++        }
++        proposed_count = result.size();
++        return result;
++    }
++
++    void accept(size_t accepted, bool other = false) {
++        if (!other) {
++            for (size_t i = 0; i < proposed_count && i <= accepted; ++i) {
++                const auto & p = proposed[i]; auto & e = table[p.slot];
++                if (!matches(e, p.key.data(), p.length)) { continue; }
++                const int k = e.token[0] == p.token ? 0 : e.token[1] == p.token ? 1 : -1;
++                if (k < 0) { continue; }
++                e.score[k] = int16_t(std::clamp(int(e.score[k]) + (i < accepted ? 4 : -16), -64, 64));
++            }
++        }
++        proposed_count = 0;
++    }
++};
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4ea4c3ffce071eb6c77837ca2f999a10074b4af5..4ec1f9360bd1ab9b0e6f4a4ea916942cf3d6ef57 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -13,6 +13,7 @@
+ #include "ngram-cache.h"
+ #include "ngram-map.h"
+ #include "ngram-mod.h"
++#include "ngram-feedback.h"
+ #include "sampling.h"
+ 
+ #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+@@ -2275,6 +2276,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+ 
+     // shared across all sequences
+     common_ngram_simple_config config;
++    std::vector<common_ngram_feedback> feedback;
+ 
+     common_speculative_impl_ngram_simple(
+             const common_params_speculative & params, uint32_t n_seq,
+@@ -2283,13 +2285,15 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+         , params(params.ngram_simple)
+         , config(config)
+     {
++        const char * enabled = std::getenv("WILDLLAMA_NGRAM_FEEDBACK");
++        if (enabled && std::strcmp(enabled, "1") == 0) { feedback.resize(n_seq); }
+         SPC_TRC("%s", "adding speculative implementation 'ngram-simple'\n");
+         SPC_TRC("- size_n=%d, size_m=%d, min_hits=%d\n",
+                 this->params.size_n, this->params.size_m, this->params.min_hits);
+     }
+ 
+-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+-        // noop
++    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
++        if (!feedback.empty()) { feedback.at(seq_id).reset(); }
+     }
+ 
+     bool process(const common_batch & /*batch*/) override {
+@@ -2306,12 +2310,18 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+                 continue;
+             }
+ 
+-            *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
++            const int limit = common_speculative_draft_limit(config.size_mgram, dp.n_max);
++            if (!feedback.empty()) {
++                *dp.result = feedback.at(seq_id).draft(*dp.prompt, dp.id_last, size_t(limit));
++            } else {
++                *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
++                if (dp.result->size() > size_t(limit)) { dp.result->resize(limit); }
++            }
+         }
+     }
+ 
+-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+-        // noop
++    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
++        if (!feedback.empty()) { feedback.at(seq_id).accept(n_accepted, is_other); }
+     }
+ };
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ab982ba3078fa4367fe35d335191d465980559eb..6cd11cb93777c2a1aee36c09845f381b50bc56a5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7809,6 +7809,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+     }
+ 
+     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
++    ggml_cuda_mmvq_l2_initialize(device);
+     if (ctx == nullptr) {
+         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
+         return nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index aa46d11ddb2a375767f13e2440052109ac941276..fb89a59969c6607bd64a602693e4e853d653d43a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3,6 +3,7 @@
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+ #include "dense-reuse.h"
++#include "token-reuse.cuh"
+ 
+ #include <cstdint>
+ #include <type_traits>
+@@ -49,6 +50,96 @@ static constexpr bool mmvq_iq3_column_reuse_setting(const char * value) {
+ }
+ 
+ #ifndef GGML_CUDA_MMVQ_KERNELS_ONLY
++static bool mmvq_feature(const char * name) {
++    const char * value = std::getenv(name);
++    return value && std::strcmp(value, "1") == 0;
++}
++static bool mmvq_token_reuse_enabled() {
++    static const bool enabled = mmvq_feature("WILDLLAMA_CUDA_TOKEN_REUSE");
++    return enabled;
++}
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12000
++static std::atomic<size_t> mmvq_l2_capacity[GGML_CUDA_MAX_DEVICES]{};
++static thread_local cudaAccessPolicyWindow mmvq_l2_window{};
++
++void ggml_cuda_mmvq_l2_initialize(int device) {
++    static const bool enabled = mmvq_feature("WILDLLAMA_CUDA_L2_REUSE");
++    if (!enabled || device < 0 || device >= GGML_CUDA_MAX_DEVICES) { return; }
++    static std::mutex mutex;
++    static bool tried[GGML_CUDA_MAX_DEVICES]{};
++    std::lock_guard<std::mutex> lock(mutex);
++    if (tried[device]) { return; }
++    tried[device] = true;
++    int previous = 0;
++    CUDA_CHECK(cudaGetDevice(&previous));
++    CUDA_CHECK(cudaSetDevice(device));
++    cudaDeviceProp prop{};
++    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
++    const size_t limit = std::min<size_t>({size_t(std::max(0, prop.persistingL2CacheMaxSize)),
++                                         size_t(std::max(0, prop.l2CacheSize))/16, 1024*1024});
++    if (limit && prop.accessPolicyMaxWindowSize > 0) {
++        size_t existing = 0;
++        cudaError_t status = cudaDeviceGetLimit(&existing, cudaLimitPersistingL2CacheSize);
++        if (status == cudaSuccess && existing < limit) { status = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit); }
++        if (status == cudaSuccess) {
++            mmvq_l2_capacity[device].store(std::min(limit, size_t(prop.accessPolicyMaxWindowSize)));
++            GGML_LOG_INFO("cuda_l2: bounded activation reuse enabled (%zu KiB L2, no VRAM allocation)\n", limit/1024);
++        } else {
++            GGML_LOG_INFO("cuda_l2: policy unavailable; retaining normal accesses (%s)\n", cudaGetErrorString(status));
++            (void)cudaGetLastError();
++        }
++    }
++    CUDA_CHECK(cudaSetDevice(previous));
++}
++
++struct mmvq_l2_scope {
++    cudaAccessPolicyWindow previous;
++    mmvq_l2_scope(int device, const void * ptr, size_t bytes) : previous(mmvq_l2_window) {
++        const size_t budget = mmvq_l2_capacity[device].load(std::memory_order_relaxed);
++        mmvq_l2_window = {};
++        if (budget && ptr && bytes) {
++            mmvq_l2_window.base_ptr = const_cast<void *>(ptr);
++            mmvq_l2_window.num_bytes = std::min(bytes, budget);
++            mmvq_l2_window.hitRatio = 1.0f;
++            mmvq_l2_window.hitProp = cudaAccessPropertyPersisting;
++            mmvq_l2_window.missProp = cudaAccessPropertyStreaming;
++        }
++    }
++    ~mmvq_l2_scope() { mmvq_l2_window = previous; }
++};
++
++template<typename Kernel, typename... Args>
++static void mmvq_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & p, Args&&... args) {
++    if (mmvq_l2_window.num_bytes) {
++        cudaLaunchAttribute attrs[2]{};
++        attrs[0].id = cudaLaunchAttributeAccessPolicyWindow;
++        attrs[0].val.accessPolicyWindow = mmvq_l2_window;
++        cudaLaunchConfig_t config{};
++        config.gridDim=p.block_nums; config.blockDim=p.block_dims;
++        config.dynamicSmemBytes=p.shmem; config.stream=p.stream;
++        config.attrs=attrs; config.numAttrs=1;
++#if defined(GGML_CUDA_USE_PDL)
++        static const bool pdl = [] { const char * v=std::getenv("GGML_CUDA_PDL"); return !v || std::atoi(v)!=0; }();
++        if (pdl && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
++            attrs[1].id=cudaLaunchAttributeProgrammaticStreamSerialization;
++            attrs[1].val.programmaticStreamSerializationAllowed=1; config.numAttrs=2;
++        }
++#endif
++        CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...));
++        return;
++    }
++    ggml_cuda_kernel_launch(kernel, p, std::forward<Args>(args)...);
++}
++#else
++void ggml_cuda_mmvq_l2_initialize(int) {}
++struct mmvq_l2_scope { mmvq_l2_scope(int, const void *, size_t) {} };
++template<typename Kernel, typename... Args>
++static void mmvq_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & p, Args&&... args) {
++    ggml_cuda_kernel_launch(kernel, p, std::forward<Args>(args)...);
++}
++#endif
++
+ struct ggml_cuda_mmvq_reuse_scope::state {
+     struct input { char * quantized = nullptr; int last; };
+     struct allocation {
+@@ -754,7 +845,8 @@ enum class mmvq_iq3_layout {
+ };
+ 
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+-        bool iq3_row_tile = false, bool iq3_column_reuse = false, mmvq_iq3_layout layout = mmvq_iq3_layout::canonical>
++        bool iq3_row_tile = false, bool iq3_column_reuse = false, mmvq_iq3_layout layout = mmvq_iq3_layout::canonical,
++        bool token_reuse = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(),
+         iq3_column_reuse && ncols_dst == 2 ? (iq3_row_tile ? 4 : 5) : 1)
+ static __global__ void mul_mat_vec_q(
+@@ -940,6 +1032,16 @@ static __global__ void mul_mat_vec_q(
+                         }
+                     }
+                 }
++            } else if constexpr (token_reuse && type == GGML_TYPE_Q4_K && !has_fusion) {
++#pragma unroll
++                for (int i = 0; i < rows_per_cuda_block; ++i) {
++                    if constexpr (check_tail) { if (uint32_t(row0 + i) >= nrows_x) { continue; } }
++                    float dots[ncols_dst];
++                    vec_dot_q4_K_q8_1_columns((const block_q4_K *)vx + kbx_offset + i*stride_row_x + kbx,
++                                             y+kby, stride_col_y, kqs, dots);
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) { tmp[j][i] += dots[j]; }
++                }
+             } else if constexpr (iq3_column_reuse) {
+ #pragma unroll
+                 for (int i = 0; i < rows_per_cuda_block; ++i) {
+@@ -1070,7 +1172,7 @@ static __global__ void mul_mat_vec_q(
+ // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
+ // Block: (warp_size, ncols_dst) - each warp handles one token independently.
+ // No shared memory reduction needed since each warp works alone.
+-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
++template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool token_reuse = false>
+ __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_moe(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+@@ -1136,12 +1238,22 @@ static __global__ void mul_mat_vec_q_moe(
+     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+ 
++    [[maybe_unused]] bool paired = false;
++    if constexpr (token_reuse && !has_fusion && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ3_S)) {
++        const uint32_t partner = token_idx ^ 1u;
++        paired = partner < ncols_dst && channel_x == uint32_t(ids[channel_dst + partner*ids_stride]);
++        // Both columns keep their original expert/rank and output position.
++        // A warp owns a pair only when the actual router IDs match.
++        if (paired && (token_idx & 1u)) { return; }
++    }
++
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+ 
+     // partial sum for each thread
+     float tmp[c_rows_per_block] = {0.0f};
+     float tmp_gate[c_rows_per_block] = {0.0f};
++    [[maybe_unused]] float tmp_pair[c_rows_per_block] = {0.0f};
+ 
+     const auto accumulate = [&](auto tail_tag) {
+         constexpr bool check_tail = decltype(tail_tag)::value;
+@@ -1152,7 +1264,23 @@ static __global__ void mul_mat_vec_q_moe(
+ #pragma unroll
+             for (int i = 0; i < c_rows_per_block; ++i) {
+                 if constexpr (check_tail) { if (uint32_t(row0 + i) >= nrows_x) { continue; } }
+-                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                if constexpr (token_reuse && !has_fusion && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ3_S)) {
++                    if (paired) {
++                        float dots[2];
++                        if constexpr (type == GGML_TYPE_Q4_K) {
++                            vec_dot_q4_K_q8_1_columns((const block_q4_K *)vx + kbx_offset + i*stride_row_x + kbx,
++                                                     y+kby, stride_col_y, kqs, dots);
++                        } else {
++                            vec_dot_iq3_s_q8_1_columns((const block_iq3_s *)vx + kbx_offset + i*stride_row_x + kbx,
++                                                      y+kby, stride_col_y, kqs, dots);
++                        }
++                        tmp[i] += dots[0]; tmp_pair[i] += dots[1];
++                    } else {
++                        tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                    }
++                } else {
++                    tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                }
+                 if constexpr (has_fusion) {
+                     if (use_gate) {
+                         tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+@@ -1170,6 +1298,9 @@ static __global__ void mul_mat_vec_q_moe(
+ #pragma unroll
+     for (int i = 0; i < c_rows_per_block; ++i) {
+         tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
++        if constexpr (token_reuse) {
++            if (paired) { tmp_pair[i] = warp_reduce_sum<warp_size>(tmp_pair[i]); }
++        }
+         if constexpr (has_fusion) {
+             if (use_gate) {
+                 tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+@@ -1179,6 +1310,9 @@ static __global__ void mul_mat_vec_q_moe(
+ 
+     // Write results
+     if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
++        if constexpr (token_reuse) {
++            if (paired) { dst[channel_dst*stride_channel_dst + (token_idx+1)*stride_col_dst + row0+threadIdx.x] = tmp_pair[threadIdx.x]; }
++        }
+         float result = tmp[threadIdx.x];
+         if constexpr (has_fusion) {
+             const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
+@@ -1238,7 +1372,7 @@ static constexpr bool mmvq_q4_head_geometry(int64_t width, int64_t rows, int64_t
+     return width == mmvq_q4_head_width && rows == mmvq_q4_head_vocab && (tokens >= 1 && tokens <= 3);
+ }
+ 
+-template<int tokens>
++template<int tokens, bool token_reuse = false>
+ static __global__ __launch_bounds__(128, 1) void mul_mat_vec_q4_head_warp(
+         const block_q4_K * __restrict__ weights, const block_q8_1 * __restrict__ input,
+         float * __restrict__ output, int rows) {
+@@ -1264,10 +1398,18 @@ static __global__ __launch_bounds__(128, 1) void mul_mat_vec_q4_head_warp(
+ #pragma unroll
+         for (int tile = part*blocks_per_warp; tile < weight_stride; tile += 4*blocks_per_warp) {
+             const int kbx = tile + lane/lanes_per_block;
++            if constexpr (token_reuse) {
++                float dots[tokens];
++                vec_dot_q4_K_q8_1_columns(row_weights + kbx,
++                    input + kbx*(QK_K/QK8_1), input_stride, kqs, dots);
+ #pragma unroll
+-            for (int j = 0; j < tokens; ++j) {
+-                partial[j] += vec_dot_q4_K_q8_1(row_weights,
+-                    input + j*input_stride + kbx*(QK_K/QK8_1), kbx, kqs);
++                for (int j = 0; j < tokens; ++j) { partial[j] += dots[j]; }
++            } else {
++#pragma unroll
++                for (int j = 0; j < tokens; ++j) {
++                    partial[j] += vec_dot_q4_K_q8_1(row_weights,
++                        input + j*input_stride + kbx*(QK_K/QK8_1), kbx, kqs);
++                }
+             }
+         }
+ #pragma unroll
+@@ -1312,7 +1454,7 @@ static void mul_mat_vec_q_switch_fusion(
+     if constexpr (c_ncols_dst == 1) {
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
++            mmvq_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x);
+@@ -1323,7 +1465,17 @@ static void mul_mat_vec_q_switch_fusion(
+     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
++    if constexpr (type == GGML_TYPE_Q4_K && c_ncols_dst >= 2) {
++        if (mmvq_token_reuse_enabled()) {
++            mmvq_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters,
++                               false, false, mmvq_iq3_layout::canonical, true>, launch_params,
++                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x);
++            return;
++        }
++    }
++    mmvq_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x);
+@@ -1347,14 +1499,24 @@ static void mul_mat_vec_q_moe_launch(
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+ 
++    if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ3_S) {
++        // There is nothing to share for ordinary single-token routed decode.
++        if (!has_fusion && ncols_dst > 1 && mmvq_token_reuse_enabled()) {
++            mmvq_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, true>, launch_params,
++                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
++                stride_row_x, stride_col_y, stride_col_dst,
++                stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
++            return;
++        }
++    }
+     if (has_fusion) {
+-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
++        mmvq_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+             stride_row_x, stride_col_y, stride_col_dst,
+             stride_channel_x, stride_channel_y, stride_channel_dst,
+             ncols_dst, ids_stride);
+     } else {
+-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
++        mmvq_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+             stride_row_x, stride_col_y, stride_col_dst,
+             stride_channel_x, stride_channel_y, stride_channel_dst,
+@@ -1838,6 +2000,11 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    // Captured per launch in CUDA graphs. Describe only the first contiguous
++    // quantized activation row, including specialized dense/head dispatches.
++    mmvq_l2_scope activation_policy(ggml_cuda_get_device(), quantized,
++                                   size_t(ne00/QK8_1)*sizeof(block_q8_1));
++
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+     // Full Q4_K vocabulary projection on the measured SM120 geometry. Keep
+     // all logits and reuse the ordinary Q8_1 activation and output buffers.
+@@ -1861,11 +2028,19 @@ void ggml_cuda_mul_mat_vec_q(
+             const auto * weights = static_cast<const block_q4_K *>(src0->data);
+             const auto * input = reinterpret_cast<const block_q8_1 *>(quantized);
+             if (ne11 == 1) {
+-                ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<1>, parameters, weights, input, dst_d, int(ne01));
++                mmvq_kernel_launch(mul_mat_vec_q4_head_warp<1>, parameters, weights, input, dst_d, int(ne01));
+             } else if (ne11 == 2) {
+-                ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<2>, parameters, weights, input, dst_d, int(ne01));
++                if (mmvq_token_reuse_enabled()) {
++                    mmvq_kernel_launch(mul_mat_vec_q4_head_warp<2,true>, parameters, weights, input, dst_d, int(ne01));
++                } else {
++                    mmvq_kernel_launch(mul_mat_vec_q4_head_warp<2>, parameters, weights, input, dst_d, int(ne01));
++                }
+             } else {
+-                ggml_cuda_kernel_launch(mul_mat_vec_q4_head_warp<3>, parameters, weights, input, dst_d, int(ne01));
++                if (mmvq_token_reuse_enabled()) {
++                    mmvq_kernel_launch(mul_mat_vec_q4_head_warp<3,true>, parameters, weights, input, dst_d, int(ne01));
++                } else {
++                    mmvq_kernel_launch(mul_mat_vec_q4_head_warp<3>, parameters, weights, input, dst_d, int(ne01));
++                }
+             }
+             static const bool trace = [] {
+                 const char * value = std::getenv("GGML_CUDA_Q4_HEAD_WARP_TRACE");
+@@ -1909,7 +2084,7 @@ void ggml_cuda_mul_mat_vec_q(
+                 constexpr bool tiled = decltype(tile_tag)::value;
+                 constexpr bool reuse = decltype(reuse_tag)::value;
+                 constexpr auto layout = decltype(layout_tag)::value;
+-                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,tokens,false,false,false,tiled,reuse,layout>, parameters,
++                mmvq_kernel_launch(mul_mat_vec_q<GGML_TYPE_IQ3_S,tokens,false,false,false,tiled,reuse,layout>, parameters,
+                     src0->data, quantized, nullptr, ggml_cuda_mm_fusion_args_device{}, dst_d,
+                     uint32_t(ne00), init_fastdiv_values(1), uint32_t(s01), uint32_t(s11), uint32_t(s1),
+                     init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 61fca260181134e2d10dd863e691504515f4ac95..926ff38d765680a35e05f56903956319d81d81de 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -7,6 +7,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+ // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
+ // based on the quantization type and GPU architecture (compute capability).
+ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
++void ggml_cuda_mmvq_l2_initialize(int device);
+ 
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+diff --git a/ggml/src/ggml-cuda/token-reuse.cuh b/ggml/src/ggml-cuda/token-reuse.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b61a0e2e6ea9e4b957dc50ca9673aa4ca97a662
+--- /dev/null
++++ b/ggml/src/ggml-cuda/token-reuse.cuh
+@@ -0,0 +1,32 @@
++#pragma once
++
++// Same packed Q4_K bytes and the same per-column scalar dot/reduction sequence.
++// Only weight unpacking is shared; no model conversion or persistent scratch.
++template<int columns>
++static __device__ __forceinline__ void vec_dot_q4_K_q8_1_columns(
++        const block_q4_K * weight, const block_q8_1 * input, uint32_t stride,
++        int iqs, float (&dots)[columns]) {
++    const int offset = QR4_K * ((iqs/2) / (QI8_1/2));
++    const int * q4 = (const int *)(weight->qs + 16*offset + 4*((iqs/2)%4));
++    const int v[2] = {q4[0], q4[4]};
++    const uint16_t * scales = (const uint16_t *)weight->scales;
++    const int j = offset/2, jm = j & 1;
++    const uint32_t s0 = scales[jm], s2 = scales[jm+2], s4 = scales[jm+4];
++    const uint32_t hi = uint32_t(-int32_t(j >= 2));
++    uint16_t aux[2];
++    aux[0] = uint16_t(((s0 & 0x3f3f) & ~hi) | (((s4 & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
++    aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
++    const uint8_t * sc = (const uint8_t *)aux;
++#pragma unroll
++    for (int c = 0; c < columns; ++c) {
++        int u[2*QR4_K]; float d8[QR4_K];
++#pragma unroll
++        for (int i = 0; i < QR4_K; ++i) {
++            const auto & a = input[c*stride + offset + i];
++            d8[i] = __low2float(a.ds);
++            const int * q8 = (const int *)a.qs + ((iqs/2)%4);
++            u[2*i] = q8[0]; u[2*i+1] = q8[4];
++        }
++        dots[c] = vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, sc+2, weight->dm, d8);
++    }
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index bc16b1c66b2d565a8cc283bfe69867468d78099a..ebcba5061fe0294089429af80057e60bd490ce43 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -549,6 +549,19 @@ target_compile_features(test-server-checkpoint-budget PRIVATE cxx_std_17)
+ llama_test(test-server-checkpoint-budget LABEL "main behavior")
+ 
+ add_executable(test-server-mtp-depth test-server-mtp-depth.cpp)
++add_executable(test-ngram-feedback test-ngram-feedback.cpp)
++if(TARGET ggml-cuda AND NOT GGML_HIP AND NOT GGML_MUSA)
++    enable_language(CUDA)
++    find_package(CUDAToolkit REQUIRED)
++    add_executable(test-cuda-token-reuse test-cuda-token-reuse.cu)
++    target_include_directories(test-cuda-token-reuse PRIVATE ../ggml/src)
++    target_link_libraries(test-cuda-token-reuse PRIVATE ggml CUDA::cudart)
++    target_compile_features(test-cuda-token-reuse PRIVATE cxx_std_17 cuda_std_17)
++    set_target_properties(test-cuda-token-reuse PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
++    llama_test(test-cuda-token-reuse LABEL "backend cuda")
++endif()
++target_compile_features(test-ngram-feedback PRIVATE cxx_std_17)
++llama_test(test-ngram-feedback LABEL "main behavior")
+ target_compile_features(test-server-mtp-depth PRIVATE cxx_std_17)
+ llama_test(test-server-mtp-depth LABEL "main behavior")
+ 
+diff --git a/tests/test-cuda-token-reuse.cu b/tests/test-cuda-token-reuse.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e80ac21ca90b2457cf0085ffd9d109c2a105d42
+--- /dev/null
++++ b/tests/test-cuda-token-reuse.cu
+@@ -0,0 +1,134 @@
++#define GGML_CUDA_MMVQ_KERNELS_ONLY
++#include "../ggml/src/ggml-cuda/mmvq.cu"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++[[noreturn]] void ggml_cuda_error(const char * s,const char *,const char *,int,const char * message) {
++    throw std::runtime_error(std::string(s)+": "+message);
++}
++static void check(bool ok,const char * message) { if (!ok) { throw std::runtime_error(message); } }
++template<class T> struct gpu {
++    T * p=nullptr;
++    gpu(size_t n) { CUDA_CHECK(cudaMalloc((void **)&p,n*sizeof(T))); }
++    ~gpu() { if (p) { cudaFree(p); } }
++};
++static uint32_t random_value(uint32_t & s) { s^=s<<13; s^=s>>17; s^=s<<5; return s; }
++
++template<ggml_type type,int cols,bool head=false> static void run_case(bool dense,int route_pattern,bool bench,int rows=513) {
++    using block=std::conditional_t<type==GGML_TYPE_Q4_K,block_q4_K,block_iq3_s>;
++    constexpr int k=head?5120:2048,experts=4,ranks=2;
++    const int n_experts=dense?1:experts, n_ranks=dense?1:ranks;
++    const int y_channels=dense?1:(route_pattern==2?ranks:1);
++    std::vector<block> weights(n_experts*rows*(k/256));
++    std::vector<block_q8_1> inputs(cols*y_channels*(k/32));
++    uint32_t seed=42;
++    for (auto & w:weights) {
++        auto * bytes=reinterpret_cast<uint8_t *>(&w);
++        for (size_t j=0;j<sizeof(w);++j) { bytes[j]=uint8_t(random_value(seed)); }
++        if constexpr(type==GGML_TYPE_Q4_K) { w.dm=__floats2half2_rn(.02f,.003f); }
++        else { w.d=__float2half(.02f); }
++    }
++    for (auto & a:inputs) {
++        int sum=0; for(auto & q:a.qs) { q=int8_t(int(random_value(seed)%255)-127); sum+=q; }
++        a.ds=__floats2half2_rn(.01f,sum*.01f);
++    }
++    // Include noncontiguous ID rows and nonzero guard columns in every test.
++    constexpr int id_stride=5;
++    std::vector<int32_t> ids(cols*id_stride,0);
++    for(int t=0;t<cols;++t) { for(int r=0;r<n_ranks;++r) {
++        ids[t*id_stride+r]=(r+(route_pattern==1?t:route_pattern==2?t/2:0))%experts;
++    } }
++    gpu<block> w(weights.size()); gpu<block_q8_1> x(inputs.size()); gpu<int32_t> indices(ids.size());
++    const int out_stride=rows+7, out_size=out_stride*n_ranks*cols;
++    gpu<float> out(out_size);
++    CUDA_CHECK(cudaMemcpy(w.p,weights.data(),weights.size()*sizeof(block),cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(x.p,inputs.data(),inputs.size()*sizeof(block_q8_1),cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(indices.p,ids.data(),ids.size()*sizeof(int32_t),cudaMemcpyHostToDevice));
++    cudaStream_t stream; CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++    const auto launch=[&](auto enabled) {
++        constexpr bool reuse=decltype(enabled)::value;
++        if constexpr (head) {
++            mul_mat_vec_q4_head_warp<cols,reuse><<<dim3((rows+3)/4),dim3(32,4),0,stream>>>(w.p,x.p,out.p,rows);
++        } else if(dense) {
++            if constexpr(type==GGML_TYPE_Q4_K) {
++                constexpr int nw=calc_nwarps(type,cols,MMVQ_PARAMETERS_GENERIC);
++                constexpr int rpb=calc_rows_per_block(type,cols,MMVQ_PARAMETERS_GENERIC,false,nw);
++                mul_mat_vec_q<type,cols,false,false,false,false,false,mmvq_iq3_layout::canonical,reuse>
++                    <<<dim3((rows+rpb-1)/rpb),dim3(32,nw),0,stream>>>(
++                    w.p,x.p,nullptr,ggml_cuda_mm_fusion_args_device{},out.p,k,init_fastdiv_values(1),
++                    k/256,k/32,out_stride,init_fastdiv_values(1),rows*(k/256),k/32,out_stride,
++                    init_fastdiv_values(1),rows*(k/256),k/32,out_stride,0,rows);
++            }
++        } else {
++            mul_mat_vec_q_moe<type,2,false,reuse><<<dim3((rows+1)/2,n_ranks),dim3(32,cols),0,stream>>>(
++                w.p,x.p,indices.p,ggml_cuda_mm_fusion_args_device{},out.p,k,init_fastdiv_values(y_channels),rows,
++                k/256,y_channels*(k/32),n_ranks*out_stride,rows*(k/256),k/32,out_stride,cols,id_stride);
++        }
++        CUDA_CHECK(cudaGetLastError());
++    };
++    std::vector<float> baseline(out_size),candidate(out_size);
++    CUDA_CHECK(cudaMemsetAsync(out.p,0xff,out_size*sizeof(float),stream));
++    launch(std::false_type{}); CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy(baseline.data(),out.p,out_size*sizeof(float),cudaMemcpyDeviceToHost));
++    CUDA_CHECK(cudaMemsetAsync(out.p,0xff,out_size*sizeof(float),stream));
++    launch(std::true_type{}); CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy(candidate.data(),out.p,out_size*sizeof(float),cudaMemcpyDeviceToHost));
++    check(std::memcmp(baseline.data(),candidate.data(),out_size*sizeof(float))==0,"token reuse changed output bits or guards");
++    for(int t=0;t<cols;++t) { for(int r=0;r<n_ranks;++r) { for(int row=0;row<rows;++row) {
++        check(std::isfinite(candidate[head?t*rows+row:(t*n_ranks+r)*out_stride+row]),"nonfinite or unwritten output");
++    } } }
++    if(bench) {
++        cudaGraph_t graph[2]{}; cudaGraphExec_t exec[2]{}; cudaEvent_t a,b;
++        CUDA_CHECK(cudaEventCreate(&a)); CUDA_CHECK(cudaEventCreate(&b));
++        for(int opt=0;opt<2;++opt) {
++            CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
++            for(int n=0;n<100;++n) { if(opt) { launch(std::true_type{}); } else { launch(std::false_type{}); } }
++            CUDA_CHECK(cudaStreamEndCapture(stream,&graph[opt]));
++            CUDA_CHECK(cudaGraphInstantiate(&exec[opt],graph[opt],nullptr,nullptr,0));
++            CUDA_CHECK(cudaGraphLaunch(exec[opt],stream)); CUDA_CHECK(cudaStreamSynchronize(stream));
++        }
++        std::vector<float> times[2];
++        for(int repeat=0;repeat<8;++repeat) { for(int j=0;j<2;++j) {
++            const int opt=j^(repeat&1); float ms;
++            CUDA_CHECK(cudaEventRecord(a,stream)); CUDA_CHECK(cudaGraphLaunch(exec[opt],stream));
++            CUDA_CHECK(cudaEventRecord(b,stream)); CUDA_CHECK(cudaEventSynchronize(b));
++            CUDA_CHECK(cudaEventElapsedTime(&ms,a,b)); times[opt].push_back(ms/100);
++        } }
++        for(auto & t:times) { std::sort(t.begin(),t.end()); }
++        std::printf("TOKEN_REUSE type=%d dense=%d head=%d rows=%d tokens=%d route=%d baseline_ms=%.6f candidate_ms=%.6f ratio=%.4f exact=1\n",
++            int(type),dense,head,rows,cols,route_pattern,times[0][4],times[1][4],times[1][4]/times[0][4]);
++        for(int opt=0;opt<2;++opt) { cudaGraphExecDestroy(exec[opt]);cudaGraphDestroy(graph[opt]); }
++        cudaEventDestroy(a);cudaEventDestroy(b);
++    }
++    CUDA_CHECK(cudaStreamDestroy(stream));
++}
++template<int n> static void cases(bool bench) {
++    run_case<GGML_TYPE_Q4_K,n>(true,0,bench);
++    for(int route=0;route<3;++route) {
++        run_case<GGML_TYPE_Q4_K,n>(false,route,bench);
++        run_case<GGML_TYPE_IQ3_S,n>(false,route,bench);
++    }
++}
++int main(int argc,char **) {
++    try {
++        cases<1>(argc>1);cases<2>(argc>1);cases<3>(argc>1);cases<4>(argc>1);cases<8>(argc>1);
++        run_case<GGML_TYPE_Q4_K,2,true>(true,0,argc>1);
++        run_case<GGML_TYPE_Q4_K,3,true>(true,0,argc>1);
++        if (argc>1) {
++            for (int route=0;route<2;++route) {
++                run_case<GGML_TYPE_Q4_K,4>(false,route,true,8193);
++                run_case<GGML_TYPE_IQ3_S,4>(false,route,true,8193);
++                run_case<GGML_TYPE_Q4_K,8>(false,route,true,8193);
++                run_case<GGML_TYPE_IQ3_S,8>(false,route,true,8193);
++            }
++            run_case<GGML_TYPE_Q4_K,3>(true,0,true,65537);
++            run_case<GGML_TYPE_Q4_K,2,true>(true,0,true,248320);
++            run_case<GGML_TYPE_Q4_K,3,true>(true,0,true,248320);
++        }
++        std::printf("PASS %d dense/MoE token-reuse cases, bitwise equality and output guards\n",argc>1?48:37);return 0;
++    } catch(const std::exception & e) { std::fprintf(stderr,"FAIL %s\n",e.what());return 1; }
++}
+diff --git a/tests/test-ngram-feedback.cpp b/tests/test-ngram-feedback.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d02912c887fab0154bf24469b18d8dddecb48e72
+--- /dev/null
++++ b/tests/test-ngram-feedback.cpp
+@@ -0,0 +1,42 @@
++#include "../common/ngram-feedback.h"
++#include <cstdio>
++#include <stdexcept>
++
++static void check(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
++int main() {
++    common_ngram_feedback a, b;
++    std::vector<int32_t> text;
++    for (int repeat = 0; repeat < 6; ++repeat) {
++        for (int i = 10; i <= 30; ++i) { text.push_back(i); }
++    }
++    for (int i = 10; i < 15; ++i) { text.push_back(i); }
++    const auto draft = a.draft(text, 15, 3);
++    check(draft == std::vector<int32_t>({16,17,18}), "known continuation missing");
++    a.accept(0);
++    // Rejection feedback must survive append-only history; this suffix repeats
++    // before enough observations have accumulated to erase the rejection.
++    text.push_back(15);
++    for (int i = 10; i < 15; ++i) { text.push_back(i); }
++    const auto rejected = a.draft(text, 15, 3);
++    check(rejected.empty() || rejected.front() != 16, "refuted suffix repeated");
++    for (int repeat=0;repeat<8;++repeat) {
++        for (int i=15;i<=30;++i) { text.push_back(i); }
++        for (int i=10;i<15;++i) { text.push_back(i); }
++    }
++    check(a.draft(text, 15, 3).front() == 16, "new target observations did not rehabilitate a suffix");
++    check(b.draft(text, 15, 3).front() == 16, "feedback leaked between sequences");
++    b.accept(0, true);
++    check(b.draft(text, 15, 0).empty(), "zero budget ignored");
++    a.reset();
++    check(a.draft(text, 15, 1) == std::vector<int32_t>({16}), "reset did not clear feedback");
++    a.accept(100); // bounded feedback, including caller overshoot
++    check(a.draft({1,2,3}, 4, 8).empty(), "short history accepted");
++    check(sizeof(common_ngram_feedback) < 160*1024, "unbounded proposer footprint");
++    // Churn more contexts than the fixed table capacity. Collision checks must
++    // never return a continuation for a suffix absent from this history.
++    std::vector<int32_t> unique(20000);
++    for (size_t i=0;i<unique.size();++i) { unique[i]=int32_t(i+10000); }
++    a.reset();
++    check(a.draft(unique, 30000, 8).empty(), "hash collision became a match");
++    std::printf("PASS bounded ngram feedback (%zu bytes/sequence)\n", sizeof(a));
++}
