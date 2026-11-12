@@ -81,8 +81,10 @@ encoder/LoRA/reference content hashes and every actual conditioning parameter.
 Reliable filesystem change times invalidate weight-digest memoization, including
 same-size edits with a restored mtime. The first unchanged encoder signature may
 need a full file read; its real progress is reported separately from generation.
-Sampling seeds, steps, CFG, sampler, sigmas and scheduler do not invalidate
+Sampling seeds, steps, CFG, sampler, sigmas, scheduler, profile IDs and live
+RAM/VRAM admission budgets do not invalidate
 deterministic conditioning; model, adapter, encoder and backend changes still do.
+The current memory budget is still enforced when reading a cached entry.
 The supported lazy
 disk parameter backend can avoid encoder computation on a hit; actual loading
 time and peak memory still depend on the selected model and backend.
@@ -96,6 +98,10 @@ device memory and decoded pixels before enabling a kernel.
 `scripts/build-wildimage.ps1` applies the maintained patch to the pinned source and
 uses the released GGML DLLs after an ABI/name-length probe. Only image-core/CLI
 code is rebuilt; the text engine and the released GGML CUDA kernels are separate.
+Supported scaled FP8 projections share activation packing inside a generation,
+with FP32 accumulation and the original LoRA/scaling order. This is exact
+intermediate computation sharing, not an image cache or skipped denoising steps.
+See `third_party/wildimage/README.md` for native tests and kernel fallback rules.
 
 ## Qwen Image 2.1 Turbo
 

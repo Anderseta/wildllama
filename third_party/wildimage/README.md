@@ -32,7 +32,7 @@ at the pinned source revision with its pinned submodules already present:
 ```powershell
 ./scripts/build-wildimage.ps1 `
   -SourceDirectory G:/build/wildimage/source `
-  -BaseRuntimeDirectory F:/WildLlama/lib/wildimage `
+  -BaseRuntimeDirectory G:/build/wildimage/released `
   -BuildDirectory G:/build/wildimage/build `
   -Destination G:/build/wildimage/runtime `
   -PrepareOnly
@@ -43,7 +43,7 @@ their recorded hashes, and runs a small CPU-only ABI probe. The imported CMake
 targets propagate `GGML_MAX_NAME=160`, matching this release rather than the GGML
 header's default of 64. The probe verifies the tensor structure overhead, a
 130-character tensor name and one CPU tensor value before configuring the build.
-The tracked conditioning and bounded-RAM patches/headers are applied to the external source
+The tracked conditioning, bounded-RAM and CUDA patches/headers are applied to the external source
 checkout; the full vendored tree remains outside Git.
 
 The RAM overlay exports configuration and managed host-allocation functions without
@@ -73,3 +73,36 @@ unlinking the old destination entry, so an existing hard link cannot overwrite
 the released payload. The new manifest records the source revision, imported DLL
 hashes, patch/header hashes, every packaged file hash and the conditioning-cache
 capability. This script prepares a separate payload and does not install it.
+
+## Exact FP8 activation packing
+
+`0003-fp8-shared-packing.patch` and `native/wildimage_fp8.{h,cu}` add explicit
+packing/matmul graph nodes for contiguous, scaled E4M3 linear layers on CUDA
+devices with FP8 support (compute capability 8.9+). Sibling projections share
+one activation reduction and conversion. Every execution recomputes that data;
+nothing is reused across denoising steps or images. Vector loads have a scalar
+fallback for unaligned input views. Unsupported weights, layouts, backends,
+scales and forced-F32 operations retain the ordinary linear path. LoRA, weight
+scaling and bias application keep their original order.
+
+The extension retains FP32 accumulation/output and the native global-amax E4M3
+conversion, uses zero cuBLASLt workspace and declares its temporary tensors to
+the existing allocator. GPU work uses the backend stream and supports graph
+capture/replay. `WILDIMAGE_DISABLE_FP8_PACK=1` selects the original path for A/B
+diagnostics; it is not needed for normal operation.
+
+`0004-workspace-aliases.patch` backports the compute-workspace, RoPE and ConvRot
+parts of upstream commit `5f8c19f98ddb84e301bb8725b5260ec79e768e22`. Measurement
+preserves separate external allocations and view ownership, invalidates when
+their addresses change, and avoids reserving copy scratch for fresh outputs.
+The GGML DLLs and WildLlama's RAM accounting stay unchanged.
+
+GPU regression tests live in `native/test_fp8.cu`. After preparation, configure
+`native/CMakeLists.txt` with `ggml_DIR=<build>/imports`,
+`SD_SOURCE_DIRECTORY=<prepared-source>`, Release and the matching CUDA
+architecture. Build and run `test-fp8` with the isolated runtime on `PATH`.
+It compares exact FP32 outputs against native FP8 multiplication, checks shared
+packing, changes inputs after capture, and covers zeros, unaligned views,
+realistic projection dimensions and fallback conditions. Run only with an idle,
+authorized GPU. Use the full benchmark script for image pixel parity and speed;
+a matrix test alone does not establish end-to-end performance.

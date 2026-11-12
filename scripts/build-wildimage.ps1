@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = '3be23788fc0c9f35a2c24b1211caae11d4a54dbc'
-$runtimeRevision = '3be2378-wildllama-ram1'
+$runtimeRevision = '3be2378-wildllama-fp8pack1'
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
 
@@ -244,7 +244,13 @@ int main() {
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
     Copy-ReplacingFile (Join-Path $nativeDirectory 'wildimage_ram_budget.h') (Join-Path $SourceDirectory 'src/core/wildimage_ram_budget.h')
-    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch')) {
+    foreach ($name in @('wildimage_fp8.h', 'wildimage_fp8.cu')) {
+        $header = Join-Path $nativeDirectory $name
+        $target = if ($name.EndsWith('.cu')) { "src/core/cuda/$name" } else { "src/core/$name" }
+        Copy-ReplacingFile $header (Join-Path $SourceDirectory $target)
+        $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
+    }
+    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0004-workspace-aliases.patch')) {
         $patch = Join-Path $repository "third_party/wildimage/patches/$patchName"
         if(-not (Test-Path -LiteralPath $patch)) {throw "Native patch is absent: $patch"}
         & git -C $SourceDirectory apply --check $patch 2>$null

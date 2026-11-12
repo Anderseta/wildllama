@@ -37,12 +37,17 @@ func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesIn
 		t.Fatal("sampling-only changes invalidated deterministic encoder namespace", second, err)
 	}
 	for name, mutate := range map[string]func(*Profile){
-		"steps":     func(p *Profile) { p.Steps++ },
-		"cfg":       func(p *Profile) { p.CFGScale++ },
-		"sampler":   func(p *Profile) { p.Sampler = "heun" },
-		"sigmas":    func(p *Profile) { p.Sigmas = "1,0.5,0" },
-		"scheduler": func(p *Profile) { p.Scheduler = "karras" },
-		"sage":      func(p *Profile) { p.SageAttention = true },
+		"steps":          func(p *Profile) { p.Steps++ },
+		"cfg":            func(p *Profile) { p.CFGScale++ },
+		"sampler":        func(p *Profile) { p.Sampler = "heun" },
+		"sigmas":         func(p *Profile) { p.Sigmas = "1,0.5,0" },
+		"scheduler":      func(p *Profile) { p.Scheduler = "karras" },
+		"sage":           func(p *Profile) { p.SageAttention = true },
+		"vram-admission": func(p *Profile) { p.MaxVRAMMiB++ },
+		"ram-admission":  func(p *Profile) { p.MaxRAMMiB++ },
+		"vram-margin":    func(p *Profile) { p.VRAMReserveMiB++ },
+		"profile-id":     func(p *Profile) { p.ID += "-copy" },
+		"model-id":       func(p *Profile) { p.ModelID += "-copy" },
 	} {
 		t.Run("sampling-"+name, func(t *testing.T) {
 			next := profile
@@ -63,9 +68,6 @@ func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesIn
 		"vae-placement":     func(p *Profile) { p.VAEOnCPU = !p.VAEOnCPU },
 		"staging":           func(p *Profile) { p.StageComponents = !p.StageComponents },
 		"offload":           func(p *Profile) { p.OffloadToCPU = !p.OffloadToCPU },
-		"vram":              func(p *Profile) { p.MaxVRAMMiB++ },
-		"ram":               func(p *Profile) { p.MaxRAMMiB++ },
-		"vram-margin":       func(p *Profile) { p.VRAMReserveMiB++ },
 	} {
 		t.Run("conditioning-"+name, func(t *testing.T) {
 			next := profile

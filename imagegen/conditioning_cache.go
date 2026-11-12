@@ -199,6 +199,15 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 	conditioningProfile.Sigmas = ""
 	conditioningProfile.Scheduler = ""
 	conditioningProfile.SageAttention = false // Applies only to the diffusion model.
+	// Admission clamps these to live free memory on every request. They bound
+	// allocations, not the encoder math, and must not invalidate identical input
+	// when unrelated desktop/GPU activity changes. The native cache loader still
+	// enforces the current RAM budget; CPU retries use a different placement key.
+	conditioningProfile.MaxVRAMMiB = 0
+	conditioningProfile.MaxRAMMiB = 0
+	conditioningProfile.VRAMReserveMiB = 0
+	conditioningProfile.ID = ""
+	conditioningProfile.ModelID = ""
 	encoded, err := json.Marshal(struct {
 		Schema     int               `json:"schema"`
 		Runtime    string            `json:"runtime"`

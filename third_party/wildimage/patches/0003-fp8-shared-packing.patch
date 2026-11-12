@@ -1,0 +1,86 @@
+diff --git a/src/core/cuda/CMakeLists.txt b/src/core/cuda/CMakeLists.txt
+index f366899..9a340c2 100644
+--- a/src/core/cuda/CMakeLists.txt
++++ b/src/core/cuda/CMakeLists.txt
+@@ -23,7 +23,8 @@ endfunction()
+ if(SD_CUDA)
+     enable_language(CUDA)
+     sd_cuda_sources(cuda CUDA)
+-    target_sources(${SD_CUDA_TARGET} PRIVATE sage_attention.cu sol_attention.cu)
++    target_sources(${SD_CUDA_TARGET} PRIVATE sage_attention.cu sol_attention.cu wildimage_fp8.cu)
++    set_source_files_properties(wildimage_fp8.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+     set_source_files_properties(sage_attention.cu sol_attention.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+     set_source_files_properties(${SD_CUDA_SOURCES} PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+     if(SD_CUDA_CUTLASS_PATH)
+@@ -32,8 +33,8 @@ if(SD_CUDA)
+         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/int8_cuda.cu" APPEND PROPERTY INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/src/core/cuda")
+     endif()
+     set_target_properties(${SD_CUDA_TARGET} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+-    target_link_libraries(${SD_CUDA_TARGET} PRIVATE CUDA::cudart CUDA::cublas)
+-    target_link_libraries(${SD_LIB} PRIVATE CUDA::cudart CUDA::cublas)
++    target_link_libraries(${SD_CUDA_TARGET} PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
++    target_link_libraries(${SD_LIB} PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+ endif()
+ 
+ if(SD_HIPBLAS)
+diff --git a/src/core/cuda/registration.cu b/src/core/cuda/registration.cu
+index 291edd6..cd3b7a0 100644
+--- a/src/core/cuda/registration.cu
++++ b/src/core/cuda/registration.cu
+@@ -1,5 +1,9 @@
+ #include "runtime.h"
+ 
++#if !defined(SD_CUDA_VENDOR_HIP) && !defined(SD_CUDA_VENDOR_MUSA)
++void wildimage_register_fp8(ggml_backend_dev_t device);
++#endif
++
+ #ifdef SD_CUDA_CUTE_ATTENTION
+ void sd_ggml_register_cuda_i8_gated_residual(ggml_backend_dev_t device);
+ void sd_ggml_register_cuda_i8_projection(ggml_backend_dev_t device);
+@@ -27,6 +31,7 @@ namespace SD_CUDA_NAMESPACE {
+         register_rope(device);
+ #if !defined(SD_CUDA_VENDOR_HIP) && !defined(SD_CUDA_VENDOR_MUSA)
+         register_sage_attention(device);
++        wildimage_register_fp8(device);
+         register_sol_attention(device);
+ #endif
+ #ifdef SD_CUDA_CUTE_ATTENTION
+diff --git a/src/core/ggml_runner.h b/src/core/ggml_runner.h
+index 5c21b1d..f5bba8f 100644
+--- a/src/core/ggml_runner.h
++++ b/src/core/ggml_runner.h
+@@ -84,6 +84,7 @@ struct GGMLRunnerContext {
+     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
+     std::function<void(ggml_tensor*, const void*)> set_backend_tensor_data;
+     std::map<std::pair<ggml_tensor*, int>, ggml_tensor*> int8_convrot_cache;
++    std::map<ggml_tensor*, ggml_tensor*> fp8_pack_cache;
+ 
+     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
+         if (debug_tensors == nullptr || tensor == nullptr) {
+diff --git a/src/model/common/ggml_block.hpp b/src/model/common/ggml_block.hpp
+index 7529848..aecccf9 100644
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -140,6 +140,8 @@ public:
+     }
+ };
+ 
++#include "core/wildimage_fp8.h"
++
+ class Linear : public UnaryBlock {
+ protected:
+     int64_t in_features;
+@@ -282,7 +284,12 @@ public:
+             return out;
+         }
+         if (has_weight_scale) {
+-            out = ggml_ext_linear(ctx->ggml_ctx, x, w, nullptr, force_prec_f32, scale);
++#ifndef SD_USE_UPSTREAM_GGML
++            out = wildimage_fp8::linear(ctx, x, w, force_prec_f32, scale);
++#endif
++            if (out == nullptr) {
++                out = ggml_ext_linear(ctx->ggml_ctx, x, w, nullptr, force_prec_f32, scale);
++            }
+             out = ggml_mul(ctx->ggml_ctx, out, weight_scale);
+             if (ctx->weight_adapter) {
+                 WeightAdapter::ForwardParams forward_params;

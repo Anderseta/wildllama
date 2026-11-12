@@ -1,0 +1,84 @@
+diff --git a/src/core/compute_workspace.cpp b/src/core/compute_workspace.cpp
+index 4e53175..cf9d04c 100644
+--- a/src/core/compute_workspace.cpp
++++ b/src/core/compute_workspace.cpp
+@@ -147,8 +147,8 @@ namespace sd {
+                         append(type);
+                     }
+                 } else {
+-                    const auto alignment_offset = reinterpret_cast<uintptr_t>(tensor->data) % ggml_backend_get_alignment(external);
+-                    append(alignment_offset);
++                    append(tensor->buffer);
++                    append(tensor->data);
+                 }
+                 const int32_t uses = ggml_graph_use_count(graph, tensor);
+                 append(uses);
+@@ -164,7 +164,7 @@ namespace sd {
+             return {};
+         }
+         std::unordered_map<const ggml_tensor*, ggml_tensor*> copies;
+-        std::map<ggml_backend_t, ggml_backend_buffer_t> external_buffers;
++        std::map<std::pair<ggml_backend_t, const void*>, ggml_backend_buffer_t> external_buffers;
+         for (auto tensor : tensors) {
+             auto copy      = ggml_dup_tensor(context, tensor);
+             *copy          = *tensor;
+@@ -179,7 +179,9 @@ namespace sd {
+             }
+             auto external = external_backend(source);
+             if (external != nullptr && source->view_src == nullptr) {
+-                auto& buffer = external_buffers[external];
++                // Preserve distinct external allocations so overlap checks do not invent aliases.
++                const void* storage = source->buffer ? static_cast<const void*>(source->buffer) : source;
++                auto& buffer        = external_buffers[{external, storage}];
+                 if (buffer == nullptr) {
+                     buffer = ggml_backend_alloc_buffer(external, 0);
+                     GGML_ASSERT(buffer != nullptr);
+@@ -191,6 +193,18 @@ namespace sd {
+                 copy->extra = nullptr;
+             }
+         }
++        for (const auto& entry : copies) {
++            const auto* source = entry.first;
++            if (source->view_src && source->buffer) {
++                const auto* owner = source->view_src;
++                while (owner->view_src) {
++                    owner = owner->view_src;
++                }
++                if (external_backend(owner) != nullptr) {
++                    entry.second->buffer = copies.at(owner)->buffer;
++                }
++            }
++        }
+         auto copy_graph = ggml_new_graph_custom(context, graph_size, false);
+         auto map_tensor = [](const ggml_tensor* tensor, void* user_data) -> ggml_tensor* {
+             const auto& mapped = *static_cast<const std::unordered_map<const ggml_tensor*, ggml_tensor*>*>(user_data);
+diff --git a/src/core/cuda/convrot.cu b/src/core/cuda/convrot.cu
+index cf78961..26920ae 100644
+--- a/src/core/cuda/convrot.cu
++++ b/src/core/cuda/convrot.cu
+@@ -204,7 +204,8 @@ namespace SD_CUDA_NAMESPACE {
+             plan->device = cuda_device_info(ggml_backend_get_device(backend));
+             if (!describe(nodes, count, plan->op) || !supported(plan->op, plan->device))
+                 return GGML_STATUS_FAILED;
+-            *workspace = ggml_nbytes(nodes[count - 1]);
++            const auto* dst = nodes[count - 1];
++            *workspace      = !dst->data && !dst->buffer && !dst->view_src ? 0 : ggml_nbytes(dst);
+             return GGML_STATUS_SUCCESS;
+         }
+         static void destroy(void* state, void*) {
+diff --git a/src/core/cuda/rope.cu b/src/core/cuda/rope.cu
+index 99cc824..f3ab216 100644
+--- a/src/core/cuda/rope.cu
++++ b/src/core/cuda/rope.cu
+@@ -277,7 +277,10 @@ namespace SD_CUDA_NAMESPACE {
+     }
+ 
+     static ggml_status rope_prepare(ggml_backend_t, ggml_tensor* const* nodes, int count, void**, size_t* workspace, void*) {
+-        *workspace = ggml_nbytes(nodes[count - 1]);
++        const auto* dst         = nodes[count - 1];
++        // Owning casts are fresh outputs; copies into existing storage retain view_src.
++        const bool fresh_output = !dst->data && !dst->buffer && !dst->view_src;
++        *workspace              = fresh_output ? 0 : ggml_nbytes(dst);
+         return GGML_STATUS_SUCCESS;
+     }
+ 
