@@ -1,6 +1,6 @@
 # Huihui IQ3_S inference on SM120
 
-The runtime retains the GGUF, target vocabulary, requested context and KV precision. These experiments are off by default. They are selected independently per model and retain the established path when the device, tensor layout, sampler or memory budget is incompatible.
+The WildLlama launcher enables IQ3_S sign expansion on a single SM120 CUDA device and offers coefficient reuse to MTP on the same device. The native kernels check the measured matrix shapes and compact recurrent layout before dispatch. The profile can override either default with `0`. GPU block verification and the packed proposal head remain opt-in.
 
 | Runner setting | Scope | Additional device storage |
 | --- | --- | --- |
@@ -14,6 +14,8 @@ GPU verification reads the target probabilities and candidate IDs on the device.
 The packed head keeps exact Q4_K rows, uploads only changes and orders the gather on the proposal stream. It skips the comparison when the shortlist revision is unchanged. Its device allocation is admitted through the backend budget. It has a separate bounded pinned upload buffer. Each proposal still uses its actual distribution for target verification. The separate contextual vocabulary can change acceptance independently of the packing layout.
 
 Compact GDN replay keeps the original FP32 arithmetic order for each state element. It moves the loop over updates outside the per-thread row loop so one thread can reuse the shared coefficients. It applies to the existing sequential compact rollback layout for three or four proposals.
+
+The launcher keeps the configured proposal count. A profile with two proposals continues to use the two-proposal rollback path. When running the native executable directly for a benchmark, set the two launcher defaults explicitly to reproduce normal server dispatch.
 
 ## Component measurements
 

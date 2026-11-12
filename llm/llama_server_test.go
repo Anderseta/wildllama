@@ -1301,8 +1301,10 @@ func TestLlamaServerPreservedTokens(t *testing.T) {
 	}
 }
 
-func TestMTPVerificationEnvironment(t *testing.T) {
-	names := []string{"WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP", "WILDLLAMA_CUDA_GDN_GATHER"}
+func TestCUDAKernelDefaults(t *testing.T) {
+	const fastSign = "WILDLLAMA_CUDA_IQ3_FAST_SIGN"
+	const replay = "WILDLLAMA_GDN_REUSE_REPLAY"
+	names := []string{"WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP", "WILDLLAMA_CUDA_GDN_GATHER", fastSign, replay}
 	for _, name := range names {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
@@ -1318,31 +1320,41 @@ func TestMTPVerificationEnvironment(t *testing.T) {
 		gpus: []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "CUDA"}, ComputeMajor: 12}},
 	}
 	environment := map[string]string{}
-	setMTPVerificationEnvironment(environment, launch)
+	setCUDAKernelDefaults(environment, launch)
 	for _, name := range names {
 		if environment[name] != "1" {
 			t.Fatalf("missing default for %s", name)
 		}
 	}
 	t.Setenv(names[0], "0")
-	environment = map[string]string{"ggml_cuda_q4_head_warp": "0"}
-	setMTPVerificationEnvironment(environment, launch)
-	if len(environment) != 2 || environment[names[2]] != "1" {
+	t.Setenv(fastSign, "0")
+	environment = map[string]string{"ggml_cuda_q4_head_warp": "0", replay: "0"}
+	setCUDAKernelDefaults(environment, launch)
+	if len(environment) != 3 || environment[names[2]] != "1" || environment[replay] != "0" {
 		t.Fatalf("an explicit override was replaced: %v", environment)
 	}
 	launch.modelArch = "future-model"
 	launch.kvCacheType = "f16"
 	launch.opts.DraftNumPredict = 3
 	environment = map[string]string{}
-	setMTPVerificationEnvironment(environment, launch)
-	if environment[names[1]] != "1" || environment[names[2]] != "1" {
+	setCUDAKernelDefaults(environment, launch)
+	if environment[names[1]] != "1" || environment[names[2]] != "1" || environment[replay] != "1" {
 		t.Fatalf("native kernel checks were bypassed for a new model: %v", environment)
 	}
 	launch.opts.SpeculativeType = "none"
+	if err := os.Unsetenv(fastSign); err != nil {
+		t.Fatal(err)
+	}
 	environment = map[string]string{}
-	setMTPVerificationEnvironment(environment, launch)
-	if len(environment) != 0 {
+	setCUDAKernelDefaults(environment, launch)
+	if len(environment) != 1 || environment[fastSign] != "1" {
 		t.Fatalf("enabled MTP optimizations for ordinary decode: %v", environment)
+	}
+	launch.gpus[0].ComputeMajor = 8
+	environment = map[string]string{}
+	setCUDAKernelDefaults(environment, launch)
+	if len(environment) != 0 {
+		t.Fatalf("enabled SM120 kernels for an unsupported GPU: %v", environment)
 	}
 }
 

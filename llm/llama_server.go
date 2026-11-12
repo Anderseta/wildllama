@@ -504,7 +504,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	adaptivePrefixSupported := adaptivePrefixRequested && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, adaptivePrefixCacheEnvironment)
 	setAdaptivePrefixCacheEnvironment(childEnvs, adaptivePrefixRequested, adaptivePrefixSupported)
 	setCUDATuningEnvironment(childEnvs, exe, launch.gpus, launch.gpuLibs)
-	setMTPVerificationEnvironment(childEnvs, launch)
+	setCUDAKernelDefaults(childEnvs, launch)
 	SetupLlamaServerCommandEnv(cmd, exe, launch.gpuLibs, childEnvs)
 
 	slog.Info("starting llama-server", "cmd", cmd)
@@ -522,22 +522,25 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	return cmd, port, nil
 }
 
-// Enable the measured MTP kernels on the supported CUDA capability.
-// The backend checks the actual weight, cache and graph layouts.
-func setMTPVerificationEnvironment(environment map[string]string, launch llamaServerLaunchConfig) {
-	draftType := launch.draftType
-	if launch.opts.SpeculativeType != "" && launch.opts.SpeculativeType != "auto" {
-		draftType = launch.opts.SpeculativeType
-	}
-	if draftType != draftTypeMTP || launch.opts.DraftNumPredict < 1 ||
-		launch.opts.NumGPU == 0 || len(launch.gpus) != 1 {
+// The backend checks the actual weight, cache and graph layouts for these SM120 kernels.
+func setCUDAKernelDefaults(environment map[string]string, launch llamaServerLaunchConfig) {
+	if launch.opts.NumGPU == 0 || len(launch.gpus) != 1 {
 		return
 	}
 	gpu := launch.gpus[0]
 	if !strings.EqualFold(gpu.Library, "cuda") || gpu.ComputeMajor != 12 || gpu.ComputeMinor != 0 {
 		return
 	}
-	for _, name := range []string{"WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP", "WILDLLAMA_CUDA_GDN_GATHER"} {
+	defaults := []string{"WILDLLAMA_CUDA_IQ3_FAST_SIGN"}
+	draftType := launch.draftType
+	if launch.opts.SpeculativeType != "" && launch.opts.SpeculativeType != "auto" {
+		draftType = launch.opts.SpeculativeType
+	}
+	if draftType == draftTypeMTP && launch.opts.DraftNumPredict > 0 {
+		defaults = append(defaults, "WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP",
+			"WILDLLAMA_CUDA_GDN_GATHER", "WILDLLAMA_GDN_REUSE_REPLAY")
+	}
+	for _, name := range defaults {
 		_, configured := os.LookupEnv(name)
 		for key := range environment {
 			if strings.EqualFold(key, name) {
