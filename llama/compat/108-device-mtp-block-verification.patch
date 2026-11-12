@@ -707,7 +707,7 @@ index 21dacce636c58d135c884ab2fe7be3e2f395665e..382ddab88faceea27b219c4c6365c428
  // Call only for nonconcurrent target/draft operations on the same inference worker.
  // A null draft explicitly declares a standalone cooperative target.
 diff --git a/tests/test-device-verification.cpp b/tests/test-device-verification.cpp
-index c36c1040656bda6c401b62e9c2edb751d3e9a271..354916d365744f9b5d94384666d7237968fc5677 100644
+index c36c1040656bda6c401b62e9c2edb751d3e9a271..a81e1b9eeb1f7069532f75906fbf7e74d4b79b46 100644
 --- a/tests/test-device-verification.cpp
 +++ b/tests/test-device-verification.cpp
 @@ -29,6 +29,16 @@ static void initial_kv(const char * value) {
@@ -871,12 +871,12 @@ index c36c1040656bda6c401b62e9c2edb751d3e9a271..354916d365744f9b5d94384666d72379
 +            require(stats.materialized_bytes == raw_bytes, "GPU verification copied deferred rows to the host");
 +        }
 +        if (round == 0) {
-+            const float * expected = llama_get_logits_ith(contexts[0].get(), 0);
-+            const float * materialized = llama_get_logits_ith(contexts[1].get(), 0);
-+            require(expected && materialized &&
-+                    std::memcmp(expected, materialized, vocabulary * sizeof(float)) == 0,
-+                    "lazy raw logits getter changed the original logits");
++            const float * expected = llama_get_logits(contexts[0].get());
++            const float * materialized = llama_get_logits(contexts[1].get());
 +            raw_bytes = indexes.size() * vocabulary * sizeof(float);
++            require(expected && materialized &&
++                    std::memcmp(expected, materialized, raw_bytes) == 0,
++                    "lazy raw logits getter changed the original logits");
 +        }
 +    }
 +    const auto stats = llama_get_device_verification_stats(contexts[1].get());
