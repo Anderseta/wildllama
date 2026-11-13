@@ -34,9 +34,9 @@ func TestLlamaServerLogArgs(t *testing.T) {
 	for _, debug := range []string{"", "0", "false", "1", "true", "2"} {
 		t.Run("debug="+debug, func(t *testing.T) {
 			t.Setenv("OLLAMA_DEBUG", debug)
-			verbosity := "3"
+			verbosity := "4"
 			if debug == "1" || debug == "true" || debug == "2" {
-				verbosity = "4"
+				verbosity = "5"
 			}
 			want := []string{"--model", "test.gguf", "--log-verbosity", verbosity,
 				"--no-log-prefix", "--no-log-timestamps"}

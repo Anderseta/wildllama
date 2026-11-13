@@ -492,6 +492,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	cmd = exec.Command(exe, params...)
 
 	if out != nil {
+		out = newNativeLogFilter(out)
 		// os/exec serializes Write calls when stdout and stderr share a writer.
 		cmd.Stdout = out
 		cmd.Stderr = out
@@ -698,11 +699,11 @@ func embeddingBatchSize(opts api.Options, numParallel int) int {
 }
 
 func appendLlamaServerLogArgs(params []string) []string {
-	// INFO retains startup memory/offload lines needed by the scheduler. DEBUG
-	// also logs graph reallocations during decoding; enable it only on request.
-	verbosity := "3"
+	// llama.cpp maps core INFO messages (including memory/offload accounting)
+	// to common TRACE (4), while its server uses INFO (3). Keep both visible.
+	verbosity := "4"
 	if envconfig.LogLevel() <= slog.LevelDebug {
-		verbosity = "4"
+		verbosity = "5"
 	}
 	return append(params,
 		"--log-verbosity", verbosity,

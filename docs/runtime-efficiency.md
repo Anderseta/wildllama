@@ -441,13 +441,15 @@ building; no native payload rebuild or model download is required.
 
 ## Native log volume
 
-Normal runs use the native INFO log level (3). Startup placement, buffer sizes,
-warnings and errors remain available to the memory parser; structured activity
-events remain enabled independently for progress reporting. Per-decode graph
-diagnostics are DEBUG output and no longer incur formatting, pipe, parsing and
-disk overhead in normal operation. `OLLAMA_DEBUG=1` (or a higher debug level)
-restores native DEBUG logging (4) for investigations. This does not change model
-math, sampling, context or memory limits.
+Normal runs retain native verbosity 4: the pinned llama.cpp maps core INFO
+messages to common TRACE, so verbosity 3 hides memory and layer accounting.
+A bounded streaming filter removes only repetitive `sched_graph_realloc: graph
+reallocation:` diagnostics before memory/activity/error parsing and disk output.
+Other messages, including partial lines, warnings, errors and structured progress,
+pass through unchanged. The native formatting and pipe transport still occur;
+this reduces downstream parsing and disk work, not model computation.
+`OLLAMA_DEBUG=1` restores these diagnostics and native DEBUG verbosity 5.
+Model math, sampling, context and memory limits are unchanged.
 
 ## Lower host overhead for resident models
 
