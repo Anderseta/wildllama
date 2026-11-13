@@ -32,8 +32,11 @@ choices.
 New image profiles enable `offload_to_cpu` as a fallback policy. A GPU-resident
 attempt runs first. With `stage_components`, the encoder and VAE load on demand
 and release their GPU copies between phases while the denoiser stays on the GPU
-across sampling steps. Only a classified GPU memory failure moves weights to RAM
-backing while retaining GPU computation. Inactive host weights can be evicted and
+across sampling steps. After all sampling and hires passes, inactive reloadable
+weights (including the resident denoiser) are released before final VAE decode,
+avoiding overlap with its large compute buffer. A later generation can reload
+them; protected/shared blocks are preserved. Only a classified GPU memory failure
+moves weights to RAM backing while retaining GPU computation. Inactive host weights can be evicted and
 loaded again from their original files under pressure. `stage_components` also
 releases an inactive component's weights at the phase boundary; it can remain
 enabled together with RAM backing. Conditioning, references and latents required

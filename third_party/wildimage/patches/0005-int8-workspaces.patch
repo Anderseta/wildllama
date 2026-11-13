@@ -1,0 +1,83 @@
+diff --git a/src/core/cuda/i8_gated_residual.cu b/src/core/cuda/i8_gated_residual.cu
+index 21b6134..9ec06b8 100644
+--- a/src/core/cuda/i8_gated_residual.cu
++++ b/src/core/cuda/i8_gated_residual.cu
+@@ -403,7 +403,9 @@ namespace sd_i8_gated {
+         plan->device = device_info(ggml_backend_get_device(backend));
+         if (!configure(describe(nodes, count), *plan))
+             return GGML_STATUS_FAILED;
+-        *workspace = plan->output_offset + ggml_nbytes(nodes[count - 1]);
++        const auto* dst = nodes[count - 1];
++        const bool fresh_output = !dst->data && !dst->buffer && !dst->view_src;
++        *workspace = std::max<size_t>(256, plan->output_offset + (fresh_output ? 0 : ggml_nbytes(dst)));
+         return GGML_STATUS_SUCCESS;
+     }
+     static void destroy(void* state, void*) {
+@@ -432,6 +434,8 @@ namespace sd_i8_gated {
+                 continue;
+             alias |= overlaps(dst, input);
+         }
++        if (alias && ggml_backend_buffer_get_size(execution->workspace) < plan.output_offset + ggml_nbytes(dst))
++            return GGML_STATUS_FAILED;
+         auto* output              = alias ? scratch + plan.output_offset : static_cast<char*>(dst->data);
+         const size_t prefix_bytes = op.prefix ? ggml_nbytes(op.prefix) : 0;
+         auto status               = plan.launch(plan, op, reinterpret_cast<float*>(output + prefix_bytes), scratch, stream);
+diff --git a/src/core/cuda/i8_projection.cu b/src/core/cuda/i8_projection.cu
+index 2f8ec3f..0264751 100644
+--- a/src/core/cuda/i8_projection.cu
++++ b/src/core/cuda/i8_projection.cu
+@@ -330,7 +330,8 @@ static __global__ void prefix_copy(const float* input, half2* output, int64_t co
+ }
+ 
+ static ggml_status projection_prepare(ggml_backend_t, ggml_tensor* const* nodes, int count, void**, size_t* workspace, void*) {
+-    *workspace = ggml_nbytes(nodes[count - 1]);
++    const auto* dst = nodes[count - 1];
++    *workspace      = !dst->data && !dst->buffer && !dst->view_src ? 0 : ggml_nbytes(dst);
+     return GGML_STATUS_SUCCESS;
+ }
+ static void projection_destroy(void*, void*) {}
+@@ -357,6 +358,8 @@ static ggml_status projection_execute(const ggml_ext_execution_context* executio
+     for (const auto* input : {mat->src[0], mat->src[1], mat->src[2], key ? nodes[3]->src[1] : nullptr, key ? nodes[4]->src[1] : nullptr, joined ? concat->src[0] : nullptr})
+         if (input)
+             alias |= overlaps(dst, input);
++    if (alias && (!execution->workspace || ggml_backend_buffer_get_size(execution->workspace) < ggml_nbytes(dst)))
++        return GGML_STATUS_FAILED;
+     void* output   = alias ? ggml_backend_buffer_get_base(execution->workspace) : dst->data;
+     int64_t prefix = joined ? concat->src[0]->ne[key ? 1 : 2] : 0;
+     float scale    = key && count == 7 && !joined ? param_f32(nodes[5], 0) : 1.f;
+diff --git a/src/core/cuda/int8.cu b/src/core/cuda/int8.cu
+index 45f6ecd..5ee401f 100644
+--- a/src/core/cuda/int8.cu
++++ b/src/core/cuda/int8.cu
+@@ -431,7 +431,7 @@ namespace SD_CUDA_NAMESPACE {
+             ggml_ext_gpu_device_info device;
+             Kind kind;
+             int64_t k, n, rows, padded;
+-            size_t quant, scales, accum, partial, output, gemm_offset;
++            size_t quant, scales, accum, partial, output, output_bytes, gemm_offset;
+             SDI8CudaGemmPlan* gemm = nullptr;
+             bool fast_swiglu       = false;
+         };
+@@ -481,8 +481,11 @@ namespace SD_CUDA_NAMESPACE {
+             }
+             const bool large_rotation = (!mat || (op.input->type == GGML_TYPE_F32 && op.group_size == 256)) && size_t(p->k) * sizeof(float) + 128 > p->device.shared_memory;
+             p->partial                = reserve(total, large_rotation ? size_t(p->rows) * (p->k / 256) * sizeof(float) : 0);
+-            p->output                 = reserve(total, p->gemm && p->kind == SWIGLU_QUANTIZE ? 0 : ggml_nbytes(dst));
+-            *workspace                = total;
++            const bool fresh_output   = !dst->data && !dst->buffer && !dst->view_src;
++            p->output_bytes           = fresh_output || (p->gemm && p->kind == SWIGLU_QUANTIZE) ? 0 : ggml_nbytes(dst);
++            p->output                 = reserve(total, p->output_bytes);
++            // Keep pointer arithmetic valid for kernels with no temporary storage.
++            *workspace                = std::max<size_t>(total, 256);
+             return GGML_STATUS_SUCCESS;
+         }
+         static void destroy(void* state, void*) {
+@@ -599,6 +602,8 @@ namespace SD_CUDA_NAMESPACE {
+             // CUTLASS quantization epilogues read only the workspace intermediate after GEMM completes.
+             if (p.gemm && p.kind == SWIGLU_QUANTIZE)
+                 alias = false;
++            if (alias && p.output_bytes < ggml_nbytes(dst))
++                return GGML_STATUS_FAILED;
+             void* output    = alias ? scratch + p.output : dst->data;
+             CUDAError error = cuda_success;
+             if (!mat) {

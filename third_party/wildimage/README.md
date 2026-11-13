@@ -106,3 +106,29 @@ packing, changes inputs after capture, and covers zeros, unaligned views,
 realistic projection dimensions and fallback conditions. Run only with an idle,
 authorized GPU. Use the full benchmark script for image pixel parity and speed;
 a matrix test alone does not establish end-to-end performance.
+
+## INT8 workspaces and final decode
+
+`0005-int8-workspaces.patch` removes redundant output-copy scratch from INT8
+ConvRot, projection and gated-residual operations when their output is a fresh
+allocation. Existing buffers/views retain alias protection; quantization scales,
+CUTLASS tile selection, accumulation and model weights are unchanged. The
+quantization path rejects a stale no-alias plan instead of overrunning scratch.
+`test-int8-workspace` checks packed activation/scale parity, zero input, aliased
+views and stale plans. `benchmark-int8` compares existing CUTLASS tile choices
+without changing production dispatch; microbenchmarks do not establish image speed.
+
+`0006-final-decode-staging.patch` finishes all runners and releases reloadable,
+unpinned inactive weights after sampling (including every batch and hires pass)
+and before final VAE decode. It acts only with `stage_components`; it preserves
+VAE weights, blocks shared with active components, source metadata and reload
+support. This also frees GPU-resident denoiser weights that ordinary disk-backed
+phase eviction left allocated during decode. It does not evict between denoising
+steps or cache approximate activations.
+
+The optional `test-image-staging` target requires `SD_RUNTIME_LIBRARY` to point
+at the built image import library. Invoke it explicitly with denoiser, encoder,
+VAE paths and the runtime directory on an idle authorized GPU. It generates two
+fixed-seed images in one context and compares decoded pixels after weight eviction
+and reload.
+Full-image A/B validation must also cover the existing FP8/LoRA editing path.

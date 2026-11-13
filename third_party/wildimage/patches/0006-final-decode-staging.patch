@@ -1,0 +1,70 @@
+diff --git a/src/pipeline/image.cpp b/src/pipeline/image.cpp
+index 607ec18..ba087e2 100644
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -1115,6 +1115,13 @@ namespace sd::pipeline {
+             final_latents = std::move(hires_final_latents);
+         }
+ 
++        if (wildimage_ram::budget().stage_components) {
++            sd->end_runners();
++            sd->model_manager->evict_inactive_components({
++                ModelComponent::Conditioner, ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion,
++                ModelComponent::CLIPVision, ModelComponent::IPAdapter, ModelComponent::AudioEncoder,
++                ModelComponent::ControlNet, ModelComponent::PhotoMaker, ModelComponent::PuLID, ModelComponent::LoRA});
++        }
+         int num_images = 0;
+         auto result    = decode_image_outputs(sd, request, final_latents, &num_images);
+         if (result == nullptr) {
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1322,6 +1322,37 @@
+     }
+ }
+ 
++void ModelManager::evict_inactive_components(const std::set<ModelComponent>& components) {
++    // Called at a completed pipeline phase, after every runner has released its use.
++    clear_all_prefetched_params();
++    std::unordered_set<TensorState*> targets;
++    for (const auto& state : tensor_states_) {
++        if (components.count(state->component) && state->pin_count == 0 && !state->sources.empty())
++            targets.insert(state.get());
++    }
++    release_compute_staging_blocks(false, &targets);
++    size_t gpu_bytes = 0, host_bytes = 0;
++    for (auto it = params_storage_blocks_.begin(); it != params_storage_blocks_.end();) {
++        auto& block = **it;
++        const bool eligible = !block.states.empty() && std::all_of(block.states.begin(), block.states.end(), [&](TensorState* state) {
++            return state && targets.count(state) && state->pin_count == 0 && !state->staged_to_compute_backend;
++        });
++        if (!eligible) {
++            ++it;
++            continue;
++        }
++        if (block.buffer) {
++            auto& bytes = ggml_backend_buffer_is_host(block.buffer) ? host_bytes : gpu_bytes;
++            bytes += ggml_backend_buffer_get_size(block.buffer);
++        }
++        free_params_storage_block(block);
++        it = params_storage_blocks_.erase(it);
++    }
++    if (gpu_bytes || host_bytes)
++        LOG_INFO("staged final decode: released inactive weights (%.2f MiB VRAM, %.2f MiB RAM)",
++                 gpu_bytes / (1024.0 * 1024.0), host_bytes / (1024.0 * 1024.0));
++}
++
+ void ModelManager::erase_params_storage_block(ParamsStorageBlock* block) {
+     auto it = std::find_if(params_storage_blocks_.begin(),
+                            params_storage_blocks_.end(),
+diff --git a/src/model_manager.h b/src/model_manager.h
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -284,6 +284,7 @@
+     bool prefetch_enabled() const override { return !prefetch_disabled_; }
+     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+     void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
++    void evict_inactive_components(const std::set<ModelComponent>& components);
+     WeightResidencyInfo inspect_compute_backend_params(
+         const std::vector<ggml_tensor*>& tensors) const override;
+     void update_runtime_residency(uintptr_t owner_id,

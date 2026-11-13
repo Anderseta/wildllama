@@ -13,3 +13,38 @@ target_compile_features(test-fp8 PRIVATE cxx_std_17 cuda_std_17)
 target_compile_options(test-fp8 PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 enable_testing()
 add_test(NAME fp8-exact-parity COMMAND test-fp8)
+
+add_executable(test-int8-workspace test_int8_workspace.cu
+    "${SD_SOURCE_DIRECTORY}/src/core/cuda/i8_gemm.cu")
+target_include_directories(test-int8-workspace PRIVATE "${SD_SOURCE_DIRECTORY}/src"
+    "${SD_SOURCE_DIRECTORY}/thirdparty/cutlass/include")
+target_link_libraries(test-int8-workspace PRIVATE ggml::ggml CUDA::cudart CUDA::cublas)
+target_compile_features(test-int8-workspace PRIVATE cxx_std_17 cuda_std_17)
+target_compile_options(test-int8-workspace PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math;--extended-lambda;--expt-relaxed-constexpr>")
+if(MSVC)
+    target_compile_options(test-int8-workspace PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor,/Zc:__cplusplus>")
+endif()
+add_test(NAME int8-workspace-aliases COMMAND test-int8-workspace)
+
+add_executable(benchmark-int8 EXCLUDE_FROM_ALL benchmark_int8.cu)
+target_include_directories(benchmark-int8 PRIVATE "${SD_SOURCE_DIRECTORY}/src"
+    "${SD_SOURCE_DIRECTORY}/thirdparty/cutlass/include")
+target_link_libraries(benchmark-int8 PRIVATE ggml::ggml CUDA::cudart)
+target_compile_features(benchmark-int8 PRIVATE cxx_std_17 cuda_std_17)
+target_compile_options(benchmark-int8 PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math;--extended-lambda;--expt-relaxed-constexpr>")
+if(MSVC)
+    target_compile_options(benchmark-int8 PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor,/Zc:__cplusplus>")
+endif()
+
+set(SD_RUNTIME_LIBRARY "" CACHE FILEPATH "Built image runtime library for the optional model staging test")
+if(EXISTS "${SD_RUNTIME_LIBRARY}")
+    add_executable(test-image-staging EXCLUDE_FROM_ALL test_image_staging.cpp)
+    target_include_directories(test-image-staging PRIVATE "${SD_SOURCE_DIRECTORY}/include")
+    target_link_libraries(test-image-staging PRIVATE "${SD_RUNTIME_LIBRARY}" ggml::ggml)
+    target_compile_features(test-image-staging PRIVATE cxx_std_17)
+    target_compile_definitions(test-image-staging PRIVATE SD_BUILD_SHARED_LIB)
+endif()
