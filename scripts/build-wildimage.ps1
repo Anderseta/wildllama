@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
-$runtimeRevision = 'b9d7176-wildllama-h3-2'
+$runtimeRevision = 'b9d7176-wildllama-h3-3'
 $originalOutputEncoding = [Console]::OutputEncoding
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
@@ -250,7 +250,7 @@ int main() {
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
     Copy-ReplacingFile (Join-Path $nativeDirectory 'wildimage_ram_budget.h') (Join-Path $SourceDirectory 'src/core/wildimage_ram_budget.h')
-    foreach ($name in @('wildimage_fp8.h', 'wildimage_fp8.cu')) {
+    foreach ($name in @('wildimage_fp8.h', 'wildimage_fp8.cu', 'wildimage_cuda_wait.h')) {
         $header = Join-Path $nativeDirectory $name
         $target = if ($name.EndsWith('.cu')) { "src/core/cuda/$name" } else { "src/core/$name" }
         Copy-ReplacingFile $header (Join-Path $SourceDirectory $target)
@@ -298,8 +298,10 @@ int main() {
         "-DCMAKE_MAKE_PROGRAM=$($ninja.Replace('\', '/'))", "-DCMAKE_C_COMPILER=$($cl.Replace('\', '/'))", "-DCMAKE_CXX_COMPILER=$($cl.Replace('\', '/'))",
         "-DCMAKE_CUDA_COMPILER=$($nvcc.Replace('\', '/'))", "-DCMAKE_CUDA_HOST_COMPILER=$($cl.Replace('\', '/'))", '-DCMAKE_BUILD_TYPE=Release',
         "-DCMAKE_PROJECT_INCLUDE=$($includeRules.Replace('\', '/'))",
-        "-DCMAKE_C_COMPILER_LAUNCHER=$($CmakePath.Replace('\', '/'));-E;env;VSLANG=1033",
-        "-DCMAKE_CXX_COMPILER_LAUNCHER=$($CmakePath.Replace('\', '/'));-E;env;VSLANG=1033",
+        # Invalidate objects created before the localized /showIncludes fix.
+        # Their zero-entry Ninja dependency records otherwise stay valid forever.
+        "-DCMAKE_C_COMPILER_LAUNCHER=$($CmakePath.Replace('\', '/'));-E;env;VSLANG=1033;WILDIMAGE_HEADER_DEPS=2",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=$($CmakePath.Replace('\', '/'));-E;env;VSLANG=1033;WILDIMAGE_HEADER_DEPS=2",
         '-DCMAKE_TRY_COMPILE_CONFIGURATION=Release', '-DCMAKE_C_FLAGS_DEBUG=/MDd /Ob0 /Od /RTC1 /Z7', '-DCMAKE_CXX_FLAGS_DEBUG=/MDd /Ob0 /Od /RTC1 /Z7',
         "-DCMAKE_INSTALL_PREFIX=$((Join-Path $BuildDirectory 'install').Replace('\', '/'))", "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures",
         '-DSD_BUILD_SHARED_LIBS=ON', '-DSD_BUILD_SHARED_GGML_LIB=OFF', '-DSD_BUILD_EXAMPLES=ON', '-DSD_SERVER_BUILD_FRONTEND=OFF',
@@ -318,6 +320,14 @@ int main() {
     }
 
     Invoke-Checked $CmakePath @('--build', $cmakeDirectory, '--target', 'sd-cli', 'sd-server', '--parallel', "$Parallel") (Join-Path $BuildDirectory 'compile.log') | Out-Null
+    foreach ($module in @('minimax_h3', 'qwen_image')) {
+        $object = "CMakeFiles/stable-diffusion.dir/src/model/integrations/$module.cpp.obj"
+        $dependencies = @(& $ninja -C $cmakeDirectory -t deps $object 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $dependencies -notmatch '#deps [1-9][0-9]*,' -or
+            $dependencies -notmatch "model[/\\]diffusion[/\\]$module[^`r`n]*\.hpp") {
+            throw "Header dependencies are missing for $module; refusing to install a potentially stale image runtime."
+        }
+    }
     $binaryDirectory = Join-Path $cmakeDirectory 'bin'
     foreach ($name in @('sd-cli.exe', 'sd-server.exe', 'stable-diffusion.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $binaryDirectory $name))) { throw "Expected compiled output is absent: $name" }

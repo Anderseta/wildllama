@@ -24,20 +24,31 @@ index e2dd3f9..28683ca 100644
  
  if(SD_HIPBLAS)
 diff --git a/src/core/cuda/registration.cu b/src/core/cuda/registration.cu
-index d92be44..1926484 100644
+index d92be44..0433be4 100644
 --- a/src/core/cuda/registration.cu
 +++ b/src/core/cuda/registration.cu
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,10 @@
  #include "runtime.h"
  
 +#if !defined(SD_CUDA_VENDOR_HIP) && !defined(SD_CUDA_VENDOR_MUSA)
++#include "core/wildimage_cuda_wait.h"
 +void wildimage_register_fp8(ggml_backend_dev_t device);
 +#endif
 +
  #ifdef SD_CUDA_CUTE_ATTENTION
  void sd_ggml_register_cuda_i8_gated_residual(ggml_backend_dev_t device);
  void sd_ggml_register_cuda_i8_projection(ggml_backend_dev_t device);
-@@ -34,6 +38,7 @@ namespace SD_CUDA_NAMESPACE {
+@@ -24,6 +29,9 @@ namespace SD_CUDA_NAMESPACE {
+     void register_extensions(ggml_backend_dev_t device) {
+         if (cuda_device_info(device).device < 0)
+             return;
++#if !defined(SD_CUDA_VENDOR_HIP) && !defined(SD_CUDA_VENDOR_MUSA)
++        wildimage_configure_cuda_wait(device);
++#endif
+         register_affine(device);
+         register_modulate(device);
+         register_i8(device);
+@@ -34,6 +42,7 @@ namespace SD_CUDA_NAMESPACE {
          register_rms_affine(device);
  #if !defined(SD_CUDA_VENDOR_HIP) && !defined(SD_CUDA_VENDOR_MUSA)
          register_sage_attention(device);

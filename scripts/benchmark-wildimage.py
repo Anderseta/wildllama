@@ -172,6 +172,22 @@ def gpu_read(nvidia_smi, device):
     return {"uuid": uuid.strip(), "used_mib": int(used), "free_mib": int(free), "total_mib": int(total)}
 
 
+def windows_cpu_seconds(handle):
+    """Process CPU time, including waits only if the CPU actually executes."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+    if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                  ctypes.byref(system), ctypes.byref(user)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return sum((time.dwHighDateTime << 32) | time.dwLowDateTime for time in (system, user)) / 10_000_000
+
+
 def windows_process_memory(pid):
     """Optional standard-library-only counters, independent of GPU telemetry."""
     if os.name != "nt":
@@ -267,11 +283,13 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
     for name in ("WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES"):
         env.pop(name, None)
     env["CUDA_VISIBLE_DEVICES"] = initial["uuid"]
-    env["CUDA_CACHE_PATH"] = str(directory.parent / "cuda-cache")
+    env["WILDIMAGE_CUDA_WAIT"] = (options.candidate_cuda_wait or options.cuda_wait) if variant == "candidate" else options.cuda_wait
+    env["CUDA_CACHE_PATH"] = str(options.cuda_cache_dir or directory.parent / "cuda-cache")
     env["TMP"] = env["TEMP"] = str(directory)
     Path(env["CUDA_CACHE_PATH"]).mkdir(exist_ok=True)
     samples, memory_samples, errors, phases, native = [], [], [], [(0.0, "loading")], {}
     phase_cursor = 0
+    cpu_seconds = None
     stop, timed_out = threading.Event(), threading.Event()
     start = time.perf_counter()
     with (directory / "runner.log").open("w", encoding="utf-8", buffering=1) as log:
@@ -314,6 +332,11 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
                     native[marker.group(1).lower()] = float(marker.group(2))
             code = child.wait()
             elapsed = time.perf_counter() - start
+            if os.name == "nt":
+                try:
+                    cpu_seconds = windows_cpu_seconds(int(child._handle))
+                except OSError as error:
+                    errors.append(f"CPU telemetry unavailable: {error}")
         finally:
             timer.cancel()
             if child.poll() is None:
@@ -333,6 +356,10 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
         "wall_phase_seconds": phase_times, "native_phase_seconds": native,
         "gpu": gpu_summary(initial, samples, phases, errors),
         "memory": memory_summary(memory_samples, phases),
+        "cpu_seconds": None if cpu_seconds is None else round(cpu_seconds, 4),
+        "average_cpu_cores": None if cpu_seconds is None else round(cpu_seconds / elapsed, 4),
+        "cuda_wait": env["WILDIMAGE_CUDA_WAIT"],
+        "cuda_cache_path": env["CUDA_CACHE_PATH"],
     }
 
 
@@ -361,6 +388,10 @@ def arguments():
     parser.add_argument("--candidate-profile", type=absolute_path,
                         help="saved image configuration or one profile JSON object for the candidate")
     parser.add_argument("--candidate-runner", type=absolute_path)
+    parser.add_argument("--cuda-wait", choices=["auto", "blocking", "spin", "yield"], default="auto")
+    parser.add_argument("--candidate-cuda-wait", choices=["auto", "blocking", "spin", "yield"])
+    parser.add_argument("--cuda-cache-dir", type=absolute_path,
+                        help="optional warmed CUDA kernel cache for fair comparisons; never caches image conditioning")
     parser.add_argument("--stock-runner", type=absolute_path,
                         help="optional upstream build at the same commit, using the baseline profile")
     parser.add_argument("--sage", action="store_true",
@@ -396,7 +427,7 @@ def main():
     candidate = load_profile(options.candidate_profile) if options.candidate_profile else baseline
     candidate_runner = options.candidate_runner or options.runner
     cases = [("baseline", options.runner, baseline)]
-    if options.candidate_profile or options.candidate_runner:
+    if options.candidate_profile or options.candidate_runner or options.candidate_cuda_wait:
         cases.append(("candidate", candidate_runner, candidate))
     if options.sage:
         cases.append(("sage", candidate_runner, candidate))
@@ -407,6 +438,7 @@ def main():
     if not options.run:
         print(json.dumps({
             "mode": "dry-run", "repetitions": options.repetitions, "prompt_file": str(options.prompt),
+            "cuda_wait": options.cuda_wait, "candidate_cuda_wait": options.candidate_cuda_wait,
             "cases": {name: runner_command(runner, profile, options, options.work_dir / "<run>" / name, name)
                       for name, runner, profile in cases},
         }, ensure_ascii=False, indent=2))

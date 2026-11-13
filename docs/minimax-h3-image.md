@@ -58,6 +58,27 @@ about 1.09 GiB, while private commit reached 16.18 GiB. This is one workload,
 not a general throughput guarantee. Avoiding repeated preparation is the main
 gain; it does not mean the weights or required VRAM became smaller.
 
+On Windows, the isolated CUDA image process uses blocking CPU waits rather than
+spinning throughout GPU synchronization. This changes host scheduling only:
+weights, arithmetic, references and sampling remain unchanged. The text runner
+is unaffected. `WILDIMAGE_CUDA_WAIT=auto` retains the driver's original policy;
+`blocking`, `spin` and `yield` are explicit diagnostic overrides. A rejected
+driver setting leaves generation on the existing policy, without resetting the
+CUDA context. Other operating systems retain their original default.
+
+The benchmark reports process CPU seconds separately from wall time. Use
+`--candidate-cuda-wait blocking` to compare the two policies in the same runner;
+repeat with alternating order and optionally `--cuda-cache-dir` pointing to a
+warmed kernel cache. This is not an image/conditioning cache. Disk cache and JIT
+warmup can dominate a first run, so a faster second run alone is not evidence of
+a throughput improvement. Fixed-seed Qwen and MiniMax image comparisons retained
+identical pixels with the new waiting policy.
+
+The Windows build invalidates old object files that were created with broken
+localized MSVC header detection once. It then checks that Ninja tracked the
+MiniMax and Qwen headers before packaging. Later builds remain incremental;
+a header edit must never silently reuse an obsolete model implementation.
+
 `0007-gguf-original-shapes.patch` restores `comfy.gguf.orig_shape.*` metadata,
 including the vision encoder's five-dimensional patch embedding. It verifies
 element counts, overflow, quantization block alignment and file bounds, without

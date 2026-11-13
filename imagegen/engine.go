@@ -811,6 +811,12 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	// Clear a parent text-runner override; the image loader discovers its own
 	// modules beside sd-cli and dependent DLLs resolve from that private folder.
 	set("GGML_BACKEND_PATH", "")
+	// Long GPU image kernels need no busy-waiting CPU core. This only affects
+	// the isolated image process; the text runner and numerical work are intact.
+	// Keep an explicit override for driver/platform latency investigations.
+	if runtime.GOOS == "windows" && strings.TrimSpace(os.Getenv("WILDIMAGE_CUDA_WAIT")) == "" {
+		set("WILDIMAGE_CUDA_WAIT", "blocking")
+	}
 	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES"} {
 		set(key, "")
 	}
