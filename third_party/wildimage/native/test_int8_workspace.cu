@@ -22,12 +22,14 @@ static void quantize_trial(ggml_backend_t gpu, int k, int rows) {
     auto ctx             = ggml_init({ggml_tensor_overhead() * 32, nullptr, true});
     auto backing         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, int64_t(k) * (rows + 4));
     auto x               = ggml_view_2d(ctx, backing, k, rows, size_t(k) * sizeof(float), 0);
-    auto out             = ggml_quantize_i8_convrot(ctx, x, 256);
+    const int32_t group = 256;
+    ggml_tensor* inputs[] = {x};
+    auto out             = ggml_ext_op_create(ctx, sd_ggml_convrot_op(), inputs, 1, &group);
     ggml_tensor* nodes[] = {out};
     void* fresh          = nullptr;
     size_t fresh_bytes   = 0;
     require(sd_cuda::sd_i8_cuda::prepare(gpu, nodes, 1, &fresh, &fresh_bytes, nullptr) == GGML_STATUS_SUCCESS, "fresh prepare");
-    require(static_cast<sd_cuda::sd_i8_cuda::Plan*>(fresh)->output_bytes == 0, "fresh output reserved copy scratch");
+    require(static_cast<sd_cuda::sd_i8_cuda::Plan*>(fresh)->output == SIZE_MAX, "fresh output reserved copy scratch");
     auto allocation = ggml_backend_alloc_ctx_tensors(ctx, gpu);
     require(allocation, "allocation");
     void* separate = out->data;

@@ -62,7 +62,20 @@ func TestImageLocalAsyncCopyRegistersBaseProfileAndSharedVisionWithoutGPU(t *tes
 	diffusion := filepath.Join(directory, "diffusion.gguf")
 	vae := filepath.Join(directory, "vae.gguf")
 	for _, path := range []string{diffusion, vae} {
-		require.NoError(t, os.WriteFile(path, append([]byte("GGUF"), make([]byte, 28)...), 0600))
+		var data bytes.Buffer
+		data.WriteString("GGUF")
+		for _, value := range []any{uint32(3), uint64(1), uint64(0), uint64(6)} {
+			require.NoError(t, binary.Write(&data, binary.LittleEndian, value))
+		}
+		data.WriteString("weight")
+		for _, value := range []any{uint32(1), uint64(8), uint32(0), uint64(0)} {
+			require.NoError(t, binary.Write(&data, binary.LittleEndian, value))
+		}
+		for data.Len()%32 != 0 {
+			data.WriteByte(0)
+		}
+		data.Write(make([]byte, 32))
+		require.NoError(t, os.WriteFile(path, data.Bytes(), 0600))
 	}
 	encoder := filepath.Join(directory, "encoder.safetensors")
 	imageLocalTensorFixture(t, encoder, map[string]any{

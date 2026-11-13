@@ -8,11 +8,13 @@ import (
 )
 
 const (
-	RunnerRevision  = "3be2378"
-	RunnerRelease   = "master-1043-3be2378"
-	DefaultRecipeID = "qwen-image-2.1-turbo-uncensored-q5"
-	ManifestName    = "wildimage-model.json"
-	TurboSigmas     = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
+	RunnerRevision    = "b9d7176"
+	RunnerRelease     = "master-1091-b9d7176"
+	DefaultRecipeID   = "qwen-image-2.1-turbo-uncensored-q5"
+	ManifestName      = "wildimage-model.json"
+	TurboSigmas       = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
+	MiniMaxH3RecipeID = "minimax-h3-image-q5-abliterated-12.5g"
+	MiniMaxH3Sigmas   = "1.0,0.9675236940383911,0.8875485062599182,0.75,0.5327739119529724,0.23200887441635132,0.0"
 	// Only the managed native runner emits this code for a retryable GPU failure.
 	GPUOutOfMemoryExitCode = 75
 	RAMBudgetExitCode      = 76
@@ -189,7 +191,11 @@ type Runner interface {
 }
 
 func DefaultProfile(modelID string) Profile {
-	return Profile{ID: "qwen-image-2.1-turbo", ModelID: modelID, Width: 1024, Height: 1024,
+	p := Profile{ID: "qwen-image-2.1-turbo", ModelID: modelID, Width: 1024, Height: 1024,
 		Steps: 8, CFGScale: 1, Sampler: "euler", Sigmas: TurboSigmas, MaxVRAMMiB: 0, VRAMReserveMiB: DefaultVRAMReserveMiB,
 		StageComponents: true, OffloadToCPU: true, FlashAttention: true, VAETiling: true}
+	if modelID == MiniMaxH3RecipeID {
+		p.ID, p.Steps, p.Sigmas = "minimax-h3-image", 6, MiniMaxH3Sigmas
+	}
+	return p
 }

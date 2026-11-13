@@ -14,6 +14,12 @@ target_compile_options(test-fp8 PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_m
 enable_testing()
 add_test(NAME fp8-exact-parity COMMAND test-fp8)
 
+add_executable(test-gguf-shapes test_gguf_shapes.cpp "${SD_SOURCE_DIRECTORY}/src/model_io/gguf_io.cpp")
+target_include_directories(test-gguf-shapes PRIVATE "${SD_SOURCE_DIRECTORY}/src" "${SD_SOURCE_DIRECTORY}/include" "${SD_SOURCE_DIRECTORY}/thirdparty")
+target_link_libraries(test-gguf-shapes PRIVATE ggml::ggml)
+target_compile_features(test-gguf-shapes PRIVATE cxx_std_17)
+add_test(NAME gguf-original-shapes COMMAND test-gguf-shapes "${CMAKE_CURRENT_BINARY_DIR}")
+
 add_executable(test-int8-workspace test_int8_workspace.cu
     "${SD_SOURCE_DIRECTORY}/src/core/cuda/i8_gemm.cu")
 target_include_directories(test-int8-workspace PRIVATE "${SD_SOURCE_DIRECTORY}/src"

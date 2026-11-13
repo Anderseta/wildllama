@@ -1,0 +1,175 @@
+diff --git a/src/model_io/gguf_io.cpp b/src/model_io/gguf_io.cpp
+index 8120131..d273f65 100644
+--- a/src/model_io/gguf_io.cpp
++++ b/src/model_io/gguf_io.cpp
+@@ -51,7 +51,12 @@ bool read_gguf_file(const std::string& file_path,
+     GGUFReader gguf_reader;
+     bool probe_ok = gguf_reader.load(file_path);
+ 
+-    if (!probe_ok || !gguf_reader.has_tensors_beyond_ggml_limits()) {
++    if (!probe_ok && gguf_reader.has_original_shapes()) {
++        set_error(error, "invalid GGUF original tensor shapes in '" + file_path + "'");
++        return false;
++    }
++
++    if (!probe_ok || (!gguf_reader.has_tensors_beyond_ggml_limits() && !gguf_reader.has_original_shapes())) {
+         ctx_gguf_ = gguf_init_from_file(file_path.c_str(), {true, &ctx_meta_});
+     }
+     if (!ctx_gguf_) {
+@@ -61,6 +66,7 @@ bool read_gguf_file(const std::string& file_path,
+         }
+ 
+         size_t data_offset = gguf_reader.data_offset();
++        const auto file_size = std::filesystem::file_size(std::filesystem::u8path(file_path));
+         for (const auto& gguf_tensor_info : gguf_reader.tensors()) {
+ #ifdef SD_USE_UPSTREAM_GGML
+             if (static_cast<int>(gguf_tensor_info.type) == SD_TYPE_F8_E4M3 ||
+@@ -74,6 +80,26 @@ bool read_gguf_file(const std::string& file_path,
+                 set_error(error, "unsupported GGUF tensor type (tensor '" + gguf_tensor_info.name + "')");
+                 return false;
+             }
++            int64_t elements = 1;
++            for (auto dim : gguf_tensor_info.shape) {
++                if (dim <= 0 || dim > INT64_MAX / elements) {
++                    set_error(error, "invalid GGUF tensor dimensions");
++                    return false;
++                }
++                elements *= dim;
++            }
++            const auto block = ggml_blck_size(gguf_tensor_info.type);
++            const auto bytes_per_block = ggml_type_size(gguf_tensor_info.type);
++            if (gguf_tensor_info.shape[0] % block || elements / block > INT64_MAX / bytes_per_block) {
++                set_error(error, "invalid GGUF tensor block layout: " + gguf_tensor_info.name);
++                return false;
++            }
++            const auto bytes = uint64_t(elements / block) * bytes_per_block;
++            if (data_offset > file_size || gguf_tensor_info.offset > file_size - data_offset ||
++                bytes > file_size - data_offset - gguf_tensor_info.offset) {
++                set_error(error, "GGUF tensor extends beyond file: " + gguf_tensor_info.name);
++                return false;
++            }
+             TensorStorage tensor_storage(
+                 gguf_tensor_info.name,
+                 gguf_tensor_info.type,
+diff --git a/src/model_io/gguf_reader_ext.h b/src/model_io/gguf_reader_ext.h
+index bf183f7..e80de3f 100644
+--- a/src/model_io/gguf_reader_ext.h
++++ b/src/model_io/gguf_reader_ext.h
+@@ -4,6 +4,9 @@
+ #include <cstdint>
+ #include <filesystem>
+ #include <fstream>
++#include <algorithm>
++#include <climits>
++#include <map>
+ #include <string>
+ #include <vector>
+ 
+@@ -36,6 +39,8 @@ enum class GGUFMetadataType : uint32_t {
+ class GGUFReader {
+ private:
+     std::vector<GGUFTensorInfo> tensors_;
++    std::map<std::string, std::vector<int64_t>> original_shapes_;
++    bool original_shapes_seen_ = false;
+     bool has_wide_tensors_    = false;
+     uint64_t remaining_bytes_ = 0;
+     size_t data_offset_;
+@@ -139,6 +144,42 @@ private:
+             return true;
+         }
+ 
++        const std::string shape_prefix = "comfy.gguf.orig_shape.";
++        if (key.compare(0, shape_prefix.size(), shape_prefix) == 0) {
++            original_shapes_seen_ = true;
++            uint32_t element_type = 0;
++            uint64_t count = 0;
++            if (type != static_cast<uint32_t>(GGUFMetadataType::ARRAY) ||
++                !safe_read(fin, element_type) || !safe_read(fin, count) || count == 0 || count > 5)
++                return false;
++            std::vector<int64_t> shape(count);
++            int64_t elements = 1;
++            for (auto& dimension : shape) {
++                uint64_t value = 0;
++                if (element_type == static_cast<uint32_t>(GGUFMetadataType::UINT32) ||
++                    element_type == static_cast<uint32_t>(GGUFMetadataType::INT32)) {
++                    uint32_t v = 0;
++                    if (!safe_read(fin, v)) return false;
++                    if (element_type == static_cast<uint32_t>(GGUFMetadataType::INT32) && v > INT32_MAX) return false;
++                    value = v;
++                } else if (element_type == static_cast<uint32_t>(GGUFMetadataType::UINT64) ||
++                           element_type == static_cast<uint32_t>(GGUFMetadataType::INT64)) {
++                    if (!safe_read(fin, value)) return false;
++                } else {
++                    return false;
++                }
++                if (value == 0 || value > uint64_t(INT64_MAX / elements)) return false;
++                dimension = static_cast<int64_t>(value);
++                elements *= dimension;
++            }
++            // Match the safetensors reader: fold the first two PyTorch axes for 5D convolution weights.
++            if (shape.size() == 5) {
++                shape[1] *= shape[0];
++                shape.erase(shape.begin());
++            }
++            std::reverse(shape.begin(), shape.end());
++            return original_shapes_.emplace(key.substr(shape_prefix.size()), std::move(shape)).second;
++        }
+         uint64_t count = 1;
+         if (type == static_cast<uint32_t>(GGUFMetadataType::ARRAY)) {
+             if (!safe_read(fin, type) || !safe_read(fin, count))
+@@ -154,6 +195,7 @@ private:
+         if (!safe_read(fin, name_len))
+             throw std::runtime_error("read tensor name length failed");
+ 
++        if (name_len == 0 || name_len > 4096) throw std::runtime_error("invalid tensor name length");
+         info.name.resize(name_len);
+         if (!safe_read(fin, (char*)info.name.data(), name_len))
+             throw std::runtime_error("read tensor name failed");
+@@ -162,10 +204,15 @@ private:
+         if (!safe_read(fin, n_dims))
+             throw std::runtime_error("read tensor dims failed");
+ 
++        if (n_dims == 0 || n_dims > 5) throw std::runtime_error("invalid tensor rank");
++        int64_t elements = 1;
+         info.shape.resize(n_dims);
+         for (uint32_t i = 0; i < n_dims; i++) {
+             if (!safe_read(fin, info.shape[i]))
+                 throw std::runtime_error("read tensor shape failed");
++            if (info.shape[i] <= 0 || info.shape[i] > INT64_MAX / elements)
++                throw std::runtime_error("invalid tensor dimension");
++            elements *= info.shape[i];
+         }
+ 
+         if (n_dims > GGML_MAX_DIMS) {
+@@ -185,11 +232,23 @@ private:
+         if (!safe_read(fin, info.offset))
+             throw std::runtime_error("read tensor offset failed");
+ 
++        const auto original = original_shapes_.find(info.name);
++        if (original != original_shapes_.end()) {
++            int64_t restored_elements = 1;
++            for (auto dim : original->second) restored_elements *= dim;
++            if (restored_elements != elements) throw std::runtime_error("original shape changes tensor element count: " + info.name);
++            info.shape = original->second;
++        }
++
+         return info;
+     }
+ 
+ public:
+     bool load(const std::string& file_path) {
++        original_shapes_.clear();
++        original_shapes_seen_ = false;
++        has_wide_tensors_ = false;
++        alignment_ = 32;
+         std::ifstream fin(std::filesystem::u8path(file_path), std::ios::binary | std::ios::ate);
+         if (!fin) {
+             LOG_ERROR("failed to open '%s'", file_path.c_str());
+@@ -254,6 +313,7 @@ public:
+     const std::vector<GGUFTensorInfo>& tensors() const { return tensors_; }
+ 
+     bool has_tensors_beyond_ggml_limits() const { return has_wide_tensors_; }
++    bool has_original_shapes() const { return original_shapes_seen_; }
+     size_t data_offset() const { return data_offset_; }
+ };
+ 

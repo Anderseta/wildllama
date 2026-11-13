@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ollama/ollama/fs/gguf"
 )
 
 type tensorDescriptor struct {
@@ -40,6 +42,20 @@ func InspectLocalComponent(path, role string) (LocalInspection, error) {
 	result.Size = info.Size()
 	if strings.EqualFold(filepath.Ext(path), ".gguf") {
 		result.Format = "GGUF"
+		metadata, err := gguf.ReadFileMetadata(path, 32)
+		if err != nil {
+			return result, fmt.Errorf("invalid image GGUF metadata: %w", err)
+		}
+		patch, merger := false, false
+		for _, tensor := range metadata.TensorInfos() {
+			result.TensorCount++
+			result.DTypes[fmt.Sprint(tensor.Type)]++
+			if strings.Contains(tensor.Name, "visual.") {
+				patch = patch || strings.Contains(tensor.Name, "patch_embed")
+				merger = merger || strings.Contains(tensor.Name, "merger.linear_fc2") || strings.Contains(tensor.Name, "merger.mlp.2")
+			}
+		}
+		result.SupportsEditing = role == "text_encoder" && patch && merger
 		result.Compatibility = "supported"
 		result.Hint = "GGUF container recognized; the runner validates architecture and tensor shapes when used"
 		return result, nil

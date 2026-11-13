@@ -5,10 +5,10 @@ param(
     [string]$CudaDirectory = $env:CUDA_PATH
 )
 $ErrorActionPreference = 'Stop'
-$revision = '3be23788fc0c9f35a2c24b1211caae11d4a54dbc'
-$release = 'master-1043-3be2378'
-$archiveName = 'sd-master-3be2378-bin-win-cuda12-x64.zip'
-$expectedHash = '76da083337834ff9c383c5f80a49c8cf7485f8fa28d1fac1ef5ce057bbcb3e51'
+$revision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
+$release = 'master-1091-b9d7176'
+$archiveName = 'sd-master-b9d7176-bin-win-cuda12-x64.zip'
+$expectedHash = '36ab0884ab3b09e7f062cc936544503364d43a84231e7671d47bdedbb5369292'
 $uri = "https://github.com/leejet/stable-diffusion.cpp/releases/download/$release/$archiveName"
 function Assert-DataPath([string]$Path) {
     $absolute = [IO.Path]::GetFullPath($Path)

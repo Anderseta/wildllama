@@ -217,7 +217,7 @@ func testProfile(t *testing.T, dir string) Profile {
 }
 func TestRecipesAndArguments(t *testing.T) {
 	list := Recipes()
-	if len(list) != 2 || list[0].ID != DefaultRecipeID {
+	if len(list) != 3 || list[0].ID != DefaultRecipeID {
 		t.Fatal("Q5 default/Q4 fallback missing")
 	}
 	for _, r := range list {
@@ -228,7 +228,7 @@ func TestRecipesAndArguments(t *testing.T) {
 				t.Fatal("unpinned component")
 			}
 		}
-		if !roles["vae"] || !roles["text_encoder"] || !roles["diffusion_model"] || !roles["vision_encoder"] {
+		if !roles["vae"] || !roles["text_encoder"] || !roles["diffusion_model"] || (!roles["vision_encoder"] && r.ID != MiniMaxH3RecipeID) {
 			t.Fatal("incomplete image recipe")
 		}
 	}

@@ -31,6 +31,15 @@ func Recipes() []Recipe {
 		diffusion := Component{Role: "diffusion_model", Repo: "AtomicChat/Qwen-Image-2.1-Turbo-GGUF", Revision: "cbcb9ff83b17e1eeef693479a8d34cea355a0ee4", Filename: q.file, SHA256: q.sha, Size: q.size, Required: true}
 		result = append(result, Recipe{ID: id, Name: "Qwen Image 2.1 Turbo · " + strings.ToUpper(q.tag) + " + Uncensored encoder Q4", Family: "qwen-image-2.1-turbo", Capabilities: []string{"generate", "edit"}, Components: []Component{diffusion, encoder, vae, vision}, DefaultProfile: DefaultProfile(id)})
 	}
+	result = append(result, Recipe{
+		ID: MiniMaxH3RecipeID, Name: "MiniMax H3 Image · Q5_K_M + encoder 12.5G com visão", Family: "minimax-h3-image",
+		Capabilities: []string{"generate", "edit"}, DefaultProfile: DefaultProfile(MiniMaxH3RecipeID),
+		Components: []Component{
+			{Role: "diffusion_model", Repo: "Abiray/MiniMax-H3-Image-GGUF", Revision: "fec7ec774db49d0c785bdc2174a488576b7396dd", Filename: "MiniMax-H3-Image-Pruned-Q5_K_M.gguf", SHA256: "f4e139d7aa5cd67727b6645a5b1c17d1c931f7289d46a3b1ea183d7a9b8ce44b", Size: 14077892224, Required: true},
+			{Role: "text_encoder", Repo: "pottokao/MiniMax-H3-TextEncoder-16GB-abliterated-GGUF", Revision: "58964486de6d8954974b4b02aac8b8885666cc6e", Filename: "MiniMax-H3-TextEncoder-Qwen3VL-32B-abliterated-12.5G_vis.gguf", SHA256: "0fae39d7618ef442d87667bd63ca1989c415656f35f892505cb207050a338fe2", Size: 13698284224, Required: true},
+			{Role: "vae", Repo: "Comfy-Org/MiniMax-H3-Image", Revision: "0bb149f51e3156ed4b90dd45d5620346bfe1df8f", Filename: "vae/minimax_h3_image_vae_fp16.safetensors", SHA256: "d80e9c2e5cfc9844869961ff5a58c9a9e52182df6bfb30b26018dd7f348721af", Size: 1168505312, Required: true},
+		},
+	})
 	return result
 }
 
@@ -114,6 +123,9 @@ func readBundle(path string) (Bundle, error) {
 	}
 	if b.Profile.Width == 0 {
 		b.Profile = DefaultProfile(b.ID)
+		if b.RecipeID == MiniMaxH3RecipeID {
+			b.Profile = DefaultProfile(b.RecipeID)
+		}
 	}
 	for i := range b.Profile.LoRAs {
 		if b.Profile.LoRAs[i].Path != "" && !filepath.IsAbs(b.Profile.LoRAs[i].Path) {
@@ -140,6 +152,10 @@ func bindProfile(b *Bundle) {
 		case "vision_encoder":
 			b.Profile.VisionEncoder = c.Path
 		}
+	}
+	// This pinned encoder contains its vision tower; never download or load it twice.
+	if b.RecipeID == MiniMaxH3RecipeID && b.Profile.VisionEncoder == "" {
+		b.Profile.VisionEncoder = b.Profile.TextEncoder
 	}
 }
 func refreshBundle(b *Bundle) {

@@ -1,25 +1,8 @@
-diff --git a/src/pipeline/image.cpp b/src/pipeline/image.cpp
-index 607ec18..ba087e2 100644
---- a/src/pipeline/image.cpp
-+++ b/src/pipeline/image.cpp
-@@ -1115,6 +1115,13 @@ namespace sd::pipeline {
-             final_latents = std::move(hires_final_latents);
-         }
- 
-+        if (wildimage_ram::budget().stage_components) {
-+            sd->end_runners();
-+            sd->model_manager->evict_inactive_components({
-+                ModelComponent::Conditioner, ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion,
-+                ModelComponent::CLIPVision, ModelComponent::IPAdapter, ModelComponent::AudioEncoder,
-+                ModelComponent::ControlNet, ModelComponent::PhotoMaker, ModelComponent::PuLID, ModelComponent::LoRA});
-+        }
-         int num_images = 0;
-         auto result    = decode_image_outputs(sd, request, final_latents, &num_images);
-         if (result == nullptr) {
 diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+index 7032bf0..9ee4d87 100644
 --- a/src/model_manager.cpp
 +++ b/src/model_manager.cpp
-@@ -1322,6 +1322,37 @@
+@@ -1337,6 +1337,37 @@ void ModelManager::release_params_storage_blocks(bool force,
      }
  }
  
@@ -58,9 +41,10 @@ diff --git a/src/model_manager.cpp b/src/model_manager.cpp
      auto it = std::find_if(params_storage_blocks_.begin(),
                             params_storage_blocks_.end(),
 diff --git a/src/model_manager.h b/src/model_manager.h
+index 0d7342b..6020ad1 100644
 --- a/src/model_manager.h
 +++ b/src/model_manager.h
-@@ -284,6 +284,7 @@
+@@ -280,6 +280,7 @@ public:
      bool prefetch_enabled() const override { return !prefetch_disabled_; }
      void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
      void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
@@ -68,3 +52,21 @@ diff --git a/src/model_manager.h b/src/model_manager.h
      WeightResidencyInfo inspect_compute_backend_params(
          const std::vector<ggml_tensor*>& tensors) const override;
      void update_runtime_residency(uintptr_t owner_id,
+diff --git a/src/pipeline/image.cpp b/src/pipeline/image.cpp
+index 5e7a349..be16551 100644
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -1202,6 +1202,13 @@ namespace sd::pipeline {
+             final_latents = std::move(hires_final_latents);
+         }
+ 
++        if (wildimage_ram::budget().stage_components) {
++            sd->end_runners();
++            sd->model_manager->evict_inactive_components({
++                ModelComponent::Conditioner, ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion,
++                ModelComponent::CLIPVision, ModelComponent::IPAdapter, ModelComponent::AudioEncoder,
++                ModelComponent::ControlNet, ModelComponent::PhotoMaker, ModelComponent::PuLID, ModelComponent::LoRA});
++        }
+         int num_images = 0;
+         auto result    = decode_image_outputs(sd, request, final_latents, &num_images);
+         if (result == nullptr) {

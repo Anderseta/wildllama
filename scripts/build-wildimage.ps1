@@ -17,8 +17,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repository = Split-Path -Parent $PSScriptRoot
-$sourceRevision = '3be23788fc0c9f35a2c24b1211caae11d4a54dbc'
-$runtimeRevision = '3be2378-wildllama-int8opt1'
+$sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
+$runtimeRevision = 'b9d7176-wildllama-h3-1'
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
 
@@ -156,7 +156,7 @@ try {
         $submodules[$relative] = $actual
     }
     $ggmlRevision = $submodules['ggml']
-    if (-not $ggmlRevision.StartsWith('d49c49e1')) { throw "Unexpected patched GGML revision: $ggmlRevision" }
+    if (-not $ggmlRevision.StartsWith('d803c238')) { throw "Unexpected patched GGML revision: $ggmlRevision" }
     $baseManifestPath = Join-Path $BaseRuntimeDirectory 'wildimage-runtime.json'
     $baseManifest = Get-Content -LiteralPath $baseManifestPath -Raw | ConvertFrom-Json
     if ($baseManifest.revision -ne $sourceRevision) { throw 'Base runtime is not the pinned upstream release.' }
@@ -250,7 +250,7 @@ int main() {
         Copy-ReplacingFile $header (Join-Path $SourceDirectory $target)
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
-    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0004-workspace-aliases.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch')) {
+    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch')) {
         $patch = Join-Path $repository "third_party/wildimage/patches/$patchName"
         if(-not (Test-Path -LiteralPath $patch)) {throw "Native patch is absent: $patch"}
         & git -C $SourceDirectory apply --check $patch 2>$null

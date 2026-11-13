@@ -91,11 +91,11 @@ the existing allocator. GPU work uses the backend stream and supports graph
 capture/replay. `WILDIMAGE_DISABLE_FP8_PACK=1` selects the original path for A/B
 diagnostics; it is not needed for normal operation.
 
-`0004-workspace-aliases.patch` backports the compute-workspace, RoPE and ConvRot
-parts of upstream commit `5f8c19f98ddb84e301bb8725b5260ec79e768e22`. Measurement
+The pinned upstream runtime includes compute-workspace, RoPE and ConvRot
+improvements from commit `5f8c19f98ddb84e301bb8725b5260ec79e768e22`. Measurement
 preserves separate external allocations and view ownership, invalidates when
 their addresses change, and avoids reserving copy scratch for fresh outputs.
-The GGML DLLs and WildLlama's RAM accounting stay unchanged.
+WildLlama's RAM accounting is applied to the unified execution engine.
 
 GPU regression tests live in `native/test_fp8.cu`. After preparation, configure
 `native/CMakeLists.txt` with `ggml_DIR=<build>/imports`,
@@ -110,8 +110,8 @@ a matrix test alone does not establish end-to-end performance.
 ## INT8 workspaces and final decode
 
 `0005-int8-workspaces.patch` removes redundant output-copy scratch from INT8
-ConvRot, projection and gated-residual operations when their output is a fresh
-allocation. Existing buffers/views retain alias protection; quantization scales,
+projection operations; ConvRot and gated-residual improvements are included upstream.
+Existing buffers/views retain alias protection; quantization scales,
 CUTLASS tile selection, accumulation and model weights are unchanged. The
 quantization path rejects a stale no-alias plan instead of overrunning scratch.
 `test-int8-workspace` checks packed activation/scale parity, zero input, aliased
