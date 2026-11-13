@@ -451,10 +451,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if err != nil {
 		return Result{}, err
 	}
-	if err := os.WriteFile(filepath.Join(jobDir, "prompt.txt"), []byte(r.Prompt+loraTags), 0600); err != nil {
+	prompt, negativePrompt := runnerReferencePrompts(p.DiffusionModel, r)
+	if err := os.WriteFile(filepath.Join(jobDir, "prompt.txt"), []byte(prompt+loraTags), 0600); err != nil {
 		return Result{}, err
 	}
-	if err := os.WriteFile(filepath.Join(jobDir, "negative.txt"), []byte(r.NegativePrompt), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(jobDir, "negative.txt"), []byte(negativePrompt), 0600); err != nil {
 		return Result{}, err
 	}
 	seed := r.Seed

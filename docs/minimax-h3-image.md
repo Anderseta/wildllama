@@ -16,6 +16,13 @@ The encoder already includes vision; no separate projector is needed. The
 MiniMax video VAE and the Qwen Image VAE are not compatible replacements.
 Existing profiles are preserved. Catalog/status requests never download weights.
 
+In the Wildgoose prompt editor, use `<image1>`, `<image2>` and so on in
+attachment order. WildLlama maps those tags to `<Picture 1>`, `<Picture 2>`
+for MiniMax H3 Image before inference. Prompts already written with the native
+MiniMax tags still work. Qwen Image 2.1 uses the editor's spelling directly.
+Other architectures that need conversion can register their tensor signature
+and output format in `imagegen/reference_prompt.go`.
+
 The recipe uses 1024 × 1024, six Euler steps, CFG 1 and the native six-step PDD
 sigmas. It retains the downloaded weight precision, Flash Attention, staged
 components, VAE tiling, RAM fallback and 256 MiB of free VRAM headroom. It does

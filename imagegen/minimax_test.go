@@ -45,45 +45,51 @@ func TestMiniMaxRecipeAndEmbeddedVision(t *testing.T) {
 
 func TestInspectGGUFCombinedEncoder(t *testing.T) {
 	for _, vision := range []bool{false, true} {
-		var buf bytes.Buffer
-		put := func(v any) {
-			if err := binary.Write(&buf, binary.LittleEndian, v); err != nil {
-				t.Fatal(err)
-			}
-		}
-		str := func(s string) { put(uint64(len(s))); buf.WriteString(s) }
-		buf.WriteString("GGUF")
-		put(uint32(3))
-		put(uint64(2))
-		put(uint64(0))
 		names := []string{"layers.0.weight", "layers.1.weight"}
 		if vision {
 			names = []string{"visual.patch_embed.proj.weight", "visual.merger.linear_fc2.weight"}
 		}
-		for i, name := range names {
-			str(name)
-			put(uint32(1))
-			put(uint64(8))
-			put(uint32(0))
-			put(uint64(i * 32))
-		}
-		for buf.Len()%32 != 0 {
-			buf.WriteByte(0)
-		}
-		buf.Write(make([]byte, 64))
-		path := filepath.Join(t.TempDir(), "encoder.gguf")
-		if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
-			t.Fatal(err)
-		}
+		path, size := writeGGUFTensorFixture(t, names)
 		inspection, err := InspectLocalComponent(path, "text_encoder")
 		if err != nil || inspection.SupportsEditing != vision || inspection.TensorCount != 2 {
 			t.Fatalf("%+v %v", inspection, err)
 		}
-		if err := os.Truncate(path, int64(buf.Len()-1)); err != nil {
+		if err := os.Truncate(path, int64(size-1)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := InspectLocalComponent(path, "text_encoder"); err == nil {
 			t.Fatal("truncated GGUF accepted")
 		}
 	}
+}
+
+func writeGGUFTensorFixture(t *testing.T, names []string) (string, int) {
+	t.Helper()
+	var buf bytes.Buffer
+	put := func(v any) {
+		if err := binary.Write(&buf, binary.LittleEndian, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf.WriteString("GGUF")
+	put(uint32(3))
+	put(uint64(len(names)))
+	put(uint64(0))
+	for i, name := range names {
+		put(uint64(len(name)))
+		buf.WriteString(name)
+		put(uint32(1))
+		put(uint64(8))
+		put(uint32(0))
+		put(uint64(i * 32))
+	}
+	for buf.Len()%32 != 0 {
+		buf.WriteByte(0)
+	}
+	buf.Write(make([]byte, len(names)*32))
+	path := filepath.Join(t.TempDir(), "model.gguf")
+	if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path, buf.Len()
 }
