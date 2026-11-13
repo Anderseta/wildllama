@@ -16,12 +16,16 @@ var imageReferenceTag = regexp.MustCompile(`<image([1-9][0-9]*)>`)
 // Reference syntax adapters. Add one entry for each architecture that needs
 // a spelling other than <imageN>. Match by tensor names, which also works for
 // imported and renamed models. Qwen Image 2.1 and unknown models pass through.
-var imageReferenceAdapters = []struct {
+type imageReferenceAdapter struct {
+	family   string
 	format   string
 	required []string
 	excluded []string
-}{
+}
+
+var imageReferenceAdapters = []imageReferenceAdapter{
 	{ // MiniMax H3 Image; the video model has an additional audio projection.
+		family:   "minimax-h3-image",
 		format:   "<Picture %d>",
 		required: []string{"video_patch_proj.weight", "condition_proj.weight"},
 		excluded: []string{"audio_patch_proj.weight"},
@@ -50,8 +54,15 @@ func runnerReferencePrompts(modelPath string, r Request) (string, string) {
 		imageReferenceTag.ReplaceAllStringFunc(r.NegativePrompt, replace)
 }
 
-// Only read model headers, and only for requests containing reference tags.
+// Read model headers only, never weight payloads.
 func imageReferenceFormat(path string) string {
+	if adapter := detectImageReferenceAdapter(path); adapter != nil {
+		return adapter.format
+	}
+	return ""
+}
+
+func detectImageReferenceAdapter(path string) *imageReferenceAdapter {
 	names := make(map[string]bool)
 	observe := func(name string) {
 		name = strings.TrimPrefix(strings.TrimPrefix(name, "model."), "diffusion_model.")
@@ -61,7 +72,7 @@ func imageReferenceFormat(path string) string {
 	case ".gguf":
 		metadata, err := gguf.ReadFileMetadata(path, 32)
 		if err != nil {
-			return ""
+			return nil
 		}
 		for _, tensor := range metadata.TensorInfos() {
 			observe(tensor.Name)
@@ -69,7 +80,7 @@ func imageReferenceFormat(path string) string {
 	case ".safetensors":
 		tensors, err := safetensors.OpenForExtraction(path)
 		if err != nil {
-			return ""
+			return nil
 		}
 		defer tensors.Close()
 		for _, name := range tensors.ListTensors() {
@@ -77,7 +88,8 @@ func imageReferenceFormat(path string) string {
 		}
 	}
 adapters:
-	for _, adapter := range imageReferenceAdapters {
+	for i := range imageReferenceAdapters {
+		adapter := &imageReferenceAdapters[i]
 		for _, name := range adapter.required {
 			if !names[name] {
 				continue adapters
@@ -88,7 +100,7 @@ adapters:
 				continue adapters
 			}
 		}
-		return adapter.format
+		return adapter
 	}
-	return ""
+	return nil
 }

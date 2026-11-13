@@ -8,6 +8,8 @@ import (
 	"reflect"
 )
 
+func conditioningStampCanReuse(_ string) bool { return true }
+
 func conditioningFileStamp(_ *os.File, info os.FileInfo) (string, bool) {
 	value := reflect.Indirect(reflect.ValueOf(info.Sys()))
 	if !value.IsValid() || value.Kind() != reflect.Struct {

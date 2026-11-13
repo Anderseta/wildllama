@@ -29,12 +29,34 @@ components, VAE tiling, RAM fallback and 256 MiB of free VRAM headroom. It does
 not enable approximate Sage Attention or introduce a negative prompt. The model
 requires its PDD schedule; adding arbitrary steps is not a quality upgrade.
 
-On 16 GiB GPUs, generator and encoder must run in separate phases. Their file
-sizes are not complete VRAM estimates: activations and workspaces also need
-memory. Generation first attempts GPU residency; a confirmed memory shortage
-retries with bounded RAM-backed GPU computation. Resolution, references and
-available system memory affect throughput. Full-model timing and peak memory
-must be measured after downloading the chosen weights.
+On 16 GiB GPUs, generator and encoder run in separate phases. The encoder's GPU
+weights are released before denoising. File sizes are not complete VRAM
+estimates: activations and workspaces also need memory. MiniMax first keeps
+weights on the GPU and lets the native allocator split work at layer boundaries.
+It can evict small weight blocks when needed without restarting reference and
+prompt encoding. A confirmed remaining shortage retains the bounded RAM-backed
+GPU/CPU fallbacks. Resolution, references and free memory affect throughput.
+
+For two or more references with a managed GPU budget of at most 16 GiB,
+independent attention heads use a 32 MiB grouping budget. This preserves all
+tokens, precision, sampling and reference resolution. Other architectures keep
+their existing placement policy; recognition uses tensor signatures, not names.
+Tensor loading wakes its progress reporter on completion instead of paying a
+fixed polling delay for each small block.
+
+Use `scripts/benchmark-wildimage.py --segmented
+--minimax-attention-budget-mib 32` with a MiniMax profile to measure this path.
+The report separates device-wide VRAM from native-process RAM on Windows:
+working set is resident memory; private commit can include nonresident pages.
+The benchmark omits conditioning caches and preserves logs and pixel hashes.
+
+A controlled RTX 5060 Ti 16 GiB run (1024², two references, six steps, fixed
+seed, 14500 MiB managed target) took 335 s through the previous failed GPU attempt
+plus RAM retry, versus 206 s directly with segmentation. The PNG pixels were
+identical. Peak native-process working set was 1.61 GiB; during sampling it was
+about 1.09 GiB, while private commit reached 16.18 GiB. This is one workload,
+not a general throughput guarantee. Avoiding repeated preparation is the main
+gain; it does not mean the weights or required VRAM became smaller.
 
 `0007-gguf-original-shapes.patch` restores `comfy.gguf.orig_shape.*` metadata,
 including the vision encoder's five-dimensional patch embedding. It verifies

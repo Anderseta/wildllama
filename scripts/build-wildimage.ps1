@@ -18,7 +18,8 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
-$runtimeRevision = 'b9d7176-wildllama-h3-1'
+$runtimeRevision = 'b9d7176-wildllama-h3-2'
+$originalOutputEncoding = [Console]::OutputEncoding
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
 
@@ -95,6 +96,7 @@ function File-Record([string]$Path, [string]$Name) {
 }
 
 try {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
     $SourceDirectory = Assert-DataPath $SourceDirectory
     $BaseRuntimeDirectory = Assert-DataPath $BaseRuntimeDirectory
     $BuildDirectory = Assert-DataPath $BuildDirectory
@@ -123,6 +125,9 @@ try {
     $env:TEMP = $temporaryDirectory
     $env:TMP = $temporaryDirectory
     $env:VSCMD_SKIP_SENDTELEMETRY = '1'
+    # Ninja must recognize /showIncludes to track header dependencies. Localized
+    # MSVC output can be decoded with the wrong code page during CMake probing.
+    $env:VSLANG = '1033'
 
     $toolsetVersion = (($MsvcVersion -split '\.')[0..1] -join '.')
     $environmentLines = & $env:ComSpec /d /s /c ('call "' + $vcvars + '" -vcvars_ver=' + $toolsetVersion + ' >nul && set')
@@ -138,6 +143,7 @@ try {
     $env:CUDA_VISIBLE_DEVICES = '-1'
     $env:CUDA_PATH = $CudaDirectory
     $env:CUDA_HOME = $CudaDirectory
+    $env:VSLANG = '1033'
     $env:VSCMD_SKIP_SENDTELEMETRY = '1'
     $env:PATH = "$toolDirectory;$(Split-Path -Parent $ninja);$CudaDirectory\bin;$BaseRuntimeDirectory;$env:PATH"
     New-Item -ItemType Directory -Force -Path $env:CUDA_CACHE_PATH | Out-Null
@@ -263,15 +269,47 @@ int main() {
         $sourceInputs += File-Record $patch "third_party/wildimage/patches/$patchName"
     }
     $sourceInputs += File-Record $PSCommandPath 'scripts/build-wildimage.ps1'
+    # CMake can misdecode localized /showIncludes output. Probe the actual
+    # compiler's UTF-8 prefix and override it after project/compiler detection.
+    $includeHeader = Join-Path $probeDirectory 'wildimage-include-probe.h'
+    $includeSource = Join-Path $probeDirectory 'wildimage-include-probe.cpp'
+    'int wildimage_include_probe;' | Set-Content -LiteralPath $includeHeader -Encoding utf8
+    '#include "wildimage-include-probe.h"' | Set-Content -LiteralPath $includeSource -Encoding utf8
+    $probeInfo = [Diagnostics.ProcessStartInfo]::new($cl)
+    $probeInfo.UseShellExecute = $false
+    # Inherit the build's console code page, just like cl launched by Ninja.
+    # CREATE_NO_WINDOW makes localized MSVC use a different byte encoding.
+    $probeInfo.CreateNoWindow = $false
+    $probeInfo.RedirectStandardOutput = $true
+    $probeInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+    foreach ($argument in @('/nologo', '/showIncludes', '/Zs', $includeSource)) { $probeInfo.ArgumentList.Add($argument) }
+    $includeProbe = [Diagnostics.Process]::Start($probeInfo)
+    try {
+        $includeOutput = $includeProbe.StandardOutput.ReadToEnd()
+        $includeProbe.WaitForExit()
+        if ($includeProbe.ExitCode -ne 0) { throw 'MSVC include prefix probe failed.' }
+    } finally { $includeProbe.Dispose() }
+    $includeLine = ($includeOutput -split "`n" | Where-Object { $_.Contains($includeHeader) } | Select-Object -First 1)
+    if (-not $includeLine) { throw 'MSVC did not report the include probe header.' }
+    $includePrefix = $includeLine.Substring(0, $includeLine.IndexOf($includeHeader)).TrimEnd() + ' '
+    $includeRules = Join-Path $probeDirectory 'msvc-includes.cmake'
+    ('set(CMAKE_CL_SHOWINCLUDES_PREFIX [==[' + $includePrefix + ']==])') | Set-Content -LiteralPath $includeRules -Encoding utf8
     $configureArguments = @('-S', $SourceDirectory, '-B', $cmakeDirectory, '-G', 'Ninja',
         "-DCMAKE_MAKE_PROGRAM=$($ninja.Replace('\', '/'))", "-DCMAKE_C_COMPILER=$($cl.Replace('\', '/'))", "-DCMAKE_CXX_COMPILER=$($cl.Replace('\', '/'))",
         "-DCMAKE_CUDA_COMPILER=$($nvcc.Replace('\', '/'))", "-DCMAKE_CUDA_HOST_COMPILER=$($cl.Replace('\', '/'))", '-DCMAKE_BUILD_TYPE=Release',
+        "-DCMAKE_PROJECT_INCLUDE=$($includeRules.Replace('\', '/'))",
+        "-DCMAKE_C_COMPILER_LAUNCHER=$($CmakePath.Replace('\', '/'));-E;env;VSLANG=1033",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=$($CmakePath.Replace('\', '/'));-E;env;VSLANG=1033",
         '-DCMAKE_TRY_COMPILE_CONFIGURATION=Release', '-DCMAKE_C_FLAGS_DEBUG=/MDd /Ob0 /Od /RTC1 /Z7', '-DCMAKE_CXX_FLAGS_DEBUG=/MDd /Ob0 /Od /RTC1 /Z7',
         "-DCMAKE_INSTALL_PREFIX=$((Join-Path $BuildDirectory 'install').Replace('\', '/'))", "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures",
         '-DSD_BUILD_SHARED_LIBS=ON', '-DSD_BUILD_SHARED_GGML_LIB=OFF', '-DSD_BUILD_EXAMPLES=ON', '-DSD_SERVER_BUILD_FRONTEND=OFF',
         '-DSD_USE_SYSTEM_GGML=ON', '-DSD_USE_UPSTREAM_GGML=OFF', "-Dggml_DIR=$($imports.Replace('\', '/'))",
         '-DSD_CUDA=ON', '-DSD_WEBP=ON', '-DSD_WEBM=ON', '-DSD_USE_SYSTEM_WEBP=OFF', '-DSD_USE_SYSTEM_WEBM=OFF')
     Invoke-Checked $CmakePath $configureArguments (Join-Path $BuildDirectory 'configure.log') | Out-Null
+    $rules = Get-Content -LiteralPath (Join-Path $cmakeDirectory 'CMakeFiles/rules.ninja') -Raw
+    if (-not $rules.Contains('msvc_deps_prefix = ' + $includePrefix)) {
+        throw 'MSVC include detection is inconsistent; refusing a native build with missing header dependencies.'
+    }
     $preparation = @{ source_revision = $sourceRevision; ggml_revision = $ggmlRevision; submodules = $submodules; msvc_toolset = $MsvcVersion; ggml_max_name = 160; cuda_architectures = $CudaArchitectures; imported_files = $importedFiles; inputs = $sourceInputs }
     $preparation | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $BuildDirectory 'build-inputs.json') -Encoding utf8
     if ($PrepareOnly) {
@@ -308,6 +346,7 @@ int main() {
     Write-Output "WildImage custom runtime prepared: $Destination"
     Write-Output 'Released GGML/CUDA DLLs were reused unchanged. No model was downloaded or loaded.'
 } finally {
+    [Console]::OutputEncoding = $originalOutputEncoding
     Get-ChildItem Env: | Where-Object { -not $originalEnvironment.ContainsKey($_.Name) } | ForEach-Object { [Environment]::SetEnvironmentVariable($_.Name, $null, 'Process') }
     foreach ($name in $originalEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $originalEnvironment[$name], 'Process') }
 }

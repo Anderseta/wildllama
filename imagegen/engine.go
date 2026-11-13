@@ -505,7 +505,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if mode == imageGPUResident {
 			residentFailedAt = p.MaxVRAMMiB
 			mode = imageRAMGPU
-			log.emit(Progress{Phase: "ram_offload", Message: "Os pesos não couberam na GPU; usando RAM dentro do orçamento e mantendo o cálculo na GPU."}, true)
+			log.emit(Progress{Phase: "ram_offload", Message: "Os pesos e buffers não couberam na GPU; usando RAM dentro do orçamento e mantendo o cálculo na GPU."}, true)
 		} else {
 			mode = imageRAMCPU
 			log.emit(Progress{Phase: "cpu_fallback", Message: "A GPU não comportou o cálculo com offload; tentando na CPU dentro do orçamento de RAM."}, true)
@@ -667,7 +667,12 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 				placement += ",vae=disk"
 			}
 		}
-		args = append(args, "--params-backend", placement, "--auto-fit", "off", "--disable-segmented-compute")
+		args = append(args, "--params-backend", placement, "--auto-fit", "off")
+		if !allowMiniMaxSegmentation(p, mode) {
+			args = append(args, "--disable-segmented-compute")
+		} else {
+			args = append(args, miniMaxAttentionArguments(p, r)...)
+		}
 	} else if p.StageComponents {
 		args = append(args, "--params-backend", "disk", "--auto-fit", "off")
 	} else {
@@ -864,19 +869,25 @@ func (p *progressLog) line(line string) {
 	}
 	lower := strings.ToLower(line)
 	imageBatchHeader := strings.Contains(lower, "generating image:")
-	samplingStart := imageBatchHeader || strings.Contains(lower, "sampling using ") || strings.Contains(lower, "sampling(high noise) using ")
+	samplerSelected := strings.Contains(lower, "sampling using ") || strings.Contains(lower, "sampling(high noise) using ")
 	update := Progress{}
 	switch {
 	case strings.Contains(lower, "conditioning disk cache hit"):
 		update.Phase = "conditioning_cache_hit"
 		update.Message = "Reusing cached prompt encoding"
-	case samplingStart:
+	case imageBatchHeader:
 		update.Phase = "sampling"
 		update.Message = "Generating image"
+	case samplerSelected:
+		// The native request planner prints the sampler before reference
+		// encoding. This is not the first diffusion step.
+		update.Phase = "preparing"
+		update.Message = "Preparing the image sampler"
+		p.counterPhase = "preparing"
 	case strings.Contains(lower, "loading") || strings.Contains(lower, "load tensors"):
 		update.Phase = "loading"
 		update.Message = "Loading image model components"
-	case strings.Contains(lower, "encoding") || strings.Contains(lower, "condition"):
+	case strings.Contains(lower, "encoding") || strings.Contains(lower, "condition") || strings.Contains(lower, "vae encode") || strings.Contains(lower, "encode_first_stage"):
 		update.Phase = "encoding"
 		update.Message = "Encoding the prompt and reference images"
 	case strings.Contains(lower, "decoding") || strings.Contains(lower, "vae decode"):

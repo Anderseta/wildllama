@@ -46,7 +46,7 @@ func (memo *conditioningDigestMemo) fileIdentity(ctx context.Context, path strin
 	if reliable && !content {
 		return stamp, nil
 	}
-	if reliable {
+	if reliable && conditioningStampCanReuse(stamp) {
 		conditioningDigests.Lock()
 		entry, ok := conditioningDigests.entries[path]
 		if ok && entry.stamp == stamp {

@@ -27,7 +27,7 @@ from pathlib import Path
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PHASE_STARTS = (
     ("encoding", re.compile(r"\bgenerate_image \d+x\d+", re.I)),
-    ("sampling", re.compile(r"\bgenerating image:|\bsampling using ", re.I)),
+    ("sampling", re.compile(r"\bgenerating image:", re.I)),
     ("decoding", re.compile(r"\bdecoding \d+(?:/\d+)? latents?", re.I)),
     ("saving", re.compile(r"\bgenerate_image completed|\bimages saved", re.I)),
 )
@@ -117,11 +117,15 @@ def runner_command(runner, profile, options, directory, variant):
             encoder = "cpu" if profile.get("encoder_on_cpu") else "disk"
             vae = "cpu" if profile.get("vae_on_cpu") else "disk"
             placement = f"cuda0,te={encoder},vae={vae}"
-        args += ["--params-backend", placement, "--auto-fit", "off", "--disable-segmented-compute"]
+        args += ["--params-backend", placement, "--auto-fit", "off"]
+        if not options.segmented:
+            args += ["--disable-segmented-compute"]
     elif staged:
         args += ["--params-backend", "disk", "--auto-fit", "off"]
     else:
         args += ["--auto-fit", "on"]
+    if options.minimax_attention_budget_mib:
+        args += ["--model-args", f"minimax_h3_attn_chunk_budget={options.minimax_attention_budget_mib / 1024}"]
     for field in ("sigmas", "scheduler", "cpu_threads"):
         if profile.get(field):
             flag = "threads" if field == "cpu_threads" else field
@@ -168,7 +172,44 @@ def gpu_read(nvidia_smi, device):
     return {"uuid": uuid.strip(), "used_mib": int(used), "free_mib": int(free), "total_mib": int(total)}
 
 
-def monitor_gpu(nvidia_smi, device, start, interval, stop, samples, errors):
+def windows_process_memory(pid):
+    """Optional standard-library-only counters, independent of GPU telemetry."""
+    if os.name != "nt":
+        return None, lambda: None
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "peak_working_set", "working_set", "peak_paged", "paged",
+                "peak_nonpaged", "nonpaged", "pagefile", "peak_pagefile", "private",
+            )
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+    kernel.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x410, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def read():
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not kernel.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {name + "_mib": round(getattr(counters, name) / 1024**2, 2)
+                for name in ("working_set", "peak_working_set", "private")}
+
+    return read, lambda: kernel.CloseHandle(handle)
+
+
+def monitor_gpu(nvidia_smi, device, start, interval, stop, samples, errors, memory_read, memory_samples):
     while not stop.is_set():
         try:
             reading = gpu_read(nvidia_smi, device)
@@ -176,6 +217,12 @@ def monitor_gpu(nvidia_smi, device, start, interval, stop, samples, errors):
             errors.append(str(error))
             return
         samples.append((time.perf_counter() - start, reading["used_mib"]))
+        if memory_read:
+            try:
+                memory_samples.append((time.perf_counter() - start, memory_read()))
+            except OSError:
+                # The native process may exit between its last log line and sampling.
+                memory_read = None
         stop.wait(interval)
 
 
@@ -194,6 +241,20 @@ def gpu_summary(initial, samples, phases, errors):
     }
 
 
+def memory_summary(samples, phases):
+    phase_peaks = {}
+    for elapsed, values in samples:
+        phase = next((name for started, name in reversed(phases) if elapsed >= started), "loading")
+        peak = phase_peaks.setdefault(phase, {})
+        for name in ("working_set_mib", "private_mib"):
+            peak[name] = max(peak.get(name, 0), values[name])
+    return {
+        "scope": "native runner only; working set is resident RAM, private is committed memory (not necessarily resident)",
+        "peak_working_set_mib": max((values["peak_working_set_mib"] for _, values in samples), default=None),
+        "phase_sampled_peaks": phase_peaks, "samples": len(samples),
+    }
+
+
 def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, negative):
     directory.mkdir()
     prepare_inputs(directory, profile, prompt, negative)
@@ -209,14 +270,19 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
     env["CUDA_CACHE_PATH"] = str(directory.parent / "cuda-cache")
     env["TMP"] = env["TEMP"] = str(directory)
     Path(env["CUDA_CACHE_PATH"]).mkdir(exist_ok=True)
-    samples, errors, phases, native = [], [], [(0.0, "loading")], {}
+    samples, memory_samples, errors, phases, native = [], [], [], [(0.0, "loading")], {}
     phase_cursor = 0
     stop, timed_out = threading.Event(), threading.Event()
     start = time.perf_counter()
-    with (directory / "runner.log").open("w", encoding="utf-8") as log:
+    with (directory / "runner.log").open("w", encoding="utf-8", buffering=1) as log:
         child = subprocess.Popen(command, cwd=runner.parent, env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                                  creationflags=NO_WINDOW)
+        memory_read, memory_close = None, lambda: None
+        try:
+            memory_read, memory_close = windows_process_memory(child.pid)
+        except OSError as error:
+            errors.append(f"RAM telemetry unavailable: {error}")
 
         def enforce_timeout():
             if child.poll() is None:
@@ -229,6 +295,7 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
         timer = threading.Timer(options.timeout_seconds, enforce_timeout)
         monitor = threading.Thread(target=monitor_gpu, args=(
             nvidia_smi, initial["uuid"], start, options.interval_ms / 1000, stop, samples, errors,
+            memory_read, memory_samples,
         ), daemon=True)
         timer.start()
         monitor.start()
@@ -255,6 +322,7 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
             child.stdout.close()
             stop.set()
             monitor.join()
+            memory_close()
 
     phase_times = {}
     for (begin, name), (end, _) in zip(phases, phases[1:] + [(elapsed, "exit")]):
@@ -264,6 +332,7 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
         "timed_out": timed_out.is_set(), "log": str(directory / "runner.log"),
         "wall_phase_seconds": phase_times, "native_phase_seconds": native,
         "gpu": gpu_summary(initial, samples, phases, errors),
+        "memory": memory_summary(memory_samples, phases),
     }
 
 
@@ -297,6 +366,9 @@ def arguments():
     parser.add_argument("--sage", action="store_true",
                         help="force SageAttention in an extra variant; standard runs use the profile setting")
     parser.add_argument("--ram-offload", action="store_true", help="test CUDA with model weights backed by RAM as an extra variant")
+    parser.add_argument("--segmented", action="store_true", help="allow bounded native workspace segments while retaining GPU weights")
+    parser.add_argument("--minimax-attention-budget-mib", type=int, choices=[32, 64, 128], default=0,
+                        help="explicit MiniMax H3 attention-head workspace budget; does not change precision")
     parser.add_argument("--work-dir", required=True, type=absolute_path,
                         help="existing directory in which to create a separate benchmark folder")
     parser.add_argument("--prompt", required=True, type=absolute_path, help="UTF-8 prompt file")

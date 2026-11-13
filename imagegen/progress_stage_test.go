@@ -14,7 +14,11 @@ func TestProgressNativeStagedQwenVAETilesRemainDecoding(t *testing.T) {
 		current, total int
 	}{
 		{"[INFO] using VAE for encoding / decoding", "encoding", 0, 0},
-		{"[INFO] sampling using Euler method", "sampling", 0, 0},
+		{"[INFO] sampling using Euler method", "preparing", 0, 0},
+		{"[VERBOSE] VAE encode tile size: 256x256 pixels (16x16 latent)", "encoding", 0, 0},
+		{"loading 144/297 tensors from vae.safetensors", "loading", 144, 297},
+		{"|====> | 1/49 - 0.73s/it", "encoding", 1, 49},
+		{"|====> | 49/49 - 1.40it/s", "encoding", 49, 49},
 		{"[INFO] get_learned_condition completed, taking 3.20s", "encoding", 0, 0},
 		{"[INFO] generating image: 1/1 - seed 42", "sampling", 0, 0},
 		{"loading 492/526 tensors from diffusion_model.safetensors", "loading", 492, 526},
@@ -47,7 +51,7 @@ func TestProgressNativeStagedQwenVAETilesRemainDecoding(t *testing.T) {
 }
 
 func TestProgressNativeSemanticResetAndTransfers(t *testing.T) {
-	for _, reset := range []string{"sampling using Euler method", "sampling(high noise) using Euler method", "generating image: 1/1 - seed 1"} {
+	for _, reset := range []string{"generating image: 1/1 - seed 1", "generating image: 2/2 - seed 2"} {
 		t.Run(reset, func(t *testing.T) {
 			var last Progress
 			log := progressLog{start: time.Now(), callback: func(update Progress) { last = update }}
@@ -72,5 +76,20 @@ func TestProgressNativeSemanticResetAndTransfers(t *testing.T) {
 				t.Fatalf("tensor transfer claimed encoding: %#v", last)
 			}
 		})
+	}
+}
+
+func TestProgressSamplerSelectionIsNotSampling(t *testing.T) {
+	for _, line := range []string{"sampling using Euler method", "sampling(high noise) using Euler method"} {
+		var last Progress
+		log := progressLog{start: time.Now(), callback: func(update Progress) { last = update }}
+		log.Write([]byte(line + "\r"))
+		if last.Phase != "preparing" || last.Total != 0 {
+			t.Fatalf("sampler selection counted as diffusion: %#v", last)
+		}
+		log.Write([]byte("VAE encode tile size: 256x256 pixels\rloading 144/297 tensors\r1/49 - 0.73s/it\r"))
+		if last.Phase != "encoding" || last.Current != 1 || last.Total != 49 {
+			t.Fatalf("reference tiles counted as diffusion: %#v", last)
+		}
 	}
 }

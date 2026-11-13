@@ -774,10 +774,18 @@ index 00b88f4..ae5da43 100644
                      std::vector<ggml_tensor*> masks, ref_inputs;
                      for (const auto& mask : mask_data) {
 diff --git a/src/model_loader.cpp b/src/model_loader.cpp
-index 9e88711..6bba3ee 100644
+index 9e88711..372d2e5 100644
 --- a/src/model_loader.cpp
 +++ b/src/model_loader.cpp
-@@ -17,6 +17,7 @@
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cinttypes>
+ #include <cstdarg>
+ #include <cstdlib>
+@@ -17,6 +18,7 @@
  #include <vector>
  
  #include "core/util.h"
@@ -785,7 +793,7 @@ index 9e88711..6bba3ee 100644
  #include "model_io/gguf_io.h"
  #include "model_io/safetensors_io.h"
  #include "model_io/torch_legacy_io.h"
-@@ -152,7 +153,7 @@ void convert_tensor(void* src,
+@@ -152,7 +154,7 @@ void convert_tensor(void* src,
              throw std::runtime_error(sd_format("type %s unsupported for integer quantization: no dequantization available",
                                                 ggml_type_name(src_type)));
          }
@@ -794,10 +802,12 @@ index 9e88711..6bba3ee 100644
          buf.resize(sizeof(float) * n);
          char* src_data_f32 = buf.data();
          qtype->to_float(src, (float*)src_data_f32, n);
-@@ -1184,13 +1185,18 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+@@ -1184,13 +1186,20 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
          std::atomic<bool> failed(false);
          std::vector<std::thread> workers;
          std::mutex backend_tensor_set_mutex;
++        std::mutex progress_mutex;
++        std::condition_variable progress_changed;
 +        wildimage_ram::ThreadFailures worker_errors;
 +        wildimage_ram::JoinThreads<decltype(workers)> join_workers(workers);
  
@@ -813,7 +823,7 @@ index 9e88711..6bba3ee 100644
                      if (zip == nullptr) {
                          LOG_ERROR("failed to open zip '%s'", file_path.c_str());
                          failed = true;
-@@ -1205,9 +1211,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+@@ -1205,9 +1214,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                      }
                  }
  
@@ -826,19 +836,33 @@ index 9e88711..6bba3ee 100644
  
                  while (true) {
                      int64_t t0, t1;
-@@ -1390,9 +1396,8 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+@@ -1390,8 +1399,13 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
  
                      bytes_processed.fetch_add((uint64_t)nbytes_to_read);
                  }
 -                if (zip != nullptr) {
 -                    zip_close(zip);
--                }
 +                });
 +                if(worker_errors.failed.load()) failed=true;
++                // Wake the progress reporter as soon as loading finishes. Small
++                // GPU segments must not pay the polling interval on every load.
++                {
++                    std::lock_guard<std::mutex> lock(progress_mutex);
++                    progress_changed.notify_one();
+                 }
              });
          }
+@@ -1409,12 +1423,16 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+                                       bytes_processed.load(),
+                                       elapsed_seconds);
+             }
+-            std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
++            std::unique_lock<std::mutex> lock(progress_mutex);
++            progress_changed.wait_for(lock, std::chrono::milliseconds(200), [&]() {
++                return tensor_idx.load() >= tensors_to_process.size() || failed.load();
++            });
+         }
  
-@@ -1415,6 +1420,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
          for (auto& w : workers) {
              w.join();
          }
