@@ -698,9 +698,14 @@ func embeddingBatchSize(opts api.Options, numParallel int) int {
 }
 
 func appendLlamaServerLogArgs(params []string) []string {
-	// Keep startup memory/offload lines visible for scheduler accounting.
+	// INFO retains startup memory/offload lines needed by the scheduler. DEBUG
+	// also logs graph reallocations during decoding; enable it only on request.
+	verbosity := "3"
+	if envconfig.LogLevel() <= slog.LevelDebug {
+		verbosity = "4"
+	}
 	return append(params,
-		"--log-verbosity", "4",
+		"--log-verbosity", verbosity,
 		"--no-log-prefix",
 		"--no-log-timestamps",
 	)

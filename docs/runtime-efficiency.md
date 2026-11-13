@@ -439,6 +439,16 @@ the installed native payload. Set `GOCACHE`, `GOMODCACHE`, `GOPATH` and `GOTMPDI
 to the installation's persistent cache/temp directories before testing or
 building; no native payload rebuild or model download is required.
 
+## Native log volume
+
+Normal runs use the native INFO log level (3). Startup placement, buffer sizes,
+warnings and errors remain available to the memory parser; structured activity
+events remain enabled independently for progress reporting. Per-decode graph
+diagnostics are DEBUG output and no longer incur formatting, pipe, parsing and
+disk overhead in normal operation. `OLLAMA_DEBUG=1` (or a higher debug level)
+restores native DEBUG logging (4) for investigations. This does not change model
+math, sampling, context or memory limits.
+
 ## Lower host overhead for resident models
 
 When weights already fit in VRAM, repeatedly synchronizing the device and
