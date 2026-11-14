@@ -8,7 +8,8 @@ param(
     [string]$VisualStudioDirectory = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools',
     [ValidatePattern('^\d+\.\d+\.\d+$')][string]$MsvcVersion = '14.39.33519',
     [string]$CmakePath = 'C:\Python310\Lib\site-packages\cmake\data\bin\cmake.exe',
-    [string]$CudaDirectory = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8',
+    [string]$CudaDirectory = $env:CUDA_PATH,
+    [string]$CudaBackendPath,
     [string]$CudaArchitectures = '80;89;120',
     [ValidateRange(1, 16)][int]$Parallel = 2,
     [switch]$PrepareOnly
@@ -116,7 +117,16 @@ try {
     $vcvars = Assert-Tool (Join-Path $VisualStudioDirectory 'VC/Auxiliary/Build/vcvars64.bat')
     $ninja = Assert-Tool (Join-Path $VisualStudioDirectory 'Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe')
     $CmakePath = Assert-Tool $CmakePath
+    if (-not $CudaDirectory) { throw 'Set CUDA_PATH or supply -CudaDirectory.' }
     $nvcc = Assert-Tool (Join-Path $CudaDirectory 'bin/nvcc.exe')
+    $cudaVersionOutput = (& $nvcc --version | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $cudaVersionOutput -notmatch 'release (12|13)\.\d+, V([0-9.]+)') { throw 'Unsupported CUDA compiler.' }
+    $cudaMajor = $Matches[1]
+    $cudaVersion = $Matches[2]
+    if (-not $PrepareOnly -and $cudaMajor -ne '12' -and -not $CudaBackendPath) {
+        throw 'Supply -CudaBackendPath with the pinned image GGML CUDA backend rebuilt for this toolkit.'
+    }
+    if ($CudaBackendPath) { $CudaBackendPath = Assert-Tool (Assert-DataPath $CudaBackendPath) }
     $temporaryDirectory = Join-Path $BuildDirectory 'temp'
     $imports = Join-Path $BuildDirectory 'imports'
     $probeDirectory = Join-Path $BuildDirectory 'abi-probe'
@@ -145,8 +155,14 @@ try {
     $env:CUDA_HOME = $CudaDirectory
     $env:VSLANG = '1033'
     $env:VSCMD_SKIP_SENDTELEMETRY = '1'
-    $env:PATH = "$toolDirectory;$(Split-Path -Parent $ninja);$CudaDirectory\bin;$BaseRuntimeDirectory;$env:PATH"
+    $env:PATH = "$toolDirectory;$(Split-Path -Parent $ninja);$CudaDirectory\bin;$CudaDirectory\bin\x64;$BaseRuntimeDirectory;$env:PATH"
     New-Item -ItemType Directory -Force -Path $env:CUDA_CACHE_PATH | Out-Null
+    if ($CudaBackendPath) {
+        $dependencies = Invoke-Checked $dumpbin @('/nologo', '/dependents', $CudaBackendPath) (Join-Path $BuildDirectory 'cuda-backend-dependencies.log')
+        if (-not ($dependencies -match "^\s*cudart64_$cudaMajor\.dll\s*$")) {
+            throw "The rebuilt image backend must link the CUDA $cudaMajor runtime."
+        }
+    }
 
     $actualRevision = (& git -C $SourceDirectory rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or $actualRevision -ne $sourceRevision) { throw "Unexpected stable-diffusion.cpp revision: $actualRevision" }
@@ -296,7 +312,7 @@ int main() {
     ('set(CMAKE_CL_SHOWINCLUDES_PREFIX [==[' + $includePrefix + ']==])') | Set-Content -LiteralPath $includeRules -Encoding utf8
     $configureArguments = @('-S', $SourceDirectory, '-B', $cmakeDirectory, '-G', 'Ninja',
         "-DCMAKE_MAKE_PROGRAM=$($ninja.Replace('\', '/'))", "-DCMAKE_C_COMPILER=$($cl.Replace('\', '/'))", "-DCMAKE_CXX_COMPILER=$($cl.Replace('\', '/'))",
-        "-DCMAKE_CUDA_COMPILER=$($nvcc.Replace('\', '/'))", "-DCMAKE_CUDA_HOST_COMPILER=$($cl.Replace('\', '/'))", '-DCMAKE_BUILD_TYPE=Release',
+        "-DCMAKE_CUDA_COMPILER=$($nvcc.Replace('\', '/'))", "-DCUDAToolkit_ROOT=$($CudaDirectory.Replace('\', '/'))", "-DCMAKE_CUDA_HOST_COMPILER=$($cl.Replace('\', '/'))", '-DCMAKE_BUILD_TYPE=Release',
         "-DCMAKE_PROJECT_INCLUDE=$($includeRules.Replace('\', '/'))",
         # Invalidate objects created before the localized /showIncludes fix.
         # Their zero-entry Ninja dependency records otherwise stay valid forever.
@@ -312,7 +328,7 @@ int main() {
     if (-not $rules.Contains('msvc_deps_prefix = ' + $includePrefix)) {
         throw 'MSVC include detection is inconsistent; refusing a native build with missing header dependencies.'
     }
-    $preparation = @{ source_revision = $sourceRevision; ggml_revision = $ggmlRevision; submodules = $submodules; msvc_toolset = $MsvcVersion; ggml_max_name = 160; cuda_architectures = $CudaArchitectures; imported_files = $importedFiles; inputs = $sourceInputs }
+    $preparation = @{ source_revision = $sourceRevision; ggml_revision = $ggmlRevision; submodules = $submodules; msvc_toolset = $MsvcVersion; ggml_max_name = 160; cuda_architectures = $CudaArchitectures; cuda_version = $cudaVersion; imported_files = $importedFiles; inputs = $sourceInputs }
     $preparation | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $BuildDirectory 'build-inputs.json') -Encoding utf8
     if ($PrepareOnly) {
         Write-Output "WildImage prepared; no core/CUDA build started: $cmakeDirectory"
@@ -333,9 +349,24 @@ int main() {
         if (-not (Test-Path -LiteralPath (Join-Path $binaryDirectory $name))) { throw "Expected compiled output is absent: $name" }
     }
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    if (Get-ChildItem -LiteralPath $Destination -File | Where-Object { $_.Name -match '^(cudart|cublas|cublasLt)64_(\d+)\.dll$' -and $Matches[2] -ne $cudaMajor }) {
+        throw 'Use a clean destination when changing CUDA major versions.'
+    }
     foreach ($file in Get-ChildItem -LiteralPath $BaseRuntimeDirectory -File) {
         if ($file.Name -eq 'wildimage-runtime.json') { continue }
+        if ($CudaBackendPath -and ($file.Name -eq 'ggml-cuda.dll' -or $file.Name -match '^(cudart|cublas|cublasLt)64_\d+\.dll$')) { continue }
         Copy-ReplacingFile $file.FullName (Join-Path $Destination $file.Name)
+    }
+    if ($CudaBackendPath) {
+        Copy-ReplacingFile $CudaBackendPath (Join-Path $Destination 'ggml-cuda.dll')
+        $preparation.cuda_backend = File-Record $CudaBackendPath 'ggml-cuda.dll'
+        foreach ($stem in @('cudart', 'cublas', 'cublasLt')) {
+            $name = '{0}64_{1}.dll' -f $stem, $cudaMajor
+            $vendor = @('bin/x64', 'bin') | ForEach-Object { Join-Path $CudaDirectory "$_/$name" } |
+                Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $vendor) { throw "Missing CUDA runtime library: $name" }
+            Copy-ReplacingFile $vendor (Join-Path $Destination $name)
+        }
     }
     foreach ($name in @('sd-cli.exe', 'sd-server.exe', 'stable-diffusion.dll')) {
         Copy-ReplacingFile (Join-Path $binaryDirectory $name) (Join-Path $Destination $name)
@@ -354,7 +385,6 @@ int main() {
     $manifest = @{ provider = 'stable-diffusion.cpp'; source = 'https://github.com/leejet/stable-diffusion.cpp'; revision = $runtimeRevision; upstream_revision = $sourceRevision; base_release = $baseManifest.release; base_archive_sha256 = $baseManifest.archive_sha256; features = @{ conditioning_cache = $true; ram_budget = $true; gpu_memory_retry_exit = 75; ram_budget_exit = 76 }; build = $preparation; files = $files }
     $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Destination 'wildimage-runtime.json') -Encoding utf8
     Write-Output "WildImage custom runtime prepared: $Destination"
-    Write-Output 'Released GGML/CUDA DLLs were reused unchanged. No model was downloaded or loaded.'
 } finally {
     [Console]::OutputEncoding = $originalOutputEncoding
     Get-ChildItem Env: | Where-Object { -not $originalEnvironment.ContainsKey($_.Name) } | ForEach-Object { [Environment]::SetEnvironmentVariable($_.Name, $null, 'Process') }

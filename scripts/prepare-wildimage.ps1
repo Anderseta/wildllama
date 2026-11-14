@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory=$true)][string]$Destination,
     [Parameter(Mandatory=$true)][string]$DownloadDirectory,
-    [string]$CudaDirectory = $env:CUDA_PATH
+    [string]$CudaDirectory = $env:CUDA_PATH,
+    [switch]$BuildInputsOnly
 )
 $ErrorActionPreference = 'Stop'
 $revision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
@@ -39,13 +40,15 @@ Expand-Archive -LiteralPath $archive -DestinationPath $Destination -Force
 
 # Only vendor CUDA runtimes may be copied from the existing toolkit. Image ggml
 # and stable-diffusion DLLs exclusively come from the pinned image archive.
-if (-not $CudaDirectory) { throw 'CUDA_PATH or -CudaDirectory is required; no toolkit is installed automatically.' }
 $vendor = @()
-foreach ($name in @('cudart64_12.dll','cublas64_12.dll','cublasLt64_12.dll')) {
-    $source = Join-Path $CudaDirectory "bin/$name"
-    if (-not (Test-Path -LiteralPath $source)) { throw "Required CUDA runtime not found: $source" }
-    Copy-Item -LiteralPath $source -Destination (Join-Path $Destination $name) -Force
-    $vendor += @{name=$name;source=$source;sha256=(Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant()}
+if (-not $BuildInputsOnly) {
+    if (-not $CudaDirectory) { throw 'CUDA_PATH or -CudaDirectory is required for the stock CUDA 12 runner.' }
+    foreach ($name in @('cudart64_12.dll','cublas64_12.dll','cublasLt64_12.dll')) {
+        $source = Join-Path $CudaDirectory "bin/$name"
+        if (-not (Test-Path -LiteralPath $source)) { throw "Required CUDA runtime not found: $source" }
+        Copy-Item -LiteralPath $source -Destination (Join-Path $Destination $name) -Force
+        $vendor += @{name=$name;source=$source;sha256=(Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant()}
+    }
 }
 $eula = Join-Path $CudaDirectory 'EULA.txt'
 if (Test-Path -LiteralPath $eula) { Copy-Item -LiteralPath $eula -Destination (Join-Path $Destination 'CUDA-EULA.txt') -Force }

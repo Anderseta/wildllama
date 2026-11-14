@@ -25,7 +25,7 @@ size and SHA256. No weights are committed or downloaded by a read-only status
 request. Model installation is an explicit resumable API action.
 
 The Windows conditioning-cache/RAM-budget build uses `scripts/build-wildimage.ps1`.
-It requires an existing PowerShell 7.2+, MSVC 14.39, CUDA 12.8 and CMake installation;
+It requires an existing PowerShell 7.2+, MSVC 14.39, a CUDA toolkit and CMake installation;
 it does not install tools or fetch source, dependencies or weights. Supply a checkout
 at the pinned source revision with its pinned submodules already present:
 
@@ -61,11 +61,16 @@ retry only GPU failures with RAM-backed GPU computation, then CPU computation.
 CPU graphs retain bounded segmentation. The build replaces both native clients
 and the image DLL together and advertises `features.ram_budget` only in that payload.
 
-Remove `-PrepareOnly` to compile the CLI, image core and its existing custom CUDA
-operations. The large GGML CUDA backend is reused unchanged, including FP8/INT8
-support and the existing CPU variants. Custom image kernels target CUDA
-architectures 80, 89 and 120 by default; use `-CudaArchitectures` to change that
-build coverage. This is not a performance measurement or a model load.
+Remove `-PrepareOnly` to compile the CLI, image core and custom CUDA operations.
+CUDA 12 can reuse the release backend. For CUDA 13, prepare the pinned archive
+with `scripts/prepare-wildimage.ps1 -BuildInputsOnly`, then build `ggml-cuda`
+from the pinned image `ggml` submodule using `GGML_CUDA=ON`,
+`GGML_BACKEND_DL=ON`, `GGML_CUDA_GRAPHS=ON`, and `GGML_MAX_NAME=160` in
+the C, C++ and CUDA compiler definitions. Pass the resulting `ggml-cuda.dll`
+as `-CudaBackendPath` and set `-CudaDirectory` or `CUDA_PATH` to the same
+toolkit. The packaged image backend and CUDA runtime must use the same major
+version. Custom image kernels target architectures 80, 89 and 120 by default;
+set `-CudaArchitectures 120` for a build specific to Blackwell GeForce.
 
 All build outputs, temporary files, CUDA cache and the destination must be outside
 C:. The destination must differ from the base runtime. Files are replaced by

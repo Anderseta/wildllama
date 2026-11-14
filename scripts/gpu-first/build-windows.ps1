@@ -5,6 +5,7 @@ param(
     [switch]$SkipConfigure,
     [string]$InstallRoot = '',
     [string]$CudaVersion = '',
+    [string]$CudaDirectory = '',
     [string]$CudaArchitectures = '120',
     [int]$Parallel = 4,
     [string[]]$Targets = @('llama-server','llama-quantize','test-moe-ram','test-moe-ram-metrics','test-gpu-exclusive-scheduler','test-gpu-exclusive','test-gpu-exclusive-op','test-gpu-exclusive-ssm','test-gpu-layer-diagnostics','test-cuda-memory-budget','test-server-component','test-moe-admission','test-moe-budget','test-moe-partition','test-cuda-upload','test-cuda-host-op','test-prepare-async','test-moe-ram-pool','test-moe-normal-upload','test-moe-ram-queue-nodes','test-expert-trace','test-cuda-dense','test-cuda-kv-growth','test-kv-growth','test-dense-embedding','test-moe-readiness','test-moe-read-plan','test-moe-copy-plan','test-moe-work-batch','test-moe-ram-admission','test-moe-packed-rows','test-moe-expert-plan','test-speculative-depth','test-speculative-graphs','test-state-transfer','test-scheduler-exceptions','test-kv-trim-ranges','test-kv-indexed-copy','test-prompt-state-transaction','test-mtp-state','test-neural-output','test-device-verification','test-output-permutation','test-host-output-copy','test-mtp-device-state','test-mtp-carry-state','test-graph-variants','test-speculative-input','test-retained-prefix','test-device-attn-mask','test-state-pager','test-state-writeback','test-server-writeback','test-server-decode-overlap','test-server-batch-overlap','test-device-mask-policy','test-hybrid-device-mask','test-file-state-failure','test-hybrid-prefix','test-sampler-output-view','test-sampler-overlap','test-penalties-canonical','test-sampler-backend-extensions','test-top-p-mask-fusion','test-server-slot-iteration','test-dist-tail-fusion','test-moe-prepare','test-adaptive-prefill','test-sampling-probability','test-prompt-prefix-index','test-server-prefix-cache','test-server-admission','test-cuda-tuning-policy','test-cuda-graph-reuse-policy','test-cuda-graph-reuse','test-paged-attn','test-cuda-paged-attn','test-kv-page-ranges','test-paged-kv-pool','test-kv-paged','test-kv-paged-hybrid','test-execution-plan')
@@ -29,22 +30,27 @@ $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
 $ninja = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
 $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
 $cudaBase = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
-if(!$CudaVersion) {
-    # Some toolkit version directories contain runtime-only installations.
-    foreach($version in @('13.0','12.9','12.8')) {
-        if(Test-Path -LiteralPath (Join-Path $cudaBase "v$version\bin\nvcc.exe") -PathType Leaf) {
-            $CudaVersion = $version
-            break
-        }
-    }
-    if(!$CudaVersion) { throw 'No existing CUDA 12.8/12.9/13.0 compiler found; this script never installs tools.' }
+if(!$CudaDirectory -and !$CudaVersion -and $env:CUDA_PATH -and
+   (Test-Path -LiteralPath (Join-Path $env:CUDA_PATH 'bin\nvcc.exe') -PathType Leaf)) {
+    $CudaDirectory = $env:CUDA_PATH
 }
-$cudaDirectory = Join-Path $cudaBase "v$CudaVersion"
+if(!$CudaDirectory -and !$CudaVersion) {
+    # Some toolkit version directories contain runtime-only installations.
+    $installed = Get-ChildItem -LiteralPath $cudaBase -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^v\d+\.\d+$' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'bin\nvcc.exe') -PathType Leaf) } |
+        Sort-Object { [version]$_.Name.Substring(1) } -Descending | Select-Object -First 1
+    if(!$installed) { throw 'CUDA compiler not found. Supply -CudaDirectory or install the toolkit.' }
+    $CudaDirectory = $installed.FullName
+}
+if(!$CudaDirectory) { $CudaDirectory = Join-Path $cudaBase "v$CudaVersion" }
+$cudaDirectory = [IO.Path]::GetFullPath($CudaDirectory)
 $cudaCmakeDirectory = $cudaDirectory.Replace('\','/')
-$runnerDirectory = if($CudaVersion.StartsWith('13.')) { 'cuda_v13' } else { 'cuda_v12' }
 foreach($required in @($vcvars,$ninja,$cmake,(Join-Path $cudaDirectory 'bin\nvcc.exe'))) {
     if(!(Test-Path -LiteralPath $required -PathType Leaf)) { throw "Existing tool not found: $required" }
 }
+$compilerVersion = (& (Join-Path $cudaDirectory 'bin\nvcc.exe') --version | Out-String)
+if($LASTEXITCODE -ne 0 -or $compilerVersion -notmatch 'release (12|13)\.\d+') { throw "Unsupported CUDA compiler at $cudaDirectory" }
+$runnerDirectory = "cuda_v$($Matches[1])"
 New-Item -ItemType Directory -Force -Path $temporaryDirectory | Out-Null
 $env:TEMP = $temporaryDirectory; $env:TMP = $temporaryDirectory; $env:TMPDIR = $temporaryDirectory
 $env:CUDA_CACHE_PATH = Join-Path $buildDirectory 'cuda-cache'
@@ -59,7 +65,7 @@ foreach($entry in $compilerEnvironment) {
     if($separator -gt 0) { [Environment]::SetEnvironmentVariable($entry.Substring(0,$separator),$entry.Substring($separator+1),'Process') }
 }
 $env:CUDA_PATH = $cudaDirectory
-$env:PATH = (Join-Path $cudaDirectory 'bin') + ';' + $env:PATH
+$env:PATH = "$cudaDirectory\bin;$cudaDirectory\bin\x64;$env:PATH"
 $env:OLLAMA_LLAMA_CPP_SOURCE = $null
 if(!$SkipConfigure) {
     # Keep a tiny bootstrap in BuildRoot. This preserves CMAKE_HOME_DIRECTORY
