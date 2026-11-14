@@ -12,6 +12,13 @@ After a transfer completes, the active encode/decode/sampling stage resumes even
 if its GPU graph emits no intermediate progress. `timings.phase_started_at`
 allows a live stage clock; absent counters mean indeterminate progress.
 
+Native terminal bars are flushed at their ANSI end marker, without waiting for
+the next step's carriage return. `progress.sampling_current`/`sampling_total`
+retain completed denoising steps through component transfers and final decoding;
+they reset on a new batch image or retry. These counters are distinct from the
+current stage's tensor/tile counters. `GET /api/images/jobs?limit=20&summary=true`
+provides bounded polling without prompt/profile snapshots or filesystem scans.
+
 `GET /api/images/assets/:id/:filename/metadata` returns the immutable positive
 and negative prompts (including profile prefixes), CFG, steps, sampler, profile
 and model identity alongside the output's dimensions and seed. These facts live

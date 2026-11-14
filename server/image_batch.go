@@ -126,6 +126,9 @@ func imageBatchFilename(index int) string {
 func (v *imageService) setImageBatchProgress(job *imageJob, index, count int) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if job.Progress.BatchIndex != index {
+		job.Progress.SamplingCurrent, job.Progress.SamplingTotal = 0, 0
+	}
 	job.Progress.BatchIndex = index
 	job.Progress.BatchCount = count
 }

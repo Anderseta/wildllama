@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,7 +67,14 @@ func (v *imageService) updateImageProgress(job *imageJob, phase, message string,
 	}
 	job.trackImagePhase(phase, time.Now())
 	job.Phase = phase
-	job.Progress = imageProgress{Current: current, Total: total, Message: message, BatchIndex: job.Progress.BatchIndex, BatchCount: job.Progress.BatchCount}
+	previous := job.Progress
+	job.Progress = imageProgress{Current: current, Total: total, Message: message, BatchIndex: previous.BatchIndex, BatchCount: previous.BatchCount,
+		SamplingCurrent: previous.SamplingCurrent, SamplingTotal: previous.SamplingTotal}
+	if phase == "starting" {
+		job.Progress.SamplingCurrent, job.Progress.SamplingTotal = 0, 0
+	} else if phase == "sampling" && total > 0 && current >= 0 && current <= total {
+		job.Progress.SamplingCurrent, job.Progress.SamplingTotal = current, total
+	}
 	backendChanged := false
 	if phase == "ram_offload" || phase == "cpu_fallback" {
 		backendChanged = !job.RAMOffload
@@ -741,13 +749,38 @@ func (s *Server) imageInstallHandler(c *gin.Context) {
 func (s *Server) imageJobsHandler(c *gin.Context) {
 	v := s.imageService()
 	if c.Request.Method == http.MethodGet {
+		limit := 0
+		if raw := c.Query("limit"); raw != "" {
+			var err error
+			limit, err = strconv.Atoi(raw)
+			if err != nil || limit < 1 || limit > 200 {
+				c.JSON(400, gin.H{"error": "image job limit must be between 1 and 200"})
+				return
+			}
+		}
+		summary := c.Query("summary") == "true"
 		v.mu.Lock()
-		jobs := make([]*imageJob, 0, len(v.jobs))
+		capacity := len(v.jobs)
+		if limit > 0 && limit < capacity {
+			capacity = limit
+		}
+		jobs := make([]*imageJob, 0, capacity)
 		requestID := c.Query("request_id")
 		sessionID := c.Query("session_id")
 		for i := len(v.jobs) - 1; i >= 0; i-- {
 			if (requestID == "" || v.jobs[i].RequestID == requestID) && (sessionID == "" || v.jobs[i].SessionID == sessionID) {
-				jobs = append(jobs, cloneImageJobLocked(v.jobs[i]))
+				source := v.jobs[i]
+				if summary {
+					// Do not copy profile/prompt metadata only to discard it.
+					value := *source
+					value.Generation = nil
+					source = &value
+				}
+				job := cloneImageJobLocked(source)
+				jobs = append(jobs, job)
+				if limit > 0 && len(jobs) >= limit {
+					break
+				}
 			}
 		}
 		v.mu.Unlock()

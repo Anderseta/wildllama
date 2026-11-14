@@ -467,7 +467,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		seed = int64(binary.LittleEndian.Uint64(data[:]) & math.MaxInt64)
 	}
 	start := time.Now()
-	log := &progressLog{callback: progress, start: start}
+	log := &progressLog{callback: progress, start: start, expectedSteps: p.Steps}
 	mode := imageGPUResident
 	residentFailedAt := 0
 	if r.CPUOnly {
@@ -845,6 +845,7 @@ type progressLog struct {
 	lastEmit       time.Time
 	counterPhase   string
 	loadPhase      string
+	expectedSteps  int
 }
 
 func (p *progressLog) Write(data []byte) (int, error) {
@@ -853,11 +854,18 @@ func (p *progressLog) Write(data []byte) (int, error) {
 	p.pending += string(data)
 	for {
 		i := strings.IndexAny(p.pending, "\r\n")
+		width := 1
+		// Native bars start with CR and end with erase-to-EOL, without a
+		// trailing newline until the final step. Consume the completed bar
+		// now, not when the next step (or unrelated log) finally arrives.
+		if end := strings.Index(p.pending, "\x1b[K"); end >= 0 && (i < 0 || end < i) {
+			i, width = end, 3
+		}
 		if i < 0 {
 			break
 		}
 		line := p.pending[:i]
-		p.pending = p.pending[i+1:]
+		p.pending = p.pending[i+width:]
 		p.line(line)
 	}
 	if len(p.pending) > 65536 {
@@ -889,6 +897,7 @@ func (p *progressLog) line(line string) {
 	case imageBatchHeader:
 		update.Phase = "sampling"
 		update.Message = "Generating image"
+		update.Total = p.expectedSteps
 	case samplerSelected:
 		// The native request planner prints the sampler before reference
 		// encoding. This is not the first diffusion step.

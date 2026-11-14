@@ -127,3 +127,47 @@ func TestProgressLargeTensorCountsAndTotalChanges(t *testing.T) {
 		t.Fatalf("incorrect tensor transfer progress: %#v", updates)
 	}
 }
+
+func TestProgressNativeBarIsDeliveredBeforeNextStep(t *testing.T) {
+	var updates []Progress
+	log := progressLog{start: time.Now(), expectedSteps: 6, callback: func(p Progress) { updates = append(updates, p) }}
+	log.Write([]byte("generating image: 1/1 - seed 42\n"))
+	if updates[0].Current != 0 || updates[0].Total != 6 {
+		t.Fatal(updates)
+	}
+	// Exact stdout framing: a leading CR and ANSI erase, no final newline.
+	log.Write([]byte("\r  |====> | 1/6 - 34.75s/it - ETA 02:53\x1b["))
+	if len(updates) != 1 {
+		t.Fatal("published an incomplete bar")
+	}
+	log.Write([]byte("K"))
+	if len(updates) != 2 || updates[1].Current != 1 {
+		t.Fatalf("step waits for a later log: %#v", updates)
+	}
+	// A separate loading log must not classify this completed step as loading.
+	log.Write([]byte("loading 28/28 tensors from diffusion.gguf\n"))
+	if updates[1].Phase != "sampling" || updates[2].Phase != "loading_diffusion" {
+		t.Fatal(updates)
+	}
+}
+
+func TestProgressNativeFramesSplitAtEveryByte(t *testing.T) {
+	var updates []Progress
+	log := progressLog{start: time.Now(), callback: func(p Progress) { updates = append(updates, p) }}
+	input := "\r|==> | 1/6 - 1.0s/it\x1b[K\r|==> | 2/6 - 1.0s/it\x1b[K"
+	for i := range input {
+		log.Write([]byte{input[i]})
+	}
+	if len(updates) != 2 || updates[0].Current != 1 || updates[1].Current != 2 {
+		t.Fatal(updates)
+	}
+}
+
+func BenchmarkProgressNativeBar(b *testing.B) {
+	log := progressLog{start: time.Now(), callback: func(Progress) {}}
+	line := []byte("\r|=========================>| 3/6 - 1.0s/it - ETA 00:03\x1b[K")
+	b.ReportAllocs()
+	for b.Loop() {
+		log.Write(line)
+	}
+}

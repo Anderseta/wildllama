@@ -85,15 +85,17 @@ type imageJobRequest struct {
 }
 
 type imageProgress struct {
-	Current    int64  `json:"current"`
-	Total      int64  `json:"total"`
-	Message    string `json:"message"`
-	Role       string `json:"role,omitempty"`
-	Filename   string `json:"filename,omitempty"`
-	FileIndex  int    `json:"file_index,omitempty"`
-	FileCount  int    `json:"file_count,omitempty"`
-	BatchIndex int    `json:"batch_index,omitempty"`
-	BatchCount int    `json:"batch_count,omitempty"`
+	Current         int64  `json:"current"`
+	Total           int64  `json:"total"`
+	Message         string `json:"message"`
+	Role            string `json:"role,omitempty"`
+	Filename        string `json:"filename,omitempty"`
+	FileIndex       int    `json:"file_index,omitempty"`
+	FileCount       int    `json:"file_count,omitempty"`
+	BatchIndex      int    `json:"batch_index,omitempty"`
+	BatchCount      int    `json:"batch_count,omitempty"`
+	SamplingCurrent int64  `json:"sampling_current,omitempty"`
+	SamplingTotal   int64  `json:"sampling_total,omitempty"`
 }
 
 type imageAsset struct {

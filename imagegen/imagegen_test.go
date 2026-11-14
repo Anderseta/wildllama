@@ -125,6 +125,12 @@ func fakeChild(mode string) {
 	}
 	time.Sleep(25 * time.Millisecond)
 	fmt.Fprintln(os.Stderr, "loading model components")
+	if mode == "progress-wait" {
+		fmt.Fprintln(os.Stdout, "generating image: 1/1 - seed 42")
+		fmt.Fprint(os.Stdout, "\r|====> | 1/8 - 1.0s/it\x1b[K")
+		time.Sleep(30 * time.Second)
+		return
+	}
 	if mode == "wait" {
 		time.Sleep(30 * time.Second)
 		return
@@ -408,7 +414,7 @@ func TestComponentPartialStatusUsesExistingFileSizes(t *testing.T) {
 	}
 }
 func TestIsolatedProcessSuccessAndCancellation(t *testing.T) {
-	for _, mode := range []string{"generate", "wait"} {
+	for _, mode := range []string{"generate", "wait", "progress-wait"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			p := testProfile(t, dir)
@@ -428,11 +434,11 @@ func TestIsolatedProcessSuccessAndCancellation(t *testing.T) {
 			var phases []string
 			result, err := engine.Run(ctx, p, request, func(v Progress) {
 				phases = append(phases, v.Phase)
-				if mode == "wait" && v.Phase == "loading" {
+				if mode == "wait" && v.Phase == "loading" || mode == "progress-wait" && v.Phase == "sampling" && v.Current == 1 {
 					cancel()
 				}
 			})
-			if mode == "wait" {
+			if mode == "wait" || mode == "progress-wait" {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("cancel: %v", err)
 				}
