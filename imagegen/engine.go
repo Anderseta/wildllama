@@ -581,7 +581,10 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	if mode == imageRAMCPU {
 		message = "Iniciando a tentativa na CPU com os mesmos parâmetros de imagem e orçamento de RAM."
 	}
+	log.mu.Lock()
+	log.counterPhase, log.loadPhase = "", ""
 	log.emit(Progress{Phase: "starting", Message: message}, true)
+	log.mu.Unlock()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start image runner: %w", err)
 	}
@@ -824,7 +827,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	return env
 }
 
-var stepPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,3})/([0-9]{1,3})(?:[^0-9]|$)`)
+var stepPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,9})/([0-9]{1,9})(?:[^0-9]|$)`)
 var byteRatePattern = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:[kmgt]i?)?b/s\b`)
 
 type progressLog struct {
@@ -838,8 +841,10 @@ type progressLog struct {
 	peakRSSBytes   uint64
 	lastPhase      string
 	lastCurrent    int
+	lastTotal      int
 	lastEmit       time.Time
 	counterPhase   string
+	loadPhase      string
 }
 
 func (p *progressLog) Write(data []byte) (int, error) {
@@ -890,13 +895,31 @@ func (p *progressLog) line(line string) {
 		update.Phase = "preparing"
 		update.Message = "Preparing the image sampler"
 		p.counterPhase = "preparing"
+	case strings.Contains(lower, "loading tensors completed"):
+		// Loading is finished, but the next (possibly untiled) GPU graph can
+		// run silently for seconds. Resume its real phase immediately.
+		update.Phase = p.counterPhase
+		if update.Phase == "" {
+			update.Phase = "preparing"
+		}
+	case strings.Contains(lower, "unloading") || strings.Contains(lower, "released inactive weights"):
+		update.Phase = "releasing_components"
 	case strings.Contains(lower, "loading") || strings.Contains(lower, "load tensors"):
 		update.Phase = "loading"
 		update.Message = "Loading image model components"
+		switch {
+		case strings.Contains(lower, "vae") || p.counterPhase == "decoding":
+			update.Phase = "loading_vae"
+		case strings.Contains(lower, "diffusion"):
+			update.Phase = "loading_diffusion"
+		case strings.Contains(lower, "text_encoder") || strings.Contains(lower, "loading llm") || strings.Contains(lower, "loading t5"):
+			update.Phase = "loading_text_encoder"
+		}
+		p.loadPhase = update.Phase
 	case strings.Contains(lower, "encoding") || strings.Contains(lower, "condition") || strings.Contains(lower, "vae encode") || strings.Contains(lower, "encode_first_stage"):
 		update.Phase = "encoding"
 		update.Message = "Encoding the prompt and reference images"
-	case strings.Contains(lower, "decoding") || strings.Contains(lower, "vae decode"):
+	case strings.Contains(lower, "decoding") || strings.Contains(lower, "vae decode") || strings.Contains(lower, "decode_first_stage"):
 		update.Phase = "decoding"
 		update.Message = "Decoding the image"
 	case strings.Contains(lower, "saving") || strings.Contains(lower, "images saved"):
@@ -910,13 +933,16 @@ func (p *progressLog) line(line string) {
 	if match := stepPattern.FindStringSubmatch(line); match != nil && !imageBatchHeader {
 		current, _ := strconv.Atoi(match[1])
 		total, _ := strconv.Atoi(match[2])
-		if total > 1 && current <= total {
+		if total > 0 && current <= total {
 			// Native tensor transfers and denoising both print unlabelled N/M
 			// bars. Byte rates identify transfers; VAE tiles retain their semantic
 			// phase even when loading weights interrupted the preceding message.
 			if update.Phase == "" {
 				if byteRatePattern.MatchString(line) {
-					update.Phase = "loading"
+					update.Phase = p.loadPhase
+					if update.Phase == "" {
+						update.Phase = "loading"
+					}
 					update.Message = "Loading image model components"
 				} else if p.counterPhase == "decoding" {
 					update.Phase = "decoding"
@@ -933,6 +959,11 @@ func (p *progressLog) line(line string) {
 				}
 			}
 			update.Current, update.Total = current, total
+			if strings.Contains(lower, "tensors from") {
+				// "loading 128/238 tensors from ..." selects 128 tensors out
+				// of the file's 238; none has been transferred yet.
+				update.Current, update.Total = 0, current
+			}
 		}
 	}
 	if update.Phase != "" {
@@ -943,11 +974,12 @@ func (p *progressLog) emit(v Progress, force bool) {
 	if p.callback == nil {
 		return
 	}
-	if !force && v.Phase == p.lastPhase && v.Current == p.lastCurrent && time.Since(p.lastEmit) < 500*time.Millisecond {
+	if !force && v.Phase == p.lastPhase && v.Current == p.lastCurrent && v.Total == p.lastTotal && time.Since(p.lastEmit) < 500*time.Millisecond {
 		return
 	}
 	p.lastPhase = v.Phase
 	p.lastCurrent = v.Current
+	p.lastTotal = v.Total
 	p.lastEmit = time.Now()
 	v.PID = p.pid
 	p.sampleWorkingSet()

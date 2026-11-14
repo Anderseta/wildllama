@@ -16,17 +16,17 @@ func TestProgressNativeStagedQwenVAETilesRemainDecoding(t *testing.T) {
 		{"[INFO] using VAE for encoding / decoding", "encoding", 0, 0},
 		{"[INFO] sampling using Euler method", "preparing", 0, 0},
 		{"[VERBOSE] VAE encode tile size: 256x256 pixels (16x16 latent)", "encoding", 0, 0},
-		{"loading 144/297 tensors from vae.safetensors", "loading", 144, 297},
+		{"loading 144/297 tensors from vae.safetensors", "loading_vae", 0, 144},
 		{"|====> | 1/49 - 0.73s/it", "encoding", 1, 49},
 		{"|====> | 49/49 - 1.40it/s", "encoding", 49, 49},
 		{"[INFO] get_learned_condition completed, taking 3.20s", "encoding", 0, 0},
 		{"[INFO] generating image: 1/1 - seed 42", "sampling", 0, 0},
-		{"loading 492/526 tensors from diffusion_model.safetensors", "loading", 492, 526},
+		{"loading 492/526 tensors from diffusion_model.safetensors", "loading_diffusion", 0, 492},
 		{"|======> | 1/2 - 8.00s/it\x1b[K", "sampling", 1, 2},
 		{"|========| 2/2 - 8.00s/it\x1b[K", "sampling", 2, 2},
 		{"[INFO] decoding 1 latents", "decoding", 0, 0},
-		{"loading 62/128 tensors from vae.safetensors", "loading", 62, 128},
-		{"|====> | 128/128 - 512.00MiB/s\x1b[K", "loading", 128, 128},
+		{"loading 128/238 tensors from vae.safetensors", "loading_vae", 0, 128},
+		{"|====> | 128/128 - 512.00MiB/s\x1b[K", "loading_vae", 128, 128},
 		{"|==>   | 2/9 - 2.00it/s\x1b[K", "decoding", 2, 9},
 		{"|====> | 4/9 - 0.50s/it\x1b[K", "decoding", 4, 9},
 		{"|======| 9/9 - 2.00it/s\x1b[K", "decoding", 9, 9},
@@ -72,7 +72,7 @@ func TestProgressNativeSemanticResetAndTransfers(t *testing.T) {
 				t.Fatalf("reference tiles claimed sampling: %#v", last)
 			}
 			log.Write([]byte("|==> | 10/128 - 512.00MB/s\r"))
-			if last.Phase != "loading" {
+			if last.Phase != "loading_vae" {
 				t.Fatalf("tensor transfer claimed encoding: %#v", last)
 			}
 		})
@@ -91,5 +91,39 @@ func TestProgressSamplerSelectionIsNotSampling(t *testing.T) {
 		if last.Phase != "encoding" || last.Current != 1 || last.Total != 49 {
 			t.Fatalf("reference tiles counted as diffusion: %#v", last)
 		}
+	}
+}
+
+func TestProgressUntiledDecodeDoesNotRemainLoading(t *testing.T) {
+	var updates []Progress
+	log := progressLog{start: time.Now(), callback: func(p Progress) { updates = append(updates, p) }}
+	for _, line := range []string{
+		"decoding 1 latents",
+		"loading 128/238 tensors from vae.safetensors",
+		"128/128 - 963.46MB/s",
+		"loading tensors completed, taking 0.50s (read: 0.18s)",
+	} {
+		log.Write([]byte(line + "\r"))
+	}
+	last := updates[len(updates)-1]
+	if last.Phase != "decoding" || last.Total != 0 {
+		t.Fatalf("silent GPU decode still claims loading: %#v", last)
+	}
+	log.Write([]byte("unloading inactive components\r"))
+	if updates[len(updates)-1].Phase != "releasing_components" {
+		t.Fatal("unloading was mistaken for loading")
+	}
+	log.Write([]byte("1/1 - 0.5s/it\r"))
+	if updates[len(updates)-1].Phase != "decoding" || updates[len(updates)-1].Total != 1 {
+		t.Fatal("single-tile decode completion was lost")
+	}
+}
+
+func TestProgressLargeTensorCountsAndTotalChanges(t *testing.T) {
+	var updates []Progress
+	log := progressLog{start: time.Now(), callback: func(p Progress) { updates = append(updates, p) }}
+	log.Write([]byte("loading 2500/8000 tensors from diffusion.gguf\r0/2501 - 512MB/s\r2048/2501 - 512MB/s\r"))
+	if len(updates) != 3 || updates[0].Current != 0 || updates[0].Total != 2500 || updates[2].Current != 2048 || updates[2].Total != 2501 {
+		t.Fatalf("incorrect tensor transfer progress: %#v", updates)
 	}
 }

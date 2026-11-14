@@ -15,11 +15,12 @@ import (
 
 type imageAssetRecord struct {
 	imageAsset
-	OutputRoot        string   `json:"output_root"`
-	Input             bool     `json:"input,omitempty"`
-	UploadFingerprint string   `json:"upload_fingerprint,omitempty"`
-	ReferenceAssetIDs []string `json:"reference_asset_ids,omitempty"`
-	DeletionCompleted bool     `json:"deletion_completed,omitempty"`
+	OutputRoot        string                   `json:"output_root"`
+	Input             bool                     `json:"input,omitempty"`
+	UploadFingerprint string                   `json:"upload_fingerprint,omitempty"`
+	ReferenceAssetIDs []string                 `json:"reference_asset_ids,omitempty"`
+	DeletionCompleted bool                     `json:"deletion_completed,omitempty"`
+	Generation        *imageGenerationMetadata `json:"generation,omitempty"`
 }
 
 func (v *imageService) persistJobsLocked() error {

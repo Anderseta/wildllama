@@ -280,6 +280,9 @@ func (s *Server) imageService() *imageService {
 		service.recoverImageJobStates()
 		service.loadDeletedImageSessions()
 		service.loadImageAssetDeletions()
+		if err := service.backfillImageMetadata(); err != nil {
+			service.configError = "Cannot preserve image generation metadata: " + err.Error()
+		}
 		s.images = service
 	})
 	return s.images
@@ -473,6 +476,7 @@ func (s *Server) registerImageRoutes(r *gin.Engine) {
 	r.POST("/api/images/jobs/:id/cancel", s.imageCancelHandler)
 	r.POST("/api/images/jobs/by-request/:request_id/cancel", s.imageCancelHandler)
 	r.GET("/api/images/assets/:id/:filename", s.imageAssetHandler)
+	r.GET("/api/images/assets/:id/:filename/metadata", s.imageAssetMetadataHandler)
 	r.DELETE("/api/images/assets/:id/:filename", s.imageAssetDeleteHandler)
 	r.POST("/api/images/assets", s.imageUploadHandler)
 	r.DELETE("/api/images/sessions/:session_id", s.imageSessionDeleteHandler)

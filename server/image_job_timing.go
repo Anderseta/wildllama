@@ -11,6 +11,7 @@ type imageJobTimings struct {
 	TotalSeconds         float64            `json:"total_seconds"`
 	FirstSamplingSeconds *float64           `json:"first_sampling_seconds,omitempty"`
 	PhaseSeconds         map[string]float64 `json:"phase_seconds,omitempty"`
+	PhaseStartedAt       *time.Time         `json:"phase_started_at,omitempty"`
 }
 
 type imageJobMemory struct {
@@ -50,6 +51,8 @@ func (job *imageJob) imageTimingSnapshot(now time.Time) *imageJobTimings {
 		result.FirstSamplingSeconds = &value
 	}
 	if !job.timingPhaseStarted.IsZero() {
+		started := job.timingPhaseStarted
+		result.PhaseStartedAt = &started
 		result.RunSeconds = max(0, now.Sub(*job.StartedAt).Seconds())
 		result.TotalSeconds = result.QueueSeconds + result.RunSeconds
 		result.PhaseSeconds[job.timingPhase] += max(0, now.Sub(job.timingPhaseStarted).Seconds())

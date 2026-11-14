@@ -6,6 +6,21 @@ libraries. It does not replace the text runner or load image DLLs into it.
 Existing chat, completion, embedding, model profiles and text memory controls
 retain their existing interfaces.
 
+Image progress reports the current stage, not an estimated percentage of the
+whole request. Tensor selection headers are distinct from transfer counters.
+After a transfer completes, the active encode/decode/sampling stage resumes even
+if its GPU graph emits no intermediate progress. `timings.phase_started_at`
+allows a live stage clock; absent counters mean indeterminate progress.
+
+`GET /api/images/assets/:id/:filename/metadata` returns the immutable positive
+and negative prompts (including profile prefixes), CFG, steps, sampler, profile
+and model identity alongside the output's dimensions and seed. These facts live
+in the per-asset SQLite catalog independently of the 200 recent jobs. Existing
+outputs are upgraded from historical job snapshots where available; unavailable
+old settings return `generation: null`, never current profile defaults. Metadata
+is fetched on demand, is not added to gallery polling payloads, and is deleted
+with the asset. Optional `session_id` enforces the same chat ownership.
+
 ## Existing local models
 
 The Image tab can inspect a local model folder and copy selected components into

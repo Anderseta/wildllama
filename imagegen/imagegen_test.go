@@ -71,7 +71,7 @@ func TestProgressNativeCounterPhases(t *testing.T) {
 		name, line, phase string
 		current, total    int
 	}{
-		{"tensor count", "loading 42/756 tensors from denoiser.safetensors", "loading", 42, 756},
+		{"tensor count", "loading 42/756 tensors from denoiser.safetensors", "loading", 0, 42},
 		{"bytes", "|###       | 42/756 - 512.00B/s\x1b[K", "loading", 42, 756},
 		{"megabytes", "|###       | 42/756 - 512.00MB/s\x1b[K", "loading", 42, 756},
 		{"gigabytes", "|###       | 42/756 - 1.20GB/s\x1b[K", "loading", 42, 756},

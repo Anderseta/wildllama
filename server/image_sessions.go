@@ -92,19 +92,22 @@ func (v *imageService) loadDeletedImageSessions() {
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		v.sessionDeleteErr = errors.Join(v.sessionDeleteErr, readErr)
 	}
+	// Join by identity once rather than scanning the entire image catalog for
+	// every recent job when opening an increasingly large gallery.
+	byJob := make(map[string]*imageJob, len(v.jobs))
 	for _, job := range v.jobs {
-		if job.SessionID == "" {
-			continue
+		if job.SessionID != "" {
+			byJob[job.ID] = job
 		}
-		for id, asset := range v.assets {
-			if asset.JobID == job.ID && asset.SessionID == "" {
-				asset.SessionID = job.SessionID
-				if job.Generation != nil {
-					asset.ReferenceAssetIDs = append([]string(nil), job.Generation.ReferenceAssetIDs...)
-				}
-				v.assets[id] = asset
-				v.assetOwnersDirty = true
+	}
+	for id, asset := range v.assets {
+		if job := byJob[asset.JobID]; job != nil && asset.SessionID == "" {
+			asset.SessionID = job.SessionID
+			if job.Generation != nil {
+				asset.ReferenceAssetIDs = append([]string(nil), job.Generation.ReferenceAssetIDs...)
 			}
+			v.assets[id] = asset
+			v.assetOwnersDirty = true
 		}
 	}
 }

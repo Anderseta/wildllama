@@ -139,6 +139,7 @@ func (v *imageService) registerImageResult(job *imageJob, result imagegen.Result
 		Width: result.Width, Height: result.Height, Seed: result.Seed, DurationSeconds: result.DurationSeconds, BatchIndex: index, BatchCount: count, ParentAssetID: job.ParentAssetID}, OutputRoot: job.Config.OutputDir}
 	if job.Generation != nil {
 		asset.ReferenceAssetIDs = append([]string(nil), job.Generation.ReferenceAssetIDs...)
+		asset.Generation = imageMetadataFor(job.Generation)
 	}
 	file, err := openImageAsset(asset)
 	if err != nil {
