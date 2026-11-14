@@ -8,6 +8,7 @@
 # is not promoted to a terminating exception by the try/catch block.
 # All native commands already check $LASTEXITCODE explicitly.
 $ErrorActionPreference = "Continue"
+. (Join-Path $PSScriptRoot 'cuda-toolkit.ps1')
 
 mkdir -Force -path .\dist | Out-Null
 
@@ -233,19 +234,9 @@ function checkEnv {
     Write-Output "Locating required tools and paths"
     $script:SRC_DIR=$PWD
 
-    # Locate CUDA versions
-    $cudaList=(get-item "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\" -ea 'silentlycontinue')
-    if ($cudaList.length -eq 0) {
-        $d=(get-command -ea 'silentlycontinue' nvcc).path
-        if ($null -ne $d) {
-            $script:CUDA_DIRS=@($d| split-path -parent)
-        }
-    } else {
-        # Favor newer patch versions if available
-        $script:CUDA_DIRS=($cudaList | sort-object -Descending)
-    }
-    if ($script:CUDA_DIRS.length -gt 0) {
-        Write-Output "Available CUDA Versions: $script:CUDA_DIRS"
+    $cudaRoot = Find-WildLlamaCudaToolkit -Optional
+    if ($cudaRoot) {
+        Write-Output "Available CUDA compiler: $cudaRoot"
     } else {
         Write-Output "No CUDA versions detected"
     }
@@ -496,30 +487,12 @@ function findCudaRoot {
     )
 
     if ($ExactVer) {
-        $envName = "CUDA_PATH_V$($ExactVer.Replace('.', '_'))"
-        $candidates = @(
-            [Environment]::GetEnvironmentVariable($envName),
-            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$ExactVer"
-        )
-
-        foreach ($candidate in ($candidates | Where-Object { $_ } | Select-Object -Unique)) {
-            if (Test-Path -LiteralPath (Join-Path $candidate "bin\nvcc.exe")) {
-                return $candidate
-            }
-        }
+        $exact = Find-WildLlamaCudaToolkit -Major ([int]$MajorVer) -Version $ExactVer -Optional
+        if ($exact) { return $exact }
     }
-
-    if ("$script:CUDA_DIRS".Contains("v$MajorVer")) {
-        foreach ($d in $Script:CUDA_DIRS){
-            if ($d.FullName.Contains("v$MajorVer")) {
-                if (test-path -literalpath (join-path -path $d -childpath "nvcc.exe" ) ) {
-                    return ($d.FullName|split-path -parent)
-                }
-            }
-        }
-    }
-
-    return $null
+    # Preserve same-major fallback for the release presets; extracted toolkits
+    # need not live in a directory named v13.x or be registered by an installer.
+    return Find-WildLlamaCudaToolkit -Major ([int]$MajorVer) -Optional
 }
 
 function cudaArm64CMakeArgs {

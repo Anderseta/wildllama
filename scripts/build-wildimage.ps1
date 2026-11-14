@@ -8,7 +8,7 @@ param(
     [string]$VisualStudioDirectory = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools',
     [ValidatePattern('^\d+\.\d+\.\d+$')][string]$MsvcVersion = '14.39.33519',
     [string]$CmakePath = 'C:\Python310\Lib\site-packages\cmake\data\bin\cmake.exe',
-    [string]$CudaDirectory = $env:CUDA_PATH,
+    [string]$CudaDirectory = '',
     [string]$CudaBackendPath,
     [string]$CudaArchitectures = '80;89;120',
     [ValidateRange(1, 16)][int]$Parallel = 2,
@@ -17,6 +17,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+. (Join-Path $PSScriptRoot 'cuda-toolkit.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
 $runtimeRevision = 'b9d7176-wildllama-h3-3'
@@ -117,7 +118,7 @@ try {
     $vcvars = Assert-Tool (Join-Path $VisualStudioDirectory 'VC/Auxiliary/Build/vcvars64.bat')
     $ninja = Assert-Tool (Join-Path $VisualStudioDirectory 'Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe')
     $CmakePath = Assert-Tool $CmakePath
-    if (-not $CudaDirectory) { throw 'Set CUDA_PATH or supply -CudaDirectory.' }
+    $CudaDirectory = Find-WildLlamaCudaToolkit -Directory $CudaDirectory
     $nvcc = Assert-Tool (Join-Path $CudaDirectory 'bin/nvcc.exe')
     $cudaVersionOutput = (& $nvcc --version | Out-String)
     if ($LASTEXITCODE -ne 0 -or $cudaVersionOutput -notmatch 'release (12|13)\.\d+, V([0-9.]+)') { throw 'Unsupported CUDA compiler.' }
@@ -288,6 +289,7 @@ int main() {
         $sourceInputs += File-Record $patch "third_party/wildimage/patches/$patchName"
     }
     $sourceInputs += File-Record $PSCommandPath 'scripts/build-wildimage.ps1'
+    $sourceInputs += File-Record (Join-Path $PSScriptRoot 'cuda-toolkit.ps1') 'scripts/cuda-toolkit.ps1'
     # CMake can misdecode localized /showIncludes output. Probe the actual
     # compiler's UTF-8 prefix and override it after project/compiler detection.
     $includeHeader = Join-Path $probeDirectory 'wildimage-include-probe.h'

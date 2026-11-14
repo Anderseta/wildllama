@@ -90,6 +90,15 @@ Additional prerequisites:
 
 For Ninja builds, run CMake from a Developer PowerShell/Command Prompt or another shell where the Visual Studio compiler is available.
 
+Windows build scripts also accept extracted CUDA toolkits outside Program Files.
+They validate `nvcc --version`, skip removed/runtime-only directories and consult
+persisted user/machine settings when an open terminal still has an obsolete
+`CUDA_PATH`. A valid process override stays first. `-CudaDirectory` is explicit
+and fails if unavailable; `-CudaVersion` in the native validation build pins the
+requested minor/build instead of silently switching. Release presets retain
+their existing same-major fallback. Verify lookup with
+`scripts/tests/test-cuda-toolkit.ps1`; it neither installs CUDA nor loads the GPU.
+
 > Building for Vulkan requires VULKAN_SDK environment variable:
 > 
 > PowerShell

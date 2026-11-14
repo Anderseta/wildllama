@@ -12,6 +12,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-integrity.ps1')
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'cuda-toolkit.ps1')
 $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if(!$BuildRoot) { $BuildRoot = Join-Path $repoRoot '.build\gpu-first-moe' }
 $buildDirectory = [IO.Path]::GetFullPath($BuildRoot)
@@ -29,21 +30,7 @@ $vsRoot = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
 $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
 $ninja = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
 $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
-$cudaBase = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
-if(!$CudaDirectory -and !$CudaVersion -and $env:CUDA_PATH -and
-   (Test-Path -LiteralPath (Join-Path $env:CUDA_PATH 'bin\nvcc.exe') -PathType Leaf)) {
-    $CudaDirectory = $env:CUDA_PATH
-}
-if(!$CudaDirectory -and !$CudaVersion) {
-    # Some toolkit version directories contain runtime-only installations.
-    $installed = Get-ChildItem -LiteralPath $cudaBase -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^v\d+\.\d+$' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'bin\nvcc.exe') -PathType Leaf) } |
-        Sort-Object { [version]$_.Name.Substring(1) } -Descending | Select-Object -First 1
-    if(!$installed) { throw 'CUDA compiler not found. Supply -CudaDirectory or install the toolkit.' }
-    $CudaDirectory = $installed.FullName
-}
-if(!$CudaDirectory) { $CudaDirectory = Join-Path $cudaBase "v$CudaVersion" }
-$cudaDirectory = [IO.Path]::GetFullPath($CudaDirectory)
+$cudaDirectory = Find-WildLlamaCudaToolkit -Directory $CudaDirectory -Version $CudaVersion
 $cudaCmakeDirectory = $cudaDirectory.Replace('\','/')
 foreach($required in @($vcvars,$ninja,$cmake,(Join-Path $cudaDirectory 'bin\nvcc.exe'))) {
     if(!(Test-Path -LiteralPath $required -PathType Leaf)) { throw "Existing tool not found: $required" }
@@ -86,6 +73,7 @@ if(!$SkipConfigure) {
 $sourceRoots = @($nativeDirectory, (Join-Path $repoRoot 'llama\compat'),
     (Join-Path $repoRoot 'llama\server'), (Join-Path $PSScriptRoot 'tests'))
 $sourceFiles = @((Join-Path $repoRoot 'LLAMA_CPP_VERSION'),
+    (Join-Path $repoRoot 'scripts\cuda-toolkit.ps1'),
     (Join-Path $PSScriptRoot 'CMakeLists.txt'), (Join-Path $PSScriptRoot 'build-windows.ps1'),
     (Join-Path $PSScriptRoot 'build-integrity.ps1'), (Join-Path $PSScriptRoot 'cuda-calibrate.cpp'))
 if($Build) {

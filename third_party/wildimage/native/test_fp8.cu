@@ -5,6 +5,7 @@
 #include "wildimage_fp8.h"
 #include <cuda_fp8.h>
 #include <map>
+#include <algorithm>
 #include <vector>
 #include <cmath>
 #include <cstdio>
@@ -17,13 +18,14 @@ struct Context {
     std::map<ggml_tensor*, ggml_tensor*> fp8_pack_cache;
 };
 static void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
-static void trial(ggml_backend_t gpu, ggml_backend_t cpu, int k, int m, int n, bool unaligned = false) {
+static void trial(ggml_backend_t gpu, ggml_backend_t cpu, int k, int m, int n, bool unaligned = false, bool weight_view = false) {
     auto ctx = ggml_init({ggml_tensor_overhead() * 128 + ggml_graph_overhead_custom(128, false), nullptr, true});
     require(ctx != nullptr, "context allocation");
     Context c{ctx, gpu, {}};
     auto x = unaligned ? ggml_view_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k*n+1), k, n, k*sizeof(float), sizeof(float)) :
         ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
-    auto w = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, m);
+    auto w = weight_view ? ggml_view_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F8_E4M3, k*m+16), k, m, k, 16) :
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, m);
     auto baseline = ggml_mul_mat(ctx, w, x);
     auto first = wildimage_fp8::linear(&c, x, w, false, 1.f);
     auto second = wildimage_fp8::linear(&c, x, w, false, 1.f);
@@ -53,9 +55,11 @@ static void trial(ggml_backend_t gpu, ggml_backend_t cpu, int k, int m, int n, b
         ggml_backend_tensor_get(baseline, original.data(), 0, original.size()*sizeof(float));
         ggml_backend_tensor_get(first, actual.data(), 0, actual.size()*sizeof(float));
         ggml_backend_tensor_get(second, other.data(), 0, other.size()*sizeof(float));
-        require(original == actual && original == other, "FP8 numerical parity / fresh activation");
+        require(std::all_of(original.begin(), original.end(), [](float v) { return std::isfinite(v); }), "finite FP8 output");
+        require(std::memcmp(original.data(), actual.data(), actual.size()*sizeof(float)) == 0 &&
+            std::memcmp(original.data(), other.data(), other.size()*sizeof(float)) == 0, "FP8 bitwise parity / fresh activation");
     }
-    std::printf("PASS K=%d M=%d N=%d unaligned=%d: exact FP32 parity, shared packing, replay and fallbacks\n", k, m, n, unaligned);
+    std::printf("PASS K=%d M=%d N=%d unaligned=%d weight_view=%d: exact FP32 parity, shared packing, replay and fallbacks\n", k, m, n, unaligned, weight_view);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
 }
@@ -71,6 +75,8 @@ int main() {
         trial(gpu, cpu, 4096, 4096, 512);
         trial(gpu, cpu, 4096, 16384, 256);
         trial(gpu, cpu, 256, 128, 17, true);
+        trial(gpu, cpu, 256, 128, 17, false, true);
+        trial(gpu, cpu, 4096, 4096, 1024);
         ggml_backend_free(gpu); ggml_backend_free(cpu);
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
