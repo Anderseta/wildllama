@@ -159,7 +159,10 @@ try {
     New-Item -ItemType Directory -Force -Path $env:CUDA_CACHE_PATH | Out-Null
     if ($CudaBackendPath) {
         $dependencies = Invoke-Checked $dumpbin @('/nologo', '/dependents', $CudaBackendPath) (Join-Path $BuildDirectory 'cuda-backend-dependencies.log')
-        if (-not ($dependencies -match "^\s*cudart64_$cudaMajor\.dll\s*$")) {
+        # nvcc can link cudart statically; cuBLAS identifies the toolkit family.
+        $vendorDependencies = @($dependencies | Where-Object { $_ -match '^\s*(cudart|cublas|cublasLt)64_\d+\.dll\s*$' })
+        if (-not ($vendorDependencies -match "^\s*cublas64_$cudaMajor\.dll\s*$") -or
+            ($vendorDependencies -notmatch "64_$cudaMajor\.dll\s*$")) {
             throw "The rebuilt image backend must link the CUDA $cudaMajor runtime."
         }
     }
