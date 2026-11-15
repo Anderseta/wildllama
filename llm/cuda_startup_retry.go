@@ -8,26 +8,11 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/ollama/ollama/internal/cudaload"
 )
 
-const cudaModuleLoadingEnv = "CUDA_MODULE_LOADING"
-
-// Only the CUDA runtime's shared-object initialization failure (error 303)
-// qualifies. An exit code, generic module/driver failure or OOM alone does not.
-func isCUDASharedObjectInitFailure(message string) bool {
-	matched := false
-	for _, line := range strings.Split(strings.ToLower(message), "\n") {
-		if strings.Contains(line, "cudaerrorsharedobjectinitfailed") ||
-			(strings.Contains(line, "cuda error") && strings.Contains(line, "shared object initialization failed")) {
-			matched = true
-		} else if strings.Contains(line, "cuda error:") {
-			// A later specific CUDA failure is not error 303. Source-location
-			// lines ending in just "CUDA error" do not replace the diagnosis.
-			matched = false
-		}
-	}
-	return matched
-}
+const cudaModuleLoadingEnv = cudaload.ModuleLoadingEnv
 
 func cudaModuleLoadingExplicit(extraEnvs map[string]string) bool {
 	for key, value := range extraEnvs {
@@ -35,13 +20,7 @@ func cudaModuleLoadingExplicit(extraEnvs map[string]string) bool {
 			return true
 		}
 	}
-	for _, entry := range os.Environ() {
-		key, value, ok := strings.Cut(entry, "=")
-		if ok && strings.EqualFold(key, cudaModuleLoadingEnv) && strings.TrimSpace(value) != "" {
-			return true
-		}
-	}
-	return false
+	return cudaload.HasExplicitModuleLoading(os.Environ())
 }
 
 func (s *llamaServerRunner) shouldRetryCUDAEagerModuleLoading(ctx context.Context, loadErr error, goos string) bool {
@@ -56,9 +35,9 @@ func (s *llamaServerRunner) shouldRetryCUDAEagerModuleLoading(ctx context.Contex
 	message := loadErr.Error()
 	lower := strings.ToLower(message)
 	if strings.Contains(lower, "cuda error") || strings.Contains(lower, "cudaerror") {
-		return usesCUDA && isCUDASharedObjectInitFailure(message)
+		return usesCUDA && cudaload.IsSharedObjectInitFailure(message)
 	}
-	return usesCUDA && isCUDASharedObjectInitFailure(s.lastErrMsg())
+	return usesCUDA && cudaload.IsSharedObjectInitFailure(s.lastErrMsg())
 }
 
 // The restart callback is the same startProcess used by normal startup. Keeping

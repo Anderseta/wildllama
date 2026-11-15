@@ -147,6 +147,14 @@ func fakeChild(mode string) {
 		fmt.Fprintln(os.Stderr, "invalid model metadata")
 		os.Exit(7)
 	}
+	if mode == "cuda-module-after-offload" && values["--params-backend"] != "cpu" {
+		os.Exit(GPUOutOfMemoryExitCode)
+	}
+	if mode == "cuda-module-always" || mode == "cuda-module-after-offload" && os.Getenv("CUDA_MODULE_LOADING") != "EAGER" {
+		fmt.Fprintln(os.Stderr, "[E] ggml: CUDA error: shared object initialization failed")
+		fmt.Fprintln(os.Stderr, "[E] ggml: cudaFuncSetAttribute(mul_mat_q, cudaFuncAttributeMaxDynamicSharedMemorySize)")
+		os.Exit(-1073740791) // Windows 0xc0000409 after a native fail-fast.
+	}
 	if mode == "gpu-oom-always" || mode == "gpu-oom-then-cpu" && values["--backend"] != "cpu" {
 		fmt.Fprintln(os.Stderr, "classified GPU allocation failure")
 		os.Exit(GPUOutOfMemoryExitCode)
@@ -181,6 +189,10 @@ func fakeChild(mode string) {
 	}
 	if mode == "saved-gpu-oom" {
 		os.Exit(GPUOutOfMemoryExitCode)
+	}
+	if mode == "saved-cuda-module" {
+		fmt.Fprintln(os.Stderr, "[E] ggml: CUDA error: shared object initialization failed")
+		os.Exit(-1073740791)
 	}
 	if mode == "saved-wait" {
 		time.Sleep(30 * time.Second)

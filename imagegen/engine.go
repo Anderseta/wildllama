@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ollama/ollama/internal/cudaload"
 	_ "golang.org/x/image/webp"
 )
 
@@ -553,16 +554,22 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	}
 	var runErr error
 	outputValidated := false
+	eagerCUDA := false
+	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
-		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, runnerStatus, log)
+		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log)
 		select {
 		case diskErr := <-diskGuard:
 			runErr = diskErr
 		default:
 		}
 		var exit *exec.ExitError
-		if runErr != nil || ctx.Err() != nil || !p.OffloadToCPU || mode == imageRAMCPU || !errors.As(err, &exit) ||
-			exit.ExitCode() != GPUOutOfMemoryExitCode {
+		if runErr != nil || ctx.Err() != nil || mode == imageRAMCPU || !errors.As(err, &exit) {
+			break
+		}
+		retryCUDA := allowCUDARetry && !eagerCUDA && cudaload.IsSharedObjectInitFailure(log.tail())
+		retryMemory := p.OffloadToCPU && exit.ExitCode() == GPUOutOfMemoryExitCode
+		if !retryCUDA && !retryMemory {
 			break
 		}
 		outputValidated = validateOutputPNG(output, p.Width, p.Height) == nil
@@ -570,11 +577,15 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			break
 		}
 		// The failed process and its CPU/GPU resources have been fully closed.
-		// Retry only the native protocol's classified GPU allocation failure;
-		// invalid models, host-budget failures, cancellation and saved PNGs must
-		// never trigger a second generation or silently change image quality.
+		// A saved PNG, cancellation, and unrelated errors must never trigger a
+		// second generation. Both recoveries keep the seed and image settings.
 		if removeErr := os.Remove(output); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			return Result{}, fmt.Errorf("remove incomplete GPU attempt: %w", removeErr)
+		}
+		if retryCUDA {
+			eagerCUDA = true
+			log.emit(Progress{Phase: "cuda_module_retry", Message: "O CUDA falhou ao inicializar um kernel. Tentando novamente na GPU com carregamento antecipado e a mesma seed."}, true)
+			continue
 		}
 		if mode == imageGPUResident {
 			residentFailedAt = p.MaxVRAMMiB
@@ -616,7 +627,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	return result, nil
 }
 
-func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode, status RunnerStatus, log *progressLog) error {
+func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode, eagerCUDA bool, status RunnerStatus, log *progressLog) error {
 	args := buildArgumentsForMode(p, r, jobDir, output, seed, mode)
 	if mode == imageRAMCPU {
 		// CPU conditioning gets a separate exact cache namespace. The saved
@@ -626,6 +637,9 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	cmd := exec.CommandContext(ctx, e.config.RunnerPath, args...)
 	cmd.Dir = jobDir
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
+	if eagerCUDA && mode != imageRAMCPU {
+		cmd.Env = append(cmd.Env, cudaload.ModuleLoadingEnv+"=EAGER")
+	}
 	if status.ConditioningCacheSupported && e.config.ConditioningCacheMiB > 0 {
 		cacheEnv, cacheErr := conditioningCacheEnvironment(ctx, e.config, p, r, status.Revision, log.callback)
 		if ctx.Err() != nil {
@@ -654,9 +668,12 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	message := "Starting the isolated CUDA image runner"
 	if mode == imageRAMCPU {
 		message = "Iniciando a tentativa na CPU com os mesmos parâmetros de imagem e orçamento de RAM."
+	} else if eagerCUDA {
+		message = "Reiniciando o gerador com carregamento antecipado dos kernels CUDA."
 	}
 	log.mu.Lock()
 	log.counterPhase, log.loadPhase = "", ""
+	log.lines = log.lines[:0]
 	log.emit(Progress{Phase: "starting", Message: message}, true)
 	log.mu.Unlock()
 	if err := cmd.Start(); err != nil {

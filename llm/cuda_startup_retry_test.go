@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/internal/cudaload"
 	"github.com/ollama/ollama/ml"
 )
 
@@ -103,7 +104,7 @@ func TestShouldRetryCUDAEagerModuleLoading(t *testing.T) {
 	if cudaRetryTestRunner().shouldRetryCUDAEagerModuleLoading(ctx, errors.New(cuda303TestLog), "windows") {
 		t.Fatal("cancelled request retried")
 	}
-	if isCUDASharedObjectInitFailure(cuda303TestLog + "CUDA error: an illegal memory access was encountered\n") {
+	if cudaload.IsSharedObjectInitFailure(cuda303TestLog + "CUDA error: an illegal memory access was encountered\n") {
 		t.Fatal("a later distinct CUDA error was retried as 303")
 	}
 }

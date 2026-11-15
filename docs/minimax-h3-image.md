@@ -66,6 +66,12 @@ is unaffected. `WILDIMAGE_CUDA_WAIT=auto` retains the driver's original policy;
 driver setting leaves generation on the existing policy, without resetting the
 CUDA context. Other operating systems retain their original default.
 
+If the isolated Windows image process reports CUDA error 303 while initializing
+a kernel, WildLlama retries once with `CUDA_MODULE_LOADING=EAGER` in the new
+child. This retains the same seed, model, memory placement and sampling settings.
+An explicit `CUDA_MODULE_LOADING` override takes precedence. A complete PNG is
+preserved if the runner fails after saving it.
+
 The benchmark reports process CPU seconds separately from wall time. Use
 `--candidate-cuda-wait blocking` to compare the two policies in the same runner;
 repeat with alternating order and optionally `--cuda-cache-dir` pointing to a
