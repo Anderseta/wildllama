@@ -172,14 +172,14 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 		}
 		components["tokenizer"] = identity
 	}
-	if len(request.ReferenceImages) > 0 && !sameComponentPath(profile.VisionEncoder, profile.TextEncoder) {
+	if len(request.ReferenceImages) > 0 && !profile.UsesMOSSEdit() && !sameComponentPath(profile.VisionEncoder, profile.TextEncoder) {
 		identity, err := memo.fileIdentity(ctx, profile.VisionEncoder, true, report)
 		if err != nil {
 			return nil, err
 		}
 		components["vision"] = identity
 	}
-	for i, lora := range profile.LoRAs {
+	for i, lora := range profile.requestLoRAs(request.ReferenceImages) {
 		if lora.Scale == 0 {
 			continue
 		}
@@ -200,6 +200,9 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 	// Native code additionally hashes every actual ConditionerParams field and
 	// reference tensor before accepting any serialized conditioning result.
 	conditioningProfile := profile
+	if len(request.ReferenceImages) == 0 {
+		conditioningProfile.MOSSEditLoRA = nil
+	}
 	conditioningProfile.Steps = 0
 	conditioningProfile.CFGScale = 0
 	conditioningProfile.Sampler = ""

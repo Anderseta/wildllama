@@ -20,7 +20,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 . (Join-Path $PSScriptRoot 'cuda-toolkit.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
-$runtimeRevision = 'b9d7176-wildllama-h3-3'
+$runtimeRevision = 'b9d7176-wildllama-h3-4'
 $originalOutputEncoding = [Console]::OutputEncoding
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
@@ -276,7 +276,7 @@ int main() {
         Copy-ReplacingFile $header (Join-Path $SourceDirectory $target)
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
-    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch')) {
+    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch','0008-moss-edit.patch')) {
         $patch = Join-Path $repository "third_party/wildimage/patches/$patchName"
         if(-not (Test-Path -LiteralPath $patch)) {throw "Native patch is absent: $patch"}
         & git -C $SourceDirectory apply --check $patch 2>$null
@@ -387,7 +387,7 @@ int main() {
     foreach ($relative in $licenses.Keys) { Copy-ReplacingFile (Join-Path $SourceDirectory $relative) (Join-Path $Destination $licenses[$relative]) }
     Invoke-Checked (Join-Path $Destination 'sd-cli.exe') @('--help') (Join-Path $BuildDirectory 'help.log') | Out-Null
     $files = @(Get-ChildItem -LiteralPath $Destination -File | Where-Object { $_.Name -ne 'wildimage-runtime.json' } | ForEach-Object { File-Record $_.FullName $_.Name })
-    $manifest = @{ provider = 'stable-diffusion.cpp'; source = 'https://github.com/leejet/stable-diffusion.cpp'; revision = $runtimeRevision; upstream_revision = $sourceRevision; base_release = $baseManifest.release; base_archive_sha256 = $baseManifest.archive_sha256; features = @{ conditioning_cache = $true; ram_budget = $true; gpu_memory_retry_exit = 75; ram_budget_exit = 76 }; build = $preparation; files = $files }
+    $manifest = @{ provider = 'stable-diffusion.cpp'; source = 'https://github.com/leejet/stable-diffusion.cpp'; revision = $runtimeRevision; upstream_revision = $sourceRevision; base_release = $baseManifest.release; base_archive_sha256 = $baseManifest.archive_sha256; features = @{ conditioning_cache = $true; ram_budget = $true; moss_edit = $true; gpu_memory_retry_exit = 75; ram_budget_exit = 76 }; build = $preparation; files = $files }
     $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Destination 'wildimage-runtime.json') -Encoding utf8
     Write-Output "WildImage custom runtime prepared: $Destination"
 } finally {

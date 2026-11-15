@@ -12,6 +12,58 @@ import (
 	"testing"
 )
 
+func TestMOSSEditAdapterIsAppliedOnlyToReferences(t *testing.T) {
+	dir := t.TempDir()
+	p := testProfile(t, dir)
+	p.ModelID = MOSSRecipeID
+	p.Tokenizer = filepath.Join(dir, "tokenizer.json")
+	putModel(t, p.Tokenizer, []byte(`{"model":{}}`))
+	style := filepath.Join(dir, "style.safetensors")
+	edit := filepath.Join(dir, "edit.safetensors")
+	writeSafeFixture(t, style, []fixtureTensor{
+		{"layers.0.proj.k.lora_A.weight", "BF16", []int64{2, 4}, make([]byte, 16)},
+		{"layers.0.proj.k.lora_B.weight", "BF16", []int64{4, 2}, make([]byte, 16)},
+	})
+	writeSafeFixture(t, edit, []fixtureTensor{
+		{"layers.0.proj.k.lora_A", "BF16", []int64{2, 4}, make([]byte, 16)},
+		{"layers.0.proj.k.lora_B", "BF16", []int64{4, 2}, make([]byte, 16)},
+	}, map[string]string{"adapter_config": `{"format":"moss-edit-lora","format_version":1,"modules":{"layers.0.proj.k":{"alpha":2,"rank":2}}}`})
+	p.LoRAs = []LoRA{{Path: style, Scale: 0.8}}
+	reference := filepath.Join(dir, "reference.png")
+	referenceSizeHeader(t, reference, 96, 96)
+	request := Request{Prompt: "Change the background", ReferenceImages: []string{reference}}
+	if err := ValidateRequest(p, request); err == nil {
+		t.Fatal("accepted an edit without an edit adapter")
+	}
+	p.MOSSEditLoRA = &LoRA{Path: edit, Scale: 1}
+	if err := ValidateRequest(p, request); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.requestLoRAs(nil)) != 1 || len(p.requestLoRAs(request.ReferenceImages)) != 2 {
+		t.Fatal("incorrect style and edit adapter selection")
+	}
+	args := strings.Join(buildArguments(p, request, dir, "edit.png", 42), "|")
+	if !strings.Contains(args, "--ref-image-args|preset=moss_edit,vae_input_max_edge=384|-r|"+reference) || strings.Contains(args, "--llm_vision") {
+		t.Fatal("incorrect MOSS edit reference settings", args)
+	}
+	config := Config{WorkDir: dir, ConditioningCacheMiB: 256}
+	key := func(profile Profile, request Request) string {
+		t.Helper()
+		env, err := conditioningCacheEnvironment(t.Context(), config, profile, request, "fixture")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return envValue(env, "WILDIMAGE_CONDITION_NAMESPACE")
+	}
+	editKey := key(p, request)
+	request.ReferenceImages = nil
+	textKey := key(p, request)
+	p.MOSSEditLoRA = nil
+	if editKey == textKey || key(p, request) != textKey {
+		t.Fatal("text-only conditioning depends on an unused edit adapter")
+	}
+}
+
 func TestMOSSInstallBindsTokenizerAndBothLoRAsAcrossResume(t *testing.T) {
 	recipe := mossRecipe()
 	fixture := testProfile(t, t.TempDir())

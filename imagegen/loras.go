@@ -28,6 +28,7 @@ type LoRAAsset struct {
 	Revision string `json:"revision"`
 	Filename string `json:"filename"`
 	SHA256   string `json:"sha256"`
+	MOSSEdit bool   `json:"moss_edit,omitempty"`
 }
 
 type downloadTokenKey struct{}
@@ -163,6 +164,7 @@ func installLoRA(ctx context.Context, modelsDir string, c Component, progress fu
 		}
 	}
 	asset.Ready = true
+	asset.MOSSEdit = inspection.MOSSEdit
 	if err := writeLoRAAsset(filepath.Join(writeDir, loraManifestName), asset); err != nil {
 		return asset, err
 	}
@@ -243,6 +245,7 @@ func LoRALibrary(modelsDir string) ([]LoRAAsset, error) {
 			asset.Error = inspection.Hint
 		} else {
 			asset.Ready = true
+			asset.MOSSEdit = inspection.MOSSEdit
 		}
 		if asset.Ready && strings.EqualFold(filepath.Ext(asset.Path), ".gguf") {
 			if ok, err := ggufLoRAMetadata(asset.Path); err != nil || !ok {

@@ -48,6 +48,7 @@ type Profile struct {
 	Sigmas          string  `json:"sigmas"`
 	Scheduler       string  `json:"scheduler,omitempty"`
 	LoRAs           []LoRA  `json:"loras,omitempty"`
+	MOSSEditLoRA    *LoRA   `json:"moss_edit_lora,omitempty"`
 	StageComponents bool    `json:"stage_components"`
 	// PreserveReferenceSize prefers a supported canvas from the first reference.
 	PreserveReferenceSize bool `json:"preserve_reference_size"`
@@ -92,6 +93,7 @@ type LocalInspection struct {
 	Compatibility   string         `json:"compatibility"`
 	Hint            string         `json:"hint"`
 	SupportsEditing bool           `json:"supports_editing"`
+	MOSSEdit        bool           `json:"moss_edit,omitempty"`
 }
 
 type Request struct {
@@ -138,6 +140,7 @@ type RunnerStatus struct {
 	Error                      string `json:"error,omitempty"`
 	ConditioningCacheSupported bool   `json:"conditioning_cache_supported"`
 	RAMBudgetSupported         bool   `json:"ram_budget_supported"`
+	MOSSEditSupported          bool   `json:"moss_edit_supported,omitempty"`
 }
 
 type Component struct {
@@ -158,12 +161,13 @@ type InstalledComponent struct {
 	DownloadState   string `json:"download_state"`
 }
 type Recipe struct {
-	ID             string      `json:"id"`
-	Name           string      `json:"name"`
-	Family         string      `json:"family"`
-	Capabilities   []string    `json:"capabilities"`
-	Components     []Component `json:"components"`
-	DefaultProfile Profile     `json:"default_profile"`
+	ID                string      `json:"id"`
+	Name              string      `json:"name"`
+	Family            string      `json:"family"`
+	Capabilities      []string    `json:"capabilities"`
+	Components        []Component `json:"components"`
+	DefaultProfile    Profile     `json:"default_profile"`
+	ReferenceEditLoRA *Component  `json:"reference_edit_lora,omitempty"`
 }
 type Bundle struct {
 	ID         string               `json:"id"`

@@ -91,6 +91,7 @@ func (e *Engine) Status() RunnerStatus {
 			Features struct {
 				ConditioningCache bool `json:"conditioning_cache"`
 				RAMBudget         bool `json:"ram_budget"`
+				MOSSEdit          bool `json:"moss_edit"`
 			} `json:"features"`
 			Files []struct {
 				Name   string `json:"name"`
@@ -149,6 +150,7 @@ func (e *Engine) Status() RunnerStatus {
 		status.Revision = e.runtimeRevision
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 		status.RAMBudgetSupported = manifest.Features.RAMBudget
+		status.MOSSEditSupported = manifest.Features.MOSSEdit
 	}
 	if !status.RAMBudgetSupported {
 		status.Error = "image runtime does not support bounded RAM offload; update the isolated image runtime"
@@ -193,6 +195,22 @@ func ValidateProfile(p Profile) error {
 	}
 	if len(p.LoRAs) > 8 {
 		return errors.New("at most eight image LoRAs are supported")
+	}
+	if p.MOSSEditLoRA != nil {
+		edit := *p.MOSSEditLoRA
+		if p.ModelID != MOSSRecipeID || !filepath.IsAbs(edit.Path) ||
+			strings.ContainsAny(edit.Path, "\x00\r\n") || !strings.EqualFold(filepath.Ext(edit.Path), ".safetensors") ||
+			math.IsNaN(edit.Scale) || math.IsInf(edit.Scale, 0) || edit.Scale < 0 || edit.Scale > 4 {
+			return errors.New("MOSS edit requires an absolute safetensors adapter path and a strength between 0 and 4")
+		}
+		if len(p.LoRAs) >= 8 && p.UsesMOSSEdit() {
+			return errors.New("the MOSS edit adapter uses one of the eight available LoRA slots")
+		}
+		for _, lora := range p.LoRAs {
+			if sameComponentPath(edit.Path, lora.Path) {
+				return errors.New("select the MOSS edit adapter only in its dedicated slot")
+			}
+		}
 	}
 	for _, lora := range p.LoRAs {
 		if math.IsNaN(lora.Scale) || math.IsInf(lora.Scale, 0) || lora.Scale < -4 || lora.Scale > 4 {
@@ -268,7 +286,10 @@ func ValidateRequest(p Profile, r Request) error {
 	if len(r.ReferenceImages) > 4 {
 		return errors.New("at most four reference images are supported per job")
 	}
-	if len(r.ReferenceImages) > 0 {
+	if len(r.ReferenceImages) > 0 && !p.UsesMOSSEdit() {
+		if p.ModelID == MOSSRecipeID {
+			return errors.New("MOSS reference editing requires an active MOSS edit LoRA")
+		}
 		if err := validateModelFile(p.VisionEncoder); err != nil {
 			return fmt.Errorf("reference edits require a valid vision projector: %w", err)
 		}
@@ -282,7 +303,7 @@ func ValidateRequest(p Profile, r Request) error {
 			}
 		}
 	}
-	for _, lora := range p.LoRAs {
+	for _, lora := range p.requestLoRAs(r.ReferenceImages) {
 		if lora.Scale == 0 {
 			continue
 		}
@@ -292,6 +313,9 @@ func ValidateRequest(p Profile, r Request) error {
 		}
 		if inspection.Compatibility != "supported" {
 			return errors.New("LoRA: " + inspection.Hint)
+		}
+		if p.UsesMOSSEdit() && sameComponentPath(lora.Path, p.MOSSEditLoRA.Path) && !inspection.MOSSEdit {
+			return errors.New("the MOSS edit adapter must carry moss-edit-lora metadata")
 		}
 	}
 	for _, path := range r.ReferenceImages {
@@ -418,6 +442,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if !runnerStatus.Ready {
 		return Result{}, errors.New(runnerStatus.Error)
 	}
+	if p.UsesMOSSEdit() && len(r.ReferenceImages) > 0 && !runnerStatus.MOSSEditSupported {
+		return Result{}, errors.New("the image runner does not support MOSS edits")
+	}
 	if err := ValidateRequest(p, r); err != nil {
 		return Result{}, err
 	}
@@ -494,7 +521,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		return Result{}, err
 	}
 	defer os.RemoveAll(jobDir)
-	loraTags, err := prepareLoRAs(ctx, p.LoRAs, jobDir)
+	loraTags, err := prepareLoRAs(ctx, p.requestLoRAs(r.ReferenceImages), jobDir)
 	if err != nil {
 		return Result{}, err
 	}
@@ -756,14 +783,16 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 		args = append(args, "--vae-tiling")
 	}
 	if len(r.ReferenceImages) > 0 {
-		if !sameComponentPath(p.VisionEncoder, p.TextEncoder) {
+		if p.UsesMOSSEdit() {
+			args = append(args, "--ref-image-args", "preset=moss_edit,vae_input_max_edge=384")
+		} else if !sameComponentPath(p.VisionEncoder, p.TextEncoder) {
 			args = append(args, "--llm_vision", p.VisionEncoder)
 		}
 		for _, path := range r.ReferenceImages {
 			args = append(args, "-r", path)
 		}
 	}
-	for _, lora := range p.LoRAs {
+	for _, lora := range p.requestLoRAs(r.ReferenceImages) {
 		if lora.Scale != 0 {
 			args = append(args, "--lora-model-dir", filepath.Join(jobDir, "loras"), "--lora-apply-mode", "at_runtime")
 			break

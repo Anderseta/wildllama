@@ -231,6 +231,7 @@ func (s *Server) imageLoRAsHandler(c *gin.Context) {
 			asset.Size = info.Size()
 			inspection, inspectErr := imagegen.InspectLocalComponent(lora.Path, "lora")
 			asset.Ready = inspectErr == nil && inspection.Compatibility == "supported"
+			asset.MOSSEdit = inspection.MOSSEdit
 			if inspectErr != nil {
 				asset.Error = inspectErr.Error()
 			} else if !asset.Ready {
@@ -257,6 +258,9 @@ func (s *Server) imageLoRAsHandler(c *gin.Context) {
 		}
 	}
 	for _, profile := range config.Profiles {
+		if profile.MOSSEditLoRA != nil {
+			add(*profile.MOSSEditLoRA, "local")
+		}
 		for _, lora := range profile.LoRAs {
 			add(lora, "local")
 		}

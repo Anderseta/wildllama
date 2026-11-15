@@ -309,6 +309,10 @@ func cloneImageProfile(profile imageProfile) imageProfile {
 		value := *profile.Seed
 		profile.Seed = &value
 	}
+	if profile.MOSSEditLoRA != nil {
+		value := *profile.MOSSEditLoRA
+		profile.MOSSEditLoRA = &value
+	}
 	profile.LoRAs = append([]imagegen.LoRA(nil), profile.LoRAs...)
 	return profile
 }

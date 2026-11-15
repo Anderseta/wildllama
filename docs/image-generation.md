@@ -59,8 +59,17 @@ starts with the current 1,750-step LoRA at 0.8, the author's prompt trigger,
 available in the LoRA library for manual substitution at 0.7.
 
 The profile defaults to exclusive GPU use and staged components. The recipe
-provides text-to-image generation. Installation runs through the normal image
-transfer queue with resumable downloads and SHA-256 verification.
+provides text-to-image generation. For reference edits, select the optional
+[MOSS-Image-Edit-HQ armV5 adapter](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ)
+in the profile's MOSS edit slot. The download is 495,529,280 bytes and uses the
+normal verified LoRA transfer queue. An edit uses the existing VAE to encode the
+references at up to 384 pixels on the long edge. Output resolution is set
+independently. The generator's selected LoRAs remain active in either mode.
+
+The native path backports [stable-diffusion.cpp PR 2203](https://github.com/leejet/stable-diffusion.cpp/pull/2203)
+at `a613c58f216a58a66534204174a55c5ac1657557` onto the pinned WildImage source.
+The image runtime advertises `moss_edit` after building that patch. Profiles
+only load the edit adapter when a request includes references.
 
 ## RAM backing and sequential components
 

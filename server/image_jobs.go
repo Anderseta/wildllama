@@ -890,6 +890,10 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "image runtime is not ready: " + status.Error})
 		return
 	}
+	if profile.UsesMOSSEdit() && len(generation.ReferenceAssetIDs) > 0 && !status.MOSSEditSupported {
+		c.JSON(400, gin.H{"error": "the image runner does not support MOSS edits"})
+		return
+	}
 	job, err := v.enqueue(&imageJob{Kind: "generate", RequestID: request.RequestID, SessionID: request.SessionID, ProfileID: profile.ID, ModelID: profile.ModelID, Request: request, Config: config, Profile: profile, Fingerprint: fingerprint, Generation: generation, ParentAssetID: parent})
 	if err != nil {
 		c.JSON(409, gin.H{"error": err.Error()})

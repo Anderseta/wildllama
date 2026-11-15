@@ -97,6 +97,9 @@ func imageProfileComponents(profile imagegen.Profile, visit func(string, string)
 	for _, lora := range profile.LoRAs {
 		visit(lora.Path, "lora")
 	}
+	if profile.MOSSEditLoRA != nil {
+		visit(profile.MOSSEditLoRA.Path, "lora")
+	}
 }
 
 // Require every ancestor and the final entry to be a plain path. OpenRoot below

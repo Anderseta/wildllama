@@ -16,9 +16,12 @@ type fixtureTensor struct {
 	data        []byte
 }
 
-func writeSafeFixture(t *testing.T, path string, items []fixtureTensor) {
+func writeSafeFixture(t *testing.T, path string, items []fixtureTensor, metadata ...map[string]string) {
 	t.Helper()
 	header := map[string]any{}
+	if len(metadata) > 0 {
+		header["__metadata__"] = metadata[0]
+	}
 	payload := []byte{}
 	for _, item := range items {
 		start := len(payload)

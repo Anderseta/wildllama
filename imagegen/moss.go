@@ -1,6 +1,9 @@
 package imagegen
 
-import "path/filepath"
+import (
+	"path/filepath"
+	"slices"
+)
 
 const (
 	mossOfficialRepo     = "OpenMOSS-Team/MOSS-Image-SFT"
@@ -11,6 +14,17 @@ const (
 	mossOriginalLoRA     = "MOSS-Image-NSFW-Uncensored-LoRA-F16.gguf"
 )
 
+func (p Profile) UsesMOSSEdit() bool {
+	return p.ModelID == MOSSRecipeID && p.MOSSEditLoRA != nil && p.MOSSEditLoRA.Scale != 0
+}
+
+func (p Profile) requestLoRAs(references []string) []LoRA {
+	if len(references) > 0 && p.UsesMOSSEdit() {
+		return append(slices.Clone(p.LoRAs), *p.MOSSEditLoRA)
+	}
+	return p.LoRAs
+}
+
 func mossRecipe() Recipe {
 	p := DefaultProfile(MOSSRecipeID)
 	p.LoRAs = []LoRA{{Path: filepath.Join("lora", mossFocusedLoRA), Scale: 0.8}}
@@ -18,6 +32,9 @@ func mossRecipe() Recipe {
 		ID: MOSSRecipeID, Family: "moss-image",
 		Name:         "MOSS-Image SFT · Q8 + Heretic + LoRAs NSFW",
 		Capabilities: []string{"generate"}, DefaultProfile: p,
+		ReferenceEditLoRA: &Component{Role: "lora", Repo: "akhaliq/MOSS-Image-Edit-HQ",
+			Revision: "ee1493ba577437e70b88bc4499b85cc7aa4594ca", Filename: "armV5-moss-edit-lora.safetensors",
+			SHA256: "5f17fd0a8e7ef3080601e5cd161b70288a635659a5f9afb6b27aaf3d1b895273", Size: 495529280},
 		Components: []Component{
 			{Role: "diffusion_model", Repo: "axiomofmind/Moss-Image-SFT-GGUF", Revision: "d8a587c3a66bcab191e93bdd6f742d41b1104c68",
 				Filename: "MOSS-Image-SFT-Q8_0.gguf", SHA256: "8349ebdd643f2c66da6b25789db7df3cc708a86c051c56207fde699156bfad8e", Size: 5705576416, Required: true},

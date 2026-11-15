@@ -1,0 +1,554 @@
+diff --git a/src/conditioning/conditioner.hpp b/src/conditioning/conditioner.hpp
+index eeebb778e..819da9716 100644
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -3251,8 +3251,11 @@ struct LLMEmbedder : public Conditioner {
+         } else if (version == VERSION_MOSS_IMAGE) {
+             prompt_template_encode_start_idx = 0;
+             max_length                       = 4096;
+-            prompt                           = "<|im_start|>user\n" + conditioner_params.text + "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+-            prompt_attn_range                = {0, 0};
++            prompt                           = "<|im_start|>user\n";
++            prompt_attn_range.first = static_cast<int>(prompt.size());
++            prompt += conditioner_params.text;
++            prompt_attn_range.second = static_cast<int>(prompt.size());
++            prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+         } else if (sd_version_is_flux3(version)) {
+             prompt_template_encode_start_idx = 0;
+             max_length                       = 4096;
+diff --git a/src/conditioning/conditioning_cache.h b/src/conditioning/conditioning_cache.h
+index 58f539a38..7f78ca08c 100644
+--- a/src/conditioning/conditioning_cache.h
++++ b/src/conditioning/conditioning_cache.h
+@@ -52,7 +52,7 @@ class ConditioningCache {
+             const auto& r = p.ref_image_params;
+             return std::tie(p.text, p.clip_skip, p.width, p.height, p.zero_out_masked,
+                             r.pass_to_vlm, r.pass_to_dit, r.ref_index_mode,
+-                            r.force_ref_timestep_zero, r.resize_before_vae, r.vae_input_max_pixels,
++                            r.force_ref_timestep_zero, r.resize_before_vae, r.vae_input_max_pixels, r.vae_input_max_edge,
+                             r.vlm_resize_mode, r.vlm_min_size, r.vlm_max_size, r.resize_vae_to_target,
+                             r.ref_image_size);
+         };
+diff --git a/src/model/adapter/lora.hpp b/src/model/adapter/lora.hpp
+index 7d71b34f6..5b1f18e68 100644
+--- a/src/model/adapter/lora.hpp
++++ b/src/model/adapter/lora.hpp
+@@ -2,12 +2,14 @@
+ #define __SD_MODEL_ADAPTER_LORA_HPP__
+ 
+ #include <cmath>
++#include <cstring>
+ #include <mutex>
+ #include "core/ggml_extend.h"
+ #include "core/ggml_extend_backend.h"
+ #include "core/ggml_runner.h"
+ #include "core/ggml_tensor_utils.h"
+ #include "core/util.h"
++#include "json.hpp"
+ #include "model.h"
+ #include "model/adapter/lora_ops.h"
+ #include "model_loader.h"
+@@ -20,6 +22,9 @@ struct LoraModel : public GGMLRunner {
+     std::string lora_id;
+     float multiplier     = 1.0f;
+     float metadata_alpha = -1.f;
++    // Per-module alpha from "adapter_config" metadata, keyed by the model tensor base name
++    // (same name conversion as the lora tensors). Takes precedence over metadata_alpha.
++    std::map<std::string, float> module_alphas;
+     std::unordered_map<std::string, ggml_tensor*> lora_tensors;
+     std::map<ggml_tensor*, ggml_tensor*> original_tensor_to_final_tensor;
+     std::set<std::string> applied_lora_tensors;
+@@ -83,6 +88,65 @@ struct LoraModel : public GGMLRunner {
+             }
+             LOG_VERBOSE("LoRA '%s' uses metadata alpha %.6g when tensor alpha/scale is absent", file_path.c_str(), metadata_alpha);
+         }
++        // MOSS-Image Edit adapters (chinoll/Moss-Image-Edit) carry alpha/rank in an
++        // "adapter_config" JSON string in the safetensors metadata instead of .alpha tensors.
++        // Non-matching "adapter_config" keys from other tools are left alone.
++        const auto adapter_config = metadata.find("adapter_config");
++        if (adapter_config != metadata.end() && metadata_alpha < 0.f && metadata.find("baked_scale") == metadata.end()) {
++            try {
++                auto cfg = nlohmann::json::parse(adapter_config->second);
++                if (cfg.value("format", "") == "moss-edit-lora" && cfg.value("format_version", 0) == 1) {
++                    float alpha  = -1.f;
++                    int64_t rank = -1;
++                    bool uniform = true;
++                    size_t valid_modules = 0;
++                    if (cfg.contains("modules") && cfg["modules"].is_object()) {
++                        for (const auto& [target, spec] : cfg["modules"].items()) {
++                            auto a_it = spec.find("alpha");
++                            auto r_it = spec.find("rank");
++                            if (a_it == spec.end() || !a_it->is_number() || r_it == spec.end() || !r_it->is_number()) {
++                                LOG_WARN("adapter_config module '%s' has a missing or non-numeric alpha/rank; using the default scale for it", target.c_str());
++                                continue;
++                            }
++                            float a   = a_it->get<float>();
++                            int64_t r = r_it->get<int64_t>();
++                            if (alpha < 0.f) {
++                                alpha = a;
++                                rank  = r;
++                            } else if (a != alpha || r != rank) {
++                                uniform = false;
++                            }
++                            // Convert the module key through the same path as the lora tensors so
++                            // it matches the model tensor base name used by the apply sites below.
++                            std::string name = convert_tensor_name("lora." + target + ".lora_A", source_version);
++                            if (starts_with(name, "lora.") && ends_with(name, ".lora_down")) {
++                                name = name.substr(std::strlen("lora."), name.size() - std::strlen("lora.") - std::strlen(".lora_down"));
++                                module_alphas[name] = a;
++                            }
++                            ++valid_modules;
++                        }
++                    }
++                    if (valid_modules == 0) {
++                        LOG_WARN("adapter_config in '%s' claims format moss-edit-lora but has no modules with a usable alpha/rank; LoRA will use the default scale", file_path.c_str());
++                    } else if (module_alphas.empty()) {
++                        // all modules parsed, but none matched a known tensor name: the uniform
++                        // alpha below is a guess, not a per-module value
++                        LOG_WARN("adapter_config in '%s' has %zu modules but none converted to known tensor names; falling back to uniform alpha %.6g", file_path.c_str(), valid_modules, alpha);
++                        metadata_alpha = alpha;
++                    } else {
++                        // fallback for any module whose key fails to convert;
++                        metadata_alpha = alpha;
++                        if (uniform) {
++                            LOG_DEBUG("MOSS edit lora: adapter_config alpha=%.6g rank=%lld (%zu modules)", alpha, (long long)rank, valid_modules);
++                        } else {
++                            LOG_DEBUG("MOSS edit lora: adapter_config has non-uniform alpha/rank (%zu modules); using per-module alpha", valid_modules);
++                        }
++                    }
++                }
++            } catch (const std::exception& e) {
++                LOG_WARN("failed to parse adapter_config metadata in '%s': %s", file_path.c_str(), e.what());
++            }
++        }
+         if (sd_version_is_minimax_h3(source_version)) {
+             for (const auto& entry : model_manager->loader().file_tensors(source_file)) {
+                 const auto name = convert_tensor_name(entry.first, VERSION_COUNT);
+@@ -134,6 +198,16 @@ struct LoraModel : public GGMLRunner {
+         return found != scalar_values.end() ? found->second : ggml_ext_backend_tensor_get_f32(tensor);
+     }
+ 
++    // Scale for a module: per-module alpha from "adapter_config" when present,
++    // else the uniform metadata alpha, else 1. Rank comes from the tensor shape.
++    float module_alpha_scale(const std::string& base_name, int64_t rank) const {
++        auto found = module_alphas.find(base_name);
++        if (found != module_alphas.end() && found->second >= 0.f) {
++            return found->second / rank;
++        }
++        return metadata_alpha >= 0.f ? metadata_alpha / rank : 1.f;
++    }
++
+     void release_loaded_tensors() {
+         runner_end();
+         if (auto manager = std::dynamic_pointer_cast<ModelManager>(residency_manager.lock())) {
+@@ -150,6 +224,7 @@ struct LoraModel : public GGMLRunner {
+         metadata_alpha = -1.f;
+         skipped_incompatible_lora_tensors.clear();
+         warned_incompatible_model_tensors.clear();
++        module_alphas.clear();
+         applied             = false;
+         tensor_preprocessed = false;
+     }
+@@ -273,7 +348,7 @@ struct LoraModel : public GGMLRunner {
+             float scale_value = 1.0f;
+ 
+             int64_t rank = lora_down->ne[ggml_n_dims(lora_down) - 1];
+-            scale_value  = metadata_alpha >= 0.f ? metadata_alpha / rank : 1.f;
++            scale_value  = module_alpha_scale(key, rank);
+             iter         = lora_tensors.find(scale_name);
+             if (iter != lora_tensors.end()) {
+                 scale_value = scalar_value(iter->second);
+@@ -840,7 +915,7 @@ struct LoraModel : public GGMLRunner {
+             std::string scale_tensor_name;
+ 
+             int64_t rank = lora_down->ne[ggml_n_dims(lora_down) - 1];
+-            scale_value  = metadata_alpha >= 0.f ? metadata_alpha / rank : 1.f;
++            scale_value  = module_alpha_scale(key, rank);
+             iter         = lora_tensors.find(scale_name);
+             if (iter != lora_tensors.end()) {
+                 scale_value       = scalar_value(iter->second);
+diff --git a/src/model/common/rope.hpp b/src/model/common/rope.hpp
+index b6f3111a0..10219c49e 100644
+--- a/src/model/common/rope.hpp
++++ b/src/model/common/rope.hpp
+@@ -1081,7 +1081,8 @@ namespace Rope {
+                                              ggml_tensor* pe,
+                                              ggml_tensor* mask,
+                                              float kv_scale        = 1.0f,
+-                                             bool rope_interleaved = true) {
++                                             bool rope_interleaved = true,
++                                             int64_t ref_start     = -1) {
+         // q,k,v: [N, L, n_head, d_head]
+         // pe: [L, d_head/2, 2, 2]
+         // return: [N, L, n_head*d_head]
+@@ -1090,6 +1091,23 @@ namespace Rope {
+         q = apply_rope(ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
+         k = apply_rope(ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
+ 
++        auto c = ctx->ggml_ctx;
++        if (ref_start >= 0 && mask == nullptr && q->ne[1] > ref_start) {
++            // q rows [ref_start, L) are reference tokens: they attend ONLY to k/v rows [ref_start, L).
++            // Body rows [0, ref_start) attend to everything. Refs sit at the END of the sequence.
++            // Mirrors ComfyUI's MOSS-Image reference_attention; two attention calls instead of a mask.
++            // q/k are contiguous 3D [d_head, L, n_head*N] after apply_rope (slice along ne[1]);
++            // v keeps its pre-rope 4D layout [d_head, n_head, L, N] (slice along ne[2]).
++            auto q_body = ggml_view_3d(c, q, q->ne[0], ref_start, q->ne[2], q->nb[1], q->nb[2], 0);
++            auto q_ref  = ggml_view_3d(c, q, q->ne[0], q->ne[1] - ref_start, q->ne[2], q->nb[1], q->nb[2], ref_start * q->nb[1]);
++            auto k_ref  = ggml_view_3d(c, k, k->ne[0], k->ne[1] - ref_start, k->ne[2], k->nb[1], k->nb[2], ref_start * k->nb[1]);
++            auto v_ref  = ggml_view_4d(c, v, v->ne[0], v->ne[1], v->ne[2] - ref_start, v->ne[3],
++                                       v->nb[1], v->nb[2], v->nb[3], ref_start * v->nb[2]);
++            auto body   = ggml_ext_attention_ext(ctx, q_body, k, v, n_head, nullptr, true, ctx->flash_attn_enabled, kv_scale);
++            auto refs   = ggml_ext_attention_ext(ctx, q_ref, k_ref, v_ref, n_head, nullptr, true, ctx->flash_attn_enabled, kv_scale);
++            return ggml_concat(c, body, refs, 1);
++        }
++
+         auto x = ggml_ext_attention_ext(ctx, q, k, v, n_head, mask, true, ctx->flash_attn_enabled, kv_scale);  // [N, L, n_head*d_head]
+         return x;
+     }
+diff --git a/src/model/diffusion/model.hpp b/src/model/diffusion/model.hpp
+index ed20c8087..8672c4fbf 100644
+--- a/src/model/diffusion/model.hpp
++++ b/src/model/diffusion/model.hpp
+@@ -28,6 +28,7 @@ struct RefImageParams {
+     bool force_ref_timestep_zero       = false;
+     bool resize_before_vae             = true;
+     int vae_input_max_pixels           = -1;
++    int vae_input_max_edge             = -1;  // >0: cap the reference long edge at N px before VAE (16-aligned)
+     RefImageResizeMode vlm_resize_mode = RefImageResizeMode::AREA;
+     int vlm_min_size                   = -1;
+     int vlm_max_size                   = -1;
+@@ -52,19 +53,32 @@ const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
+          params.vlm_use_vae_input           = true;
+          return params;
+      }()},
+-    {"flux_kontext", {false, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::NONE, -1, -1}},
+-    {"longcat", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+-    {"flux2", {false, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::NONE, -1, -1}},
+-    {"qwen", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+-    {"qwen_layered", {true, true, Rope::RefIndexMode::DECREASE, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+-    {"mage_flow", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, -1, 384, true}},
+-    {"z_image_omni", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+-    {"krea2_ostris_edit", {true, true, Rope::RefIndexMode::INCREASE, true, true, -1, RefImageResizeMode::AREA, -1, -1}},
+-    {"krea2_edit", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768}},
++    {"flux_kontext", {false, true, Rope::RefIndexMode::FIXED, false, true, -1, -1, RefImageResizeMode::NONE, -1, -1}},
++    {"longcat", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, -1, RefImageResizeMode::AREA, -1, -1}},
++    {"flux2", {false, true, Rope::RefIndexMode::INCREASE, false, true, -1, -1, RefImageResizeMode::NONE, -1, -1}},
++    {"qwen", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, -1, RefImageResizeMode::AREA, -1, -1}},
++    {"qwen_layered", {true, true, Rope::RefIndexMode::DECREASE, false, true, -1, -1, RefImageResizeMode::AREA, -1, -1}},
++    {"mage_flow", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, -1, RefImageResizeMode::LONGEST_SIDE, -1, 384, true}},
++    {"z_image_omni", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, -1, RefImageResizeMode::AREA, -1, -1}},
++    {"krea2_ostris_edit", {true, true, Rope::RefIndexMode::INCREASE, true, true, -1, -1, RefImageResizeMode::AREA, -1, -1}},
++    {"krea2_edit", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768}},
+     // pass_to_vlm routes the reference image to the conditioner, which is where LLaDA-Image's
+     // SigVQ encoder lives; it does its own half-resolution resize.
+-    {"llada_image", {true, true, Rope::RefIndexMode::FIXED, true, true, -1, RefImageResizeMode::NONE, -1, -1, true}},
+-    {"cosmos_reference", {false, true, Rope::RefIndexMode::INCREASE, false, false, -1, RefImageResizeMode::NONE, -1, -1}},
++    {"llada_image", {true, true, Rope::RefIndexMode::FIXED, true, true, -1, -1, RefImageResizeMode::NONE, -1, -1, true}},
++    {"cosmos_reference", {false, true, Rope::RefIndexMode::INCREASE, false, false, -1, -1, RefImageResizeMode::NONE, -1, -1}},
++    // MOSS-Image Edit: FLUX.2-VAE latent refs into the DiT at t=0 (chinoll/Moss-Image-Edit adapter).
++    // pass_to_vlm=false: the ViT is unused; refs never appear in the text prompt.
++    {"moss_edit", [] {
++         RefImageParams params;
++         params.pass_to_vlm             = false;
++         params.pass_to_dit             = true;
++         params.ref_index_mode          = Rope::RefIndexMode::INCREASE;  // refs numbered 1..N (documentation; MOSS builds its own PE)
++         params.force_ref_timestep_zero = true;
++         params.resize_before_vae       = true;
++         params.vlm_resize_mode         = RefImageResizeMode::NONE;
++         params.vae_input_max_edge      = 1024;  // official adapter default; ComfyUI node ships 512
++         return params;
++     }()},
+ };
+ 
+ struct UNetDiffusionExtra {
+diff --git a/src/model/diffusion/moss_image.hpp b/src/model/diffusion/moss_image.hpp
+index 4bb9077c4..ba84ec41a 100644
+--- a/src/model/diffusion/moss_image.hpp
++++ b/src/model/diffusion/moss_image.hpp
+@@ -109,7 +109,8 @@ namespace MOSSImage {
+             blocks["proj.ffn_down"]    = std::make_shared<Linear>(config.ffn_dim, config.dim, false);
+         }
+ 
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::array<ggml_tensor*, 6>& mod) {
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::array<ggml_tensor*, 6>& mod,
++                             int64_t ref_start = -1) {
+             auto c      = ctx->ggml_ctx;
+             auto linear = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, h); };
+             auto norm   = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<RMSNorm>(blocks[name])->forward(ctx, h); };
+@@ -124,7 +125,7 @@ namespace MOSSImage {
+             auto q       = norm("q_norm", split(0));
+             auto k       = norm("k_norm", split(1));
+             auto v       = split(2);
+-            y            = Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false);
++            y            = Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false, ref_start);
+             y            = linear("proj.o", y);
+             y            = ggml_mul(c, y, part(2));
+             x            = ggml_add(c, x, y);
+@@ -159,7 +160,8 @@ namespace MOSSImage {
+             blocks["final_linear_video"] = std::make_shared<Linear>(config.dim, config.channels, false);
+         }
+ 
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* image, ggml_tensor* time, ggml_tensor* text, ggml_tensor* pe, const std::vector<int>& skip) {
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* image, ggml_tensor* time, ggml_tensor* time_0, ggml_tensor* text,
++                             ggml_tensor* pe, const std::vector<int>& skip, const std::vector<ggml_tensor*>& refs) {
+             auto c            = ctx->ggml_ctx;
+             auto linear       = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, h); };
+             int64_t image_len = image->ne[0] * image->ne[1];
+@@ -171,19 +173,51 @@ namespace MOSSImage {
+                 text = std::dynamic_pointer_cast<TextBlock>(blocks["text_embedder.blocks." + std::to_string(i)])->forward(ctx, text, text_pe);
+             }
+             time      = linear("time_embedding.2", ggml_silu(c, linear("time_embedding.0", time)));
+-            auto mod  = linear("shared_block_modulation", time);
+             auto head = linear("video_head_modulation", time);
++            x         = ggml_concat(c, x, text, 1);
++            int64_t body_len = x->ne[1];  // image + text; refs are appended after this
++
++            // Per-token modulation: body rows use timestep t, ref rows use the constant t=0
++            // embedding (the MOSS-Image edit contract). With no refs, `parts` stays as plain
++            // [dim] vectors and the graph is bit-identical to the t2i path.
++            auto mod0 = time_0 != nullptr
++                            ? linear("shared_block_modulation",
++                                     linear("time_embedding.2", ggml_silu(c, linear("time_embedding.0", time_0))))
++                            : nullptr;
++            auto mod  = linear("shared_block_modulation", time);
+             std::array<ggml_tensor*, 6> parts;
++            auto ref_len = [&]() {
++                int64_t n = 0;
++                for (ggml_tensor* ref : refs) {
++                    n += ref->ne[0] * ref->ne[1];
++                }
++                return n;
++            };
+             for (int i = 0; i < 6; ++i) {
+                 parts[i] = ggml_ext_slice(ctx, mod, 0, i * config.dim, (i + 1) * config.dim);
++                if (mod0 != nullptr) {
++                    auto seg    = [&](ggml_tensor* vec, int64_t len) {
++                        return ggml_repeat(c, ggml_reshape_3d(c, vec, config.dim, 1, 1),
++                                           ggml_new_tensor_3d(c, GGML_TYPE_F32, config.dim, len, 1));
++                    };
++                    auto refp   = ggml_ext_slice(ctx, mod0, 0, i * config.dim, (i + 1) * config.dim);
++                    parts[i]    = ggml_concat(c, seg(parts[i], body_len), seg(refp, ref_len()), 1);  // [dim, L_total, 1]
++                }
+                 if (ctx->graph != nullptr) {
+                     ggml_build_forward_expand(ctx->graph, parts[i]);
+                 }
+             }
+-            x = ggml_concat(c, x, text, 1);
++
++            for (ggml_tensor* ref : refs) {  // refs appended at the END of the sequence
++                auto pixels_ref = ggml_reshape_3d(c, ref, ref->ne[0] * ref->ne[1], ref->ne[2], ref->ne[3]);
++                pixels_ref      = ggml_cont(c, ggml_transpose(c, pixels_ref));
++                x               = ggml_concat(c, x, linear("video_embedder", pixels_ref), 1);
++            }
++            int64_t ref_start = ref_len() > 0 ? body_len : -1;
++
+             for (int64_t i = 0; i < config.depth; ++i) {
+                 if (std::find(skip.begin(), skip.end(), i) == skip.end()) {
+-                    x = std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)])->forward(ctx, x, pe, parts);
++                    x = std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)])->forward(ctx, x, pe, parts, ref_start);
+                     sd::ggml_graph_cut::mark_graph_cut(x, "moss_image.layers." + std::to_string(i), "x");
+                 }
+             }
+@@ -202,6 +236,7 @@ namespace MOSSImage {
+         MOSSImageConfig config;
+         Model model;
+         std::vector<float> time_data;
++        std::vector<float> time0_data;
+ 
+         MOSSImageRunner(ggml_backend_t backend, const String2TensorStorage& weights, const std::string& prefix, std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+             : DiffusionModelRunner(backend, prefix, weight_manager), config(MOSSImageConfig::detect_from_weights(weights, prefix)), model(config) {
+@@ -224,21 +259,50 @@ namespace MOSSImage {
+                     skip = *extra->skip_layers;
+                 }
+             }
++            // edit refs: FLUX.2-VAE latents consumed by the DiT (moss_edit preset)
++            // validation only: the graph inputs are made inside the lambda, because make_input
++            // allocates in compute_ctx which exists only after new_graph_custom
++            const bool use_edit_refs = inputs.ref_latents != nullptr && inputs.ref_image_params.pass_to_dit &&
++                                       !inputs.ref_latents->empty();
++            if (use_edit_refs && !inputs.ref_image_params.force_ref_timestep_zero) {
++                LOG_WARN("MOSS-Image edit requires force_ref_timestep_zero; using t=0 for refs anyway");
++            }
+             auto graph = [&]() {
+                 auto gf   = new_graph_custom(65536);
+                 auto x    = make_input(*inputs.x);
+                 auto text = make_input(*inputs.context);
+                 GGML_ASSERT(x->ne[3] == 1 && x->ne[2] == config.channels && text->ne[0] == config.text_dim);
+                 int64_t h = x->ne[1], w = x->ne[0], nt = text->ne[1];
++                // edit refs: VAE latents with the same layout as x (ne[0]=W_lat, ne[1]=H_lat, ne[2]=128, ne[3]=1).
++                std::vector<ggml_tensor*> refs;
++                if (use_edit_refs) {
++                    for (const auto& ref : *inputs.ref_latents) {
++                        GGML_ASSERT(ref.shape()[2] == config.channels && ref.shape()[3] == 1);
++                        refs.push_back(make_input(ref));
++                    }
++                }
++                int64_t ref_tokens = 0;
++                for (const auto& ref : refs) {
++                    ref_tokens += ref->ne[1] * ref->ne[0];
++                }
+                 sd::PECacheKey pe_key("moss_image.pe");
+                 pe_key.add(h).add(w).add(nt).add(config.head_dim).add(circular_x_enabled).add(circular_y_enabled);
++                for (const auto& ref : refs) {
++                    pe_key.add(ref->ne[1]).add(ref->ne[0]);
++                }
+                 auto pe = make_input(pe_cache_.get_or_create(pe_key, [&]() {
+                     Rope::Embedding embedding;
+                     embedding.positions.append_image(static_cast<int>(h), static_cast<int>(w));
+                     embedding.positions.images.back().height_axis = 2;
+                     embedding.positions.images.back().width_axis  = 3;
+                     embedding.positions.append_tokens(nt);
+-                    for (int64_t token = 0; token < h * w + nt; ++token) {
++                    for (const auto& ref : refs) {
++                        embedding.positions.append_image(static_cast<int>(ref->ne[1]), static_cast<int>(ref->ne[0]));
++                        embedding.positions.images.back().height_axis = 2;
++                        embedding.positions.images.back().width_axis  = 3;
++                    }
++                    int64_t body = h * w + nt;
++                    for (int64_t token = 0; token < body; ++token) {
+                         float pos[4] = {0.f, float(token - h * w), 0.f, 0.f};
+                         if (token < h * w) {
+                             pos[1] = float(nt);
+@@ -247,9 +311,21 @@ namespace MOSSImage {
+                         }
+                         embedding.ids.push_back({pos[0], pos[1], pos[2], pos[3]});
+                     }
++                    // ref i owns r-index i+1 with f=0, centered in h/w, on its own PE rows so a
++                    // later Scale-ROPE on the generated image cannot corrupt the ref frequencies.
++                    for (int64_t ri = 0; ri < (int64_t)refs.size(); ++ri) {
++                        const int64_t rh = refs[ri]->ne[1], rw = refs[ri]->ne[0];
++                        for (int64_t t = 0; t < rh * rw; ++t) {
++                            float pos[4] = {float(ri + 1), 0.f,
++                                            float(t / rw) - float(rh - 1) / 2.f,
++                                            float(t % rw) - float(rw - 1) / 2.f};
++                            embedding.ids.push_back({pos[0], pos[1], pos[2], pos[3]});
++                        }
++                    }
++                    GGML_ASSERT((int64_t)embedding.ids.size() == body + ref_tokens);
+                     embedding.values = Rope::embed_nd(embedding.ids, 1, 10000.f, std::vector<int>(4, static_cast<int>(config.head_dim / 4)), embedding.layout, &embedding.frequencies);
+                     auto values      = finish_rope_pe(std::move(embedding));
+-                    return sd::Tensor<float>({2, 2, config.head_dim / 2, h * w + nt}, std::move(values));
++                    return sd::Tensor<float>({2, 2, config.head_dim / 2, body + ref_tokens}, std::move(values));
+                 }));
+                 time_data.resize(config.freq_dim);
+                 for (int64_t i = 0; i < config.freq_dim / 2; ++i) {
+@@ -259,8 +335,17 @@ namespace MOSSImage {
+                 }
+                 auto time = ggml_new_tensor_3d(compute_ctx, GGML_TYPE_F32, config.freq_dim, 1, 1);
+                 set_backend_tensor_data(time, time_data.data());
++                // timestep_embedding(0) = [1 x freq_dim/2, 0 x freq_dim/2] (cos(0)=1, sin(0)=0).
++                // Not built as ggml_scale(time, 0) — that would zero the cos half as well.
++                ggml_tensor* time_0 = nullptr;
++                if (!refs.empty()) {
++                    time0_data.assign(config.freq_dim / 2, 1.f);
++                    time0_data.resize(config.freq_dim, 0.f);
++                    time_0            = ggml_new_tensor_3d(compute_ctx, GGML_TYPE_F32, config.freq_dim, 1, 1);
++                    set_backend_tensor_data(time_0, time0_data.data());
++                }
+                 auto ctx = get_context(gf);
+-                ggml_build_forward_expand(gf, model.forward(&ctx, x, time, text, pe, skip));
++                ggml_build_forward_expand(gf, model.forward(&ctx, x, time, time_0, text, pe, skip, refs));
+                 return gf;
+             };
+             return restore_trailing_singleton_dims(GGMLRunner::compute(graph, n_threads, false), inputs.x->dim());
+diff --git a/src/model/integrations/moss_image.cpp b/src/model/integrations/moss_image.cpp
+index 6a2114da2..33d778e2a 100644
+--- a/src/model/integrations/moss_image.cpp
++++ b/src/model/integrations/moss_image.cpp
+@@ -20,6 +20,7 @@ const std::vector<ModelDefinition>& moss_image_definitions() {
+         ModelDefinition definition;
+         definition.version                        = VERSION_MOSS_IMAGE;
+         definition.geometry                       = {1, 128, 3};
++        definition.ref_image_preset               = "moss_edit";
+         definition.name                           = "MOSS-Image";
+         definition.traits.is_dit                  = true;
+         definition.traits.vae_kind                = ModelVAEKind::FLUX2;
+diff --git a/src/name_conversion.cpp b/src/name_conversion.cpp
+index bd232319c..212b3b4e3 100644
+--- a/src/name_conversion.cpp
++++ b/src/name_conversion.cpp
+@@ -1828,7 +1828,8 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
+             if (starts_with(name, "down_blocks.") || starts_with(name, "up_blocks.") ||
+                 starts_with(name, "mid_block.") || starts_with(name, "conv_in.") ||
+                 starts_with(name, "conv_out.") || starts_with(name, "time_embedding.") ||
+-                starts_with(name, "conv_norm_out.")) {
++                starts_with(name, "conv_norm_out.") ||
++                (version == VERSION_MOSS_IMAGE && starts_with(name, "layers."))) {
+                 const std::string& canonical_prefix = diffuison_model_prefix_vec.front();
+                 name                                = convert_diffusion_model_name(name, canonical_prefix, version);
+                 name                                = canonical_prefix + name;
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+index 745c8ba46..07d48bfd1 100644
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -3241,6 +3241,11 @@ RefImageParams StableDiffusionGGML::resolve_ref_image_params(const char* ref_ima
+                 LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                 rejected_keys.insert(key);
+             }
++        } else if (key == "vae_input_max_edge") {
++            if (!parse_strict_int(value, params.vae_input_max_edge)) {
++                LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
++                rejected_keys.insert(key);
++            }
+         } else if (key == "vlm_resize_mode") {
+             if (value == "longest_side") {
+                 params.vlm_resize_mode = RefImageResizeMode::LONGEST_SIDE;
+@@ -3294,8 +3299,8 @@ RefImageParams StableDiffusionGGML::resolve_ref_image_params(const char* ref_ima
+             break;
+         }
+     }
+-    if (params.force_ref_timestep_zero && !sd_version_is_krea2(version)) {
+-        LOG_WARN("force_ref_timestep_zero is only supported by Krea2 architecture for now");
++    if (params.force_ref_timestep_zero && !sd_version_is_krea2(version) && version != VERSION_MOSS_IMAGE) {
++        LOG_WARN("force_ref_timestep_zero is only supported by Krea2 and MOSS-Image for now");
+     }
+     if (version == VERSION_MINIMAX_H3) {
+         // H3 consumes references as VAE latents in its own packed sequence rather than
+diff --git a/src/pipeline/image.cpp b/src/pipeline/image.cpp
+index 5e7a34958..21adba2db 100644
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -390,21 +390,34 @@ namespace sd::pipeline {
+                     vae_width  = request->width;
+                     vae_height = request->height;
+                 } else {
+-                    int default_pixels = sd->version == VERSION_QWEN_IMAGE_2_1 ? request->width * request->height : 1024 * 1024;
+-                    int target_pixels  = ref_image_params.vae_input_max_pixels > 0 ? ref_image_params.vae_input_max_pixels : default_pixels;
+-                    if (ref_image_params.vae_size_buckets) {
+-                        auto size  = sd::select_image_size_bucket(static_cast<int>(ref_images[i].shape()[0]), static_cast<int>(ref_images[i].shape()[1]), target_pixels, factor, request->width, request->height);
+-                        vae_width  = size.first;
+-                        vae_height = size.second;
++                    if (ref_image_params.vae_input_max_edge > 0) {
++                        // Long-edge cap (ComfyUI MOSS-Image-Edit parity): scale down so the
++                        // longest edge is at most vae_input_max_edge px, preserving aspect ratio.
++                        double edge_scale = std::min(1.0,
++                            double(ref_image_params.vae_input_max_edge) /
++                            double(std::max(ref_images[i].shape()[0], ref_images[i].shape()[1])));
++                        vae_width  = double(ref_images[i].shape()[0]) * edge_scale;
++                        vae_height = double(ref_images[i].shape()[1]) * edge_scale;
+                     } else {
+-                        int vae_image_size = std::min(target_pixels, request->width * request->height);
+-                        vae_width          = sqrt(vae_image_size * ref_images[i].shape()[0] / ref_images[i].shape()[1]);
+-                        vae_height         = vae_width * ref_images[i].shape()[1] / ref_images[i].shape()[0];
++                        int default_pixels = sd->version == VERSION_QWEN_IMAGE_2_1 ? request->width * request->height : 1024 * 1024;
++                        int target_pixels  = ref_image_params.vae_input_max_pixels > 0 ? ref_image_params.vae_input_max_pixels : default_pixels;
++                        if (ref_image_params.vae_size_buckets) {
++                            auto size  = sd::select_image_size_bucket(static_cast<int>(ref_images[i].shape()[0]), static_cast<int>(ref_images[i].shape()[1]), target_pixels, factor, request->width, request->height);
++                            vae_width  = size.first;
++                            vae_height = size.second;
++                        } else {
++                            int vae_image_size = std::min(target_pixels, request->width * request->height);
++                            vae_width          = sqrt(vae_image_size * ref_images[i].shape()[0] / ref_images[i].shape()[1]);
++                            vae_height         = vae_width * ref_images[i].shape()[1] / ref_images[i].shape()[0];
++                        }
+                     }
+                 }
+ 
+                 vae_height = round(vae_height / factor) * factor;
+                 vae_width  = round(vae_width / factor) * factor;
++                // Never produce a sub-16px axis (ComfyUI's max(16, ...) floor).
++                vae_height = std::max(double(factor), vae_height);
++                vae_width  = std::max(double(factor), vae_width);
+ 
+                 auto resized_ref_img = ref_image_params.vae_center_crop
+                                            ? sd::resize_and_center_crop(ref_images[i], static_cast<int>(vae_width), static_cast<int>(vae_height))

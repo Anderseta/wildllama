@@ -167,6 +167,17 @@ func InspectLocalComponent(path, role string) (LocalInspection, error) {
 		}
 	}
 	if role == "lora" {
+		var metadata struct {
+			AdapterConfig string `json:"adapter_config"`
+		}
+		var mossConfig struct {
+			Format  string                     `json:"format"`
+			Version int                        `json:"format_version"`
+			Modules map[string]json.RawMessage `json:"modules"`
+		}
+		result.MOSSEdit = json.Unmarshal(raw["__metadata__"], &metadata) == nil &&
+			json.Unmarshal([]byte(metadata.AdapterConfig), &mossConfig) == nil &&
+			mossConfig.Format == "moss-edit-lora" && mossConfig.Version == 1 && len(mossConfig.Modules) > 0
 		pairs := 0
 		for name, a := range tensors {
 			var bName string
@@ -177,6 +188,8 @@ func InspectLocalComponent(path, role string) (LocalInspection, error) {
 				bName = strings.Replace(name, ".lora_A.weight", ".lora_B.weight", 1)
 			case strings.Contains(name, ".lora_down.weight"):
 				bName = strings.Replace(name, ".lora_down.weight", ".lora_up.weight", 1)
+			case result.MOSSEdit && strings.HasSuffix(name, ".lora_A"):
+				bName = strings.TrimSuffix(name, ".lora_A") + ".lora_B"
 			default:
 				continue
 			}

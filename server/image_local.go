@@ -431,6 +431,7 @@ func (v *imageService) copyLocal(job *imageJob) error {
 	profile.ID = "profile-" + job.ID
 	profile.ModelID = id
 	profile.LoRAs = nil
+	profile.MOSSEditLoRA = nil
 	profile.DiffusionModel, profile.TextEncoder, profile.VAE, profile.VisionEncoder = "", "", "", ""
 	name := strings.TrimSpace(request.Name)
 	if name == "" {
