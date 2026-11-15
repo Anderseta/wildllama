@@ -21,6 +21,7 @@ type imageAssetRecord struct {
 	UploadFingerprint string                   `json:"upload_fingerprint,omitempty"`
 	ReferenceAssetIDs []string                 `json:"reference_asset_ids,omitempty"`
 	DeletionCompleted bool                     `json:"deletion_completed,omitempty"`
+	DeletionBatch     string                   `json:"deletion_batch,omitempty"`
 	Generation        *imageGenerationMetadata `json:"generation,omitempty"`
 }
 
@@ -755,6 +756,45 @@ func (s *Server) imageInstallHandler(c *gin.Context) {
 	v.writeJob(c, 202, job)
 }
 
+func (s *Server) imageJobHistoryClearHandler(c *gin.Context) {
+	v := s.imageService()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	previous := v.jobs
+	jobs := append([]*imageJob(nil), previous...)
+	cleared := []string{}
+	for i, job := range jobs {
+		if job.HistoryCleared || job.executing || !imageTerminal(job.Status) {
+			continue
+		}
+		// Retain request identity and the published asset links for chat and
+		// idempotent retries. The queue transcript and telemetry can be discarded.
+		value := *job
+		value.HistoryCleared = true
+		value.Error, value.PersistenceError, value.RestoreErrors = "", "", nil
+		value.Progress, value.Timings, value.Memory = imageProgress{}, nil, nil
+		jobs[i] = &value
+		cleared = append(cleared, job.ID)
+	}
+	if len(cleared) > 0 {
+		v.jobs = jobs
+		if err := v.persistJobsLocked(); err != nil {
+			v.jobs = previous
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	for _, job := range jobs {
+		if job.HistoryCleared && imageSafeID(job.ID) {
+			if err := removeImageOwnedPath(v.root, filepath.Join("job-state", job.ID+".json"), false); err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+		}
+	}
+	c.JSON(200, gin.H{"cleared": len(cleared), "cleared_ids": cleared})
+}
+
 func (s *Server) imageJobsHandler(c *gin.Context) {
 	v := s.imageService()
 	if c.Request.Method == http.MethodGet {
@@ -776,7 +816,11 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		jobs := make([]*imageJob, 0, capacity)
 		requestID := c.Query("request_id")
 		sessionID := c.Query("session_id")
+		queueSummary := summary && requestID == "" && sessionID == ""
 		for i := len(v.jobs) - 1; i >= 0; i-- {
+			if queueSummary && v.jobs[i].HistoryCleared {
+				continue
+			}
 			if (requestID == "" || v.jobs[i].RequestID == requestID) && (sessionID == "" || v.jobs[i].SessionID == sessionID) {
 				source := v.jobs[i]
 				if summary {
@@ -794,7 +838,7 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		}
 		revision := v.galleryRevision
 		v.mu.Unlock()
-		c.JSON(200, gin.H{"jobs": jobs, "gallery_revision": revision})
+		c.JSON(200, gin.H{"jobs": jobs, "gallery_revision": revision, "history_clear_supported": true})
 		return
 	}
 	var request imageJobRequest

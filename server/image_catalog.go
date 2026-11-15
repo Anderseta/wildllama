@@ -179,7 +179,7 @@ func (v *imageService) persistImageJobStateLocked(job *imageJob) {
 
 func (v *imageService) recoverImageJobStates() {
 	for _, job := range v.jobs {
-		if !imageSafeID(job.ID) {
+		if job.HistoryCleared || !imageSafeID(job.ID) {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(v.root, "job-state", job.ID+".json"))

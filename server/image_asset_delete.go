@@ -5,12 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 
 	"github.com/gin-gonic/gin"
+)
+
+var (
+	errImageAssetInUse    = errors.New("Uma das imagens está em uso. Aguarde a geração terminar antes de excluir.")
+	errImageAssetIdentity = errors.New("invalid managed image identity")
 )
 
 func validImageDeletionAsset(asset imageAssetRecord) bool {
@@ -94,35 +100,30 @@ func (v *imageService) cleanupImageAssetDeletionsLocked() error {
 		}
 		dirs[asset.OutputRoot+"\x00"+filepath.Dir(asset.relativePath())] = asset
 	}
+	occupied := make(map[string]bool, len(v.assets))
+	for _, asset := range v.assets {
+		occupied[filepath.Clean(asset.OutputRoot)+"\x00"+filepath.Dir(asset.relativePath())] = true
+	}
 	for _, asset := range dirs {
 		relative := filepath.Dir(asset.relativePath())
-		shared := false
-		for _, other := range v.assets {
-			if filepath.Clean(other.OutputRoot) == filepath.Clean(asset.OutputRoot) && filepath.Dir(other.relativePath()) == relative {
-				shared = true
-				break
-			}
-		}
-		if !shared {
+		if !occupied[filepath.Clean(asset.OutputRoot)+"\x00"+relative] {
 			if err := removeImageOwnedPath(asset.OutputRoot, relative, true); err != nil {
 				return err
 			}
 			delete(v.ownedDirectories, asset.JobID)
 		}
 	}
+	byJob := map[string][]string{}
+	for id, asset := range v.assetDeletions {
+		byJob[asset.JobID] = append(byJob[asset.JobID], id)
+	}
 	for _, job := range v.jobs {
-		touched := false
-		for _, asset := range v.assetDeletions {
-			if asset.JobID == job.ID {
-				touched = true
-				break
-			}
-		}
-		if !touched {
+		ids := byJob[job.ID]
+		if len(ids) == 0 {
 			continue
 		}
-		for id, asset := range v.assetDeletions {
-			if asset.JobID == job.ID && !slices.Contains(job.DeletedAssetIDs, id) {
+		for _, id := range ids {
+			if !slices.Contains(job.DeletedAssetIDs, id) {
 				job.DeletedAssetIDs = append(job.DeletedAssetIDs, id)
 			}
 		}
@@ -186,19 +187,6 @@ func (s *Server) imageAssetDeleteHandler(c *gin.Context) {
 	v := s.imageService()
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.assetDeleteErr != nil {
-		// A recorded filesystem failure is retryable; malformed journals are not.
-		if len(v.assetDeletions) == 0 {
-			c.JSON(500, gin.H{"error": v.assetDeleteErr.Error()})
-			return
-		}
-		for key, entry := range v.assetDeletions {
-			if key != entry.AssetID || !validImageDeletionAsset(entry) {
-				c.JSON(500, gin.H{"error": "invalid image deletion journal"})
-				return
-			}
-		}
-	}
 	asset, exists := v.assets[id]
 	if !exists {
 		asset, exists = v.assetDeletions[id]
@@ -211,88 +199,125 @@ func (s *Server) imageAssetDeleteHandler(c *gin.Context) {
 		c.JSON(403, gin.H{"error": "image belongs to another chat"})
 		return
 	}
-	if !validImageDeletionAsset(asset) {
-		c.JSON(400, gin.H{"error": "invalid managed image identity"})
+	removed, err := v.deleteImageAssetsLocked([]imageAssetRecord{asset}, "")
+	imageAssetDeletionResponse(c, removed, err)
+}
+
+func imageAssetDeletionResponse(c *gin.Context, removed []string, err error) {
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "deleted_asset_ids": removed})
 		return
 	}
-	for _, job := range v.jobs {
-		if (!imageTerminal(job.Status) || job.executing) && (job.ID == asset.JobID || slices.Contains(imageJobReferences(job), id)) {
-			c.JSON(409, gin.H{"error": "A imagem está em uso. Aguarde a geração terminar ou cancele-a antes de excluir."})
-			return
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, errImageAssetInUse):
+		status = http.StatusConflict
+	case errors.Is(err, errImageAssetIdentity):
+		status = http.StatusBadRequest
+	}
+	c.JSON(status, gin.H{"error": err.Error()})
+}
+
+func (v *imageService) deleteImageAssetsLocked(assets []imageAssetRecord, batch string) ([]string, error) {
+	if v.assetDeleteErr != nil {
+		// A recorded filesystem failure is retryable. Invalid journals are not.
+		if len(v.assetDeletions) == 0 {
+			return nil, v.assetDeleteErr
+		}
+		for key, entry := range v.assetDeletions {
+			if key != entry.AssetID || !validImageDeletionAsset(entry) {
+				return nil, errors.New("invalid image deletion journal")
+			}
 		}
 	}
-	if v.assetDeletions == nil {
-		v.assetDeletions = map[string]imageAssetRecord{}
+	journal := maps.Clone(v.assetDeletions)
+	if journal == nil {
+		journal = map[string]imageAssetRecord{}
 	}
-	v.assetDeletions[id] = asset
-	removedSet := map[string]bool{id: true}
+	removed := map[string]bool{}
+	selectedJobs := map[string]bool{}
+	var refs []string
+	for _, asset := range assets {
+		if !validImageDeletionAsset(asset) {
+			return nil, errImageAssetIdentity
+		}
+		if _, exists := journal[asset.AssetID]; !exists {
+			asset.DeletionBatch = batch
+			journal[asset.AssetID] = asset
+		}
+		removed[asset.AssetID] = true
+		selectedJobs[asset.JobID] = true
+		refs = append(refs, asset.ReferenceAssetIDs...)
+		refs = append(refs, asset.ParentAssetID)
+	}
+	retainedJobs := map[string]bool{}
+	used := map[string]bool{}
+	for id, asset := range v.assets {
+		if _, gone := journal[id]; gone {
+			continue
+		}
+		if !asset.Input {
+			retainedJobs[asset.JobID] = true
+		}
+		used[asset.ParentAssetID] = true
+		for _, ref := range asset.ReferenceAssetIDs {
+			used[ref] = true
+		}
+	}
 	// Collect managed input copies only when no remaining image or other job
 	// needs them. Never traverse to source files outside the registered store.
-	refs := append(append([]string(nil), asset.ReferenceAssetIDs...), asset.ParentAssetID)
 	for _, job := range v.jobs {
-		if job.ID == asset.JobID {
-			refs = append(refs, imageJobReferences(job)...)
+		jobRefs := imageJobReferences(job)
+		if !imageTerminal(job.Status) || job.executing {
+			if selectedJobs[job.ID] {
+				return nil, errImageAssetInUse
+			}
+			for _, ref := range jobRefs {
+				if removed[ref] {
+					return nil, errImageAssetInUse
+				}
+			}
 		}
-	}
-	keepBatchReferences := false
-	for key, other := range v.assets {
-		if _, gone := v.assetDeletions[key]; !gone && other.JobID == asset.JobID && !other.Input {
-			keepBatchReferences = true
-			break
+		if selectedJobs[job.ID] {
+			refs = append(refs, jobRefs...)
+			if !retainedJobs[job.ID] {
+				continue
+			}
+		}
+		for _, ref := range jobRefs {
+			used[ref] = true
 		}
 	}
 	for _, ref := range refs {
-		if _, gone := v.assetDeletions[ref]; gone {
-			removedSet[ref] = true
+		if _, gone := journal[ref]; gone {
+			removed[ref] = true
 			continue
 		}
 		input, ok := v.assets[ref]
-		if !ok || !input.Input {
-			continue
-		}
-		used := false
-		for key, other := range v.assets {
-			if _, gone := v.assetDeletions[key]; gone {
-				continue
+		if ok && input.Input && !used[ref] {
+			if !validImageDeletionAsset(input) {
+				return nil, errImageAssetIdentity
 			}
-			if other.ParentAssetID == ref || slices.Contains(other.ReferenceAssetIDs, ref) {
-				used = true
-				break
-			}
-		}
-		for _, job := range v.jobs {
-			if job.ID == asset.JobID && !keepBatchReferences {
-				continue
-			}
-			if slices.Contains(imageJobReferences(job), ref) {
-				used = true
-				break
-			}
-		}
-		if !used {
-			v.assetDeletions[ref] = input
-			removedSet[ref] = true
+			input.DeletionBatch = batch
+			journal[ref] = input
+			removed[ref] = true
 		}
 	}
-	if err := writeImageJSON(filepath.Join(v.root, "deleted-assets.json"), v.assetDeletions); err != nil {
-		// Reload before another deletion rather than acting on an uncommitted fence.
-		v.assetDeleteErr = fmt.Errorf("cannot persist image deletion: %w", err)
-		c.JSON(500, gin.H{"error": v.assetDeleteErr.Error()})
-		return
+	if err := writeImageJSON(filepath.Join(v.root, "deleted-assets.json"), journal); err != nil {
+		return nil, fmt.Errorf("cannot persist image deletion: %w", err)
 	}
-	if err := v.fenceImageAssetRequestsLocked(); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
+	v.assetDeletions = journal
+	if err := v.finishImageAssetDeletionLocked(); err != nil {
+		return nil, err
 	}
-	if err := v.cleanupImageAssetDeletionsLocked(); err != nil {
-		v.assetDeleteErr = err
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
+	ids := slices.Sorted(maps.Keys(removed))
+	return ids, nil
+}
+
+func (v *imageService) finishImageAssetDeletionLocked() error {
+	v.assetDeleteErr = v.fenceImageAssetRequestsLocked()
+	if v.assetDeleteErr == nil {
+		v.assetDeleteErr = v.cleanupImageAssetDeletionsLocked()
 	}
-	v.assetDeleteErr = nil
-	removed := make([]string, 0, len(removedSet))
-	for key := range removedSet {
-		removed = append(removed, key)
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "deleted_asset_ids": removed})
+	return v.assetDeleteErr
 }

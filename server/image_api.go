@@ -133,6 +133,7 @@ type imageJob struct {
 	StartedAt           *time.Time              `json:"started_at,omitempty"`
 	FinishedAt          *time.Time              `json:"finished_at,omitempty"`
 	Error               string                  `json:"error,omitempty"`
+	HistoryCleared      bool                    `json:"history_cleared,omitempty"`
 	PersistenceError    string                  `json:"persistence_error,omitempty"`
 	Result              *imageAsset             `json:"result,omitempty"`
 	Results             []imageAsset            `json:"results,omitempty"`
@@ -480,12 +481,14 @@ func (s *Server) registerImageRoutes(r *gin.Engine) {
 	r.POST("/api/images/models/install", s.imageInstallHandler)
 	r.GET("/api/images/jobs", s.imageJobsHandler)
 	r.POST("/api/images/jobs", s.imageJobsHandler)
+	r.DELETE("/api/images/jobs/history", s.imageJobHistoryClearHandler)
 	r.GET("/api/images/jobs/:id", s.imageJobHandler)
 	r.POST("/api/images/jobs/:id/cancel", s.imageCancelHandler)
 	r.POST("/api/images/jobs/by-request/:request_id/cancel", s.imageCancelHandler)
 	r.GET("/api/images/assets/:id/:filename", s.imageAssetHandler)
 	r.GET("/api/images/assets/:id/:filename/metadata", s.imageAssetMetadataHandler)
 	r.GET("/api/images/gallery", s.imageGalleryHandler)
+	r.DELETE("/api/images/gallery/day", s.imageGalleryDayDeleteHandler)
 	r.DELETE("/api/images/assets/:id/:filename", s.imageAssetDeleteHandler)
 	r.POST("/api/images/assets", s.imageUploadHandler)
 	r.DELETE("/api/images/sessions/:session_id", s.imageSessionDeleteHandler)

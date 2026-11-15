@@ -1,9 +1,12 @@
 package server
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,8 +23,9 @@ const imageGalleryOutputs = "COALESCE(json_extract(record, '$.input'), 0) = 0 AN
 var errInvalidGalleryCursor = errors.New("invalid gallery cursor")
 
 type imageGalleryDay struct {
-	Day   string `json:"day"`
-	Count int    `json:"count"`
+	Day         string `json:"day"`
+	Count       int    `json:"count"`
+	DeleteToken string `json:"delete_token"`
 }
 
 type imageGalleryItem struct {
@@ -115,13 +119,33 @@ func imageGalleryDayStart(date time.Time, location *time.Location) int64 {
 	return lo
 }
 
+func imageGalleryLocation(zone string) (*time.Location, error) {
+	if len(zone) > 100 || zone == "Local" {
+		return nil, errors.New("invalid gallery timezone")
+	}
+	return time.LoadLocation(zone)
+}
+
+func imageGalleryDayKey(stamp int64, location *time.Location) string {
+	if stamp == 0 {
+		return "undated"
+	}
+	return time.UnixMilli(stamp).In(location).Format(imageGalleryDate)
+}
+
+func imageGalleryDeleteToken(day, zone string, ids []string) string {
+	slices.Sort(ids)
+	digest := sha256.New()
+	digest.Write([]byte(day + "\x00" + zone))
+	for _, id := range ids {
+		digest.Write([]byte("\x00" + id))
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
 func (s *Server) imageGalleryHandler(c *gin.Context) {
 	zone := c.DefaultQuery("tz", "UTC")
-	if len(zone) > 100 || zone == "Local" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid gallery timezone"})
-		return
-	}
-	location, err := time.LoadLocation(zone)
+	location, err := imageGalleryLocation(zone)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid gallery timezone"})
 		return
@@ -172,6 +196,7 @@ func (s *Server) imageGalleryHandler(c *gin.Context) {
 		if day == "" {
 			days := []imageGalleryDay{}
 			byDay := map[string]int{}
+			ids := map[string][]string{}
 			for rows.Next() {
 				var id string
 				var stamp int64
@@ -181,10 +206,7 @@ func (s *Server) imageGalleryHandler(c *gin.Context) {
 				if _, ok := v.visibleGalleryAssetLocked(id); !ok {
 					continue
 				}
-				key := "undated"
-				if stamp != 0 {
-					key = time.UnixMilli(stamp).In(location).Format(imageGalleryDate)
-				}
+				key := imageGalleryDayKey(stamp, location)
 				index, ok := byDay[key]
 				if !ok {
 					index = len(days)
@@ -192,6 +214,10 @@ func (s *Server) imageGalleryHandler(c *gin.Context) {
 					days = append(days, imageGalleryDay{Day: key})
 				}
 				days[index].Count++
+				ids[key] = append(ids[key], id)
+			}
+			for i := range days {
+				days[i].DeleteToken = imageGalleryDeleteToken(days[i].Day, zone, ids[days[i].Day])
 			}
 			return gin.H{"days": days, "today": time.Now().In(location).Format(imageGalleryDate)}, rows.Err()
 		}
@@ -231,4 +257,66 @@ func (s *Server) imageGalleryHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) imageGalleryDayDeleteHandler(c *gin.Context) {
+	var request struct {
+		Day   string `json:"day"`
+		Zone  string `json:"tz"`
+		Token string `json:"delete_token"`
+		Count int    `json:"count"`
+	}
+	if !imageBind(c, &request) {
+		return
+	}
+	location, zoneErr := imageGalleryLocation(request.Zone)
+	date, dateErr := time.Parse(imageGalleryDate, request.Day)
+	_, tokenErr := hex.DecodeString(request.Token)
+	if zoneErr != nil || request.Zone == "" || request.Count < 1 || len(request.Token) != 64 || tokenErr != nil ||
+		(request.Day != "undated" && (dateErr != nil || date.Format(imageGalleryDate) != request.Day)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid gallery day selection"})
+		return
+	}
+	v := s.imageService()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	var prior []string
+	for id, asset := range v.assetDeletions {
+		if asset.DeletionBatch == request.Token {
+			prior = append(prior, id)
+		}
+	}
+	if len(prior) > 0 {
+		// Recover a partial filesystem write or a lost acknowledgement without
+		// including new images that may since have appeared on this day.
+		imageAssetDeletionResponse(c, prior, v.finishImageAssetDeletionLocked())
+		return
+	}
+	if v.assetCatalogError != nil {
+		imageAssetDeletionResponse(c, nil, v.assetCatalogError)
+		return
+	}
+	db, err := v.openImageCatalog()
+	if err == nil {
+		err = v.prepareImageGalleryLocked(db)
+		db.Close()
+	}
+	if err != nil {
+		imageAssetDeletionResponse(c, nil, err)
+		return
+	}
+	ids := []string{}
+	assets := []imageAssetRecord{}
+	for id := range v.assets {
+		if asset, ok := v.visibleGalleryAssetLocked(id); ok && imageGalleryDayKey(asset.GeneratedAtMS, location) == request.Day {
+			ids = append(ids, id)
+			assets = append(assets, asset)
+		}
+	}
+	if len(ids) != request.Count || imageGalleryDeleteToken(request.Day, request.Zone, ids) != request.Token {
+		c.JSON(http.StatusConflict, gin.H{"error": "As imagens deste dia mudaram. Atualize a galeria e confirme novamente."})
+		return
+	}
+	removed, err := v.deleteImageAssetsLocked(assets, request.Token)
+	imageAssetDeletionResponse(c, removed, err)
 }
