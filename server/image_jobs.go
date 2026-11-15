@@ -783,8 +783,9 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 				}
 			}
 		}
+		revision := v.galleryRevision
 		v.mu.Unlock()
-		c.JSON(200, gin.H{"jobs": jobs})
+		c.JSON(200, gin.H{"jobs": jobs, "gallery_revision": revision})
 		return
 	}
 	var request imageJobRequest

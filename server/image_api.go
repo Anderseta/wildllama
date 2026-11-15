@@ -110,6 +110,7 @@ type imageAsset struct {
 	Height          int     `json:"height"`
 	Seed            int64   `json:"seed"`
 	DurationSeconds float64 `json:"duration_seconds"`
+	GeneratedAtMS   int64   `json:"generated_at_ms,omitempty"`
 	BatchIndex      int     `json:"batch_index,omitempty"`
 	BatchCount      int     `json:"batch_count,omitempty"`
 	ParentAssetID   string  `json:"parent_asset_id,omitempty"`
@@ -185,6 +186,8 @@ type imageService struct {
 	sessionDeleteErr  error
 	assetOwnersDirty  bool
 	assetCatalogError error
+	galleryIndexed    bool
+	galleryRevision   uint64
 	assetDeletions    map[string]imageAssetRecord
 	assetDeleteErr    error
 	ownedDirectories  map[string]imageOwnedDirectory
@@ -214,6 +217,7 @@ func defaultImageConfig(root string) imageConfig {
 func (s *Server) imageService() *imageService {
 	s.imagesOnce.Do(func() {
 		service := &imageService{server: s, root: imageRoot(), gate: newImageGPUGate(), queue: make(chan *imageJob, 16), assets: map[string]imageAssetRecord{}, cancelledRequests: map[string]time.Time{}, uploadSlot: make(chan struct{}, 1)}
+		service.galleryRevision = uint64(time.Now().UnixMilli())
 		service.ctx, service.shutdownCancel = context.WithCancel(context.Background())
 		service.config = defaultImageConfig(service.root)
 		service.newEngine = func(config imagegen.Config) (imagegen.Runner, error) { return imagegen.NewEngine(config) }
@@ -479,6 +483,7 @@ func (s *Server) registerImageRoutes(r *gin.Engine) {
 	r.POST("/api/images/jobs/by-request/:request_id/cancel", s.imageCancelHandler)
 	r.GET("/api/images/assets/:id/:filename", s.imageAssetHandler)
 	r.GET("/api/images/assets/:id/:filename/metadata", s.imageAssetMetadataHandler)
+	r.GET("/api/images/gallery", s.imageGalleryHandler)
 	r.DELETE("/api/images/assets/:id/:filename", s.imageAssetDeleteHandler)
 	r.POST("/api/images/assets", s.imageUploadHandler)
 	r.DELETE("/api/images/sessions/:session_id", s.imageSessionDeleteHandler)

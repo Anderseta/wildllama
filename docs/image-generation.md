@@ -320,3 +320,9 @@ never deletion targets. An empty per-image directory and its task recovery file
 are removed after the final output disappears. Durable deletion records fence
 upload replay and sanitize recovered task/catalog state after restart; completed
 cleanup records do not repeat filesystem scans on subsequent deletions.
+
+`GET /api/images/gallery?tz=America/Sao_Paulo` lists generation dates and counts
+from the asset catalog, independently of recent jobs. Add `day=YYYY-MM-DD`
+(or `day=undated`) for the latest 20 results in a group, and pass its nonempty
+`next` as `before` to continue. Results contain asset metadata; open originals
+and generation parameters through the existing asset endpoints.

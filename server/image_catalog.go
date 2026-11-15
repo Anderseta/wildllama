@@ -154,7 +154,11 @@ func (v *imageService) commitImageAssetsLocked(changed map[string]imageAssetReco
 	if _, err = tx.Exec(`INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('json_migrated','1')`); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	v.galleryRevision++
+	return nil
 }
 
 func (v *imageService) persistImageJobStateLocked(job *imageJob) {
