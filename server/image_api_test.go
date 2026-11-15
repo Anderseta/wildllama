@@ -400,3 +400,34 @@ func TestImageInstallRecipeAliasDefaultsVisionWithoutDownloading(t *testing.T) {
 	response = imageTestHTTP(router, "POST", "/api/images/models/install", []byte(`{"recipe_id":"one","pipeline_id":"other"}`), "application/json")
 	require.Equal(t, 400, response.Code)
 }
+
+func TestImageMOSSInstallExposesPresetWithoutChangingActiveProfile(t *testing.T) {
+	_, service, router, _, _ := newImageTestService(t)
+	service.transferStarted = true
+	mossID := imagegen.MOSSRecipeID
+	list := imageTestHTTP(router, "GET", "/api/images/models", nil, "")
+	require.Equal(t, 200, list.Code)
+	require.Contains(t, list.Body.String(), mossID)
+	response := imageTestHTTP(router, "POST", "/api/images/models/install", []byte(`{"recipe_id":"`+mossID+`"}`), "application/json")
+	require.Equal(t, 202, response.Code, response.Body.String())
+	require.Len(t, service.jobs, 1)
+	require.Equal(t, mossID, service.jobs[0].RecipeID)
+
+	preset := imagegen.DefaultProfile(mossID)
+	preset.Tokenizer = filepath.Join(service.root, "models", mossID, "tokenizer", "tokenizer.json")
+	preset.LoRAs = []imagegen.LoRA{{Path: filepath.Join(service.root, "models", mossID, "lora", "canonical.gguf"), Scale: 0.8}}
+	previousDefault := service.config.DefaultProfileID
+	require.NoError(t, service.recordBundle(imagegen.Bundle{ID: mossID, RecipeID: mossID, Name: "MOSS", Profile: preset}))
+	require.Equal(t, previousDefault, service.config.DefaultProfileID)
+	require.Len(t, service.config.Profiles, 2)
+	persistedConfig := imageTestHTTP(router, "GET", "/api/images/config", nil, "")
+	var saved struct{ Config imageConfig }
+	require.NoError(t, json.Unmarshal(persistedConfig.Body.Bytes(), &saved))
+	profile := saved.Config.Profiles[1]
+	require.Equal(t, "exclusive", profile.ExecutionMode)
+	require.Equal(t, preset.Tokenizer, profile.Tokenizer)
+	require.Equal(t, preset.LoRAs, profile.LoRAs)
+	generation, err := imageGenerationFor(imageJobRequest{Prompt: "An orange lantern beside a window."}, profile)
+	require.NoError(t, err)
+	require.Equal(t, "moss_xvstyle\nAn orange lantern beside a window.", generation.Prompt)
+}

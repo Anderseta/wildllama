@@ -49,6 +49,7 @@ func localImageProfile() imagegen.Profile {
 	profile.Steps, profile.CFGScale, profile.Sigmas = 25, 1, ""
 	profile.Scheduler = "simple"
 	profile.DiffusionModel, profile.TextEncoder, profile.VAE, profile.VisionEncoder = "", "", "", ""
+	profile.Tokenizer = ""
 	profile.StageComponents = true
 	return profile
 }

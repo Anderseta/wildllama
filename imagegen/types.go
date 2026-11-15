@@ -12,6 +12,7 @@ const (
 	RunnerRelease     = "master-1091-b9d7176"
 	DefaultRecipeID   = "qwen-image-2.1-turbo-uncensored-q5"
 	ManifestName      = "wildimage-model.json"
+	MOSSRecipeID      = "moss-image-sft-q8-heretic-nsfw"
 	TurboSigmas       = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
 	MiniMaxH3RecipeID = "minimax-h3-image-q5-abliterated-12.5g"
 	MiniMaxH3Sigmas   = "1.0,0.9675236940383911,0.8875485062599182,0.75,0.5327739119529724,0.23200887441635132,0.0"
@@ -33,10 +34,12 @@ type Config struct {
 type Profile struct {
 	ID              string  `json:"id"`
 	ModelID         string  `json:"model_id"`
+	PromptPrefix    string  `json:"prompt_prefix,omitempty"`
 	DiffusionModel  string  `json:"diffusion_model"`
 	TextEncoder     string  `json:"text_encoder"`
 	VAE             string  `json:"vae"`
 	VisionEncoder   string  `json:"vision_encoder,omitempty"`
+	Tokenizer       string  `json:"tokenizer,omitempty"`
 	Width           int     `json:"width"`
 	Height          int     `json:"height"`
 	Steps           int     `json:"steps"`
@@ -196,6 +199,12 @@ func DefaultProfile(modelID string) Profile {
 		StageComponents: true, OffloadToCPU: true, FlashAttention: true, VAETiling: true}
 	if modelID == MiniMaxH3RecipeID {
 		p.ID, p.Steps, p.Sigmas = "minimax-h3-image", 6, MiniMaxH3Sigmas
+	}
+	if modelID == MOSSRecipeID {
+		p.ID = MOSSRecipeID
+		p.PromptPrefix = "moss_xvstyle"
+		p.Steps, p.CFGScale = 30, 3
+		p.Sigmas, p.Scheduler = "", "discrete"
 	}
 	return p
 }

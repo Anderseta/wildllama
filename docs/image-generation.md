@@ -49,6 +49,19 @@ model adapters apply at runtime rather than expanding and rewriting the base
 weights. Model quantization, base/Turbo training and LoRA strength are independent
 choices.
 
+## MOSS-Image SFT
+
+The MOSS recipe installs the pinned Q8 diffusion model, Heretic DHQ Qwen3.5
+9B encoder, official FLUX.2 VAE and MOSS tokenizer, and both published F16
+LoRA checkpoints. The download is 11,903,865,129 bytes. The saved profile
+starts with the current 1,750-step LoRA at 0.8, the author's prompt trigger,
+1024 × 1024, Euler/discrete, 30 steps and CFG 3. The 2,000-step variant is
+available in the LoRA library for manual substitution at 0.7.
+
+The profile defaults to exclusive GPU use and staged components. The recipe
+provides text-to-image generation. Installation runs through the normal image
+transfer queue with resumable downloads and SHA-256 verification.
+
 ## RAM backing and sequential components
 
 New image profiles enable `offload_to_cpu` as a fallback policy. A GPU-resident

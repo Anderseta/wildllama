@@ -247,6 +247,11 @@ func (s *Server) imageLoRAsHandler(c *gin.Context) {
 		return
 	}
 	for _, bundle := range models {
+		for _, component := range bundle.Components {
+			if component.Role == "lora" && component.Ready {
+				add(imagegen.LoRA{Path: component.Path}, "pipeline")
+			}
+		}
 		for _, lora := range bundle.Profile.LoRAs {
 			add(lora, "local")
 		}

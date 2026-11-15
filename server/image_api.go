@@ -25,7 +25,6 @@ import (
 type imageProfile struct {
 	imagegen.Profile
 	Name           string `json:"name"`
-	PromptPrefix   string `json:"prompt_prefix,omitempty"`
 	NegativePrompt string `json:"negative_prompt,omitempty"`
 	ExecutionMode  string `json:"execution_mode,omitempty"`
 	Seed           *int64 `json:"seed,omitempty"`
@@ -40,7 +39,6 @@ func (p *imageProfile) UnmarshalJSON(data []byte) error {
 	}
 	var extra struct {
 		Name           string `json:"name"`
-		PromptPrefix   string `json:"prompt_prefix"`
 		NegativePrompt string `json:"negative_prompt"`
 		ExecutionMode  string `json:"execution_mode"`
 		Seed           *int64 `json:"seed"`
@@ -48,7 +46,7 @@ func (p *imageProfile) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &extra); err != nil {
 		return err
 	}
-	*p = imageProfile{Profile: base, Name: extra.Name, PromptPrefix: extra.PromptPrefix,
+	*p = imageProfile{Profile: base, Name: extra.Name,
 		NegativePrompt: extra.NegativePrompt, ExecutionMode: extra.ExecutionMode, Seed: extra.Seed}
 	return nil
 }

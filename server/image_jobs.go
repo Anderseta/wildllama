@@ -383,9 +383,15 @@ func (v *imageService) recordBundle(bundle imagegen.Bundle) error {
 		if profile.VisionEncoder == "" {
 			profile.VisionEncoder = bundle.Profile.VisionEncoder
 		}
+		if profile.Tokenizer == "" {
+			profile.Tokenizer = bundle.Profile.Tokenizer
+		}
 	}
 	if !matched {
 		profile := imageProfile{Profile: bundle.Profile, Name: bundle.Name}
+		if bundle.RecipeID == imagegen.MOSSRecipeID {
+			profile.ExecutionMode = "exclusive"
+		}
 		profile.LoRAs = append([]imagegen.LoRA(nil), bundle.Profile.LoRAs...)
 		for _, existing := range next.Profiles {
 			if existing.ID == profile.ID {
@@ -394,6 +400,9 @@ func (v *imageService) recordBundle(bundle imagegen.Bundle) error {
 			}
 		}
 		next.Profiles = append(next.Profiles, profile)
+	}
+	if err := validateImageConfig(next); err != nil {
+		return err
 	}
 	next.Revision++
 	if err := writeImageJSON(filepath.Join(v.root, "config.json"), next); err != nil {

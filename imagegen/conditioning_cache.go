@@ -165,6 +165,13 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 		}
 		components[role] = identity
 	}
+	if profile.Tokenizer != "" {
+		identity, err := memo.fileIdentity(ctx, profile.Tokenizer, true, report)
+		if err != nil {
+			return nil, err
+		}
+		components["tokenizer"] = identity
+	}
 	if len(request.ReferenceImages) > 0 && !sameComponentPath(profile.VisionEncoder, profile.TextEncoder) {
 		identity, err := memo.fileIdentity(ctx, profile.VisionEncoder, true, report)
 		if err != nil {

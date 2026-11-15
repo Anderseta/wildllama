@@ -1,6 +1,7 @@
 package imagegen
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -187,6 +188,9 @@ func ValidateProfile(p Profile) error {
 	if p.Scheduler != "" && p.Scheduler != "simple" && p.Scheduler != "discrete" && p.Scheduler != "karras" {
 		return errors.New("unsupported image scheduler")
 	}
+	if p.Tokenizer != "" && !isTokenizerPath(p.Tokenizer) {
+		return errors.New("image tokenizer must be an absolute JSON path")
+	}
 	if len(p.LoRAs) > 8 {
 		return errors.New("at most eight image LoRAs are supported")
 	}
@@ -254,6 +258,11 @@ func ValidateRequest(p Profile, r Request) error {
 	for role, path := range map[string]string{"diffusion model": p.DiffusionModel, "text encoder": p.TextEncoder, "VAE": p.VAE} {
 		if err := validateModelFile(path); err != nil {
 			return fmt.Errorf("%s: %w", role, err)
+		}
+	}
+	if p.Tokenizer != "" || p.ModelID == MOSSRecipeID {
+		if err := validateTokenizerFile(p.Tokenizer); err != nil {
+			return fmt.Errorf("tokenizer: %w", err)
 		}
 	}
 	if len(r.ReferenceImages) > 4 {
@@ -324,6 +333,44 @@ func validateModelFile(path string) error {
 		}
 	}
 	return nil
+}
+
+func isTokenizerPath(path string) bool {
+	return filepath.IsAbs(path) && strings.EqualFold(filepath.Ext(path), ".json") &&
+		!strings.ContainsAny(path, "\x00\r\n,=")
+}
+
+func validateTokenizerFile(path string) error {
+	if !isTokenizerPath(path) {
+		return errors.New("expected an absolute tokenizer JSON path without comma or equals sign")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 2 || info.Size() > 64<<20 {
+		return errors.New("tokenizer JSON is missing or outside the 64 MiB limit")
+	}
+	// The runner parses and checks the full vocabulary when loading it.
+	for reader := bufio.NewReader(file); ; {
+		value, err := reader.ReadByte()
+		if err != nil {
+			return errors.New("tokenizer JSON is empty")
+		}
+		switch value {
+		case ' ', '\r', '\n', '\t':
+			continue
+		case '{':
+			return nil
+		default:
+			return errors.New("tokenizer JSON must contain an object")
+		}
+	}
 }
 
 func validateWritePath(path string) error {
@@ -635,6 +682,9 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 		"--prompt-file", filepath.Join(jobDir, "prompt.txt"), "--negative-prompt-file", filepath.Join(jobDir, "negative.txt"),
 		"--width", strconv.Itoa(p.Width), "--height", strconv.Itoa(p.Height), "--steps", strconv.Itoa(p.Steps),
 		"--cfg-scale", strconv.FormatFloat(p.CFGScale, 'g', -1, 64), "--sampling-method", p.Sampler, "--seed", strconv.FormatInt(seed, 10), "--output", output}
+	if p.Tokenizer != "" {
+		args = append(args, "--tokenizer", p.Tokenizer)
+	}
 	stage := "off"
 	if p.StageComponents {
 		stage = "on"

@@ -19,6 +19,15 @@ var installSlot = func() chan struct{} { c := make(chan struct{}, 1); c <- struc
 var downloadClient = &http.Client{Timeout: 12 * time.Hour, Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, ResponseHeaderTimeout: 45 * time.Second}}
 
 func Install(ctx context.Context, modelsDir, recipeID string, includeVision bool, progress func(DownloadProgress)) (Bundle, error) {
+	for _, recipe := range Recipes() {
+		if recipe.ID == recipeID {
+			return installRecipe(ctx, modelsDir, recipe, includeVision, downloadClient, "https://huggingface.co", progress)
+		}
+	}
+	return Bundle{}, errors.New("unknown image pipeline recipe")
+}
+
+func installRecipe(ctx context.Context, modelsDir string, recipe Recipe, includeVision bool, client *http.Client, base string, progress func(DownloadProgress)) (Bundle, error) {
 	if err := validateWritePath(modelsDir); err != nil {
 		return Bundle{}, err
 	}
@@ -28,16 +37,6 @@ func Install(ctx context.Context, modelsDir, recipeID string, includeVision bool
 	case <-installSlot:
 	}
 	defer func() { installSlot <- struct{}{} }()
-	var recipe Recipe
-	for _, candidate := range Recipes() {
-		if candidate.ID == recipeID {
-			recipe = candidate
-			break
-		}
-	}
-	if recipe.ID == "" {
-		return Bundle{}, errors.New("unknown image pipeline recipe")
-	}
 	directory := filepath.Join(modelsDir, recipe.ID)
 	if err := validateWritePath(directory); err != nil {
 		return Bundle{}, err
@@ -84,7 +83,7 @@ func Install(ctx context.Context, modelsDir, recipeID string, includeVision bool
 				progress(v)
 			}
 		}
-		if err := downloadComponent(ctx, downloadClient, "https://huggingface.co", c, callback); err != nil {
+		if err := downloadComponent(ctx, client, base, c, callback); err != nil {
 			refreshBundle(&b)
 			_ = writeBundle(filepath.Join(directory, ManifestName), b)
 			return b, fmt.Errorf("%s: %w", c.Role, err)
@@ -94,7 +93,9 @@ func Install(ctx context.Context, modelsDir, recipeID string, includeVision bool
 			return b, err
 		}
 	}
-	refreshBundle(&b)
+	if !b.Ready {
+		return b, fmt.Errorf("incomplete image pipeline: %s", strings.Join(b.Missing, "; "))
+	}
 	return b, nil
 }
 
@@ -264,7 +265,7 @@ func downloadComponent(ctx context.Context, client *http.Client, base string, c 
 	if err := os.Rename(part, c.Path); err != nil {
 		return err
 	}
-	if err := validateModelFile(c.Path); err != nil {
+	if err := validateBundleComponent(c); err != nil {
 		return err
 	}
 	if err := writeReceipt(c); err != nil {

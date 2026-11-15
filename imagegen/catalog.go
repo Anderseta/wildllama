@@ -40,7 +40,7 @@ func Recipes() []Recipe {
 			{Role: "vae", Repo: "Comfy-Org/MiniMax-H3-Image", Revision: "0bb149f51e3156ed4b90dd45d5620346bfe1df8f", Filename: "vae/minimax_h3_image_vae_fp16.safetensors", SHA256: "d80e9c2e5cfc9844869961ff5a58c9a9e52182df6bfb30b26018dd7f348721af", Size: 1168505312, Required: true},
 		},
 	})
-	return result
+	return append(result, mossRecipe())
 }
 
 var bundleID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
@@ -95,16 +95,19 @@ func readBundle(path string) (Bundle, error) {
 		return b, errors.New("invalid image model id")
 	}
 	if len(b.Components) < 3 || len(b.Components) > 8 {
-		return b, errors.New("image bundle must contain three required components and optional projector")
+		return b, errors.New("image bundle must contain between three and eight components")
 	}
 	b.Directory = filepath.Dir(path)
 	roles := map[string]bool{}
+	loras := map[string]bool{}
 	for i := range b.Components {
 		c := &b.Components[i]
-		if c.Role != "diffusion_model" && c.Role != "text_encoder" && c.Role != "vae" && c.Role != "vision_encoder" {
+		switch c.Role {
+		case "diffusion_model", "text_encoder", "vae", "vision_encoder", "tokenizer", "lora":
+		default:
 			return b, errors.New("unknown image component role")
 		}
-		if roles[c.Role] {
+		if c.Role != "lora" && roles[c.Role] {
 			return b, errors.New("duplicate image component role")
 		}
 		roles[c.Role] = true
@@ -112,6 +115,12 @@ func readBundle(path string) (Bundle, error) {
 			c.Path = filepath.Join(b.Directory, c.Path)
 		}
 		c.Path = filepath.Clean(c.Path)
+		if c.Role == "lora" {
+			if loras[c.Path] {
+				return b, errors.New("duplicate image LoRA component")
+			}
+			loras[c.Path] = true
+		}
 		if c.Role != "vision_encoder" {
 			c.Required = true
 		}
@@ -122,25 +131,26 @@ func readBundle(path string) (Bundle, error) {
 		}
 	}
 	if b.Profile.Width == 0 {
-		b.Profile = DefaultProfile(b.ID)
-		if b.RecipeID == MiniMaxH3RecipeID {
-			b.Profile = DefaultProfile(b.RecipeID)
+		profileID := b.ID
+		if b.RecipeID != "" {
+			profileID = b.RecipeID
 		}
+		b.Profile = DefaultProfile(profileID)
 	}
-	for i := range b.Profile.LoRAs {
-		if b.Profile.LoRAs[i].Path != "" && !filepath.IsAbs(b.Profile.LoRAs[i].Path) {
-			b.Profile.LoRAs[i].Path = filepath.Join(b.Directory, b.Profile.LoRAs[i].Path)
-		}
-	}
+	bindProfile(&b)
 	if err := ValidateProfile(b.Profile); err != nil {
 		return b, err
 	}
-	bindProfile(&b)
 	return b, nil
 }
 
 func bindProfile(b *Bundle) {
 	b.Profile.ModelID = b.ID
+	for i := range b.Profile.LoRAs {
+		if b.Profile.LoRAs[i].Path != "" && !filepath.IsAbs(b.Profile.LoRAs[i].Path) {
+			b.Profile.LoRAs[i].Path = filepath.Join(b.Directory, b.Profile.LoRAs[i].Path)
+		}
+	}
 	for _, c := range b.Components {
 		switch c.Role {
 		case "diffusion_model":
@@ -151,6 +161,8 @@ func bindProfile(b *Bundle) {
 			b.Profile.VAE = c.Path
 		case "vision_encoder":
 			b.Profile.VisionEncoder = c.Path
+		case "tokenizer":
+			b.Profile.Tokenizer = c.Path
 		}
 	}
 	// This pinned encoder contains its vision tower; never download or load it twice.
@@ -164,13 +176,17 @@ func refreshBundle(b *Bundle) {
 	b.Missing = []string{}
 	for i := range b.Components {
 		c := &b.Components[i]
-		err := validateModelFile(c.Path)
+		err := validateBundleComponent(*c)
 		if info, statErr := os.Stat(c.Path); err == nil && (statErr != nil || c.Size > 0 && info.Size() != c.Size) {
 			err = errors.New("component size differs from its manifest")
 		}
 		if err != nil && c.Required {
 			b.Ready = false
-			b.Missing = append(b.Missing, c.Role+": "+err.Error())
+			role := c.Role
+			if role == "lora" {
+				role += ": " + c.Filename
+			}
+			b.Missing = append(b.Missing, role+": "+err.Error())
 		}
 		c.Ready = err == nil
 		c.Error = ""
@@ -199,6 +215,13 @@ func refreshBundle(b *Bundle) {
 			b.Profile.VisionEncoder = ""
 		}
 	}
+}
+
+func validateBundleComponent(c InstalledComponent) error {
+	if c.Role == "tokenizer" {
+		return validateTokenizerFile(c.Path)
+	}
+	return validateModelFile(c.Path)
 }
 func writeBundle(path string, b Bundle) error {
 	data, err := json.MarshalIndent(b, "", "  ")
@@ -246,7 +269,7 @@ func ImportLocal(ctx context.Context, modelsDir, bundlePath string) (Bundle, err
 		if err := ctx.Err(); err != nil {
 			return b, err
 		}
-		if err := validateModelFile(c.Path); err != nil {
+		if err := validateBundleComponent(*c); err != nil {
 			if c.Required {
 				return b, fmt.Errorf("%s: %w", c.Role, err)
 			}

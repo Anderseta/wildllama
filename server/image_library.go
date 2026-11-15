@@ -93,6 +93,7 @@ func imageProfileComponents(profile imagegen.Profile, visit func(string, string)
 	visit(profile.TextEncoder, "text_encoder")
 	visit(profile.VAE, "vae")
 	visit(profile.VisionEncoder, "vision_encoder")
+	visit(profile.Tokenizer, "tokenizer")
 	for _, lora := range profile.LoRAs {
 		visit(lora.Path, "lora")
 	}
