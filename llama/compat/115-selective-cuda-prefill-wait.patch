@@ -1,0 +1,211 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 57a57bc..322b217 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -373,6 +373,8 @@ extern "C" {
+     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+ #endif
+     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
++    // Allow backends to block the host during a potentially long prompt wait.
++    GGML_API void                 ggml_backend_sched_synchronize_prefill(ggml_backend_sched_t sched);
+ 
+     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
+     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 906aaf8..1f03f5d 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2302,10 +2302,24 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+     return ggml_backend_sched_compute_splits(sched);
+ }
+ 
+-void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
++static void ggml_backend_sched_synchronize_impl(ggml_backend_sched_t sched, bool prefill) {
+     GGML_ASSERT(sched);
+     for (int i = 0; i < sched->n_backends; i++) {
+-        ggml_backend_synchronize(sched->backends[i]);
++        auto * backend = sched->backends[i];
++        if (prefill) {
++            auto * device = ggml_backend_get_device(backend);
++            auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++            if (reg) {
++                using synchronize_prefill_fn = void (*)(ggml_backend_t);
++                auto sync = reinterpret_cast<synchronize_prefill_fn>(
++                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_synchronize_prefill"));
++                if (sync) {
++                    sync(backend);
++                    continue;
++                }
++            }
++        }
++        ggml_backend_synchronize(backend);
+     }
+     if (!sched->is_alloc) {
+         // if the graph is not already allocated, always use copy 0 after a synchronization
+@@ -2315,6 +2329,14 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+     }
+ }
+ 
++void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
++    ggml_backend_sched_synchronize_impl(sched, false);
++}
++
++void ggml_backend_sched_synchronize_prefill(ggml_backend_sched_t sched) {
++    ggml_backend_sched_synchronize_impl(sched, true);
++}
++
+ void ggml_backend_sched_set_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
+     sched->callback_prepare = callback;
+     sched->callback_prepare_user_data = user_data;
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index c70f739..8ab55b0 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -4,6 +4,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-cuda.h"
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <memory>
+@@ -1491,6 +1492,11 @@ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
++    struct {
++        std::atomic<uint64_t> calls{0};
++        std::atomic<uint64_t> elapsed_us{0};
++    } host_wait[2]; // ordinary and prefill scheduler fences
++    std::atomic<uint64_t> host_blocking_calls{0};
+     std::unique_ptr<ggml_cuda_execution_timing> execution_timing;
+     std::shared_ptr<wildllama_cuda_tuning::policy> resident_tuning;
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1c3ff21..a474e70 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1031,6 +1031,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
++    const auto ordinary_calls = host_wait[0].calls.load(std::memory_order_relaxed);
++    const auto prefill_calls = host_wait[1].calls.load(std::memory_order_relaxed);
++    if (ordinary_calls || prefill_calls) {
++        GGML_LOG_INFO("wildllama CUDA host wait: device=%d ordinary_calls=%llu ordinary_us=%llu "
++                      "prefill_calls=%llu prefill_us=%llu blocking_calls=%llu\n",
++                device, (unsigned long long) ordinary_calls,
++                (unsigned long long) host_wait[0].elapsed_us.load(std::memory_order_relaxed),
++                (unsigned long long) prefill_calls,
++                (unsigned long long) host_wait[1].elapsed_us.load(std::memory_order_relaxed),
++                (unsigned long long) host_blocking_calls.load(std::memory_order_relaxed));
++    }
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -3539,10 +3551,57 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+     return true;
+ }
+ 
+-static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static bool ggml_cuda_synchronize_prefill(ggml_backend_cuda_context & context, cudaStream_t stream) {
++    const cudaError_t pending = cudaStreamQuery(stream);
++    if (pending != cudaErrorNotReady) {
++        CUDA_CHECK(pending);
++        return false;
++    }
++
++    const int previous_device = ggml_cuda_get_device();
++    ggml_cuda_set_device(context.device);
++    cudaEvent_t event = nullptr;
++    const cudaError_t created = cudaEventCreateWithFlags(&event, cudaEventBlockingSync | cudaEventDisableTiming);
++    if (created == cudaErrorMemoryAllocation) {
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++    } else {
++        CUDA_CHECK(created);
++        CUDA_CHECK(cudaEventRecord(event, stream));
++        CUDA_CHECK(cudaEventSynchronize(event));
++        CUDA_CHECK(cudaEventDestroy(event));
++    }
++    if (previous_device != ggml_cuda_get_physical_device(context.device)) {
++        CUDA_CHECK(cudaSetDevice(previous_device));
++    }
++    return created == cudaSuccess;
++}
++#endif
++
++static void ggml_backend_cuda_synchronize_impl(ggml_backend_t backend, bool prefill) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
++    static const bool trace = ggml_cuda_env_flag("WILDLLAMA_CUDA_SYNC_TRACE");
++    const int64_t start_us = trace ? ggml_time_us() : 0;
++    bool blocking = false;
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (prefill && ggml_cuda_env_flag("WILDLLAMA_CUDA_PREFILL_BLOCKING")) {
++        blocking = ggml_cuda_synchronize_prefill(*cuda_ctx, cuda_ctx->stream());
++    } else
++#endif
++    {
++        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++    }
+ 
+-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++    if (trace) {
++        const auto elapsed_us = ggml_time_us() - start_us;
++        auto & wait = cuda_ctx->host_wait[prefill ? 1 : 0];
++        wait.calls.fetch_add(1, std::memory_order_relaxed);
++        wait.elapsed_us.fetch_add(elapsed_us, std::memory_order_relaxed);
++        if (blocking) {
++            cuda_ctx->host_blocking_calls.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
+ 
+     if (ggml_cuda_env_flag("WILDLLAMA_CUDA_POOL_TRIM")) {
+         bool pending=false;
+@@ -3572,6 +3631,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     GGML_UNUSED(backend);
+ }
+ 
++static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
++    ggml_backend_cuda_synchronize_impl(backend, false);
++}
++
+ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+@@ -7637,6 +7700,9 @@ static bool ggml_backend_cuda_mtp_pack_rows(
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_synchronize_prefill") == 0) {
++        return (void *) +[](ggml_backend_t backend) { ggml_backend_cuda_synchronize_impl(backend, true); };
++    }
+     if (strcmp(name, "ggml_backend_cuda_mtp_pack_rows") == 0) {
+         return (void *) ggml_backend_cuda_mtp_pack_rows;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cc7cced..d386f23 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1098,7 +1098,18 @@ void llama_context::synchronize() {
+         return;
+     }
+ 
+-    ggml_backend_sched_synchronize(sched.get());
++    static const bool prefill_wait = [] {
++        const char * blocking = std::getenv("WILDLLAMA_CUDA_PREFILL_BLOCKING");
++        const char * trace = std::getenv("WILDLLAMA_CUDA_SYNC_TRACE");
++        return (blocking && std::atoi(blocking) != 0) || (trace && std::atoi(trace) != 0);
++    }();
++    // Ordinary generation and speculative verification queue only a few rows.
++    // A large prefill can afford the host wake-up cost if the backend supports it.
++    if (prefill_wait && n_queued_tokens >= 128) {
++        ggml_backend_sched_synchronize_prefill(sched.get());
++    } else {
++        ggml_backend_sched_synchronize(sched.get());
++    }
+ 
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
