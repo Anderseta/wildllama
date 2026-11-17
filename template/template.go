@@ -255,11 +255,6 @@ func (t *Template) Subtree(fn func(parse.Node) bool) *template.Template {
 }
 
 func (t *Template) Execute(w io.Writer, v Values) error {
-	system, messages := collate(v.Messages)
-	vars, err := t.Vars()
-	if err != nil {
-		return err
-	}
 	if v.Prompt != "" && v.Suffix != "" {
 		return t.Template.Execute(w, map[string]any{
 			"Prompt":     v.Prompt,
@@ -269,7 +264,13 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 			"ThinkLevel": v.ThinkLevel,
 			"IsThinkSet": v.IsThinkSet,
 		})
-	} else if !v.forceLegacy && slices.Contains(vars, "messages") {
+	}
+	system, messages := collate(v.Messages)
+	vars, err := t.Vars()
+	if err != nil {
+		return err
+	}
+	if !v.forceLegacy && slices.Contains(vars, "messages") {
 		return t.Template.Execute(w, map[string]any{
 			"System":     system,
 			"Messages":   convertMessagesForTemplate(messages),
@@ -333,8 +334,19 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 		return cut
 	})
 
-	tree := parse.Tree{Root: nodes.(*parse.ListNode)}
-	if err := template.Must(template.New("").AddParseTree("", &tree)).Execute(&b, map[string]any{
+	// Preserve named helpers, functions and options when rendering the final,
+	// open-ended turn. Clone the association before replacing its root.
+	prefix, err := t.Template.Clone()
+	if err != nil {
+		return err
+	}
+	tree := *t.Tree
+	tree.Root = nodes.(*parse.ListNode)
+	prefix, err = prefix.Option("missingkey=zero").AddParseTree(t.Name(), &tree)
+	if err != nil {
+		return err
+	}
+	if err := prefix.Execute(&b, map[string]any{
 		"System":     system,
 		"Prompt":     prompt,
 		"Response":   response,
@@ -352,8 +364,7 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 // collate messages based on role. consecutive messages of the same role are merged
 // into a single message (except for tool messages which preserve individual metadata).
 // collate also collects and returns all system messages.
-// The first message's metadata is preserved when merging, without changing the
-// caller's history. Join each run once instead of copying its growing prefix.
+// Preserve structured fields in order without writing into the caller's slices.
 func collate(msgs []api.Message) (string, []*api.Message) {
 	var system []string
 	var collated []*api.Message
@@ -373,9 +384,25 @@ func collate(msgs []api.Message) (string, []*api.Message) {
 			collated = append(collated, &msgs[i])
 		} else {
 			merged := msgs[i]
+			merged.Images = slices.Clip(merged.Images)
+			merged.ToolCalls = slices.Clip(merged.ToolCalls)
 			parts := make([]string, end-i)
-			for j := i; j < end; j++ {
-				parts[j-i] = msgs[j].Content
+			parts[0] = merged.Content
+			var thinking []string
+			for j := i + 1; j < end; j++ {
+				next := msgs[j]
+				parts[j-i] = next.Content
+				merged.Images = append(merged.Images, next.Images...)
+				merged.ToolCalls = append(merged.ToolCalls, next.ToolCalls...)
+				if next.Thinking != "" {
+					if len(thinking) == 0 && merged.Thinking != "" {
+						thinking = append(thinking, merged.Thinking)
+					}
+					thinking = append(thinking, next.Thinking)
+				}
+			}
+			if len(thinking) > 0 {
+				merged.Thinking = strings.Join(thinking, "\n\n")
 			}
 			merged.Content = strings.Join(parts, "\n\n")
 			collated = append(collated, &merged)
@@ -500,6 +527,7 @@ func convertMessagesForTemplate(messages []*api.Message) []*templateMessage {
 		return nil
 	}
 	result := make([]*templateMessage, len(messages))
+	storage := make([]templateMessage, len(messages))
 	for i, msg := range messages {
 		var toolCalls []templateToolCall
 		for _, tc := range msg.ToolCalls {
@@ -512,7 +540,8 @@ func convertMessagesForTemplate(messages []*api.Message) []*templateMessage {
 				},
 			})
 		}
-		result[i] = &templateMessage{
+		result[i] = &storage[i]
+		storage[i] = templateMessage{
 			Role:       msg.Role,
 			Content:    msg.Content,
 			Thinking:   msg.Thinking,
@@ -623,7 +652,7 @@ func deleteNode(n parse.Node, fn func(parse.Node) bool) parse.Node {
 		case *parse.BranchNode:
 			t.List = walk(t.List).(*parse.ListNode)
 			if t.ElseList != nil {
-				t.ElseList = walk(t.ElseList).(*parse.ListNode)
+				t.ElseList, _ = walk(t.ElseList).(*parse.ListNode)
 			}
 		case *parse.ActionNode:
 			n := walk(t.Pipe)

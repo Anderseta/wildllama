@@ -353,7 +353,7 @@ Montréal
 				t.Fatalf("renderer output mismatch (-want +got):\n%s", diff)
 			}
 			if verifyJinja {
-				normalized, err := normalizeQwen38Messages(tt.messages)
+				normalized, err := NormalizeQwenInstructionMessages(tt.messages)
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -134,10 +134,10 @@ func qwen38ReasoningInstructions(think *api.ThinkValue) (string, error) {
 	}
 }
 
-// Qwen3.8 accepts exactly one leading system turn and has no developer role.
+// NormalizeQwenInstructionMessages adapts history to Qwen templates that accept one leading system turn.
 // Fold instruction messages from the effective history into that turn while
 // preserving instruction order and the order of all conversation messages.
-func normalizeQwen38Messages(messages []api.Message) ([]api.Message, error) {
+func NormalizeQwenInstructionMessages(messages []api.Message) ([]api.Message, error) {
 	var instructionCount int
 	var instructions []string
 	for _, message := range messages {
@@ -203,7 +203,7 @@ func (r *Qwen35Renderer) validateMessages(messages []api.Message) error {
 func (r *Qwen35Renderer) Render(messages []api.Message, tools []api.Tool, think *api.ThinkValue) (string, error) {
 	if r.variant == qwen35Renderer38 {
 		var err error
-		messages, err = normalizeQwen38Messages(messages)
+		messages, err = NormalizeQwenInstructionMessages(messages)
 		if err != nil {
 			return "", err
 		}

@@ -665,7 +665,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					}
 					return
 				}
-				nativeReq.Messages, media, err = imageTaggedMessages(m, nativeReq.Messages, 0, true)
+				nativeReq.Messages, media, err = imageTaggedMessages(m, nativeReq.Messages, true)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 					return
@@ -1258,34 +1258,35 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return tokens, err
 	}
 
+	contextLimit := int(m.metadata.Int("context_length"))
+	if contextLimit == 0 && m.Config.ModelFormat == "safetensors" {
+		contextLimit = m.Config.ContextLen
+	}
+	if opts.NumCtx > 0 && (contextLimit == 0 || opts.NumCtx < contextLimit) {
+		contextLimit = opts.NumCtx
+	}
+	// Keep the conservative defaults for GGUFs predating the tokenizer flags.
+	addBOS := m.metadata.Bool("tokenizer.ggml.add_bos_token", true)
+	addEOS := m.metadata.Bool("tokenizer.ggml.add_eos_token", true)
+	bos := int(m.metadata.Int("tokenizer.ggml.bos_token_id"))
+	eos := int(m.metadata.Int("tokenizer.ggml.eos_token_id"))
 	adjustTokenLimit := func(tokens []int, limit int) int {
-		if bos := m.metadata.Int("tokenizer.ggml.bos_token_id"); len(tokens) > 0 && tokens[0] != int(bos) && m.metadata.Bool("add_bos_token", true) {
-			limit--
-		}
-		if eos := m.metadata.Int("tokenizer.ggml.eos_token_id"); len(tokens) > 0 && tokens[len(tokens)-1] != int(eos) && m.metadata.Bool("add_eos_token", true) {
-			limit--
+		if len(tokens) > 0 {
+			if addBOS && tokens[0] != bos {
+				limit--
+			}
+			if addEOS && tokens[len(tokens)-1] != eos {
+				limit--
+			}
 		}
 		return limit
 	}
-
 	inputTokensAndContext := func(text string) ([]int, int, error) {
 		tokens, err := cachedTokenize(text)
 		if err != nil {
 			return nil, 0, err
 		}
-
-		// GGUF metadata carries the GGUF context length; safetensors (MLX)
-		// models never populate ggufMetadata, so fall back to the manifest
-		// config's context_length written by create/ from the HF config.
-		ctxLen := int(m.metadata.Int("context_length"))
-		if ctxLen == 0 && m.Config.ModelFormat == "safetensors" {
-			ctxLen = m.Config.ContextLen
-		}
-		if opts.NumCtx > 0 {
-			ctxLen = min(opts.NumCtx, ctxLen)
-		}
-
-		return tokens, adjustTokenLimit(tokens, ctxLen), nil
+		return tokens, adjustTokenLimit(tokens, contextLimit), nil
 	}
 
 	truncateInputToLimit := func(text string, limit int) (string, bool, error) {
@@ -1355,7 +1356,11 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 			return nil, 0, err
 		}
 
-		truncated, ok, terr := truncateInputToLimit(text, opts.NumBatch)
+		physicalLimit := opts.NumBatch
+		if opts.NumUbatch > 0 && (physicalLimit == 0 || opts.NumUbatch < physicalLimit) {
+			physicalLimit = opts.NumUbatch
+		}
+		truncated, ok, terr := truncateInputToLimit(text, physicalLimit)
 		if terr != nil {
 			return nil, 0, terr
 		}
@@ -3646,6 +3651,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 }
 
 func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, nativeReq llm.ChatRequest, truncate, allowPrepared bool) (llm.ChatRequest, llm.PreparedChat, error) {
+	messages, err := nativeInstructionMessages(m, nativeReq.Messages)
+	if err != nil {
+		return nativeReq, nil, err
+	}
+	nativeReq.Messages = messages
 	key := ""
 	if allowPrepared && truncate && len(nativeReq.Messages) > 1 && countChatImages(nativeReq.Messages) == 0 {
 		key = crand.Text()
@@ -3695,7 +3705,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 			CreatedAt: time.Now().UTC(),
 			DebugInfo: &api.DebugInfo{
 				RenderedTemplate: prompt,
-				ImageCount:       countChatImages(msgs),
+				ImageCount:       countChatImages(nativeReq.Messages),
 			},
 		})
 		return
@@ -3773,6 +3783,17 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 	counter, canCount := r.(interface {
 		ApplyChatTemplateWithTokenCount(context.Context, llm.ChatRequest) (string, int, error)
 	})
+	mediaCounter, hasMediaCounter := r.(interface {
+		ChatMediaTokenCount(context.Context, llm.ChatRequest) (int, error)
+	})
+	var mediaBudget chatMediaBudget
+	if !hasMediaCounter {
+		var err error
+		mediaBudget, err = estimateChatMedia(ctx, m, req.Messages, false)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	currMsgIdx, err := fittingPromptStart(ctx, req.Messages, opts.NumCtx, func(valid []bool) int {
 		return monotonicPromptLimit(m, req.Messages, true, valid)
 	}, func(i int) (int, error) {
@@ -3814,9 +3835,13 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 			}
 			ctxLen = previousTokenCount
 		}
-		mediaTokens, err := nativeMediaTokens(ctx, m, r, renderReq)
-		if err != nil {
-			return 0, err
+		mediaTokens := mediaBudget.at(i)
+		if hasMediaCounter {
+			var err error
+			mediaTokens, err = mediaCounter.ChatMediaTokenCount(ctx, renderReq)
+			if err != nil {
+				return 0, err
+			}
 		}
 		if mediaTokens > math.MaxInt-ctxLen {
 			return math.MaxInt, nil

@@ -2999,54 +2999,64 @@ func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [
 		return nil, 0, api.StatusError{StatusCode: statusCode, ErrorMessage: errMsg}
 	}
 
-	// With "input" field, llama-server returns OAI-compatible format:
-	//   {"data": [{"embedding": [0.1, ...], "tokens_evaluated": N}], "usage": {"prompt_tokens": N}}
-	// With "content" field, it returns:
-	//   [{"embedding": [[0.1, ...]], "index": 0}]
-	var oaiResp struct {
-		Data []struct {
-			Embedding       json.RawMessage `json:"embedding"`
-			TokensEvaluated int             `json:"tokens_evaluated"`
-		} `json:"data"`
-		Usage struct {
-			PromptTokens int `json:"prompt_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &oaiResp); err == nil && len(oaiResp.Data) > 0 {
-		var embedding []float32
-		if err := json.Unmarshal(oaiResp.Data[0].Embedding, &embedding); err != nil {
-			return nil, 0, fmt.Errorf("unmarshal embedding values: %w", err)
-		}
-		promptTokens := oaiResp.Usage.PromptTokens
-		if promptTokens == 0 {
-			promptTokens = oaiResp.Data[0].TokensEvaluated
-		}
-		return embedding, promptTokens, nil
-	}
+	return decodeEmbeddingResponse(body)
+}
 
-	// Fallback: non-OAI array format [{"embedding": [[0.1, ...]], "index": 0}]
-	var results []struct {
-		Embedding json.RawMessage `json:"embedding"`
+func decodeEmbeddingResponse(body []byte) ([]float32, int, error) {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return nil, 0, errors.New("empty embedding response")
 	}
-	if err := json.Unmarshal(body, &results); err != nil {
-		return nil, 0, fmt.Errorf("unmarshal embedding response: %w", err)
-	}
-	if len(results) == 0 {
-		return nil, 0, fmt.Errorf("empty embedding response")
-	}
-
-	var embedding []float32
-	if err := json.Unmarshal(results[0].Embedding, &embedding); err != nil {
-		var nested [][]float32
-		if err2 := json.Unmarshal(results[0].Embedding, &nested); err2 != nil {
-			return nil, 0, fmt.Errorf("unmarshal embedding values: %w (also tried nested: %w)", err, err2)
+	var vector []float32
+	var tokens int
+	if body[0] == '[' {
+		// Legacy runners return either a flat vector or one pooled row.
+		var items []struct {
+			Embedding json.RawMessage `json:"embedding"`
 		}
-		if len(nested) > 0 {
-			embedding = nested[0]
+		if err := json.Unmarshal(body, &items); err != nil {
+			return nil, 0, fmt.Errorf("unmarshal embedding response: %w", err)
+		}
+		if len(items) != 1 {
+			return nil, 0, fmt.Errorf("expected one embedding result, got %d", len(items))
+		}
+		raw := items[0].Embedding
+		if err := json.Unmarshal(raw, &vector); err != nil {
+			var nested [][]float32
+			if nestedErr := json.Unmarshal(raw, &nested); nestedErr != nil {
+				return nil, 0, fmt.Errorf("unmarshal embedding values: %w", err)
+			}
+			if len(nested) > 0 {
+				vector = nested[0]
+			}
+		}
+	} else {
+		// Numeric components are decoded directly into the owned output slice.
+		var response struct {
+			Data []struct {
+				Embedding       []float32 `json:"embedding"`
+				TokensEvaluated int       `json:"tokens_evaluated"`
+			} `json:"data"`
+			Usage struct {
+				PromptTokens int `json:"prompt_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			return nil, 0, fmt.Errorf("unmarshal embedding response: %w", err)
+		}
+		if len(response.Data) != 1 {
+			return nil, 0, fmt.Errorf("expected one embedding result, got %d", len(response.Data))
+		}
+		vector = response.Data[0].Embedding
+		tokens = response.Usage.PromptTokens
+		if tokens == 0 {
+			tokens = response.Data[0].TokensEvaluated
 		}
 	}
-
-	return embedding, 0, nil
+	if len(vector) == 0 {
+		return nil, 0, errors.New("runner returned an empty embedding vector")
+	}
+	return vector, tokens, nil
 }
 
 func normalizeEmbeddingError(statusCode int, body []byte) (int, string) {

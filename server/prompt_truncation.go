@@ -68,13 +68,17 @@ func monotonicPromptLimit(m *Model, messages []api.Message, native bool, starts 
 	return lastQuery
 }
 
+func promptInstruction(role string) bool {
+	return role == "system" || role == "developer"
+}
+
 func promptMessagesFrom(messages []api.Message, start int) []api.Message {
 	if start == 0 {
 		return slices.Clone(messages)
 	}
 	system := make([]api.Message, 0)
 	for _, message := range messages[:start] {
-		if message.Role == "system" {
+		if promptInstruction(message.Role) {
 			system = append(system, message)
 		}
 	}
@@ -98,7 +102,7 @@ func fittingPromptStart(ctx context.Context, messages []api.Message, budget int,
 	starts := make([]int, 0, len(messages))
 	changed := true
 	for i := range messages {
-		if i > 0 && messages[i-1].Role != "system" {
+		if i > 0 && !promptInstruction(messages[i-1].Role) {
 			changed = true
 		}
 		if valid[i] && changed {

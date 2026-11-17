@@ -17,6 +17,29 @@ func testConfigWithRenderer(renderer string) model.ConfigV2 {
 	return model.ConfigV2{Renderer: renderer}
 }
 
+func TestTruncationRetainsInstructionsAndTheirMedia(t *testing.T) {
+	tmpl, err := template.Parse(`{{range .Messages}}{{.Role}}:{{.Content}};{{end}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := []api.Message{
+		{Role: "system", Content: "guide", Images: []api.ImageData{[]byte("guide picture")}},
+		{Role: "developer", Content: "keep this rule"},
+		{Role: "user", Content: "old request", Images: []api.ImageData{[]byte("outdated")}},
+		{Role: "user", Content: "current", Images: []api.ImageData{[]byte("current picture")}},
+	}
+	count := func(_ context.Context, p string) ([]int, error) {
+		if strings.Contains(p, "old request") {
+			return make([]int, 8193), nil
+		}
+		return []int{1}, nil
+	}
+	p, media, err := chatPrompt(t.Context(), &Model{Template: tmpl, ProjectorPaths: []string{"vision"}}, count, &api.Options{Runner: api.Runner{NumCtx: 8192}}, history, nil, nil, true)
+	if err != nil || p != "system:[img-0]guide;developer:keep this rule;user:[img-1]current;" || len(media) != 2 || string(media[0].Data) != "guide picture" || string(media[1].Data) != "current picture" {
+		t.Fatalf("prompt=%q media=%v err=%v", p, media, err)
+	}
+}
+
 func testConfigWithRendererAndType(renderer, modelType string) model.ConfigV2 {
 	return model.ConfigV2{Renderer: renderer, ModelType: modelType}
 }

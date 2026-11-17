@@ -118,3 +118,43 @@ func TestEmbedHandlerPreparedSingleAvoidsRetokenization(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbedAtConfiguredTokenBoundaries(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	writeShowManifestVariant(t, "embedding-boundaries", manifest.RunnerGGML, manifest.FormatGGUF, model.ConfigV2{ModelFormat: manifest.FormatGGUF, Capabilities: []string{string(model.CapabilityEmbedding)}}, map[string]any{
+		"general.architecture": "llama", "llama.context_length": uint32(4),
+		"tokenizer.ggml.add_bos_token": false, "tokenizer.ggml.add_eos_token": false,
+		"tokenizer.ggml.bos_token_id": uint32(7), "tokenizer.ggml.eos_token_id": uint32(8),
+	})
+	for _, physicalLimit := range []bool{false, true} {
+		runner := &preparedEmbeddingFixture{rejectLong: physicalLimit}
+		s := &Server{sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 1),
+			finishedReqCh:   make(chan *LlmRequest, 1),
+			expiredCh:       make(chan *runnerRef, 1),
+			unloadedCh:      make(chan any, 1),
+			loaded:          make(map[string]*runnerRef),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				req.successCh <- &runnerRef{llama: runner}
+				return false
+			},
+		}}
+		go s.sched.Run(t.Context())
+		req := api.EmbedRequest{Model: "embedding-boundaries", Input: "one two three four", Truncate: &physicalLimit, Options: map[string]any{"num_ctx": 4, "num_batch": 4, "num_ubatch": 2}}
+		response := createRequest(t, s.EmbedHandler, req)
+		if response.Code != http.StatusOK {
+			t.Errorf("retry=%v status=%d body=%s", physicalLimit, response.Code, response.Body.String())
+			continue
+		}
+		want := "one two three four"
+		if physicalLimit {
+			want = "trim trim"
+		}
+		if len(runner.embedded) == 0 || runner.embedded[0] != req.Input || runner.embedded[len(runner.embedded)-1] != want {
+			t.Errorf("retry=%v embedded=%v", physicalLimit, runner.embedded)
+		}
+	}
+}

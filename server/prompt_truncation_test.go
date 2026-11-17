@@ -182,3 +182,27 @@ func TestFittingHistorySkipsTruncationPlanning(t *testing.T) {
 		t.Fatalf("start=%d calls=%d err=%v", start, calls, err)
 	}
 }
+
+func TestNativeQwenInstructionCompatibility(t *testing.T) {
+	history := []api.Message{{Role: "system", Content: "first"}, {Role: "user", Content: "question"}, {Role: "developer", Content: "second"}, {Role: "assistant", Content: "answer"}}
+	const guard = "{{ raise_exception('System message must be at the beginning.') }}"
+	for _, tc := range []struct {
+		arch, source string
+		fold         bool
+	}{
+		{"qwen35", guard, true}, {"qwen35", guard + " {{ developer }}", false}, {"qwen35", "other template", false}, {"other", guard, false},
+	} {
+		m := &Model{metadata: ggufMetadata{KV: map[string]any{"general.architecture": tc.arch, "tokenizer.chat_template": tc.source}}}
+		req, _, err := prepareNativeChatRequest(t.Context(), m, nil, nil, llm.ChatRequest{Messages: history}, false, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := history
+		if tc.fold {
+			want = []api.Message{{Role: "system", Content: "first\n\nsecond"}, history[1], history[3]}
+		}
+		if !reflect.DeepEqual(req.Messages, want) || history[0].Content != "first" {
+			t.Fatalf("%s: got %+v want %+v", tc.arch, req.Messages, want)
+		}
+	}
+}

@@ -53,10 +53,11 @@ func (r *mediaCounterRunner) ChatMediaTokenCount(context.Context, llm.ChatReques
 }
 
 func TestNativeMediaBudgetPrefersBackendCounter(t *testing.T) {
-	runner := &mediaCounterRunner{count: 2100}
-	count, err := nativeMediaTokens(t.Context(), projectorModel("qwen2vl", nil), runner, llm.ChatRequest{})
-	if err != nil || count != 2100 || runner.calls != 1 {
-		t.Fatalf("count=%d calls=%d err=%v", count, runner.calls, err)
+	runner := &mediaCounterRunner{LlamaServer: &mockRunner{TemplateFn: func(context.Context, llm.ChatRequest) (string, error) { return "text", nil }}, count: 2100}
+	req := llm.ChatRequest{Messages: []api.Message{{Role: "user", Content: "old"}, {Role: "user", Content: "current"}}}
+	msgs, _, err := truncateNativeChatMessages(t.Context(), projectorModel("qwen2vl", nil), runner, &api.Options{Runner: api.Runner{NumCtx: 2000}}, &req, true, "")
+	if err != nil || len(msgs) != 1 || msgs[0].Content != "current" || runner.calls != 2 {
+		t.Fatalf("retained=%v calls=%d err=%v", msgs, runner.calls, err)
 	}
 }
 
@@ -65,15 +66,17 @@ func TestNativeMediaBudgetReadsImageHeadersAndHonorsCancellation(t *testing.T) {
 	if err := png.Encode(&buffer, image.NewRGBA(image.Rect(0, 0, 224, 224))); err != nil {
 		t.Fatal(err)
 	}
-	req := llm.ChatRequest{Messages: []api.Message{{Role: "user", Images: []api.ImageData{buffer.Bytes(), buffer.Bytes()}}}}
+	msgs := []api.Message{{Role: "developer", Images: []api.ImageData{buffer.Bytes()}}, {Role: "user", Images: []api.ImageData{buffer.Bytes()}}, {Role: "user", Content: "continue"}}
 	m := projectorModel("qwen2vl", map[string]int{"patch_size": 14})
-	count, err := nativeMediaTokens(t.Context(), m, nil, req)
-	if err != nil || count != 132 {
-		t.Fatalf("count=%d err=%v", count, err)
+	for _, legacy := range []bool{true, false} {
+		budget, err := estimateChatMedia(t.Context(), m, msgs, legacy)
+		if err != nil || budget.at(0) != 132 || budget.at(1) != 132 || budget.at(2) != 66 {
+			t.Fatalf("legacy=%v budget=%+v err=%v", legacy, budget, err)
+		}
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := nativeMediaTokens(ctx, m, nil, req); err != context.Canceled {
+	if _, err := estimateChatMedia(ctx, m, msgs, false); err != context.Canceled {
 		t.Fatal(err)
 	}
 }

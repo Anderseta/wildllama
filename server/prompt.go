@@ -1,11 +1,11 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 
@@ -19,29 +19,32 @@ type tokenizeFunc func(context.Context, string) ([]int, error)
 
 // chatPrompt accepts a list of messages and returns the prompt and media that should be used for the next chat turn.
 // chatPrompt truncates any messages that exceed the context window of the model, making sure to always include 1) the
-// latest message and 2) system messages
+// latest message and 2) system and developer instructions
 func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.Options, msgs []api.Message, tools []api.Tool, think *api.ThinkValue, truncate bool) (prompt string, media []llm.MediaData, _ error) {
-	var system []api.Message
-
-	// TODO: This is only a truncation heuristic; llama-server handles the
-	// actual image/media inputs. Replace this with projector/model-aware media
-	// token accounting so image history is neither over-packed nor over-trimmed.
-	// Clip images are represented as 768 tokens, each an embedding.
-	imageNumTokens := 768
-
 	currMsgIdx := 0
 	countedStart := -1
 	var countedPrompt string
 
 	if truncate {
 		textOnly := !slices.ContainsFunc(msgs, func(message api.Message) bool { return len(message.Images) > 0 })
+		var budget chatMediaBudget
 		var err error
+		if !textOnly {
+			budget, err = estimateChatMedia(ctx, m, msgs, true)
+			if err != nil {
+				return "", nil, err
+			}
+		}
 		currMsgIdx, err = fittingPromptStart(ctx, msgs, opts.NumCtx, func(valid []bool) int {
 			return monotonicPromptLimit(m, msgs, false, valid)
 		}, func(i int) (int, error) {
 			// Retain only the latest candidate, never every truncation attempt.
 			countedPrompt, countedStart = "", -1
-			candidate := promptMessagesFrom(msgs, i)
+			candidate := msgs
+			// Go templates read the original history. Isolate custom renderers.
+			if i > 0 || m.Config.Renderer != "" {
+				candidate = promptMessagesFrom(msgs, i)
+			}
 			p, err := renderPrompt(m, candidate, tools, think)
 			if err != nil {
 				return 0, err
@@ -53,27 +56,19 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 			if err != nil {
 				return 0, err
 			}
-			ctxLen := len(s)
-			if m.ProjectorPaths != nil {
-				for _, msg := range candidate {
-					ctxLen += imageNumTokens * len(msg.Images)
-				}
+			mediaTokens := budget.at(i)
+			if mediaTokens > math.MaxInt-len(s) {
+				return math.MaxInt, nil
 			}
-			return ctxLen, nil
+			return len(s) + mediaTokens, nil
 		})
 		if err != nil {
 			return "", nil, err
 		}
-		system = nil
-		for _, message := range msgs[:currMsgIdx] {
-			if message.Role == "system" {
-				system = append(system, message)
-			}
-		}
 	}
 
 	if currMsgIdx > 0 {
-		slog.Debug("truncating input messages which exceed context length", "truncated", len(msgs[currMsgIdx:]))
+		slog.Debug("truncating input messages which exceed context length", "start", currMsgIdx)
 	}
 	if countedStart == currMsgIdx {
 		// Text-only preparation need not tag media or render the same history
@@ -82,13 +77,16 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	}
 	countedPrompt = ""
 
-	renderMsgs, media, err := imageTaggedMessages(m, msgs, currMsgIdx, false)
+	selected := msgs
+	if currMsgIdx > 0 {
+		selected = promptMessagesFrom(msgs, currMsgIdx)
+	}
+	renderMsgs, media, err := imageTaggedMessages(m, selected, false)
 	if err != nil {
 		return "", nil, err
 	}
 
-	// truncate any messages that do not fit into the context window
-	p, err := renderPrompt(m, append(system, renderMsgs[currMsgIdx:]...), tools, think)
+	p, err := renderPrompt(m, renderMsgs, tools, think)
 	if err != nil {
 		return "", nil, err
 	}
@@ -135,11 +133,11 @@ func promptTruncationStarts(messages []api.Message) []bool {
 	return result
 }
 
-func imageTaggedMessages(m *Model, msgs []api.Message, start int, clearImages bool) ([]api.Message, []llm.MediaData, error) {
+func imageTaggedMessages(m *Model, msgs []api.Message, clearImages bool) ([]api.Message, []llm.MediaData, error) {
 	renderMsgs := slices.Clone(msgs)
 	var media []llm.MediaData
 
-	for cnt, msg := range renderMsgs[start:] {
+	for cnt, msg := range renderMsgs {
 		if slices.Contains(m.Config.ModelFamilies, "mllama") && len(msg.Images) > 1 {
 			return nil, nil, errors.New("this model only supports one image while more than one image requested")
 		}
@@ -166,14 +164,45 @@ func imageTaggedMessages(m *Model, msgs []api.Message, start int, clearImages bo
 		}
 
 		if m.Config.Renderer == "" {
-			renderMsgs[start+cnt].Content = prefix + prompt
+			renderMsgs[cnt].Content = prefix + prompt
 		}
 		if clearImages {
-			renderMsgs[start+cnt].Images = nil
+			renderMsgs[cnt].Images = nil
 		}
 	}
 
 	return renderMsgs, media, nil
+}
+
+// Some native Qwen templates reject even a second leading instruction. Other
+// templates may implement developer roles or accept interleaved instructions.
+func nativeInstructionMessages(m *Model, messages []api.Message) ([]api.Message, error) {
+	if m == nil || !strings.HasPrefix(m.metadata.String("general.architecture"), "qwen") {
+		return messages, nil
+	}
+	for i, message := range messages {
+		if message.Role == "developer" || (i > 0 && message.Role == "system") {
+			source := m.metadata.String("tokenizer.chat_template")
+			if strings.Contains(source, "raise_exception('System message must be at the beginning.')") && !strings.Contains(source, "developer") {
+				normalized, err := renderers.NormalizeQwenInstructionMessages(messages)
+				if err != nil {
+					return nil, api.StatusError{StatusCode: 400, ErrorMessage: err.Error()}
+				}
+				return normalized, nil
+			}
+			break
+		}
+	}
+	return messages, nil
+}
+
+// Go templates issue many small writes for alternating turns. Reserve room
+// before appending and return the builder's final string without copying it.
+type promptWriter struct{ strings.Builder }
+
+func (w *promptWriter) Write(p []byte) (int, error) {
+	w.Grow(len(p))
+	return w.Builder.Write(p)
 }
 
 func renderPrompt(m *Model, msgs []api.Message, tools []api.Tool, think *api.ThinkValue) (string, error) {
@@ -186,7 +215,7 @@ func renderPrompt(m *Model, msgs []api.Message, tools []api.Tool, think *api.Thi
 		return rendered, nil
 	}
 
-	var b bytes.Buffer
+	var b promptWriter
 	thinkVal := false
 	thinkLevel := ""
 	if think != nil {

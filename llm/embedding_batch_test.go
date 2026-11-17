@@ -42,3 +42,11 @@ func TestNativeEmbeddingBatchOrderAndTokenization(t *testing.T) {
 		t.Fatalf("embedding ordering or usage: %v", err)
 	}
 }
+
+func TestDecodeSingleEmbeddingRejectsIncompleteResults(t *testing.T) {
+	for _, body := range []string{`{"data":[{"embedding":null}]}`, `{"data":[{"embedding":[]}]}`, `[]`, `[{"embedding":[[]]}]`, `{"data":[{"embedding":[1]},{"embedding":[2]}]}`} {
+		if _, _, err := decodeEmbeddingResponse([]byte(body)); err == nil {
+			t.Errorf("accepted %s", body)
+		}
+	}
+}

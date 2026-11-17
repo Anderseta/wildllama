@@ -8,40 +8,55 @@ import (
 	"math"
 	"strings"
 
-	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/api"
 )
 
-// Prefer a backend's exact preprocessing cost when available. Older native
-// payloads expose text tokens only, so account for the projector separately.
-func nativeMediaTokens(ctx context.Context, m *Model, runner llm.LlamaServer, req llm.ChatRequest) (int, error) {
-	if counter, ok := runner.(interface {
-		ChatMediaTokenCount(context.Context, llm.ChatRequest) (int, error)
-	}); ok {
-		return counter.ChatMediaTokenCount(ctx, req)
-	}
+// Each candidate retains every instruction and a suffix of the conversation.
+// Read the media headers once per request, even if several cut points are tried.
+type chatMediaBudget struct {
+	total         int64
+	removedBefore []int64
+}
+
+func estimateChatMedia(ctx context.Context, m *Model, messages []api.Message, legacy bool) (chatMediaBudget, error) {
+	var budget chatMediaBudget
 	if m == nil || len(m.ProjectorPaths) == 0 {
-		return 0, nil
+		return budget, nil
 	}
-	total := 0
-	for _, message := range req.Messages {
+	var removable int64
+	for i, message := range messages {
+		if len(message.Images) > 0 && budget.removedBefore == nil {
+			budget.removedBefore = make([]int64, len(messages))
+		}
+		if budget.removedBefore != nil {
+			budget.removedBefore[i] = removable
+		}
 		for _, data := range message.Images {
 			if err := ctx.Err(); err != nil {
-				return 0, err
+				return chatMediaBudget{}, err
 			}
-			// Decode headers only; no full-resolution image buffers or base64 copies.
-			config, _, err := image.DecodeConfig(io.LimitReader(bytes.NewReader(data), 128<<10))
-			width, height := config.Width, config.Height
-			if err != nil {
-				width, height = 0, 0
+			cost := 768 // Legacy templates without projector metadata.
+			if !legacy || len(m.projectorMetadata) > 0 {
+				config, _, err := image.DecodeConfig(io.LimitReader(bytes.NewReader(data), 128<<10))
+				if err != nil {
+					config = image.Config{}
+				}
+				cost = projectorImageTokens(m, config.Width, config.Height)
 			}
-			cost := projectorImageTokens(m, width, height)
-			if total > math.MaxInt-cost {
-				return math.MaxInt, nil
+			budget.total += int64(cost)
+			if !promptInstruction(message.Role) {
+				removable += int64(cost)
 			}
-			total += cost
 		}
 	}
-	return total, nil
+	return budget, nil
+}
+
+func (budget chatMediaBudget) at(start int) int {
+	if budget.removedBefore == nil {
+		return 0
+	}
+	return int(min(budget.total-budget.removedBefore[start], int64(math.MaxInt)))
 }
 
 func projectorImageTokens(m *Model, width, height int) int {
