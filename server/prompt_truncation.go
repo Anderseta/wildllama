@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/ollama/ollama/api"
@@ -13,7 +14,7 @@ import (
 // Only these reviewed ChatML renderers remove whole, independently delimited
 // message blocks. Arbitrary Jinja/Go templates need the exact linear fallback:
 // their output can grow, or change entirely, when an old message is removed.
-func monotonicPromptLimit(m *Model, messages []api.Message, native bool) int {
+func monotonicPromptLimit(m *Model, messages []api.Message, native bool, starts []bool) int {
 	if m == nil || len(messages) < 32 {
 		return -1
 	}
@@ -59,7 +60,6 @@ func monotonicPromptLimit(m *Model, messages []api.Message, native bool) int {
 		}
 	}
 	// Keeping the latest real user query preserves historical-thinking policy.
-	starts := promptTruncationStarts(messages)
 	for i := 0; i <= lastQuery; i++ {
 		if messages[i].Role == "tool" && starts[i] {
 			return -1
@@ -81,7 +81,19 @@ func promptMessagesFrom(messages []api.Message, start int) []api.Message {
 	return append(system, messages[start:]...)
 }
 
-func fittingPromptStart(ctx context.Context, messages []api.Message, budget, monotonicLimit int, count func(int) (int, error)) (int, error) {
+func fittingPromptStart(ctx context.Context, messages []api.Message, budget int, limit func([]bool) int, count func(int) (int, error)) (int, error) {
+	if len(messages) == 0 || ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	// Keeping the entire history is always a legal boundary, including tool
+	// groups. Only build the tool-ownership map when truncation is necessary.
+	size, err := count(0)
+	if err != nil {
+		return 0, err
+	}
+	if size <= budget || ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
 	valid := promptTruncationStarts(messages)
 	starts := make([]int, 0, len(messages))
 	changed := true
@@ -94,9 +106,6 @@ func fittingPromptStart(ctx context.Context, messages []api.Message, budget, mon
 			changed = false
 		}
 	}
-	if len(starts) == 0 {
-		return 0, ctx.Err()
-	}
 	fits := func(index int) (bool, error) {
 		if err := ctx.Err(); err != nil {
 			return false, err
@@ -107,18 +116,12 @@ func fittingPromptStart(ctx context.Context, messages []api.Message, budget, mon
 		}
 		return size <= budget, err
 	}
-	ok, err := fits(0)
-	if err != nil || ok {
-		return starts[0], err
-	}
 	next := 1
-	if len(starts) >= 32 && monotonicLimit >= 0 {
-		high := len(starts) - 1
-		for high > 0 && starts[high] > monotonicLimit {
-			high--
-		}
+	if len(starts) >= 32 {
+		monotonicLimit := limit(valid)
+		high := sort.Search(len(starts), func(i int) bool { return starts[i] > monotonicLimit }) - 1
 		if high > 1 {
-			ok, err = fits(high)
+			ok, err := fits(high)
 			if err != nil {
 				return 0, err
 			}
@@ -142,7 +145,7 @@ func fittingPromptStart(ctx context.Context, messages []api.Message, budget, mon
 		}
 	}
 	for i := next; i < len(starts); i++ {
-		ok, err = fits(i)
+		ok, err := fits(i)
 		if err != nil || ok {
 			return starts[i], err
 		}

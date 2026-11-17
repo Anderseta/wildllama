@@ -3773,9 +3773,13 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 	counter, canCount := r.(interface {
 		ApplyChatTemplateWithTokenCount(context.Context, llm.ChatRequest) (string, int, error)
 	})
-	currMsgIdx, err := fittingPromptStart(ctx, req.Messages, opts.NumCtx, monotonicPromptLimit(m, req.Messages, true), func(i int) (int, error) {
+	currMsgIdx, err := fittingPromptStart(ctx, req.Messages, opts.NumCtx, func(valid []bool) int {
+		return monotonicPromptLimit(m, req.Messages, true, valid)
+	}, func(i int) (int, error) {
 		renderReq := *req
-		renderReq.Messages = promptMessagesFrom(req.Messages, i)
+		if i > 0 {
+			renderReq.Messages = promptMessagesFrom(req.Messages, i)
+		}
 		var ctxLen int
 		if canPrepare && prepareKey != "" {
 			renderReq.PreparedChat = prepareKey

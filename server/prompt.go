@@ -36,7 +36,9 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	if truncate {
 		textOnly := !slices.ContainsFunc(msgs, func(message api.Message) bool { return len(message.Images) > 0 })
 		var err error
-		currMsgIdx, err = fittingPromptStart(ctx, msgs, opts.NumCtx, monotonicPromptLimit(m, msgs, false), func(i int) (int, error) {
+		currMsgIdx, err = fittingPromptStart(ctx, msgs, opts.NumCtx, func(valid []bool) int {
+			return monotonicPromptLimit(m, msgs, false, valid)
+		}, func(i int) (int, error) {
 			// Retain only the latest candidate, never every truncation attempt.
 			countedPrompt, countedStart = "", -1
 			candidate := promptMessagesFrom(msgs, i)

@@ -16,6 +16,27 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
+func BenchmarkNativeChatHistoryEncoding(b *testing.B) {
+	runner := &llamaServerRunner{}
+	messages := make([]api.Message, 0, 1024)
+	for range 512 {
+		messages = append(messages,
+			api.Message{Role: "user", Content: "Check the following procedure."},
+			api.Message{Role: "assistant", Content: "The check passed.", Thinking: "I verified the inputs."})
+	}
+	req := ChatRequest{Messages: messages}
+	b.ReportAllocs()
+	for b.Loop() {
+		body, err := runner.llamaServerChatRequest(req, true)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err = encodeLlamaServerChatRequest(body); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestNativeChatPreservesAssistantReasoningOnly(t *testing.T) {
 	for _, role := range []string{"assistant", "user", "system", "tool"} {
 		t.Run(role, func(t *testing.T) {
@@ -24,7 +45,15 @@ func TestNativeChatPreservesAssistantReasoningOnly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			reasoning, exists := converted["reasoning_content"]
+			body, err := json.Marshal(converted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(body, &fields); err != nil {
+				t.Fatal(err)
+			}
+			reasoning, exists := fields["reasoning_content"]
 			if role == "assistant" {
 				if !exists || reasoning != message.Thinking {
 					t.Fatalf("assistant reasoning was not preserved byte-for-byte: %#v", reasoning)
@@ -32,7 +61,7 @@ func TestNativeChatPreservesAssistantReasoningOnly(t *testing.T) {
 			} else if exists {
 				t.Fatalf("%s must not acquire assistant reasoning", role)
 			}
-			if converted["content"] != message.Content {
+			if fields["content"] != message.Content {
 				t.Fatal("reasoning conversion changed visible content")
 			}
 		})
@@ -41,8 +70,9 @@ func TestNativeChatPreservesAssistantReasoningOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := converted["reasoning_content"]; exists {
-		t.Fatal("empty reasoning should not override the template's default")
+	body, err := json.Marshal(converted)
+	if err != nil || string(body) != `{"content":"","role":"assistant"}` {
+		t.Fatalf("unexpected empty assistant message %s: %v", body, err)
 	}
 }
 

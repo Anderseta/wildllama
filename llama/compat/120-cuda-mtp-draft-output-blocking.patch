@@ -1,0 +1,84 @@
+--- a/common/speculative-output.h
++++ b/common/speculative-output.h
+@@ -8,16 +8,36 @@
+ // or submit. It never caches readiness across generations or changes public
+ // getter synchronization, and it owns no tensor/staging storage.
+ class common_speculative_output {
++public:
++    using wait_setter = bool (*)(bool);
++
++private:
++    struct wait_scope {
++        const wait_setter set_wait;
++        const bool previous;
++
++        explicit wait_scope(wait_setter setter) : set_wait(setter), previous(setter && setter(true)) {}
++        ~wait_scope() { if (set_wait) { set_wait(previous); } }
++        wait_scope(const wait_scope &) = delete;
++        wait_scope & operator=(const wait_scope &) = delete;
++    };
++
+     llama_context * context;
++    const wait_setter set_wait;
+     bool completed = false;
+     bool supported = true;
+ 
+     void complete() {
+-        if (!completed) { llama_synchronize(context); completed = true; }
++        if (!completed) {
++            const wait_scope wait(set_wait);
++            llama_synchronize(context);
++            completed = true;
++        }
+     }
+ 
+ public:
+-    explicit common_speculative_output(llama_context * context) : context(context) {}
++    explicit common_speculative_output(llama_context * context, wait_setter set_wait = nullptr)
++        : context(context), set_wait(set_wait) {}
+     common_speculative_output(const common_speculative_output &) = delete;
+     common_speculative_output & operator=(const common_speculative_output &) = delete;
+ 
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1539,6 +1539,17 @@
+ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+ 
++    const common_speculative_output::wait_setter set_output_wait = []() -> common_speculative_output::wait_setter {
++        const char * enabled = std::getenv("WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING");
++        if (enabled && std::atoi(enabled) != 0) {
++            if (auto * cuda = ggml_backend_reg_by_name("CUDA")) {
++                return reinterpret_cast<common_speculative_output::wait_setter>(
++                    ggml_backend_reg_get_proc_address(cuda, "ggml_backend_cuda_set_target_wait"));
++            }
++        }
++        return nullptr;
++    }();
++
+     common_batch batch;
+ 
+     std::vector<common_sampler_ptr> smpls;
+@@ -2088,7 +2099,7 @@
+                 break;
+             }
+             submitted();
+-            common_speculative_output outputs(ctx_dft);
++            common_speculative_output outputs(ctx_dft, set_output_wait);
+ 
+             // rebuild the batch for the next step: the growing-KV paths re-add only the
+             // new token (the KV already holds the prefix), while chained heads re-add the
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3591,8 +3591,9 @@
+     bool blocking = false;
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-    static const bool target_wait = ggml_cuda_env_flag("WILDLLAMA_CUDA_TARGET_BLOCKING");
+-    if ((target_wait && cuda_host_target_wait_blocking) ||
++    static const bool scoped_wait = ggml_cuda_env_flag("WILDLLAMA_CUDA_TARGET_BLOCKING") ||
++                                    ggml_cuda_env_flag("WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING");
++    if ((scoped_wait && cuda_host_target_wait_blocking) ||
+         (prefill && ggml_cuda_env_flag("WILDLLAMA_CUDA_PREFILL_BLOCKING"))) {
+         blocking = ggml_cuda_synchronize_blocking(*cuda_ctx, cuda_ctx->stream());
+     } else

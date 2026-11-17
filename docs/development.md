@@ -87,6 +87,12 @@ blocking policy to that host call. Prompt batches, the MTP draft and the
 sampler keep their original synchronization paths. The phase trace reports
 these waits independently of the selected policy.
 
+For single-slot Qwen35 with Q8_0 KV, two MTP proposals and one SM120 GPU,
+the launcher enables the target and prefill waits plus
+`WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING`. The latter sleeps at the host readback
+of draft output. Each switch accepts an explicit `0` override. The native
+runner used directly enables these waits only when requested.
+
 ## macOS (Apple Silicon)
 
 Additional prerequisites:

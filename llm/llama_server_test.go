@@ -1321,8 +1321,9 @@ func TestLlamaServerPreservedTokens(t *testing.T) {
 func TestCUDAKernelDefaults(t *testing.T) {
 	const fastSign = "WILDLLAMA_CUDA_IQ3_FAST_SIGN"
 	const replay = "WILDLLAMA_GDN_REUSE_REPLAY"
+	waits := []string{"WILDLLAMA_CUDA_TARGET_BLOCKING", "WILDLLAMA_CUDA_PREFILL_BLOCKING", "WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING"}
 	names := []string{"WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP", "WILDLLAMA_CUDA_GDN_GATHER", fastSign, replay}
-	for _, name := range names {
+	for _, name := range slices.Concat(names, waits) {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -1338,16 +1339,17 @@ func TestCUDAKernelDefaults(t *testing.T) {
 	}
 	environment := map[string]string{}
 	setCUDAKernelDefaults(environment, launch)
-	for _, name := range names {
+	for _, name := range slices.Concat(names, waits) {
 		if environment[name] != "1" {
 			t.Fatalf("missing default for %s", name)
 		}
 	}
 	t.Setenv(names[0], "0")
 	t.Setenv(fastSign, "0")
+	t.Setenv(waits[0], "0")
 	environment = map[string]string{"ggml_cuda_q4_head_warp": "0", replay: "0"}
 	setCUDAKernelDefaults(environment, launch)
-	if len(environment) != 3 || environment[names[2]] != "1" || environment[replay] != "0" {
+	if len(environment) != 5 || environment[names[2]] != "1" || environment[replay] != "0" || environment[waits[0]] != "" {
 		t.Fatalf("an explicit override was replaced: %v", environment)
 	}
 	launch.modelArch = "future-model"
@@ -1355,6 +1357,11 @@ func TestCUDAKernelDefaults(t *testing.T) {
 	launch.opts.DraftNumPredict = 3
 	environment = map[string]string{}
 	setCUDAKernelDefaults(environment, launch)
+	for _, name := range waits {
+		if _, ok := environment[name]; ok {
+			t.Fatalf("applied unmeasured wait to another workload: %s", name)
+		}
+	}
 	if environment[names[1]] != "1" || environment[names[2]] != "1" || environment[replay] != "1" {
 		t.Fatalf("native kernel checks were bypassed for a new model: %v", environment)
 	}
@@ -3939,9 +3946,9 @@ func TestLlamaServerChatMessageConvertsToolCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	toolCalls, ok := msg["tool_calls"].([]llamaServerChatToolCall)
-	if !ok || len(toolCalls) != 1 {
-		t.Fatalf("expected one llama-server tool call, got %#v", msg["tool_calls"])
+	toolCalls := msg.Calls
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one llama-server tool call, got %#v", msg.Calls)
 	}
 	if toolCalls[0].Index != 2 || toolCalls[0].Type != "function" || toolCalls[0].Function.Name != "bash" {
 		t.Fatalf("unexpected tool call metadata: %#v", toolCalls[0])
@@ -3969,9 +3976,9 @@ func TestLlamaServerChatMessageConvertsMediaParts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts, ok := msg["content"].([]map[string]any)
+	parts, ok := msg.Content.([]map[string]any)
 	if !ok || len(parts) != 5 {
-		t.Fatalf("expected five content parts, got %#v", msg["content"])
+		t.Fatalf("expected five content parts, got %#v", msg.Content)
 	}
 	if parts[1]["type"] != "image_url" {
 		t.Fatalf("expected image_url for PNG, got %#v", parts[1])

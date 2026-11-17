@@ -540,6 +540,9 @@ func setCUDAKernelDefaults(environment map[string]string, launch llamaServerLaun
 	if draftType == draftTypeMTP && launch.opts.DraftNumPredict > 0 {
 		defaults = append(defaults, "WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP",
 			"WILDLLAMA_CUDA_GDN_GATHER", "WILDLLAMA_GDN_REUSE_REPLAY")
+		if launch.numParallel == 1 && launch.modelArch == "qwen35" && launch.kvCacheType == "q8_0" && launch.opts.DraftNumPredict == 2 {
+			defaults = append(defaults, "WILDLLAMA_CUDA_TARGET_BLOCKING", "WILDLLAMA_CUDA_PREFILL_BLOCKING", "WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING")
+		}
 	}
 	for _, name := range defaults {
 		_, configured := os.LookupEnv(name)
@@ -2690,7 +2693,7 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 		req.Options = &opts
 	}
 
-	messages := make([]map[string]any, 0, len(req.Messages))
+	messages := make([]nativeChatMessage, 0, len(req.Messages))
 	for _, msg := range req.Messages {
 		converted, err := llamaServerChatMessage(MessageFromAPI(msg))
 		if err != nil {
@@ -2766,31 +2769,33 @@ func llamaServerChatTemplateKwargs(think *api.ThinkValue) map[string]any {
 	return kwargs
 }
 
-func llamaServerChatMessage(msg Message) (map[string]any, error) {
-	converted := map[string]any{
-		"role": msg.Role,
-	}
+// Keep the original JSON key order for templates that iterate message fields.
+type nativeChatMessage struct {
+	Content   any                       `json:"content"`
+	Name      string                    `json:"name,omitempty"`
+	Reasoning string                    `json:"reasoning_content,omitempty"`
+	Role      string                    `json:"role"`
+	CallID    string                    `json:"tool_call_id,omitempty"`
+	Calls     []llamaServerChatToolCall `json:"tool_calls,omitempty"`
+}
+
+func llamaServerChatMessage(msg Message) (nativeChatMessage, error) {
+	converted := nativeChatMessage{Role: msg.Role, Name: msg.ToolName, CallID: msg.ToolCallID}
 	// Native templates decide which assistant reasoning belongs in the history.
 	// Preserve it separately instead of changing content or thinking policy here.
 	if msg.Role == "assistant" && msg.Thinking != "" {
-		converted["reasoning_content"] = msg.Thinking
-	}
-	if msg.ToolCallID != "" {
-		converted["tool_call_id"] = msg.ToolCallID
-	}
-	if msg.ToolName != "" {
-		converted["name"] = msg.ToolName
+		converted.Reasoning = msg.Thinking
 	}
 	if len(msg.ToolCalls) > 0 {
 		toolCalls, err := llamaServerChatToolCalls(msg.ToolCalls)
 		if err != nil {
-			return nil, err
+			return nativeChatMessage{}, err
 		}
-		converted["tool_calls"] = toolCalls
+		converted.Calls = toolCalls
 	}
 
 	if len(msg.Media) == 0 {
-		converted["content"] = msg.Content
+		converted.Content = msg.Content
 		return converted, nil
 	}
 
@@ -2804,11 +2809,11 @@ func llamaServerChatMessage(msg Message) (map[string]any, error) {
 	for _, media := range msg.Media {
 		part, err := llamaServerChatMediaPart(media)
 		if err != nil {
-			return nil, err
+			return nativeChatMessage{}, err
 		}
 		parts = append(parts, part)
 	}
-	converted["content"] = parts
+	converted.Content = parts
 	return converted, nil
 }
 

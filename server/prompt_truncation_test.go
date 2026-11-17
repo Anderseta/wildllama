@@ -28,11 +28,11 @@ func TestFittingPromptStartMatchesLinearWithFewerCounts(t *testing.T) {
 		linearCalls, fastCalls := 0, 0
 		linear := func(i int) (int, error) { linearCalls++; return len(promptMessagesFrom(messages, i)), nil }
 		fast := func(i int) (int, error) { fastCalls++; return len(promptMessagesFrom(messages, i)), nil }
-		want, err := fittingPromptStart(t.Context(), messages, budget, -1, linear)
+		want, err := fittingPromptStart(t.Context(), messages, budget, func([]bool) int { return -1 }, linear)
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := fittingPromptStart(t.Context(), messages, budget, len(messages)-1, fast)
+		got, err := fittingPromptStart(t.Context(), messages, budget, func([]bool) int { return len(messages) - 1 }, fast)
 		if err != nil || got != want {
 			t.Fatalf("budget=%d start=%d want=%d err=%v", budget, got, want, err)
 		}
@@ -60,7 +60,7 @@ func TestNativeLongTruncationMatchesLinearForReviewedTemplates(t *testing.T) {
 			messages[101] = api.Message{Role: "tool", ToolCallID: "two", Content: "second result"}
 			messages[102] = api.Message{Role: "tool", ToolCallID: "one", Content: "first result"}
 			original := slices.Clone(messages)
-			if monotonicPromptLimit(m, messages, true) < 0 || monotonicPromptLimit(m, messages, false) < 0 {
+			if monotonicPromptLimit(m, messages, true, promptTruncationStarts(messages)) < 0 || monotonicPromptLimit(m, messages, false, promptTruncationStarts(messages)) < 0 {
 				t.Fatal("reviewed template was not recognized")
 			}
 			for _, budget := range []int{120, 500, 1700} {
@@ -111,17 +111,17 @@ func TestUnknownTemplateKeepsEarliestNonMonotonicFit(t *testing.T) {
 func TestMonotonicPromptLimitRejectsUnreviewedInputs(t *testing.T) {
 	m := &Model{Config: testConfigWithRenderer("qwen3.5")}
 	messages := longTruncationHistory()
-	if monotonicPromptLimit(m, messages, false) < 0 {
+	if monotonicPromptLimit(m, messages, false, promptTruncationStarts(messages)) < 0 {
 		t.Fatal("expected reviewed renderer")
 	}
 	for _, message := range []api.Message{{Role: "system"}, {Role: "developer"}, {Role: "user", Images: []api.ImageData{[]byte("image")}}} {
 		changed := slices.Clone(messages)
 		changed[10] = message
-		if monotonicPromptLimit(m, changed, false) >= 0 {
+		if monotonicPromptLimit(m, changed, false, promptTruncationStarts(changed)) >= 0 {
 			t.Fatalf("unsafe fast path for %#v", message)
 		}
 	}
-	if monotonicPromptLimit(m, messages, true) >= 0 {
+	if monotonicPromptLimit(m, messages, true, promptTruncationStarts(messages)) >= 0 {
 		t.Fatal("renderer name must not authorize an arbitrary native template")
 	}
 }
@@ -131,7 +131,7 @@ func TestFittingPromptStartStopsDuringBinarySearch(t *testing.T) {
 	defer cancel()
 	calls := 0
 	messages := longTruncationHistory()
-	_, err := fittingPromptStart(ctx, messages, 20, len(messages)-1, func(i int) (int, error) {
+	_, err := fittingPromptStart(ctx, messages, 20, func([]bool) int { return len(messages) - 1 }, func(i int) (int, error) {
 		calls++
 		if calls == 2 {
 			cancel()
@@ -153,7 +153,7 @@ func BenchmarkPromptTruncation(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				_, err := fittingPromptStart(b.Context(), messages, 20, limit, func(i int) (int, error) {
+				_, err := fittingPromptStart(b.Context(), messages, 20, func([]bool) int { return limit }, func(i int) (int, error) {
 					// Mirror the word tokenizer used by the HTTP runner test fixture.
 					return len(strings.Fields(nativeChatQualityPrompt(llm.ChatRequest{Messages: promptMessagesFrom(messages, i)}))), nil
 				})
@@ -162,5 +162,23 @@ func BenchmarkPromptTruncation(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestFittingHistorySkipsTruncationPlanning(t *testing.T) {
+	messages := longTruncationHistory()
+	calls := 0
+	start, err := fittingPromptStart(t.Context(), messages, 100, func([]bool) int {
+		t.Fatal("evaluated truncation policy for a fitting prompt")
+		return -1
+	}, func(index int) (int, error) {
+		calls++
+		if index != 0 {
+			t.Fatalf("counted suffix %d", index)
+		}
+		return 100, nil
+	})
+	if err != nil || start != 0 || calls != 1 {
+		t.Fatalf("start=%d calls=%d err=%v", start, calls, err)
 	}
 }
