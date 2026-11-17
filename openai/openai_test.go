@@ -22,6 +22,70 @@ func testArgs(m map[string]any) api.ToolCallFunctionArguments {
 	return args
 }
 
+func TestMultipartChatHistory(t *testing.T) {
+	var r ChatCompletionRequest
+	err := json.Unmarshal([]byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"look "},{"type":"text","text":"up"}]},
+		{"role":"assistant","content":[],"reasoning":"first","tool_calls":[{"id":"id","function":{"name":"search","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"id","content":"found"},
+		{"role":"assistant","content":[],"tool_calls":[{"id":"id","function":{"name":"read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"id","content":"text"},
+		{"role":"assistant","content":[{"type":"text","text":"done"}],"reasoning":"second"}
+	]}`), &r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := FromChatRequest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := request.Messages
+	if len(m) != 6 {
+		t.Fatalf("got %d messages, want 6", len(m))
+	}
+	if m[0].Content != "look up" || len(m[0].ToolCalls) != 0 || m[5].Thinking != "second" {
+		t.Fatalf("text history: %+v, %+v", m[0], m[5])
+	}
+	for i, name := range map[int]string{1: "search", 3: "read"} {
+		if m[i].Role != "assistant" || len(m[i].ToolCalls) != 1 || m[i].ToolCalls[0].Function.Name != name || m[i+1].ToolName != name {
+			t.Fatalf("wrong call/result pair: %+v, %+v", m[i], m[i+1])
+		}
+	}
+	if m[1].Thinking != "first" {
+		t.Errorf("thinking = %q", m[1].Thinking)
+	}
+}
+
+func TestChatCompletionTokenCap(t *testing.T) {
+	for _, tc := range []struct {
+		input   string
+		want    any
+		invalid bool
+	}{
+		{`{}`, nil, false},
+		{`{"max_tokens":6}`, 6, false},
+		{`{"max_completion_tokens":2}`, 2, false},
+		{`{"max_completion_tokens":1,"max_tokens":6}`, 1, false},
+		{`{"max_completion_tokens":0}`, nil, true},
+		{`{"max_completion_tokens":-1}`, nil, true},
+	} {
+		var r ChatCompletionRequest
+		if err := json.Unmarshal([]byte(tc.input), &r); err != nil {
+			t.Fatal(err)
+		}
+		got, err := FromChatRequest(r)
+		if tc.invalid {
+			if err == nil {
+				t.Errorf("accepted %s", tc.input)
+			}
+		} else if err != nil {
+			t.Errorf("%s: %v", tc.input, err)
+		} else if cap := got.Options["num_predict"]; cap != tc.want {
+			t.Errorf("%s: got cap %v, want %v", tc.input, cap, tc.want)
+		}
+	}
+}
+
 // argsComparer provides cmp options for comparing ToolCallFunctionArguments by value
 var argsComparer = cmp.Comparer(func(a, b api.ToolCallFunctionArguments) bool {
 	return cmp.Equal(a.ToMap(), b.ToMap())

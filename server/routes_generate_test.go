@@ -3135,3 +3135,13 @@ func TestImageGenerateUnsupported(t *testing.T) {
 		t.Fatalf("expected unsupported error in body, got %q", w.Body.String())
 	}
 }
+
+func TestLogprobBytesIncludeTokenFragments(t *testing.T) {
+	got := toAPILogprobs([]llm.Logprob{{
+		TokenLogprob: llm.TokenLogprob{Bytes: []int{240, 159}},
+		TopLogprobs:  []llm.TokenLogprob{{Bytes: []int{240}}, {Token: "é"}},
+	}})
+	if diff := cmp.Diff([][]int{{240, 159}, {240}, {195, 169}}, [][]int{got[0].Bytes, got[0].TopLogprobs[0].Bytes, got[0].TopLogprobs[1].Bytes}); diff != "" {
+		t.Fatalf("token bytes (-want +got):\n%s", diff)
+	}
+}

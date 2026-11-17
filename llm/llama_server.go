@@ -1895,8 +1895,9 @@ type llamaServerApplyTemplateResponse struct {
 
 type llamaServerTokenProb struct {
 	Token       string                 `json:"token"`
-	Logprob     float64                `json:"logprob"`
-	Prob        float64                `json:"prob"`
+	Bytes       []int                  `json:"bytes"`
+	Logprob     *float64               `json:"logprob"`
+	Prob        *float64               `json:"prob"`
 	TopLogprobs []llamaServerTokenProb `json:"top_logprobs"`
 	TopProbs    []llamaServerTokenProb `json:"top_probs"`
 }
@@ -2113,7 +2114,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 				}
 			}
 
-			if lsResp.Content != "" && !lsResp.Stop {
+			if !lsResp.Stop && (lsResp.Content != "" || len(lsResp.CompletionProbabilities) > 0) {
 				fn(CompletionResponse{
 					Content:  lsResp.Content,
 					Logprobs: convertLogprobs(lsResp.CompletionProbabilities, req.TopLogprobs > 0),
@@ -2128,6 +2129,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 
 				finalResp = CompletionResponse{
 					Content:               lsResp.Content,
+					Logprobs:              convertLogprobs(lsResp.CompletionProbabilities, req.TopLogprobs > 0),
 					Done:                  true,
 					DoneReason:            doneReason,
 					PromptEvalCount:       lsResp.Timings.promptEvalCount(),
@@ -2210,6 +2212,20 @@ func (s *llamaServerRunner) statusErrorMessage(body []byte) string {
 	return errMsg
 }
 
+func (p llamaServerTokenProb) tokenLogprob() TokenLogprob {
+	token := TokenLogprob{Token: p.Token, Bytes: p.Bytes}
+	switch {
+	case p.Logprob != nil:
+		token.Logprob = *p.Logprob
+	case p.Prob != nil && *p.Prob > 0:
+		token.Logprob = math.Log(*p.Prob)
+	case p.Prob != nil:
+		// Match llama-server's finite JSON representation for log(0).
+		token.Logprob = -math.MaxFloat32
+	}
+	return token
+}
+
 // convertLogprobs converts llama-server's completion_probabilities to Ollama's Logprob format.
 // includeTop controls whether top alternatives are included in the output.
 func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
@@ -2218,17 +2234,7 @@ func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
 	}
 	result := make([]Logprob, len(probs))
 	for i, p := range probs {
-		// llama-server uses "logprob" for log-probs mode, "prob" for sampling-probs mode
-		logprob := p.Logprob
-		if logprob == 0 && p.Prob != 0 {
-			logprob = p.Prob // Use whichever is set
-		}
-		result[i] = Logprob{
-			TokenLogprob: TokenLogprob{
-				Token:   p.Token,
-				Logprob: logprob,
-			},
-		}
+		result[i].TokenLogprob = p.tokenLogprob()
 
 		if !includeTop {
 			continue
@@ -2239,15 +2245,11 @@ func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
 		if len(topProbs) == 0 {
 			topProbs = p.TopProbs
 		}
-		for _, tp := range topProbs {
-			tl := tp.Logprob
-			if tl == 0 && tp.Prob != 0 {
-				tl = tp.Prob
+		if len(topProbs) > 0 {
+			result[i].TopLogprobs = make([]TokenLogprob, len(topProbs))
+			for j, alternative := range topProbs {
+				result[i].TopLogprobs[j] = alternative.tokenLogprob()
 			}
-			result[i].TopLogprobs = append(result[i].TopLogprobs, TokenLogprob{
-				Token:   tp.Token,
-				Logprob: tl,
-			})
 		}
 	}
 	return result

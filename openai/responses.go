@@ -809,6 +809,9 @@ func FromResponsesRequest(r ResponsesRequest, thinking ...*model.Thinking) (*api
 	}
 
 	if r.MaxOutputTokens != nil {
+		if *r.MaxOutputTokens <= 0 {
+			return nil, errors.New("max_output_tokens must be greater than zero")
+		}
 		options["num_predict"] = *r.MaxOutputTokens
 	}
 

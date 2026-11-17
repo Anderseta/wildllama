@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -133,6 +135,31 @@ func TestLlamaServerCompletionRequiresTerminalMarker(t *testing.T) {
 			}
 			runner.sem.Release(1)
 		})
+	}
+}
+
+func TestLlamaServerCompletionProbabilityFrames(t *testing.T) {
+	stream := `data: {"content":"","completion_probabilities":[{"token":"","bytes":[240,159],"prob":0.25,"top_probs":[{"token":"","bytes":[240],"prob":0}]}]}
+
+data: {"stop":true,"content":"end","completion_probabilities":[{"token":"end","logprob":0,"prob":0.125}]}
+
+`
+	runner, _, _ := terminalTestRunner(t, stream, nil)
+	opts := api.DefaultOptions()
+	var frames []CompletionResponse
+	err := runner.Completion(t.Context(), CompletionRequest{Prompt: "test", Options: &opts, Logprobs: true, TopLogprobs: 1}, func(r CompletionResponse) { frames = append(frames, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 2 || !frames[1].Done || frames[1].Content != "end" || len(frames[0].Logprobs) != 1 || len(frames[1].Logprobs) != 1 {
+		t.Fatalf("unexpected frames: %+v", frames)
+	}
+	p := frames[0].Logprobs[0]
+	if p.Logprob != math.Log(0.25) || len(p.TopLogprobs) != 1 || p.TopLogprobs[0].Logprob != -math.MaxFloat32 || frames[1].Logprobs[0].Logprob != 0 {
+		t.Fatalf("unexpected scores: %+v, %+v", p, frames[1].Logprobs)
+	}
+	if !slices.Equal(p.Bytes, []int{240, 159}) || !slices.Equal(p.TopLogprobs[0].Bytes, []int{240}) {
+		t.Fatalf("lost token bytes: %+v", p)
 	}
 }
 

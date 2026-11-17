@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -109,24 +108,25 @@ type Reasoning struct {
 }
 
 type ChatCompletionRequest struct {
-	Model            string          `json:"model"`
-	Messages         []Message       `json:"messages"`
-	Stream           bool            `json:"stream"`
-	StreamOptions    *StreamOptions  `json:"stream_options"`
-	MaxTokens        *int            `json:"max_tokens"`
-	Seed             *int            `json:"seed"`
-	Stop             any             `json:"stop"`
-	Temperature      *float64        `json:"temperature"`
-	FrequencyPenalty *float64        `json:"frequency_penalty"`
-	PresencePenalty  *float64        `json:"presence_penalty"`
-	TopP             *float64        `json:"top_p"`
-	ResponseFormat   *ResponseFormat `json:"response_format"`
-	Tools            []api.Tool      `json:"tools"`
-	Reasoning        *Reasoning      `json:"reasoning,omitempty"`
-	ReasoningEffort  *string         `json:"reasoning_effort,omitempty"`
-	Logprobs         *bool           `json:"logprobs"`
-	TopLogprobs      int             `json:"top_logprobs"`
-	DebugRenderOnly  bool            `json:"_debug_render_only"`
+	Model               string          `json:"model"`
+	Messages            []Message       `json:"messages"`
+	Stream              bool            `json:"stream"`
+	StreamOptions       *StreamOptions  `json:"stream_options"`
+	MaxTokens           *int            `json:"max_tokens"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	Seed                *int            `json:"seed"`
+	Stop                any             `json:"stop"`
+	Temperature         *float64        `json:"temperature"`
+	FrequencyPenalty    *float64        `json:"frequency_penalty"`
+	PresencePenalty     *float64        `json:"presence_penalty"`
+	TopP                *float64        `json:"top_p"`
+	ResponseFormat      *ResponseFormat `json:"response_format"`
+	Tools               []api.Tool      `json:"tools"`
+	Reasoning           *Reasoning      `json:"reasoning,omitempty"`
+	ReasoningEffort     *string         `json:"reasoning_effort,omitempty"`
+	Logprobs            *bool           `json:"logprobs"`
+	TopLogprobs         int             `json:"top_logprobs"`
+	DebugRenderOnly     bool            `json:"_debug_render_only"`
 	// Ollama extension: without it an OpenAI-API client cannot release a model.
 	KeepAlive *api.Duration `json:"keep_alive,omitempty"`
 }
@@ -619,113 +619,48 @@ func ThinkingFromReasoningEffort(effort string, thinking ...*model.Thinking) (*a
 // An optional thinking descriptor preserves model-defined effort names for rendering.
 func FromChatRequest(r ChatCompletionRequest, thinking ...*model.Thinking) (*api.ChatRequest, error) {
 	var messages []api.Message
+	callNames := make(map[string]string)
 	for _, msg := range r.Messages {
-		toolName := ""
-		if strings.ToLower(msg.Role) == "tool" {
-			toolName = msg.Name
-			if toolName == "" && msg.ToolCallID != "" {
-				toolName = nameFromToolCallID(r.Messages, msg.ToolCallID)
-			}
+		base := api.Message{Role: msg.Role, ToolCallID: msg.ToolCallID}
+		if strings.EqualFold(msg.Role, "tool") {
+			base.ToolName = cmp.Or(msg.Name, callNames[msg.ToolCallID])
 		}
 		switch content := msg.Content.(type) {
 		case string:
-			toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
+			base.Content = content
+			messages = append(messages, base)
+		case []any:
+			if len(content) == 0 && len(msg.ToolCalls) == 0 && msg.Reasoning == "" && base.ToolName == "" && base.ToolCallID == "" {
+				continue
+			}
+			var err error
+			messages, err = appendMessageParts(messages, base, content)
 			if err != nil {
 				return nil, err
 			}
-			messages = append(messages, api.Message{Role: msg.Role, Content: content, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolName: toolName, ToolCallID: msg.ToolCallID})
-		case []any:
-			start := len(messages)
-			for _, c := range content {
-				data, ok := c.(map[string]any)
-				if !ok {
-					return nil, errors.New("invalid message format")
-				}
-				switch data["type"] {
-				case "text":
-					text, ok := data["text"].(string)
-					if !ok {
-						return nil, errors.New("invalid message format")
-					}
-					messages = append(messages, api.Message{Role: msg.Role, Content: text})
-				case "image_url":
-					var url string
-					if urlMap, ok := data["image_url"].(map[string]any); ok {
-						if url, ok = urlMap["url"].(string); !ok {
-							return nil, errors.New("invalid message format")
-						}
-					} else {
-						if url, ok = data["image_url"].(string); !ok {
-							return nil, errors.New("invalid message format")
-						}
-					}
-
-					img, err := decodeImageURL(url)
-					if err != nil {
-						return nil, err
-					}
-
-					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{img}})
-				case "input_audio":
-					audioMap, ok := data["input_audio"].(map[string]any)
-					if !ok {
-						return nil, errors.New("invalid input_audio format")
-					}
-					b64Data, ok := audioMap["data"].(string)
-					if !ok {
-						return nil, errors.New("invalid input_audio format: missing data")
-					}
-					audioBytes, err := base64.StdEncoding.DecodeString(b64Data)
-					if err != nil {
-						return nil, fmt.Errorf("invalid input_audio base64 data: %w", err)
-					}
-					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{audioBytes}})
-				default:
-					return nil, errors.New("invalid message format")
-				}
-			}
-			// a tool message is a single result, so every message built from it
-			// keeps the tool call it answers. text parts are merged into one
-			// message; parts with images stay split so each image keeps its
-			// position among the text
-			if strings.ToLower(msg.Role) == "tool" {
-				parts := messages[start:]
-				if slices.ContainsFunc(parts, func(m api.Message) bool { return len(m.Images) > 0 }) {
-					for i := range parts {
-						parts[i].ToolName = toolName
-						parts[i].ToolCallID = msg.ToolCallID
-					}
-				} else if len(parts) > 0 || toolName != "" || msg.ToolCallID != "" {
-					var sb strings.Builder
-					for _, part := range parts {
-						sb.WriteString(part.Content)
-					}
-					messages = append(messages[:start], api.Message{Role: msg.Role, Content: sb.String(), ToolName: toolName, ToolCallID: msg.ToolCallID})
-				}
-			}
-			// since we might have added multiple messages above, if we have tools
-			// calls we'll add them to the last message
-			if len(messages) > 0 && len(msg.ToolCalls) > 0 {
-				toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
-				if err != nil {
-					return nil, err
-				}
-				messages[len(messages)-1].ToolCalls = toolCalls
-				messages[len(messages)-1].ToolName = toolName
-				messages[len(messages)-1].ToolCallID = msg.ToolCallID
-				messages[len(messages)-1].Thinking = msg.Reasoning
-			}
-		default:
-			// content is only optional if tool calls are present
+		case nil:
 			if msg.ToolCalls == nil {
 				return nil, fmt.Errorf("invalid message content type: %T", content)
 			}
-
-			toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
+			messages = append(messages, base)
+		default:
+			return nil, fmt.Errorf("invalid message content type: %T", content)
+		}
+		last := &messages[len(messages)-1]
+		last.Thinking = msg.Reasoning
+		if msg.ToolCalls != nil {
+			calls, err := FromCompletionToolCall(msg.ToolCalls)
 			if err != nil {
 				return nil, err
 			}
-			messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolCallID: msg.ToolCallID})
+			last.ToolCalls = calls
+			if strings.EqualFold(msg.Role, "assistant") {
+				for _, call := range calls {
+					if call.ID != "" {
+						callNames[call.ID] = call.Function.Name
+					}
+				}
+			}
 		}
 	}
 
@@ -744,7 +679,12 @@ func FromChatRequest(r ChatCompletionRequest, thinking ...*model.Thinking) (*api
 		options["stop"] = stops
 	}
 
-	if r.MaxTokens != nil {
+	if r.MaxCompletionTokens != nil {
+		if *r.MaxCompletionTokens <= 0 {
+			return nil, errors.New("max_completion_tokens must be greater than zero")
+		}
+		options["num_predict"] = *r.MaxCompletionTokens
+	} else if r.MaxTokens != nil {
 		options["num_predict"] = *r.MaxTokens
 	}
 
@@ -813,18 +753,77 @@ func FromChatRequest(r ChatCompletionRequest, thinking ...*model.Thinking) (*api
 	}, nil
 }
 
-func nameFromToolCallID(messages []Message, toolCallID string) string {
-	// iterate backwards to be more resilient to duplicate tool call IDs (this
-	// follows "last one wins")
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		for _, tc := range msg.ToolCalls {
-			if tc.ID == toolCallID {
-				return tc.Function.Name
-			}
+// appendMessageParts preserves media order while joining adjacent text from the same turn.
+func appendMessageParts(messages []api.Message, base api.Message, content []any) ([]api.Message, error) {
+	var textParts strings.Builder
+	start := len(messages)
+	flushText := func() {
+		if textParts.Len() > 0 {
+			part := base
+			part.Content = textParts.String()
+			messages = append(messages, part)
+			textParts.Reset()
 		}
 	}
-	return ""
+	appendMedia := func(data api.ImageData) {
+		flushText()
+		part := base
+		part.Images = []api.ImageData{data}
+		messages = append(messages, part)
+	}
+	for _, c := range content {
+		data, ok := c.(map[string]any)
+		if !ok {
+			return nil, errors.New("invalid message format")
+		}
+		switch data["type"] {
+		case "text":
+			text, ok := data["text"].(string)
+			if !ok {
+				return nil, errors.New("invalid message format")
+			}
+			textParts.WriteString(text)
+		case "image_url":
+			var url string
+			if urlMap, ok := data["image_url"].(map[string]any); ok {
+				if url, ok = urlMap["url"].(string); !ok {
+					return nil, errors.New("invalid message format")
+				}
+			} else {
+				if url, ok = data["image_url"].(string); !ok {
+					return nil, errors.New("invalid message format")
+				}
+			}
+
+			img, err := decodeImageURL(url)
+			if err != nil {
+				return nil, err
+			}
+
+			appendMedia(img)
+		case "input_audio":
+			audioMap, ok := data["input_audio"].(map[string]any)
+			if !ok {
+				return nil, errors.New("invalid input_audio format")
+			}
+			b64Data, ok := audioMap["data"].(string)
+			if !ok {
+				return nil, errors.New("invalid input_audio format: missing data")
+			}
+			audioBytes, err := base64.StdEncoding.DecodeString(b64Data)
+			if err != nil {
+				return nil, fmt.Errorf("invalid input_audio base64 data: %w", err)
+			}
+			appendMedia(audioBytes)
+		default:
+			return nil, errors.New("invalid message format")
+		}
+	}
+	flushText()
+	if len(messages) == start {
+		messages = append(messages, base)
+	}
+	return messages, nil
 }
 
 // decodeImageURL decodes a base64 data URI into raw image bytes.

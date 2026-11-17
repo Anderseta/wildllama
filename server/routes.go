@@ -3595,7 +3595,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 			if thinkTagParser != nil {
 				thinkingContent, remainingContent := thinkTagParser.AddContent(res.Message.Content)
-				if thinkingContent == "" && remainingContent == "" && !r.Done {
+				if thinkingContent == "" && remainingContent == "" && !r.Done && len(res.Logprobs) == 0 {
 					// need to accumulate more to decide what to send
 					sendBufferedProgress("buffered_output")
 					return

@@ -2612,6 +2612,12 @@ func TestFromResponsesRequest_MaxOutputTokens(t *testing.T) {
 	if numPredict != 100 {
 		t.Errorf("num_predict = %v, want 100", numPredict)
 	}
+	for _, limit := range []int{-1, 0} {
+		req.MaxOutputTokens = &limit
+		if _, err := FromResponsesRequest(req); err == nil {
+			t.Errorf("accepted max_output_tokens = %d", limit)
+		}
+	}
 }
 
 func TestFromResponsesRequest_TextFormatJsonSchema(t *testing.T) {

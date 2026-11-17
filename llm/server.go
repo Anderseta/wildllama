@@ -297,6 +297,7 @@ func (d DoneReason) String() string {
 
 // TokenLogprob represents log probability information for a single token alternative.
 type TokenLogprob struct {
+	Bytes   []int   `json:"bytes,omitempty"`
 	Token   string  `json:"token"`
 	Logprob float64 `json:"logprob"`
 }
