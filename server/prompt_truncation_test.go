@@ -71,13 +71,13 @@ func TestNativeLongTruncationMatchesLinearForReviewedTemplates(t *testing.T) {
 				}}
 				opts := &api.Options{Runner: api.Runner{NumCtx: budget}}
 				req := llm.ChatRequest{Messages: messages}
-				want, err := truncateNativeChatMessages(t.Context(), nil, runner, opts, &req, true)
+				want, _, err := truncateNativeChatMessages(t.Context(), nil, runner, opts, &req, true, "")
 				if err != nil {
 					t.Fatal(err)
 				}
 				linear := counts
 				counts = 0
-				got, err := truncateNativeChatMessages(t.Context(), m, runner, opts, &req, true)
+				got, _, err := truncateNativeChatMessages(t.Context(), m, runner, opts, &req, true, "")
 				if err != nil || !reflect.DeepEqual(got, want) {
 					t.Fatalf("budget=%d different retained history, err=%v", budget, err)
 				}
@@ -102,7 +102,7 @@ func TestUnknownTemplateKeepsEarliestNonMonotonicFit(t *testing.T) {
 		return strings.Repeat("too large ", 100), nil
 	}}
 	m := &Model{metadata: ggufMetadata{KV: map[string]any{"tokenizer.chat_template": "custom non-monotonic template"}}}
-	got, err := truncateNativeChatMessages(t.Context(), m, runner, &api.Options{Runner: api.Runner{NumCtx: 4}}, &llm.ChatRequest{Messages: messages}, true)
+	got, _, err := truncateNativeChatMessages(t.Context(), m, runner, &api.Options{Runner: api.Runner{NumCtx: 4}}, &llm.ChatRequest{Messages: messages}, true, "")
 	if err != nil || !reflect.DeepEqual(got, promptMessagesFrom(messages, 3)) {
 		t.Fatalf("must retain earliest fit in arbitrary template: err=%v length=%d", err, len(got))
 	}

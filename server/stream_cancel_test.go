@@ -319,3 +319,43 @@ func TestInferenceParserErrorSurvivesChildCancellation(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamKeepsInferenceErrorDetails(t *testing.T) {
+	for _, started := range []bool{false, true} {
+		router := gin.New()
+		router.POST("/", func(c *gin.Context) {
+			frames := make(chan any, 2)
+			if started {
+				frames <- api.ChatResponse{Message: api.Message{Role: "assistant", Content: "partial"}}
+			}
+			frames <- gin.H{"error": "out of memory", "status": 507, "code": "out_of_memory", "retryable": false, "request_id": "test-id"}
+			close(frames)
+			streamResponse(c, frames)
+		})
+		backend := httptest.NewServer(router)
+		resp, err := http.Post(backend.URL, "application/json", nil)
+		if err != nil {
+			backend.Close()
+			t.Fatal(err)
+		}
+		dec := json.NewDecoder(resp.Body)
+		if started {
+			var first api.ChatResponse
+			err = dec.Decode(&first)
+			if err != nil || first.Message.Content != "partial" {
+				t.Errorf("first frame: %+v %v", first, err)
+			}
+		}
+		var last map[string]any
+		err = dec.Decode(&last)
+		resp.Body.Close()
+		backend.Close()
+		want := 507
+		if started {
+			want = 200
+		}
+		if err != nil || resp.StatusCode != want || last["code"] != "out_of_memory" || last["request_id"] != "test-id" || last["retryable"] != false {
+			t.Fatalf("started=%t status=%d final=%#v err=%v", started, resp.StatusCode, last, err)
+		}
+	}
+}

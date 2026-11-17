@@ -41,14 +41,8 @@ func toolProgressTestRunner(t *testing.T, stream func(http.ResponseWriter, *http
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := fakeRunningCmd()
-	t.Cleanup(func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
-	})
-	return &llamaServerRunner{port: port, cmd: cmd, sem: semaphore.NewWeighted(1), options: api.Options{Runner: api.Runner{NumCtx: 2048}}}
+
+	return &llamaServerRunner{port: port, cmd: fakeRunningCmd(), sem: semaphore.NewWeighted(1), options: api.Options{Runner: api.Runner{NumCtx: 2048}}}
 }
 
 func toolProgressEvent(t *testing.T, arguments string) string {

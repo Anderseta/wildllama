@@ -268,22 +268,80 @@ func TestNativeChatPreparedBodyMatchesGeneration(t *testing.T) {
 			opts := api.DefaultOptions()
 			opts.NumPredict = 1000
 			req := ChatRequest{
-				Options: &opts, PreparedChat: key,
+				Options:  &opts,
 				Messages: []api.Message{{Role: "system", Content: "<instructions>"}, {Role: "user", Content: "Parâmetros & Unicode."}},
 			}
-			count, accepted, err := runner.PrepareChatTemplateWithTokenCount(t.Context(), req, 64)
-			if err != nil || count != 17 || accepted != prepared {
-				t.Fatalf("count=%d accepted=%t err=%v", count, accepted, err)
+			count, accepted, err := runner.PrepareChatSnapshot(t.Context(), req, key, 64)
+			if err != nil || count != 17 || (accepted != nil) != prepared {
+				t.Fatalf("count=%d accepted=%t err=%v", count, accepted != nil, err)
 			}
-			if !accepted {
-				req.PreparedChat = ""
+			if accepted != nil {
+				// Sending the accepted snapshot is independent of any later edits.
+				req.Messages[1].Content = "different request"
+				err = accepted(t.Context(), func(ChatResponse) {})
+			} else {
+				err = runner.Chat(t.Context(), req, func(ChatResponse) {})
 			}
-			if err := runner.Chat(t.Context(), req, func(ChatResponse) {}); err != nil {
+			if err != nil {
 				t.Fatal(err)
+			}
+			// Independently sized clients can still submit their own request.
+			if prepared {
+				req.PreparedChat = key
+				_, ok, err := runner.PrepareChatTemplateWithTokenCount(t.Context(), req, 64)
+				if err != nil || !ok {
+					t.Fatalf("key-based API: accepted=%t error=%v", ok, err)
+				}
+				if err := runner.Chat(t.Context(), req, func(ChatResponse) {}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if opts.NumPredict != 1000 {
 				t.Fatal("preparation or generation changed the caller's options")
 			}
 		})
+	}
+}
+
+func TestNativeResponseSchemaExactLiterals(t *testing.T) {
+	const schema = `{"type":"object","properties":{"z":{"const":5232021495785965240},"a":{"enum":[18446744073709551615]}}}`
+	format, err := llamaServerChatResponseFormat(json.RawMessage(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(format)
+	if err != nil || !strings.Contains(string(encoded), schema) {
+		t.Fatalf("schema changed on its way to the runner: %s, %v", encoded, err)
+	}
+}
+
+func BenchmarkPreparedNativeChatRoundTrip(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		switch r.URL.Path {
+		case "/health":
+			io.WriteString(w, `{"status":"ok"}`)
+		case "/apply-template":
+			io.WriteString(w, `{"prepared":true,"token_count":12000}`)
+		default:
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		}
+	}))
+	defer server.Close()
+	runner := &llamaServerRunner{port: server.Listener.Addr().(*net.TCPAddr).Port, cmd: fakeRunningCmd(), sem: semaphore.NewWeighted(1), options: api.Options{Runner: api.Runner{NumCtx: 40960}}}
+	msgs := make([]api.Message, 1024)
+	for i := range msgs {
+		msgs[i] = api.Message{Role: "user", Content: strings.Repeat("example <source> & UTF-8 ação ", 4)}
+	}
+	req := ChatRequest{Messages: msgs}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, submit, err := runner.PrepareChatSnapshot(b.Context(), req, "test_preparation_key", 40960)
+		if err != nil || submit == nil {
+			b.Fatalf("preparation: %t, %v", submit != nil, err)
+		}
+		if err := submit(b.Context(), func(ChatResponse) {}); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

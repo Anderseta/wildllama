@@ -646,7 +646,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		if values.Messages != nil && values.Suffix == "" && req.Template == "" {
 			genTruncate := (req.Truncate == nil || *req.Truncate) && !m.IsMLX()
 			if m.HasChatTemplate && chatModeForModel(m) == chatExecutionModeNative {
-				nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
+				nativeReq, _, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
 					Messages:    values.Messages,
 					Format:      req.Format,
 					Options:     opts,
@@ -2779,7 +2779,8 @@ func sendResponse(ctx context.Context, ch chan<- any, value any) {
 func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
 	ctx := c.Request.Context()
-	c.Stream(func(w io.Writer) bool {
+	encoder := json.NewEncoder(c.Writer)
+	c.Stream(func(_ io.Writer) bool {
 		var val any
 		var ok bool
 		select {
@@ -2804,9 +2805,9 @@ func streamResponse(c *gin.Context, ch chan any) {
 
 				if !c.Writer.Written() {
 					c.Header("Content-Type", "application/json")
-					c.JSON(status, gin.H{"error": e})
+					c.JSON(status, inferenceErrorBody(h, e))
 				} else {
-					if err := json.NewEncoder(c.Writer).Encode(gin.H{"error": e}); err != nil {
+					if err := encoder.Encode(inferenceErrorBody(h, e)); err != nil {
 						slog.Error("streamResponse failed to encode json error", "error", err)
 					}
 				}
@@ -2815,16 +2816,9 @@ func streamResponse(c *gin.Context, ch chan any) {
 			}
 		}
 
-		bts, err := json.Marshal(val)
-		if err != nil {
-			slog.Info(fmt.Sprintf("streamResponse: json.Marshal failed with %s", err))
-			return false
-		}
-
-		// Delineate chunks with new-line delimiter
-		bts = append(bts, '\n')
-		if _, err := w.Write(bts); err != nil {
-			slog.Info(fmt.Sprintf("streamResponse: w.Write failed with %s", err))
+		// Encode writes the complete NDJSON frame and its delimiter together.
+		if err := encoder.Encode(val); err != nil {
+			slog.Info("streamResponse: writing JSON frame failed", "error", err)
 			return false
 		}
 
@@ -3651,18 +3645,19 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	writeChatResponse(c, req, ch)
 }
 
-func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, nativeReq llm.ChatRequest, truncate, allowPrepared bool) (llm.ChatRequest, error) {
+func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, nativeReq llm.ChatRequest, truncate, allowPrepared bool) (llm.ChatRequest, llm.PreparedChat, error) {
+	key := ""
 	if allowPrepared && truncate && len(nativeReq.Messages) > 1 && countChatImages(nativeReq.Messages) == 0 {
-		nativeReq.PreparedChat = crand.Text()
+		key = crand.Text()
 	}
-	var err error
-	nativeReq.Messages, err = truncateNativeChatMessages(ctx, m, r, optionsForPrompt(opts, r), &nativeReq, truncate)
-	return nativeReq, err
+	messages, submit, err := truncateNativeChatMessages(ctx, m, r, optionsForPrompt(opts, r), &nativeReq, truncate, key)
+	nativeReq.Messages = messages
+	return nativeReq, submit, err
 }
 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
 	truncate := req.Truncate == nil || *req.Truncate
-	nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
+	nativeReq, prepared, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
 		Messages:    msgs,
 		Tools:       req.Tools,
 		Format:      req.Format,
@@ -3712,7 +3707,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 	go func() {
 		defer close(ch)
 
-		err := r.Chat(streamCtx, nativeReq, func(r llm.ChatResponse) {
+		onResponse := func(r llm.ChatResponse) {
 			res := api.ChatResponse{
 				PromptProgress:     r.PromptProgress,
 				GenerationProgress: r.GenerationProgress,
@@ -3746,7 +3741,13 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 			}
 
 			sendResponse(streamCtx, ch, res)
-		})
+		}
+		var err error
+		if prepared != nil {
+			err = prepared(streamCtx, onResponse)
+		} else {
+			err = r.Chat(streamCtx, nativeReq, onResponse)
+		}
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
 			sendResponse(streamCtx, ch, inferenceErrorPayload(err))
@@ -3756,19 +3757,18 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 	writeChatResponse(c, req, ch)
 }
 
-func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, req *llm.ChatRequest, truncate bool) ([]api.Message, error) {
-	prepareKey := req.PreparedChat
-	req.PreparedChat = ""
+func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, req *llm.ChatRequest, truncate bool, prepareKey string) ([]api.Message, llm.PreparedChat, error) {
 	if !truncate || opts == nil || opts.NumCtx <= 0 || len(req.Messages) <= 1 {
-		return req.Messages, nil
+		return req.Messages, nil, nil
 	}
 
 	var previousPrompt string
 	var previousTokenCount int
 	haveTokenCount := false
 	preparedStart := -1
+	var preparedSubmit llm.PreparedChat
 	preparer, canPrepare := r.(interface {
-		PrepareChatTemplateWithTokenCount(context.Context, llm.ChatRequest, int) (int, bool, error)
+		PrepareChatSnapshot(context.Context, llm.ChatRequest, string, int) (int, llm.PreparedChat, error)
 	})
 	counter, canCount := r.(interface {
 		ApplyChatTemplateWithTokenCount(context.Context, llm.ChatRequest) (string, int, error)
@@ -3782,14 +3782,13 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 		}
 		var ctxLen int
 		if canPrepare && prepareKey != "" {
-			renderReq.PreparedChat = prepareKey
-			count, prepared, err := preparer.PrepareChatTemplateWithTokenCount(ctx, renderReq, opts.NumCtx)
+			count, prepared, err := preparer.PrepareChatSnapshot(ctx, renderReq, prepareKey, opts.NumCtx)
 			if err != nil {
 				return 0, err
 			}
 			ctxLen = count
-			if prepared {
-				preparedStart = i
+			if prepared != nil {
+				preparedStart, preparedSubmit = i, prepared
 			}
 		} else if canCount {
 			_, count, err := counter.ApplyChatTemplateWithTokenCount(ctx, renderReq)
@@ -3827,17 +3826,19 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 		return ctxLen, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if currMsgIdx > 0 {
 		slog.Debug("truncating native chat messages which exceed context length", "truncated", currMsgIdx)
 	}
-	if currMsgIdx == preparedStart {
-		req.PreparedChat = prepareKey
+	if currMsgIdx != preparedStart {
+		preparedSubmit = nil
 	}
-
-	return promptMessagesFrom(req.Messages, currMsgIdx), nil
+	if currMsgIdx == 0 {
+		return req.Messages, preparedSubmit, nil
+	}
+	return promptMessagesFrom(req.Messages, currMsgIdx), preparedSubmit, nil
 }
 
 func countChatImages(msgs []api.Message) int {

@@ -168,7 +168,8 @@ type ServerStatusResponse struct {
 // Request/Response types
 
 const (
-	llamaServerStreamInitialBufferSize = 64 * 1024
+	// Most token deltas fit in one small buffer; scanners grow for larger frames.
+	llamaServerStreamInitialBufferSize = 4 * 1024
 	// llamaServerStreamMaxBufferSize bounds a single runner response stream line.
 	llamaServerStreamMaxBufferSize = 8 * format.MegaByte
 )
@@ -244,12 +245,16 @@ type ChatRequest struct {
 	Options  *api.Options
 	Think    *api.ThinkValue
 	Shift    bool
-	// A runner may reuse a prior preparation only for the exact encoded request.
+
+	// Native preparation key for callers using the count-and-key API.
 	PreparedChat string
 
 	Logprobs    bool
 	TopLogprobs int
 }
+
+// PreparedChat sends the immutable request accepted during native template sizing.
+type PreparedChat func(context.Context, func(ChatResponse)) error
 
 type ChatResponse struct {
 	SpeculativeDraftTokens    *int                    `json:"speculative_draft_tokens,omitempty"`

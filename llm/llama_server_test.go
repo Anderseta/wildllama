@@ -4054,16 +4054,9 @@ func testGGUFTensor(name string, kind gguf.TensorType, shape []uint64) *gguftest
 	return tensor
 }
 
-// fakeRunningCmd returns an exec.Cmd that looks like it's still running
-// (ProcessState is nil, which is the case before Wait() completes).
-// Registers cleanup via t.Cleanup to prevent zombie processes.
+// Mock HTTP runners only inspect ProcessState, which is nil before process exit.
 func fakeRunningCmd() *exec.Cmd {
-	cmd := exec.Command("sleep", "3600")
-	cmd.Start()
-	// Note: cleanup happens when the test binary exits since we can't
-	// pass *testing.T here without changing all call sites. The OS will
-	// SIGKILL children when the test process exits.
-	return cmd
+	return &exec.Cmd{}
 }
 
 // TestLlamaServerCompletionThinkingFormat checks that a format on a thinking

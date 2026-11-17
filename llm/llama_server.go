@@ -1886,10 +1886,11 @@ func (t llamaServerTimings) promptEvalCount() int {
 }
 
 type llamaServerApplyTemplateResponse struct {
-	Prompt     string `json:"prompt"`
-	TokenCount *int   `json:"token_count"`
-	Prepared   bool   `json:"prepared"`
-	Error      any    `json:"error"`
+	requestBody []byte // owned by the request, only for accepted native preparations
+	Prompt      string `json:"prompt"`
+	TokenCount  *int   `json:"token_count"`
+	Prepared    bool   `json:"prepared"`
+	Error       any    `json:"error"`
 }
 
 type llamaServerTokenProb struct {
@@ -2253,7 +2254,7 @@ func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
 }
 
 func (s *llamaServerRunner) ApplyChatTemplate(ctx context.Context, req ChatRequest) (string, error) {
-	response, err := s.applyChatTemplate(ctx, req, false, 0)
+	response, err := s.applyChatTemplate(ctx, req, false, "", 0)
 	return response.Prompt, err
 }
 
@@ -2261,7 +2262,7 @@ func (s *llamaServerRunner) ApplyChatTemplate(ctx context.Context, req ChatReque
 // BOS/special-token policy. Older payloads omit token_count and use /tokenize.
 // Media token accounting remains the caller's separate, model-aware concern.
 func (s *llamaServerRunner) ApplyChatTemplateWithTokenCount(ctx context.Context, req ChatRequest) (string, int, error) {
-	response, err := s.applyChatTemplate(ctx, req, true, 0)
+	response, err := s.applyChatTemplate(ctx, req, true, "", 0)
 	if err != nil {
 		return "", 0, err
 	}
@@ -2269,20 +2270,37 @@ func (s *llamaServerRunner) ApplyChatTemplateWithTokenCount(ctx context.Context,
 	return response.Prompt, count, err
 }
 
-// PrepareChatTemplateWithTokenCount offers the native runner one short-lived
-// preparation for this API request. Older native payloads only report a count.
+// PrepareChatTemplateWithTokenCount supports existing callers that submit the
+// ChatRequest separately with the same preparation key.
 func (s *llamaServerRunner) PrepareChatTemplateWithTokenCount(ctx context.Context, req ChatRequest, budget int) (int, bool, error) {
+	count, submit, err := s.PrepareChatSnapshot(ctx, req, req.PreparedChat, budget)
+	return count, submit != nil, err
+}
+
+// PrepareChatSnapshot returns a submit function only for the exact
+// candidate the native runner accepted. The snapshot also works after native
+// cache eviction because it retains the complete original request body.
+func (s *llamaServerRunner) PrepareChatSnapshot(ctx context.Context, req ChatRequest, key string, budget int) (int, PreparedChat, error) {
 	if req.Logprobs && len(req.Tools) > 0 {
-		// Streaming with both options uses the existing validation path.
 		_, count, err := s.ApplyChatTemplateWithTokenCount(ctx, req)
-		return count, false, err
+		return count, nil, err
 	}
-	response, err := s.applyChatTemplate(ctx, req, true, budget)
+	response, err := s.applyChatTemplate(ctx, req, true, key, budget)
 	if err != nil {
-		return 0, false, err
+		return 0, nil, err
 	}
 	count, err := s.chatTemplateTokenCount(ctx, response)
-	return count, response.Prepared && response.TokenCount != nil, err
+	body := response.requestBody
+	if err != nil || body == nil {
+		return count, nil, err
+	}
+	// Capture the wire bytes and the decoding option, never the original history.
+	decode := ChatRequest{TopLogprobs: req.TopLogprobs}
+	submit := func(ctx context.Context, fn func(ChatResponse)) error {
+		slog.Debug("submitting prepared llama-server chat", "bytes", len(body))
+		return s.chat(ctx, decode, fn, key, body)
+	}
+	return count, submit, nil
 }
 
 func (s *llamaServerRunner) chatTemplateTokenCount(ctx context.Context, response llamaServerApplyTemplateResponse) (int, error) {
@@ -2298,11 +2316,11 @@ func (s *llamaServerRunner) chatTemplateTokenCount(ctx context.Context, response
 
 const preparedChatHeader = "X-Wildllama-Chat-Preparation"
 
-func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatRequest, countTokens bool, prepareBudget int) (llamaServerApplyTemplateResponse, error) {
+func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatRequest, countTokens bool, key string, prepareBudget int) (llamaServerApplyTemplateResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return llamaServerApplyTemplateResponse{}, err
 	}
-	prepare := prepareBudget > 0 && req.PreparedChat != ""
+	prepare := prepareBudget > 0 && key != ""
 	if prepare {
 		req.Options = s.boundedChatOptions(req.Options)
 	}
@@ -2319,6 +2337,7 @@ func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatReque
 		return llamaServerApplyTemplateResponse{}, fmt.Errorf("failed to marshal chat template request: %v", err)
 	}
 
+	wire := body.Bytes() // the HTTP client consumes the buffer during sizing
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/apply-template", s.port)
 	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
@@ -2326,7 +2345,7 @@ func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatReque
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
 	if prepare {
-		serverReq.Header.Set(preparedChatHeader, req.PreparedChat)
+		serverReq.Header.Set(preparedChatHeader, key)
 		serverReq.Header.Set("X-Wildllama-Chat-Token-Limit", strconv.Itoa(prepareBudget))
 	}
 
@@ -2359,11 +2378,19 @@ func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatReque
 		return llamaServerApplyTemplateResponse{}, fmt.Errorf("llama-server template error: %v", lsResp.Error)
 	}
 
+	if prepare && lsResp.Prepared && lsResp.TokenCount != nil && len(wire) <= 1<<20 {
+		// Same upper bound as the native prepared-chat store.
+		lsResp.requestBody = wire
+	}
 	return lsResp, nil
 }
 
 func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(ChatResponse)) error {
 	slog.Debug("llama-server chat request", "messages", len(req.Messages), "tools", len(req.Tools))
+	return s.chat(ctx, req, fn, req.PreparedChat, nil)
+}
+
+func (s *llamaServerRunner) chat(ctx context.Context, req ChatRequest, fn func(ChatResponse), key string, wire []byte) error {
 
 	if err := s.sem.Acquire(ctx, 1); err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -2376,8 +2403,6 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
 	memoryVersion := s.status.memoryFailureVersion()
 
-	req.Options = s.boundedChatOptions(req.Options)
-
 	status, err := s.getServerStatusRetry(ctx)
 	if err != nil {
 		return err
@@ -2385,27 +2410,30 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		return fmt.Errorf("unexpected server status: %s", status)
 	}
 
-	lsReq, err := s.llamaServerChatRequest(req, true)
-	if err != nil {
-		return err
-	}
-
-	if req.PreparedChat != "" {
-		lsReq["count_tokens"] = true // use exactly the bytes sized by the runner
-	}
-	buffer, err := encodeLlamaServerChatRequest(lsReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal chat request: %v", err)
+	if wire == nil {
+		req.Options = s.boundedChatOptions(req.Options)
+		data, err := s.llamaServerChatRequest(req, true)
+		if err != nil {
+			return err
+		}
+		if key != "" {
+			data["count_tokens"] = true
+		}
+		buffer, err := encodeLlamaServerChatRequest(data)
+		if err != nil {
+			return fmt.Errorf("failed to marshal chat request: %w", err)
+		}
+		wire = buffer.Bytes()
 	}
 
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", s.port)
-	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, buffer)
+	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(wire))
 	if err != nil {
 		return fmt.Errorf("error creating chat request: %v", err)
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
-	if req.PreparedChat != "" {
-		serverReq.Header.Set(preparedChatHeader, req.PreparedChat)
+	if key != "" {
+		serverReq.Header.Set(preparedChatHeader, key)
 	}
 
 	if id := api.RequestID(ctx); id != "" {
@@ -2880,6 +2908,7 @@ func llamaServerChatToolCalls(tcs []api.ToolCall) ([]llamaServerChatToolCall, er
 }
 
 func llamaServerChatResponseFormat(format json.RawMessage) (map[string]any, error) {
+	format = bytes.TrimSpace(format)
 	if len(format) == 0 {
 		return nil, nil
 	}
@@ -2890,12 +2919,7 @@ func llamaServerChatResponseFormat(format json.RawMessage) (map[string]any, erro
 	case `"json"`:
 		return map[string]any{"type": "json_object"}, nil
 	default:
-		if format[0] != '{' {
-			return nil, fmt.Errorf("invalid format: %q; expected \"json\" or a valid JSON Schema object", format)
-		}
-
-		var schema map[string]any
-		if err := json.Unmarshal(format, &schema); err != nil {
+		if format[0] != '{' || !json.Valid(format) {
 			return nil, fmt.Errorf("invalid format: %q; expected \"json\" or a valid JSON Schema object", format)
 		}
 
@@ -2903,7 +2927,7 @@ func llamaServerChatResponseFormat(format json.RawMessage) (map[string]any, erro
 			"type": "json_schema",
 			"json_schema": map[string]any{
 				"name":   "schema",
-				"schema": schema,
+				"schema": format,
 			},
 		}, nil
 	}
