@@ -146,7 +146,10 @@ func prepareEmbeddingBatch(ctx context.Context, runner llm.LlamaServer, inputs [
 			return nil, 0, true, fmt.Errorf("invalid embedding batch result")
 		}
 		for i, job := range group {
-			for _, index := range job.indices {
+			// The runner hands ownership of each result to the caller. Only
+			// repeated inputs need extra copies for independent normalization.
+			result[job.indices[0]] = vectors[i]
+			for _, index := range job.indices[1:] {
 				result[index] = slices.Clone(vectors[i])
 			}
 		}

@@ -16,6 +16,24 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
+func TestNativeToolIntegerRoundTrip(t *testing.T) {
+	const arguments = `{"seed":5232021495785965240,"nested":[-9223372036854775808,{"id":18446744073709551615}],"ordinary":42,"text":"5232021495785965240"}`
+	var acc llamaServerToolCallAccumulator
+	acc.append("call", "fixture", arguments[:12])
+	acc.append("", "", arguments[12:])
+	calls, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{0: &acc}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := llamaServerChatToolCalls(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := history[0].Function.Arguments; got != arguments {
+		t.Fatalf("tool history changed numeric arguments: %s", got)
+	}
+}
+
 func BenchmarkNativeChatHistoryEncoding(b *testing.B) {
 	runner := &llamaServerRunner{}
 	messages := make([]api.Message, 0, 1024)

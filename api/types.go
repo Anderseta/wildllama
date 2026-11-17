@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -297,8 +298,73 @@ func (t *ToolCallFunctionArguments) String() string {
 }
 
 func (t *ToolCallFunctionArguments) UnmarshalJSON(data []byte) error {
-	t.om = orderedmap.New[string, any]()
-	return json.Unmarshal(data, t.om)
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		t.om = orderedmap.New[string, any]()
+		return json.Unmarshal(data, t.om)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	open, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if open != json.Delim('{') {
+		return fmt.Errorf("tool arguments must be a JSON object")
+	}
+	args := orderedmap.New[string, any]()
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+		args.Set(key.(string), toolArgumentNumbers(value))
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(data[dec.InputOffset():])) != 0 {
+		return fmt.Errorf("unexpected data after tool arguments")
+	}
+	t.om = args
+	return nil
+}
+
+// Keep the float64 representation expected by existing renderers for ordinary
+// numbers. Large integer literals must survive the tool call and its replay.
+func toolArgumentNumbers(value any) any {
+	switch v := value.(type) {
+	case json.Number:
+		s := v.String()
+		if len(s) >= 16 && !strings.ContainsAny(s, ".eE") {
+			const safeInteger = 1<<53 - 1
+			if i, err := v.Int64(); err == nil {
+				if i < -safeInteger || i > safeInteger {
+					return i
+				}
+			} else if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+				return u
+			} else {
+				return v
+			}
+		}
+		if f, err := v.Float64(); err == nil {
+			return f
+		}
+		return v
+	case []any:
+		for i, item := range v {
+			v[i] = toolArgumentNumbers(item)
+		}
+	case map[string]any:
+		for key, item := range v {
+			v[key] = toolArgumentNumbers(item)
+		}
+	}
+	return value
 }
 
 func (t ToolCallFunctionArguments) MarshalJSON() ([]byte, error) {

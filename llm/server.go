@@ -89,6 +89,7 @@ type LlamaServerConfig struct {
 type EmbeddingBatchRunner interface {
 	EmbeddingBatchLimits() (items, tokens int)
 	TokenizeBatch(context.Context, []string) ([][]int, error)
+	// Each returned vector is owned by the caller and may be normalized in place.
 	EmbeddingBatch(context.Context, []string) ([][]float32, int, error)
 }
 
