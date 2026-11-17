@@ -581,6 +581,13 @@ type DebugInfo struct {
 	ImageCount       int    `json:"image_count,omitempty"`
 }
 
+// PromptCacheReuse describes the native runner's decision before evaluating the prompt.
+type PromptCacheReuse struct {
+	Reason         string `json:"reason"`
+	RetainedTokens int    `json:"retained_tokens"`
+	MatchedTokens  int    `json:"matched_tokens"`
+}
+
 type Metrics struct {
 	// GPUFirst contains optional native diagnostics. Shared counters can include
 	// concurrent requests; the payload reports its scope and lifetime peaks.
@@ -591,6 +598,7 @@ type Metrics struct {
 	LoadDuration              time.Duration   `json:"load_duration,omitempty"`
 	PromptEvalCount           int             `json:"prompt_eval_count,omitempty"`
 	PromptEvalCachedCount     *int            `json:"prompt_eval_cached_count,omitempty"`
+	PromptCacheReuse          *PromptCacheReuse `json:"prompt_cache_reuse,omitempty"`
 	PromptEvalDuration        time.Duration   `json:"prompt_eval_duration,omitempty"`
 	EvalCount                 int             `json:"eval_count,omitempty"`
 	EvalDuration              time.Duration   `json:"eval_duration,omitempty"`

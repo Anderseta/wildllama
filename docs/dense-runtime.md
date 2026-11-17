@@ -217,11 +217,20 @@ local trained-model comparison are recorded below.
   back to separate whole-prompt tokenization. Projector/media runners retain
   their separate accounting path and existing media heuristic.
 
-Counts are never summed independently per message: Jinja control flow, tools,
-schema, thinking and delimiters affect the whole rendered prompt. Final native
-chat still applies its template to construct the correct parser and grammar.
-This does not introduce a cross-request rendered-prompt, session or date cache,
-and does not claim that Jinja runs only once for an entire request.
+Whole-prompt counts preserve the effects of Jinja control flow, tools, schema,
+thinking and delimiters. For compatible requests without media, the server can
+keep the candidate that fits together with its parser and grammar. It also
+keeps token IDs on runners without a projector. Projector runners use the
+existing text count for sizing and the existing multimodal tokenizer for
+generation. The count response omits the rendered text. Generation consumes
+the preparation once when the private request key and exact body match.
+Prompt truncation continues to count each distinct candidate when needed.
+
+The runner keeps up to four preparations in memory for reuse within 30 seconds.
+A preparation is limited to a 1 MiB request, a 1 MiB rendered prompt, a 1 MiB
+grammar and 131,072 tokens. Model sleep or replacement drops the preparations.
+Ineligible requests, unmatched preparations and older runners retain the
+ordinary template and tokenization paths.
 
 ## Snapshot and shift safety
 

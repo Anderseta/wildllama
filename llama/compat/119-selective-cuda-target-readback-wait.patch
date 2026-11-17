@@ -1,0 +1,133 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2ab4084..fbbe62a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3552,7 +3552,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+ }
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-static bool ggml_cuda_synchronize_prefill(ggml_backend_cuda_context & context, cudaStream_t stream) {
++static bool ggml_cuda_synchronize_blocking(ggml_backend_cuda_context & context, cudaStream_t stream) {
+     const cudaError_t pending = cudaStreamQuery(stream);
+     if (pending != cudaErrorNotReady) {
+         CUDA_CHECK(pending);
+@@ -3580,6 +3580,9 @@ static bool ggml_cuda_synchronize_prefill(ggml_backend_cuda_context & context, c
+ 
+ static thread_local uint64_t cuda_host_wait_calls = 0;
+ static thread_local uint64_t cuda_host_wait_elapsed_us = 0;
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static thread_local bool cuda_host_target_wait_blocking = false;
++#endif
+ 
+ static void ggml_backend_cuda_synchronize_impl(ggml_backend_t backend, bool prefill) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+@@ -3588,8 +3591,10 @@ static void ggml_backend_cuda_synchronize_impl(ggml_backend_t backend, bool pref
+     bool blocking = false;
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-    if (prefill && ggml_cuda_env_flag("WILDLLAMA_CUDA_PREFILL_BLOCKING")) {
+-        blocking = ggml_cuda_synchronize_prefill(*cuda_ctx, cuda_ctx->stream());
++    static const bool target_wait = ggml_cuda_env_flag("WILDLLAMA_CUDA_TARGET_BLOCKING");
++    if ((target_wait && cuda_host_target_wait_blocking) ||
++        (prefill && ggml_cuda_env_flag("WILDLLAMA_CUDA_PREFILL_BLOCKING"))) {
++        blocking = ggml_cuda_synchronize_blocking(*cuda_ctx, cuda_ctx->stream());
+     } else
+ #endif
+     {
+@@ -7711,6 +7716,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+         };
+     }
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_cuda_set_target_wait") == 0) {
++        return (void *) +[](bool blocking) {
++            const bool previous = cuda_host_target_wait_blocking;
++            cuda_host_target_wait_blocking = blocking;
++            return previous;
++        };
++    }
+     if (strcmp(name, "ggml_backend_synchronize_prefill") == 0) {
+         return (void *) +[](ggml_backend_t backend) { ggml_backend_cuda_synchronize_impl(backend, true); };
+     }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ea5fa13..49a5a92 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -66,6 +66,7 @@ constexpr int HTTP_POLLING_SECONDS = 1;
+ struct server_cuda_wait_trace {
+     enum phase { prefill, forward, target_readback, draft, draft_catchup, verify, rollback, phase_count };
+     using snapshot_fn = void (*)(uint64_t *, uint64_t *);
++    using target_wait_fn = bool (*)(bool);
+ 
+     struct totals {
+         uint64_t calls = 0;
+@@ -73,18 +74,38 @@ struct server_cuda_wait_trace {
+     };
+     std::array<totals, phase_count> waits{};
+     snapshot_fn snapshot = nullptr;
++    target_wait_fn set_target_wait = nullptr;
+ 
+     void setup() {
+-        const char * env = std::getenv("WILDLLAMA_CUDA_SYNC_TRACE");
+-        if (!env || std::atoi(env) == 0) {
++        const char * trace_env = std::getenv("WILDLLAMA_CUDA_SYNC_TRACE");
++        const char * wait_env = std::getenv("WILDLLAMA_CUDA_TARGET_BLOCKING");
++        const bool tracing = trace_env && std::atoi(trace_env) != 0;
++        const bool blocking = wait_env && std::atoi(wait_env) != 0;
++        if (!tracing && !blocking) {
+             return;
+         }
+         if (auto * cuda = ggml_backend_reg_by_name("CUDA")) {
+-            snapshot = reinterpret_cast<snapshot_fn>(
+-                ggml_backend_reg_get_proc_address(cuda, "ggml_backend_cuda_host_wait_snapshot"));
++            if (tracing) {
++                snapshot = reinterpret_cast<snapshot_fn>(
++                    ggml_backend_reg_get_proc_address(cuda, "ggml_backend_cuda_host_wait_snapshot"));
++            }
++            if (blocking) {
++                set_target_wait = reinterpret_cast<target_wait_fn>(
++                    ggml_backend_reg_get_proc_address(cuda, "ggml_backend_cuda_set_target_wait"));
++            }
+         }
+     }
+ 
++    struct target_wait_scope {
++        const target_wait_fn set_wait;
++        const bool previous;
++
++        explicit target_wait_scope(target_wait_fn fn) : set_wait(fn), previous(fn && fn(true)) {}
++        ~target_wait_scope() { if (set_wait) { set_wait(previous); } }
++        target_wait_scope(const target_wait_scope &) = delete;
++        target_wait_scope & operator=(const target_wait_scope &) = delete;
++    };
++
+     struct scope {
+         const snapshot_fn snapshot;
+         totals & destination;
+@@ -121,6 +142,7 @@ struct server_cuda_wait_trace {
+         }
+         waits = {};
+         snapshot = nullptr;
++        set_target_wait = nullptr;
+     }
+ };
+ 
+@@ -5343,7 +5365,7 @@ private:
+         bool contains_prompt = false;
+         for (int i = off; i < off + batch.view.size(); ++i) {
+             has_output |= batch.tokens[i].output;
+-            if (cuda_wait_trace.snapshot) {
++            if (cuda_wait_trace.snapshot || cuda_wait_trace.set_target_wait) {
+                 contains_prompt |= batch.tokens[i].is_prompt;
+             }
+         }
+@@ -5374,6 +5396,10 @@ private:
+                 if (has_output) {
+                     server_cuda_wait_trace::scope wait(cuda_wait_trace,
+                         contains_prompt ? server_cuda_wait_trace::prefill : server_cuda_wait_trace::target_readback);
++                    // The forward has been submitted. Scope the optional
++                    // blocking policy to the target fence for single-slot generation.
++                    server_cuda_wait_trace::target_wait_scope target_wait(
++                        !contains_prompt && slots.size() == 1 ? cuda_wait_trace.set_target_wait : nullptr);
+                     llama_synchronize(ctx_tgt);
+                     target_fenced = true;
+                 }

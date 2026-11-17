@@ -1,0 +1,240 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 99ed74f..0c94d59 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1615,10 +1615,10 @@ common_chat_msg common_chat_parse(const common_chat_input &         input,
+     return common_chat_peg_parse(params.parser, input, is_partial, params);
+ }
+ 
+-common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_parser,
+-                                      const common_chat_input &         input,
+-                                      bool                              is_partial,
+-                                      const common_chat_parser_params & params) {
++static common_chat_msg common_chat_peg_parse_impl(
++        const common_peg_arena & src_parser, const common_chat_input & input,
++        bool is_partial, const common_chat_parser_params & params,
++        std::vector<common_peg_stream_scan> * stream_scans) {
+     // both branches must be lvalues, a temporary here would copy the arena on every call
+     static const common_peg_arena content_only =
+         build_chat_peg_parser([](common_chat_peg_builder & p) { return p.content(p.rest()) + p.end(); });
+@@ -1639,6 +1639,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+     }
+ 
+     common_peg_parse_context ctx(std::move(effective_input.text), std::move(effective_input.tokens), flags);
++    ctx.stream_scans = params.debug ? nullptr : stream_scans;
+     auto result = parser.parse(ctx);
+ 
+     if (result.fail()) {
+@@ -1693,6 +1694,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+     return msg;
+ }
+ 
++common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const common_chat_input & input,
++                                      bool is_partial, const common_chat_parser_params & params) {
++    return common_chat_peg_parse_impl(src_parser, input, is_partial, params, nullptr);
++}
++
+ common_chat_session::common_chat_session(const common_chat_templates *        tmpls,
+                                          const llama_vocab *                  vocab,
+                                          const common_chat_templates_inputs & inputs,
+@@ -1753,7 +1759,7 @@ void common_chat_session::apply_sampling(common_params_sampling & sampling) cons
+ const common_chat_msg & common_chat_session::feed(const common_chat_input & chunk) {
+     GGML_ASSERT(!finished && "feed() after finish()");
+     input.append(chunk);
+-    auto msg = common_chat_parse(input, true, parser_params);
++    auto msg = common_chat_peg_parse_impl(parser_params.parser, input, true, parser_params, &stream_scans);
+     if (!msg.empty()) {
+         result = std::move(msg);
+     }
+diff --git a/common/chat.h b/common/chat.h
+index dcff949..3187537 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -437,6 +437,7 @@ class common_chat_session {
+     common_chat_parser_params  parser_params;
+     common_chat_msg_delimiters delimiters;
+     common_chat_input          input;
++    std::vector<common_peg_stream_scan> stream_scans;
+     common_chat_msg            result;
+     bool                       templated = false;
+     bool                       finished  = false;
+diff --git a/common/peg-parser.cpp b/common/peg-parser.cpp
+index 8033f7e..621e68e 100644
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -226,9 +226,10 @@ struct parser_executor {
+     const common_peg_arena & arena;
+     common_peg_parse_context & ctx;
+     size_t start_pos;
++    common_peg_parser_id parser_id;
+ 
+-    parser_executor(const common_peg_arena & arena, common_peg_parse_context & ctx, size_t start)
+-        : arena(arena), ctx(ctx), start_pos(start) {}
++    parser_executor(const common_peg_arena & arena, common_peg_parse_context & ctx, size_t start, common_peg_parser_id id)
++        : arena(arena), ctx(ctx), start_pos(start), parser_id(id) {}
+ 
+     std::string debug_indent() const { return std::string(ctx.parse_depth * 2, ' '); }
+ 
+@@ -685,15 +686,36 @@ struct parser_executor {
+     common_peg_parse_result operator()(const common_peg_until_parser & p) const {
+         common_trie matcher(p.delimiters);
+ 
+-        // Scan input and check for delimiters
+-        size_t pos = start_pos;
+-        size_t last_valid_pos = start_pos;
++        auto * scans = ctx.stream_scans;
++        common_peg_stream_scan * scan = nullptr;
++        if (scans) {
++            auto it = std::find_if(scans->begin(), scans->end(), [&](const auto & entry) {
++                return entry.parser == parser_id && entry.start == start_pos;
++            });
++            if (it != scans->end()) {
++                scan = &*it;
++            } else if (scans->size() < 16) {
++                scans->push_back({parser_id, start_pos, start_pos});
++                scan = &scans->back();
++            }
++        }
++
++        size_t pos = scan ? scan->resume : start_pos;
++        size_t last_valid_pos = pos;
+         std::vector<common_peg_invalid_utf8> invalid_utf8;
++        const auto remember = [&](size_t next) {
++            // Recheck any partial delimiter or UTF-8 sequence on the next
++            // chunk, and preserve the original invalid-byte reporting.
++            if (scan && invalid_utf8.empty()) {
++                scan->resume = next;
++            }
++        };
+ 
+         while (pos < ctx.input.size()) {
+             auto utf8_result = common_parse_utf8_codepoint(ctx.input, pos);
+ 
+             if (utf8_result.status == utf8_parse_result::INCOMPLETE && ctx.is_lenient()) {
++                remember(last_valid_pos);
+                 // The rest of the sequence may still arrive, return what we have so far
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, last_valid_pos, {}, std::move(invalid_utf8));
+             }
+@@ -711,11 +733,13 @@ struct parser_executor {
+             auto match = matcher.check_at(ctx.input, pos);
+ 
+             if (match == common_trie::COMPLETE_MATCH) {
++                remember(pos);
+                 // Found a complete delimiter, return everything before it
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos, {}, std::move(invalid_utf8));
+             }
+ 
+             if (match == common_trie::PARTIAL_MATCH) {
++                remember(pos);
+                 // Found a partial match extending to end of input, return everything before it
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos, {}, std::move(invalid_utf8));
+             }
+@@ -724,6 +748,7 @@ struct parser_executor {
+             last_valid_pos = pos;
+         }
+ 
++        remember(last_valid_pos);
+         if (last_valid_pos == ctx.input.size() && ctx.is_lenient()) {
+             // Reached the end of a partial stream, there might still be more input that we need to consume.
+             return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, last_valid_pos, {}, std::move(invalid_utf8));
+@@ -825,7 +850,7 @@ common_peg_parse_result common_peg_arena::parse(common_peg_parse_context & ctx,
+ common_peg_parse_result common_peg_arena::parse(common_peg_parser_id id, common_peg_parse_context & ctx, size_t start) const {
+     // Execute parser
+     const auto & parser = parsers_.at(id);
+-    parser_executor exec(*this, ctx, start);
++    parser_executor exec(*this, ctx, start, id);
+     return std::visit(exec, parser);
+ }
+ 
+diff --git a/common/peg-parser.h b/common/peg-parser.h
+index 9255d6e..4fa64c1 100644
+--- a/common/peg-parser.h
++++ b/common/peg-parser.h
+@@ -182,11 +182,19 @@ inline common_peg_parse_flags operator~(common_peg_parse_flags a) {
+     return static_cast<common_peg_parse_flags>(~int(a));
+ }
+ 
++struct common_peg_stream_scan {
++    common_peg_parser_id parser;
++    size_t start;
++    size_t resume;
++};
++
+ struct common_peg_parse_context {
+     std::string input;               // [h,   e,  l,  l,  o,  _,  w,  o,  r,  l,  d]
+     std::vector<llama_token> tokens; // [id, -1, -1, -1, -1, id, -1, -1, -1, -1, -1]
+     common_peg_parse_flags flags;
+     common_peg_ast_arena ast;
++    // Owned by a streaming session with append-only input and an immutable grammar.
++    std::vector<common_peg_stream_scan> * stream_scans = nullptr;
+ 
+     int parse_depth;
+ 
+diff --git a/tests/test-stream-scan.cpp b/tests/test-stream-scan.cpp
+new file mode 100644
+index 0000000..2597464
+--- /dev/null
++++ b/tests/test-stream-scan.cpp
+@@ -0,0 +1,62 @@
++#include "chat-peg-parser.h"
++#include "peg-parser.h"
++
++#include <chrono>
++#include <cstdio>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool valid, const char * message) {
++    if (!valid) {
++        throw std::runtime_error(message);
++    }
++}
++
++static void verify_fragments() {
++    const auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
++        return p.reasoning(p.until("</think>")) + p.literal("</think>") +
++            p.content(p.until("<tool_call>")) + p.literal("<tool_call>") + p.rest();
++    });
++
++    std::vector<common_peg_stream_scan> scans;
++    std::string text;
++    const std::string chunks[] = {
++        "Pensando ", "\xc3", "\xa7", "</thi", "ng> ", "\xff", "</thi", "nk>",
++        "resposta ", "<tool_", "x> ", "<tool_", "call>", "{\"x\": 2}",
++    };
++    for (const auto & chunk : chunks) {
++        text += chunk;
++        common_peg_parse_context baseline(text, COMMON_PEG_PARSE_FLAG_LENIENT);
++        common_peg_parse_context incremental(text, COMMON_PEG_PARSE_FLAG_LENIENT);
++        incremental.stream_scans = &scans;
++        const auto a = parser.parse(baseline);
++        const auto b = parser.parse(incremental);
++        require(a.type == b.type && a.start == b.start && a.end == b.end, "stream result differs");
++        require(baseline.ast.dump() == incremental.ast.dump(), "stream AST differs");
++    }
++}
++
++static double replay(bool incremental) {
++    const auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
++        return p.until("</think>");
++    });
++    std::vector<common_peg_stream_scan> scans;
++    const auto start = std::chrono::steady_clock::now();
++    std::string text;
++    for (int i = 0; i < 8192; ++i) {
++        text += "token ";
++        common_peg_parse_context context(text, COMMON_PEG_PARSE_FLAG_LENIENT);
++        context.stream_scans = incremental ? &scans : nullptr;
++        const auto result = parser.parse(context);
++        require(result.end == text.size(), "plain scan lost input");
++    }
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++}
++
++int main() {
++    verify_fragments();
++    const double reference = replay(false);
++    const double resumed = replay(true);
++    std::printf("PASS stream scan parity (reference %.2f ms, resumed %.2f ms)\n", reference, resumed);
++}

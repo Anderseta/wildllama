@@ -55,7 +55,7 @@ func TestNativeChatTruncationKeepsParallelToolsWithOwner(t *testing.T) {
 				}
 				return nativeChatQualityPrompt(req), nil
 			}}}
-			got, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 6}}, llm.ChatRequest{Messages: messages}, true)
+			got, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 6}}, &llm.ChatRequest{Messages: messages}, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -81,7 +81,7 @@ func TestNativeChatOversizedLastToolGroupRetainsItsOwner(t *testing.T) {
 	runner := &mockRunner{TemplateFn: func(_ context.Context, req llm.ChatRequest) (string, error) {
 		return nativeChatQualityPrompt(req), nil
 	}}
-	got, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 2}}, llm.ChatRequest{Messages: messages}, true)
+	got, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 2}}, &llm.ChatRequest{Messages: messages}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestNativeChatCountingIsLocalToOnePreparation(t *testing.T) {
 		return "always the same prompt", nil
 	}}}
 	for range 2 {
-		_, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 1}}, llm.ChatRequest{Messages: messages}, true)
+		_, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 1}}, &llm.ChatRequest{Messages: messages}, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +125,7 @@ func TestNativeChatUsesOptionalCombinedCount(t *testing.T) {
 		return "", nil
 	}}}
 	messages := []api.Message{{Role: "system", Content: "instructions"}, {Role: "user", Content: "hello"}}
-	got, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 7}}, llm.ChatRequest{Messages: messages}, true)
+	got, err := truncateNativeChatMessages(context.Background(), nil, runner, &api.Options{Runner: api.Runner{NumCtx: 7}}, &llm.ChatRequest{Messages: messages}, true)
 	if err != nil || !reflect.DeepEqual(got, messages) || runner.countCalls != 1 {
 		t.Fatalf("got=%#v err=%v calls=%d; want one combined count and unchanged history", got, err, runner.countCalls)
 	}
@@ -138,8 +138,49 @@ func TestNativeChatTruncationStopsOnCancellation(t *testing.T) {
 		t.Error("canceled preparation must not render")
 		return "", nil
 	}}
-	_, err := truncateNativeChatMessages(ctx, nil, runner, &api.Options{Runner: api.Runner{NumCtx: 2}}, llm.ChatRequest{Messages: []api.Message{{Role: "user"}, {Role: "assistant"}}}, true)
+	_, err := truncateNativeChatMessages(ctx, nil, runner, &api.Options{Runner: api.Runner{NumCtx: 2}}, &llm.ChatRequest{Messages: []api.Message{{Role: "user"}, {Role: "assistant"}}}, true)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v; want context cancellation", err)
+	}
+}
+
+type nativeChatPreparer struct {
+	nativeChatCombinedCounter
+	key          string
+	prepared     []api.Message
+	prepareCalls int
+}
+
+func (r *nativeChatPreparer) PrepareChatTemplateWithTokenCount(_ context.Context, req llm.ChatRequest, budget int) (int, bool, error) {
+	r.prepareCalls++
+	if r.key != "" && r.key != req.PreparedChat {
+		return 0, false, errors.New("rewrote preparation key during truncation")
+	}
+	r.key = req.PreparedChat
+	count := len(strings.Fields(nativeChatQualityPrompt(req)))
+	if count > budget {
+		return count, false, nil
+	}
+	r.prepared = req.Messages
+	return count, true, nil
+}
+
+func TestNativeChatKeepsOnlyWinningPreparedCandidate(t *testing.T) {
+	runner := &nativeChatPreparer{}
+	messages := []api.Message{
+		{Role: "system", Content: "instructions"},
+		{Role: "user", Content: "old question with too many words"},
+		{Role: "assistant", Content: "old answer"},
+		{Role: "user", Content: "latest"},
+	}
+	opts := &api.Options{Runner: api.Runner{NumCtx: 4}}
+	req, err := prepareNativeChatRequest(t.Context(), nil, runner, opts, llm.ChatRequest{Messages: messages}, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.prepareCalls < 2 || req.PreparedChat == "" || req.PreparedChat != runner.key ||
+		!reflect.DeepEqual(req.Messages, runner.prepared) || !reflect.DeepEqual(req.Messages, []api.Message{messages[0], messages[3]}) {
+		t.Fatalf("prepared candidate and selected history diverged: calls=%d prepared=%#v selected=%#v",
+			runner.prepareCalls, runner.prepared, req.Messages)
 	}
 }

@@ -43,7 +43,7 @@ func TestNativeCancelledRequestSkipsSerialization(t *testing.T) {
 			case "template":
 				arguments := api.NewToolCallFunctionArguments()
 				arguments.Set("data", &spy)
-				_, err = runner.applyChatTemplate(ctx, ChatRequest{Messages: []api.Message{{Role: "assistant", ToolCalls: []api.ToolCall{{Function: api.ToolCallFunction{Name: "write", Arguments: arguments}}}}}}, false)
+				_, err = runner.applyChatTemplate(ctx, ChatRequest{Messages: []api.Message{{Role: "assistant", ToolCalls: []api.ToolCall{{Function: api.ToolCallFunction{Name: "write", Arguments: arguments}}}}}}, false, 0)
 			}
 			if !errors.Is(err, context.Canceled) || spy.calls.Load() != 0 {
 				t.Fatalf("cancelled request was encoded: calls=%d error=%v", spy.calls.Load(), err)

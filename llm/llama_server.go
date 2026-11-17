@@ -1857,14 +1857,15 @@ func (e *llamaServerProgressEmitter) next(p *llamaServerPromptProgress) *api.Pro
 }
 
 type llamaServerTimings struct {
-	DraftN         *int            `json:"draft_n"`
-	DraftNAccepted *int            `json:"draft_n_accepted"`
-	GPUFirst       json.RawMessage `json:"gpu_first,omitempty"`
-	CacheN         *int            `json:"cache_n"`
-	PromptN        int             `json:"prompt_n"`
-	PromptMS       float64         `json:"prompt_ms"`
-	PredictN       int             `json:"predicted_n"`
-	PredictMS      float64         `json:"predicted_ms"`
+	DraftN         *int                  `json:"draft_n"`
+	DraftNAccepted *int                  `json:"draft_n_accepted"`
+	GPUFirst       json.RawMessage       `json:"gpu_first,omitempty"`
+	CacheN         *int                  `json:"cache_n"`
+	CacheReuse     *api.PromptCacheReuse `json:"cache_reuse,omitempty"`
+	PromptN        int                   `json:"prompt_n"`
+	PromptMS       float64               `json:"prompt_ms"`
+	PredictN       int                   `json:"predicted_n"`
+	PredictMS      float64               `json:"predicted_ms"`
 }
 
 func (t llamaServerTimings) speculativeCounts() (*int, *int) {
@@ -1884,6 +1885,7 @@ func (t llamaServerTimings) promptEvalCount() int {
 type llamaServerApplyTemplateResponse struct {
 	Prompt     string `json:"prompt"`
 	TokenCount *int   `json:"token_count"`
+	Prepared   bool   `json:"prepared"`
 	Error      any    `json:"error"`
 }
 
@@ -2126,6 +2128,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 					DoneReason:            doneReason,
 					PromptEvalCount:       lsResp.Timings.promptEvalCount(),
 					PromptEvalCachedCount: lsResp.Timings.CacheN,
+					PromptCacheReuse:      lsResp.Timings.CacheReuse,
 					PromptEvalDuration:    time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond)),
 					EvalCount:             lsResp.Timings.PredictN,
 					EvalDuration:          time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond)),
@@ -2247,7 +2250,7 @@ func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
 }
 
 func (s *llamaServerRunner) ApplyChatTemplate(ctx context.Context, req ChatRequest) (string, error) {
-	response, err := s.applyChatTemplate(ctx, req, false)
+	response, err := s.applyChatTemplate(ctx, req, false, 0)
 	return response.Prompt, err
 }
 
@@ -2255,25 +2258,52 @@ func (s *llamaServerRunner) ApplyChatTemplate(ctx context.Context, req ChatReque
 // BOS/special-token policy. Older payloads omit token_count and use /tokenize.
 // Media token accounting remains the caller's separate, model-aware concern.
 func (s *llamaServerRunner) ApplyChatTemplateWithTokenCount(ctx context.Context, req ChatRequest) (string, int, error) {
-	response, err := s.applyChatTemplate(ctx, req, true)
+	response, err := s.applyChatTemplate(ctx, req, true, 0)
 	if err != nil {
 		return "", 0, err
 	}
-	if response.TokenCount != nil {
-		if *response.TokenCount < 0 {
-			return "", 0, errors.New("llama-server returned a negative template token count")
-		}
-		return response.Prompt, *response.TokenCount, nil
-	}
-	tokens, err := s.tokenize(ctx, response.Prompt, true)
-	return response.Prompt, len(tokens), err
+	count, err := s.chatTemplateTokenCount(ctx, response)
+	return response.Prompt, count, err
 }
 
-func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatRequest, countTokens bool) (llamaServerApplyTemplateResponse, error) {
+// PrepareChatTemplateWithTokenCount offers the native runner one short-lived
+// preparation for this API request. Older native payloads only report a count.
+func (s *llamaServerRunner) PrepareChatTemplateWithTokenCount(ctx context.Context, req ChatRequest, budget int) (int, bool, error) {
+	if req.Logprobs && len(req.Tools) > 0 {
+		// Streaming with both options uses the existing validation path.
+		_, count, err := s.ApplyChatTemplateWithTokenCount(ctx, req)
+		return count, false, err
+	}
+	response, err := s.applyChatTemplate(ctx, req, true, budget)
+	if err != nil {
+		return 0, false, err
+	}
+	count, err := s.chatTemplateTokenCount(ctx, response)
+	return count, response.Prepared && response.TokenCount != nil, err
+}
+
+func (s *llamaServerRunner) chatTemplateTokenCount(ctx context.Context, response llamaServerApplyTemplateResponse) (int, error) {
+	if response.TokenCount != nil {
+		if *response.TokenCount < 0 {
+			return 0, errors.New("llama-server returned a negative template token count")
+		}
+		return *response.TokenCount, nil
+	}
+	tokens, err := s.tokenize(ctx, response.Prompt, true)
+	return len(tokens), err
+}
+
+const preparedChatHeader = "X-Wildllama-Chat-Preparation"
+
+func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatRequest, countTokens bool, prepareBudget int) (llamaServerApplyTemplateResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return llamaServerApplyTemplateResponse{}, err
 	}
-	data, err := s.llamaServerChatRequest(req, false)
+	prepare := prepareBudget > 0 && req.PreparedChat != ""
+	if prepare {
+		req.Options = s.boundedChatOptions(req.Options)
+	}
+	data, err := s.llamaServerChatRequest(req, prepare)
 	if err != nil {
 		return llamaServerApplyTemplateResponse{}, err
 	}
@@ -2281,17 +2311,21 @@ func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatReque
 		data["count_tokens"] = true
 	}
 
-	body, err := json.Marshal(data)
+	body, err := encodeLlamaServerChatRequest(data)
 	if err != nil {
 		return llamaServerApplyTemplateResponse{}, fmt.Errorf("failed to marshal chat template request: %v", err)
 	}
 
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/apply-template", s.port)
-	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return llamaServerApplyTemplateResponse{}, fmt.Errorf("error creating chat template request: %v", err)
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
+	if prepare {
+		serverReq.Header.Set(preparedChatHeader, req.PreparedChat)
+		serverReq.Header.Set("X-Wildllama-Chat-Token-Limit", strconv.Itoa(prepareBudget))
+	}
 
 	if id := api.RequestID(ctx); id != "" {
 		serverReq.Header.Set("X-Request-ID", id)
@@ -2328,11 +2362,6 @@ func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatReque
 func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(ChatResponse)) error {
 	slog.Debug("llama-server chat request", "messages", len(req.Messages), "tools", len(req.Tools))
 
-	if req.Options == nil {
-		opts := api.DefaultOptions()
-		req.Options = &opts
-	}
-
 	if err := s.sem.Acquire(ctx, 1); err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("aborting chat request due to client closing the connection")
@@ -2344,7 +2373,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
 	memoryVersion := s.status.memoryFailureVersion()
 
-	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
+	req.Options = s.boundedChatOptions(req.Options)
 
 	status, err := s.getServerStatusRetry(ctx)
 	if err != nil {
@@ -2358,10 +2387,11 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		return err
 	}
 
-	buffer := &bytes.Buffer{}
-	enc := json.NewEncoder(buffer)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(lsReq); err != nil {
+	if req.PreparedChat != "" {
+		lsReq["count_tokens"] = true // use exactly the bytes sized by the runner
+	}
+	buffer, err := encodeLlamaServerChatRequest(lsReq)
+	if err != nil {
 		return fmt.Errorf("failed to marshal chat request: %v", err)
 	}
 
@@ -2371,6 +2401,9 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		return fmt.Errorf("error creating chat request: %v", err)
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
+	if req.PreparedChat != "" {
+		serverReq.Header.Set(preparedChatHeader, req.PreparedChat)
+	}
 
 	if id := api.RequestID(ctx); id != "" {
 		serverReq.Header.Set("X-Request-ID", id)
@@ -2479,6 +2512,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				resp.DoneReason = doneReason
 				resp.PromptEvalCount = lsResp.Timings.promptEvalCount()
 				resp.PromptEvalCachedCount = lsResp.Timings.CacheN
+				resp.PromptCacheReuse = lsResp.Timings.CacheReuse
 				resp.PromptEvalDuration = time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond))
 				resp.EvalCount = lsResp.Timings.PredictN
 				resp.EvalDuration = time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond))
@@ -2631,6 +2665,23 @@ func accumulatedToolCalls(accs map[int]*llamaServerToolCallAccumulator, allowMis
 	}
 
 	return toolCalls, nil
+}
+
+func (s *llamaServerRunner) boundedChatOptions(options *api.Options) *api.Options {
+	if options == nil {
+		defaults := api.DefaultOptions()
+		options = &defaults
+	}
+	bounded := *options
+	bounded.NumPredict = boundedNumPredict(bounded.NumPredict, s.options.NumCtx)
+	return &bounded
+}
+
+func encodeLlamaServerChatRequest(data map[string]any) (*bytes.Buffer, error) {
+	buffer := &bytes.Buffer{}
+	encoder := json.NewEncoder(buffer)
+	encoder.SetEscapeHTML(false)
+	return buffer, encoder.Encode(data)
 }
 
 func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool) (map[string]any, error) {

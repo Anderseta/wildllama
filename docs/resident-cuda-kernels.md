@@ -167,3 +167,9 @@ and JSON serialization routines. Median time over five measured replays fell
 from 5,395 ms to 39 ms for plain completions. Structured chat measured 5,345
 and 5,402 ms respectively. This isolates server-side work on a long response
 and excludes model generation and network transport.
+
+Streaming structured chat can resume PEG delimiter scans from the last
+confirmed byte of an append-only segment. The parser still handles grammar
+branches, incomplete delimiters and invalid UTF-8 through its ordinary logic.
+The final parse runs over the complete output. The `stream-scan` fixture
+compares parse results and ASTs on fragmented reasoning and tool delimiters.

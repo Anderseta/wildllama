@@ -3,11 +3,15 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+
+	"golang.org/x/sync/semaphore"
 
 	"github.com/ollama/ollama/api"
 )
@@ -155,5 +159,83 @@ func TestNativeChatTemplateCountDoesNotRetryInvalidTemplate(t *testing.T) {
 	_, _, err := runner.ApplyChatTemplateWithTokenCount(context.Background(), ChatRequest{Options: &opts})
 	if err == nil || !strings.Contains(err.Error(), "invalid tool history") {
 		t.Fatalf("template error was hidden: %v", err)
+	}
+}
+
+func TestNativeChatPreparedBodyMatchesGeneration(t *testing.T) {
+	for _, prepared := range []bool{false, true} {
+		name := "legacy runner"
+		if prepared {
+			name = "prepared chat"
+		}
+		t.Run(name, func(t *testing.T) {
+			const key = "ONE_PRIVATE_PREPARATION_KEY"
+			var mutex sync.Mutex
+			var preparedBody string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					_, _ = io.WriteString(w, `{"status":"ok"}`)
+					return
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				mutex.Lock()
+				defer mutex.Unlock()
+				switch r.URL.Path {
+				case "/apply-template":
+					preparedBody = string(body)
+					if r.Header.Get(preparedChatHeader) != key || r.Header.Get("X-Wildllama-Chat-Token-Limit") != "64" {
+						t.Error("missing runner preparation identity or budget")
+					}
+					if prepared {
+						_, _ = io.WriteString(w, `{"token_count":17,"prepared":true}`)
+					} else {
+						_, _ = io.WriteString(w, `{"prompt":"legacy","token_count":17}`)
+					}
+				case "/v1/chat/completions":
+					if prepared && (r.Header.Get(preparedChatHeader) != key || string(body) != preparedBody) {
+						t.Error("generation differs from prepared streaming body")
+					}
+					if !prepared && r.Header.Get(preparedChatHeader) != "" {
+						t.Error("generation sent a preparation key rejected by the runner")
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"timings\":{\"prompt_n\":17,\"predicted_n\":1}}\n\ndata: [DONE]\n\n")
+				default:
+					t.Errorf("unexpected endpoint %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			runner := &llamaServerRunner{
+				port:    srv.Listener.Addr().(*net.TCPAddr).Port,
+				cmd:     fakeRunningCmd(),
+				sem:     semaphore.NewWeighted(1),
+				options: api.Options{Runner: api.Runner{NumCtx: 128}},
+			}
+			opts := api.DefaultOptions()
+			opts.NumPredict = 1000
+			req := ChatRequest{
+				Options: &opts, PreparedChat: key,
+				Messages: []api.Message{{Role: "system", Content: "<instructions>"}, {Role: "user", Content: "Parâmetros & Unicode."}},
+			}
+			count, accepted, err := runner.PrepareChatTemplateWithTokenCount(t.Context(), req, 64)
+			if err != nil || count != 17 || accepted != prepared {
+				t.Fatalf("count=%d accepted=%t err=%v", count, accepted, err)
+			}
+			if !accepted {
+				req.PreparedChat = ""
+			}
+			if err := runner.Chat(t.Context(), req, func(ChatResponse) {}); err != nil {
+				t.Fatal(err)
+			}
+			if opts.NumPredict != 1000 {
+				t.Fatal("preparation or generation changed the caller's options")
+			}
+		})
 	}
 }

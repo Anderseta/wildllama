@@ -243,6 +243,8 @@ type ChatRequest struct {
 	Options  *api.Options
 	Think    *api.ThinkValue
 	Shift    bool
+	// A runner may reuse a prior preparation only for the exact encoded request.
+	PreparedChat string
 
 	Logprobs    bool
 	TopLogprobs int
@@ -260,6 +262,7 @@ type ChatResponse struct {
 	Done                      bool                    `json:"done"`
 	PromptEvalCount           int                     `json:"prompt_eval_count"`
 	PromptEvalCachedCount     *int                    `json:"prompt_eval_cached_count,omitempty"`
+	PromptCacheReuse          *api.PromptCacheReuse   `json:"prompt_cache_reuse,omitempty"`
 	PromptEvalDuration        time.Duration           `json:"prompt_eval_duration"`
 	EvalCount                 int                     `json:"eval_count"`
 	EvalDuration              time.Duration           `json:"eval_duration"`
@@ -299,18 +302,19 @@ type Logprob struct {
 }
 
 type CompletionResponse struct {
-	SpeculativeDraftTokens    *int                `json:"speculative_draft_tokens,omitempty"`
-	SpeculativeAcceptedTokens *int                `json:"speculative_accepted_tokens,omitempty"`
-	PromptProgress            *api.PromptProgress `json:"prompt_progress,omitempty"`
-	GPUFirst                  json.RawMessage     `json:"gpu_first,omitempty"`
-	Content                   string              `json:"content"`
-	DoneReason                DoneReason          `json:"done_reason"`
-	Done                      bool                `json:"done"`
-	PromptEvalCount           int                 `json:"prompt_eval_count"`
-	PromptEvalCachedCount     *int                `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration        time.Duration       `json:"prompt_eval_duration"`
-	EvalCount                 int                 `json:"eval_count"`
-	EvalDuration              time.Duration       `json:"eval_duration"`
+	SpeculativeDraftTokens    *int                  `json:"speculative_draft_tokens,omitempty"`
+	SpeculativeAcceptedTokens *int                  `json:"speculative_accepted_tokens,omitempty"`
+	PromptProgress            *api.PromptProgress   `json:"prompt_progress,omitempty"`
+	GPUFirst                  json.RawMessage       `json:"gpu_first,omitempty"`
+	Content                   string                `json:"content"`
+	DoneReason                DoneReason            `json:"done_reason"`
+	Done                      bool                  `json:"done"`
+	PromptEvalCount           int                   `json:"prompt_eval_count"`
+	PromptEvalCachedCount     *int                  `json:"prompt_eval_cached_count,omitempty"`
+	PromptCacheReuse          *api.PromptCacheReuse `json:"prompt_cache_reuse,omitempty"`
+	PromptEvalDuration        time.Duration         `json:"prompt_eval_duration"`
+	EvalCount                 int                   `json:"eval_count"`
+	EvalDuration              time.Duration         `json:"eval_duration"`
 
 	// Logprobs contains log probability information if requested
 	Logprobs []Logprob `json:"logprobs,omitempty"`

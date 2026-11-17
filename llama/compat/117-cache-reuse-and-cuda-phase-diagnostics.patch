@@ -1,0 +1,424 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 147c76a..57432f5 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -951,6 +951,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     return common_sampler_sample_synchronized(gsmpl, ctx, idx, grammar_first);
+ }
+ 
++llama_token common_sampler_sample_after_sync(common_sampler * gsmpl, llama_context * ctx, int idx) {
++    return common_sampler_sample_synchronized(gsmpl, ctx, idx, false);
++}
++
+ bool common_sampler_draft_host_only(const common_sampler * gsmpl) {
+     return gsmpl && !gsmpl->grmr && !gsmpl->rbudget && !gsmpl->params.reasoning_control &&
+         llama_sampler_draft_host_only(gsmpl->chain);
+diff --git a/common/sampling.h b/common/sampling.h
+index dc5c4b0..dedc77c 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -87,6 +87,8 @@ bool common_sampler_can_overlap_output(const struct common_sampler * gsmpl);
+ // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
+ //
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
++// The caller has completed the latest forward and has not submitted more work.
++llama_token common_sampler_sample_after_sync(common_sampler * gsmpl, llama_context * ctx, int idx);
+ 
+ // Internal neural-draft contract: the caller already fenced this output
+ // generation and will not submit/mutate the context while consuming it.
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a474e70..2ab4084 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3578,6 +3578,9 @@ static bool ggml_cuda_synchronize_prefill(ggml_backend_cuda_context & context, c
+ }
+ #endif
+ 
++static thread_local uint64_t cuda_host_wait_calls = 0;
++static thread_local uint64_t cuda_host_wait_elapsed_us = 0;
++
+ static void ggml_backend_cuda_synchronize_impl(ggml_backend_t backend, bool prefill) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+     static const bool trace = ggml_cuda_env_flag("WILDLLAMA_CUDA_SYNC_TRACE");
+@@ -3595,6 +3598,8 @@ static void ggml_backend_cuda_synchronize_impl(ggml_backend_t backend, bool pref
+ 
+     if (trace) {
+         const auto elapsed_us = ggml_time_us() - start_us;
++        ++cuda_host_wait_calls;
++        cuda_host_wait_elapsed_us += elapsed_us;
+         auto & wait = cuda_ctx->host_wait[prefill ? 1 : 0];
+         wait.calls.fetch_add(1, std::memory_order_relaxed);
+         wait.elapsed_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+@@ -7699,6 +7704,12 @@ static bool ggml_backend_cuda_mtp_pack_rows(
+ #endif
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_cuda_host_wait_snapshot") == 0) {
++        return (void *) +[](uint64_t * calls, uint64_t * elapsed_us) {
++            *calls = cuda_host_wait_calls;
++            *elapsed_us = cuda_host_wait_elapsed_us;
++        };
++    }
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+     if (strcmp(name, "ggml_backend_synchronize_prefill") == 0) {
+         return (void *) +[](ggml_backend_t backend) { ggml_backend_cuda_synchronize_impl(backend, true); };
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index e0cb0ce..dca6e7a 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -159,6 +159,13 @@ json server_slot_stats::to_json() const {
+     if (!gpu_first.is_null()) {
+         base["gpu_first"] = gpu_first;
+     }
++    if (prompt_cache_reason) {
++        base["cache_reuse"] = {
++            {"reason", prompt_cache_reason},
++            {"retained_tokens", prompt_cache_retained},
++            {"matched_tokens", prompt_cache_matched},
++        };
++    }
+     return base;
+ }
+ 
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 809febe..74e3898 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -524,6 +524,9 @@ struct server_speculation_control {
+ // shared between server_slot and server_task_result_*
+ struct server_slot_stats {
+     json gpu_first; // populated only for the final diagnostic response
++    const char * prompt_cache_reason = nullptr;
++    int32_t prompt_cache_retained = 0;
++    int32_t prompt_cache_matched = 0;
+     uint64_t n_prompt_cached    = 0;
+     uint64_t n_prompt_processed = 0;
+     uint64_t n_gen              = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 5b13201..d0ac951 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -35,6 +35,7 @@
+ #include "base64.hpp"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cctype>
+ #include <charconv>
+ #include <cstddef>
+@@ -59,6 +60,67 @@
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
++struct server_cuda_wait_trace {
++    enum phase { prefill, forward, target_readback, draft, draft_catchup, verify, rollback, phase_count };
++    using snapshot_fn = void (*)(uint64_t *, uint64_t *);
++
++    struct totals {
++        uint64_t calls = 0;
++        uint64_t us = 0;
++    };
++    std::array<totals, phase_count> waits{};
++    snapshot_fn snapshot = nullptr;
++
++    void setup() {
++        const char * env = std::getenv("WILDLLAMA_CUDA_SYNC_TRACE");
++        if (!env || std::atoi(env) == 0) {
++            return;
++        }
++        if (auto * cuda = ggml_backend_reg_by_name("CUDA")) {
++            snapshot = reinterpret_cast<snapshot_fn>(
++                ggml_backend_reg_get_proc_address(cuda, "ggml_backend_cuda_host_wait_snapshot"));
++        }
++    }
++
++    struct scope {
++        const snapshot_fn snapshot;
++        totals & destination;
++        totals initial{};
++
++        scope(server_cuda_wait_trace & owner, phase value)
++            : snapshot(owner.snapshot), destination(owner.waits[value]) {
++            if (snapshot) {
++                snapshot(&initial.calls, &initial.us);
++            }
++        }
++
++        ~scope() {
++            if (snapshot) {
++                totals current;
++                snapshot(&current.calls, &current.us);
++                destination.calls += current.calls - initial.calls;
++                destination.us += current.us - initial.us;
++            }
++        }
++        scope(const scope &) = delete;
++        scope & operator=(const scope &) = delete;
++    };
++
++    void flush() {
++        constexpr const char * names[phase_count] = {
++            "prefill", "forward", "target_readback", "draft", "draft_catchup", "verify", "rollback",
++        };
++        for (size_t i = 0; i < waits.size(); ++i) {
++            if (waits[i].calls != 0) {
++                SRV_INF("CUDA host wait by phase: phase=%s calls=%" PRIu64 " wall_us=%" PRIu64 "\n",
++                        names[i], waits[i].calls, waits[i].us);
++            }
++        }
++        waits = {};
++        snapshot = nullptr;
++    }
++};
++
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (!params.mmproj.path.empty()) {
+         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
+@@ -355,6 +417,7 @@ struct server_slot {
+     slot_state state = SLOT_STATE_IDLE;
+ 
+     server_prompt prompt;
++    const char * prompt_clear_reason = nullptr;
+ 
+     bool prompt_save(server_prompt_cache & prompt_cache) const {
+         if (prompt.tokens.size() == 0) {
+@@ -389,9 +452,12 @@ struct server_slot {
+         return res;
+     }
+ 
+-    void prompt_clear() {
++    void prompt_clear(const char * reason = nullptr) {
+         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+ 
++        if (reason || !prompt.tokens.empty()) {
++            prompt_clear_reason = reason;
++        }
+         mem.seq_rm(id, -1, -1);
+ 
+         prompt.clear();
+@@ -1192,9 +1258,12 @@ private:
+ 
+     int64_t t_last_load_progress_ms = 0;
+ 
++    server_cuda_wait_trace cuda_wait_trace;
++
+     void destroy() {
+         flush_response_overlap();
+         discard_multi_overlap();
++        cuda_wait_trace.flush();
+         multi_entropy.reset();
+         response_overlap_ready = false;
+         discard_decode_overlap();
+@@ -1377,6 +1446,7 @@ private:
+ 
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();
++        cuda_wait_trace.setup();
+ 
+         if (model_tgt == nullptr) {
+             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
+@@ -1979,7 +2049,7 @@ private:
+                 }
+ 
+                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+-                    ret->prompt_clear();
++                    ret->prompt_clear("checkpoint_restore_failed");
+                 }
+ 
+                 prompt_cache->update();
+@@ -2011,7 +2081,7 @@ private:
+             if (slot.prompt.n_tokens() > 0) {
+                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+ 
+-                slot.prompt_clear();
++                slot.prompt_clear("memory_pressure");
+ 
+                 res = true;
+ 
+@@ -4056,12 +4126,13 @@ private:
+         for (int32_t off = 0; off < batch.size(); off = off_next) {
+             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+             bool defer_mtp_catchup = false;
++            bool target_fenced = false;
+             try {
+                 scoped_timer t(t_decode, n_decode);
+                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
+ 
+                 batch.render(off, n_tokens);
+-                bool ok = decode(n_batch, off, defer_mtp_catchup);
++                bool ok = decode(n_batch, off, defer_mtp_catchup, target_fenced);
+ #ifdef DEBUG_TIMINGS
+                 llama_synchronize(ctx_tgt);
+ #endif
+@@ -4084,7 +4155,7 @@ private:
+ 
+             try {
+                 scoped_timer t(t_post_decode, n_post_decode);
+-                post_decode(n_tokens, off, defer_mtp_catchup);
++                post_decode(n_tokens, off, defer_mtp_catchup, target_fenced);
+             } catch (const std::exception & e) {
+                 SRV_ERR("post_decode() failed: %s\n", e.what());
+                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
+@@ -4249,6 +4320,7 @@ private:
+         if (!drafting.empty()) {
+             queue_tasks.yield_to_queue([&]() {
+                 try {
++                    server_cuda_wait_trace::scope wait(cuda_wait_trace, server_cuda_wait_trace::draft);
+                     common_speculative_draft(spec.get(), on_submit);
+                 } catch (...) {
+                     // Publication can throw after the first async submit. Drain
+@@ -4626,9 +4698,19 @@ private:
+                                 return;
+                             }
+ 
++                            const char * cleared = std::exchange(slot.prompt_clear_reason, nullptr);
++                            slot.stats.prompt_cache_retained = slot.prompt.n_tokens();
+                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                                 // reuse any previously computed tokens that are common with the new prompt
+                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
++                                slot.stats.prompt_cache_matched = n_past;
++                                if (slot.prompt.tokens.empty()) {
++                                    slot.stats.prompt_cache_reason = cleared ? cleared : "cold_slot";
++                                } else {
++                                    const size_t comparable = std::min(slot.prompt.tokens.size(), input_tokens.size());
++                                    slot.stats.prompt_cache_reason = static_cast<size_t>(n_past) < comparable
++                                        ? "prefix_changed" : "prefix_reused";
++                                }
+ 
+                                 // the children start from the shared prefix, do not go past it
+                                 if (slot.task->n_tokens_shared > 0) {
+@@ -4708,6 +4790,7 @@ private:
+                             } else {
+                                 // if we don't cache the prompt, we have to remove all previous tokens
+                                 n_past = 0;
++                                slot.stats.prompt_cache_reason = "cache_disabled";
+                             }
+ 
+                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+@@ -4792,6 +4875,9 @@ private:
+                                     );
+ 
+                                     bool do_reset = it == slot.prompt.checkpoints.rend();
++                                    if (do_reset) {
++                                        slot.stats.prompt_cache_reason = "checkpoint_unavailable";
++                                    }
+ 
+                                     if (!do_reset) {
+                                         const common_state_view state {it->data_tgt, it->data_dft, it->data_spec};
+@@ -4814,6 +4900,7 @@ private:
+                                         if (!restored) {
+                                             SLT_WRN(slot, "%s", "failed to restore complete context checkpoint; target and draft cleared, reprocessing the full prompt\n");
+                                             do_reset = true;
++                                            slot.stats.prompt_cache_reason = "checkpoint_restore_failed";
+                                         }
+                                     }
+ 
+@@ -4856,6 +4943,9 @@ private:
+                         const llama_pos resume_pos = slot.prompt.tokens.pos_next(n_past);
+                         if (slot.can_speculate() && !common_speculative_can_resume(spec.get(), slot.id, resume_pos)) {
+                             SLT_WRN(slot, "%s", "MTP predecessor state unavailable for cached prefix; reprocessing the full prompt\n");
++                            if (n_past > 0) {
++                                slot.stats.prompt_cache_reason = "mtp_state_unavailable";
++                            }
+                             n_past = 0;
+                             slot.prompt.checkpoints.clear();
+                             common_speculative_set_state(spec.get(), slot.id, {});
+@@ -5220,7 +5310,7 @@ private:
+         return common_speculative_mtp_can_defer_catchup(spec.get(), batch.view);
+     }
+ 
+-    bool decode(int32_t & n_batch, int32_t off, bool & defer_mtp_catchup) {
++    bool decode(int32_t & n_batch, int32_t off, bool & defer_mtp_catchup, bool & target_fenced) {
+         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
+ 
+         metrics_pre_decode();
+@@ -5247,8 +5337,12 @@ private:
+         }
+ 
+         bool has_output = false;
++        bool contains_prompt = false;
+         for (int i = off; i < off + batch.view.size(); ++i) {
+             has_output |= batch.tokens[i].output;
++            if (cuda_wait_trace.snapshot) {
++                contains_prompt |= batch.tokens[i].is_prompt;
++            }
+         }
+ 
+         // yield to the queue, so we can still handle metrics tasks while decoding
+@@ -5260,6 +5354,8 @@ private:
+                 llama_context::graph_variant_admission_stats{};
+             const auto before_secondary = observe_memory ? ctx_tgt->get_graph_variant_stats().compute_bytes : 0;
+             {
++                server_cuda_wait_trace::scope wait(cuda_wait_trace,
++                    contains_prompt ? server_cuda_wait_trace::prefill : server_cuda_wait_trace::forward);
+                 server_prefill_reuse_scope<llama_context> reuse_only(ctx_tgt, prefill_round_reuse_only);
+                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+             }
+@@ -5273,7 +5369,10 @@ private:
+                     throw;
+                 }
+                 if (has_output) {
++                    server_cuda_wait_trace::scope wait(cuda_wait_trace,
++                        contains_prompt ? server_cuda_wait_trace::prefill : server_cuda_wait_trace::target_readback);
+                     llama_synchronize(ctx_tgt);
++                    target_fenced = true;
+                 }
+             }
+             if (observe_memory) {
+@@ -5367,6 +5466,7 @@ private:
+                 {
+                     // A changed target prompt slice also changes draft catch-up.
+                     // It must not silently retain additional draft graph arenas.
++                    server_cuda_wait_trace::scope wait(cuda_wait_trace, server_cuda_wait_trace::draft_catchup);
+                     server_prefill_reuse_scope<llama_context> reuse_only(ctx_dft, ctx_dft && prefill_round_reuse_only);
+                     ok = common_speculative_process(spec.get(), batch.view);
+                 }
+@@ -5423,7 +5523,7 @@ private:
+         return true;
+     }
+ 
+-    void post_decode(int32_t n_batch_tokens, int32_t off, bool defer_mtp_catchup = false) {
++    void post_decode(int32_t n_batch_tokens, int32_t off, bool defer_mtp_catchup = false, bool target_fenced = false) {
+         response_overlap_ready = decode_overlap_enabled && !decode_overlap_failed &&
+             (spec && ctx_dft ? !common_speculative_needs_prompt_tokens(spec.get()) &&
+                 llama_draft_response_overlap_supported(ctx_tgt) && llama_draft_response_overlap_supported(ctx_dft) :
+@@ -5510,7 +5610,14 @@ private:
+             {
+                 scoped_timer timer(t_sampl, n_sampl);
+                 try {
+-                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
++                    server_cuda_wait_trace::scope wait(cuda_wait_trace, server_cuda_wait_trace::target_readback);
++                    // With one plain slot, no speculative catch-up or another
++                    // slot can submit work between the explicit fence and sampling.
++                    if (target_fenced && slots.size() == 1 && !spec && slot.ctx_tgt == ctx_tgt) {
++                        id = common_sampler_sample_after_sync(slot.smpl.get(), slot.ctx_tgt, tok_idx);
++                    } else {
++                        id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
++                    }
+                 } catch(const common_sampler_constraint_error & error) {
+                     send_error(slot,error.what(),ERROR_TYPE_INVALID_REQUEST);
+                     slot.release();slot.prompt_clear();slot.i_batch=-1;
+@@ -5612,6 +5719,7 @@ private:
+ 
+                 std::vector<llama_token> accepted;
+                 try {
++                server_cuda_wait_trace::scope wait(cuda_wait_trace, server_cuda_wait_trace::verify);
+                 if (!synth_probs.empty()) {
+                     // synthetic acceptance replaces verification entirely, so it comes first
+                     accepted = server_sample_and_accept_synth(
+@@ -5642,6 +5750,7 @@ private:
+                 // check for partial draft acceptance
+                 if (n_rollback > 0) {
+                     if (use_ckpt_tgt) {
++                        server_cuda_wait_trace::scope wait(cuda_wait_trace, server_cuda_wait_trace::rollback);
+                         if (trace > 0) {
+                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                         }
+@@ -5679,6 +5788,7 @@ private:
+                     // The final sampled token has not been evaluated yet.
+                     bool ok = true;
+                     queue_tasks.yield_to_queue([&]() {
++                        server_cuda_wait_trace::scope wait(cuda_wait_trace, server_cuda_wait_trace::draft_catchup);
+                         ok = common_speculative_mtp_process_prefix(spec.get(), batch.view, int32_t(accepted.size()));
+                     });
+                     if (!ok) {

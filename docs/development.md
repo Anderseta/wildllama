@@ -69,6 +69,10 @@ Start a runner with `WILDLLAMA_CUDA_SYNC_TRACE=1` to print counts and wall time
 for ordinary and large-batch host waits when its CUDA backends shut down. The
 trace measures the scheduler's CUDA stream fences and includes no prompt data.
 Compare process CPU time separately from the trace's elapsed wait time.
+The native server also groups the measured fences by its prefill, forward,
+target readback, draft, draft catch-up, verification and rollback scopes.
+Work submitted outside those scopes is included only in the backend totals.
+The phase trace never changes the wait policy.
 
 `WILDLLAMA_CUDA_PREFILL_BLOCKING=1` enables experimental blocking waits on
 NVIDIA CUDA when a context synchronization has at least 128 evaluation tokens
@@ -76,6 +80,12 @@ queued. It records a host-wait event on the existing stream when work is still
 pending. Other fences retain their existing synchronization behavior. Compare
 prompt and generation timings, process CPU time, and output tokens against the
 same build with the option off before enabling it for a workload.
+
+`WILDLLAMA_CUDA_TARGET_BLOCKING=1` is a separate experiment for the target
+output fence of a single-slot generation batch. The CUDA backend limits the
+blocking policy to that host call. Prompt batches, the MTP draft and the
+sampler keep their original synchronization paths. The phase trace reports
+these waits independently of the selected policy.
 
 ## macOS (Apple Silicon)
 

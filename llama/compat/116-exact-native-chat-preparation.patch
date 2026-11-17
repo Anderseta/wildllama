@@ -1,0 +1,292 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 5b13201..bcff208 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -35,6 +35,8 @@
+ #include "base64.hpp"
+ 
+ #include <algorithm>
++#include <cctype>
++#include <charconv>
+ #include <cstddef>
+ #include <cstdlib>
+ #include <cstring>
+@@ -45,6 +47,7 @@
+ #include <memory>
+ #include <filesystem>
+ #include <random>
++#include <string_view>
+ #include <utility>
+ #include <fstream>
+ 
+@@ -6033,13 +6036,86 @@ void server_context::set_state_callback(server_state_callback_t callback) {
+ // server_routes
+ //
+ 
++namespace {
++constexpr size_t prepared_chat_capacity = 4;
++constexpr size_t prepared_chat_max_bytes = 1 << 20;
++constexpr size_t prepared_chat_max_tokens = 128 << 10;
++constexpr auto prepared_chat_lifetime = std::chrono::seconds(30);
++constexpr char prepared_chat_header[] = "x-wildllama-chat-preparation";
++constexpr char prepared_chat_limit_header[] = "x-wildllama-chat-token-limit";
++
++std::string_view prepared_chat_request_header(const server_http_req & req, std::string_view name) {
++    for (const auto & [key, value] : req.headers) {
++        if (key.size() == name.size() && std::equal(key.begin(), key.end(), name.begin(),
++                [](unsigned char a, char b) { return std::tolower(a) == b; })) {
++            return value;
++        }
++    }
++    return {};
++}
++
++std::string prepared_chat_key(const server_http_req & req) {
++    const auto key = prepared_chat_request_header(req, prepared_chat_header);
++    if (key.size() < 16 || key.size() > 64 || req.body.size() > prepared_chat_max_bytes ||
++        key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string_view::npos) {
++        return {};
++    }
++    return std::string(key);
++}
++
++size_t prepared_chat_limit(const server_http_req & req) {
++    const auto value = prepared_chat_request_header(req, prepared_chat_limit_header);
++    if (value.empty()) {
++        return 0;
++    }
++    size_t limit = 0;
++    const auto end = value.data() + value.size();
++    const auto parsed = std::from_chars(value.data(), end, limit);
++    return parsed.ec == std::errc{} && parsed.ptr == end ? std::min(limit, prepared_chat_max_tokens) : 0;
++}
++} // namespace
++
++void server_routes::clear_prepared_chat() {
++    std::lock_guard<std::mutex> lock(prepared_chat_mutex);
++    prepared_chats.clear();
++}
++
++void server_routes::remember_prepared_chat(prepared_chat_request prepared) {
++    const auto now = std::chrono::steady_clock::now();
++    prepared.expires = now + prepared_chat_lifetime;
++    std::lock_guard<std::mutex> lock(prepared_chat_mutex);
++    prepared_chats.erase(std::remove_if(prepared_chats.begin(), prepared_chats.end(),
++            [&](const auto & entry) { return entry.expires <= now || entry.key == prepared.key; }), prepared_chats.end());
++    if (prepared_chats.size() >= prepared_chat_capacity) {
++        prepared_chats.pop_front();
++    }
++    prepared_chats.push_back(std::move(prepared));
++}
++
++std::optional<server_routes::prepared_chat_request> server_routes::take_prepared_chat(
++        const std::string & key, const std::string & body) {
++    const auto now = std::chrono::steady_clock::now();
++    std::lock_guard<std::mutex> lock(prepared_chat_mutex);
++    prepared_chats.erase(std::remove_if(prepared_chats.begin(), prepared_chats.end(),
++            [&](const auto & entry) { return entry.expires <= now; }), prepared_chats.end());
++    for (auto it = prepared_chats.begin(); it != prepared_chats.end(); ++it) {
++        if (it->key == key && it->body == body) {
++            auto prepared = std::move(*it);
++            prepared_chats.erase(it);
++            return prepared;
++        }
++    }
++    return std::nullopt;
++}
++
+ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+             const json & data,
+             const std::vector<raw_buffer> & files,
+             task_response_type res_type,
+-            const common_chat_session & chat_session) {
++            const common_chat_session & chat_session,
++            std::vector<server_tokens> inputs) {
+     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+ 
+     auto res = create_response();
+@@ -6074,14 +6150,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         }
+ 
+         // process prompt
+-        std::vector<server_tokens> inputs;
+-
+-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+-            // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+-        } else {
+-            // Everything else, including multimodal completions.
+-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
++        if (inputs.empty()) {
++            if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
++                // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
++                inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
++            } else {
++                // Everything else, including multimodal completions.
++                inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
++            }
+         }
+ 
+         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+@@ -6729,6 +6805,15 @@ void server_routes::init_routes() {
+     this->post_chat_completions = [this](const server_http_req & req) {
+         auto res = create_response();
+         std::vector<raw_buffer> files;
++        const auto key = prepared_chat_key(req);
++        if (!key.empty()) {
++            if (auto prepared = take_prepared_chat(key, req.body)) {
++                auto response = handle_completions_impl(req, SERVER_TASK_TYPE_COMPLETION, prepared->data,
++                        files, TASK_RESPONSE_TYPE_OAI_CHAT, prepared->session, std::move(prepared->inputs));
++                response->headers[prepared_chat_header] = "reused";
++                return response;
++            }
++        }
+         json body = json::parse(req.body);
+         common_chat_session session;
+         json body_parsed = oaicompat_chat_params_parse(
+@@ -7077,6 +7162,29 @@ void server_routes::init_routes() {
+             meta->chat_params,
+             files,
+             session);
++        const auto key = prepared_chat_key(req);
++        const auto limit = key.empty() ? 0 : prepared_chat_limit(req);
++        if (limit && files.empty() && json_value(body, "count_tokens", false)) {
++            std::vector<server_tokens> inputs;
++            size_t count;
++            if (ctx_server.mctx != nullptr) {
++                // Preserve the existing /tokenize sizing policy. Generation
++                // still uses process_mtmd_prompt on the prepared text.
++                count = tokenize_mixed(ctx_server.vocab, data.at("prompt"), true, true).size();
++            } else {
++                inputs = tokenize_input_prompts(ctx_server.vocab, nullptr, data.at("prompt"), true, true, ctx_server.init_opt);
++                GGML_ASSERT(inputs.size() == 1);
++                count = inputs.front().size();
++            }
++            const bool prepared = count <= limit && !req.should_stop() &&
++                data.at("prompt").get<std::string>().size() <= prepared_chat_max_bytes &&
++                session.grammar().size() <= prepared_chat_max_bytes;
++            if (prepared) {
++                remember_prepared_chat({key, req.body, {}, std::move(data), std::move(session), std::move(inputs)});
++            }
++            res->ok({{"token_count", count}, {"prepared", prepared}});
++            return res;
++        }
+         json result = {{ "prompt", std::move(data.at("prompt")) }};
+         if (json_value(body, "count_tokens", false) && files.empty() && ctx_server.mctx == nullptr) {
+             // Match text generation's tokenize_input_prompts(..., true, true),
+@@ -7931,6 +8039,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
+     std::unique_lock<std::mutex> lock(mutex_cache);
+ 
+     if (is_sleeping) {
++        clear_prepared_chat();
+         cached_models  = get_res_models(*meta);
+         cached_props   = get_res_props(*meta, params, true);
+         cached_metrics = ctx_server.get_metrics();
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 4a8e327..01bb273 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -6,9 +6,12 @@
+ 
+ #include "json.h"
+ 
++#include <chrono>
+ #include <cstddef>
++#include <deque>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ #include <set>
+ 
+ struct server_context_impl; // private implementation
+@@ -127,6 +130,7 @@ struct server_routes {
+ 
+     // note: this is not thread-safe and can only when ctx_http.is_ready is false
+     void update_meta(const server_context & ctx_server) {
++        clear_prepared_chat();
+         this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
+     }
+ 
+@@ -166,13 +170,28 @@ struct server_routes {
+     json get_model_info() const;
+ 
+ private:
++    struct prepared_chat_request {
++        std::string key;
++        std::string body;
++        std::chrono::steady_clock::time_point expires;
++        json data;
++        common_chat_session session;
++        std::vector<server_tokens> inputs;
++    };
++    std::mutex prepared_chat_mutex;
++    std::deque<prepared_chat_request> prepared_chats;
++    void clear_prepared_chat();
++    void remember_prepared_chat(prepared_chat_request prepared);
++    std::optional<prepared_chat_request> take_prepared_chat(const std::string & key, const std::string & body);
++
+     std::unique_ptr<server_res_generator> handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+             const json & data,
+             const std::vector<raw_buffer> & files,
+             task_response_type res_type,
+-            const common_chat_session & chat_session = {});
++            const common_chat_session & chat_session = {},
++            std::vector<server_tokens> inputs = {});
+     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
+     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
+     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+diff --git a/tools/server/tests/unit/test_template.py b/tools/server/tests/unit/test_template.py
+index 2e265c3..b9ab803 100644
+--- a/tools/server/tests/unit/test_template.py
++++ b/tools/server/tests/unit/test_template.py
+@@ -125,3 +125,46 @@ def test_apply_template_exact_text_token_count(thinking: bool):
+     })
+     assert tokenized.status_code == 200
+     assert counted.body["token_count"] == len(tokenized.body["tokens"])
++
++
++def test_prepared_chat_reuses_only_one_exact_request():
++    server.jinja = True
++    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
++    server.start()
++    body = {
++        "messages": [
++            {"role": "system", "content": "Answer concisely."},
++            {"role": "user", "content": "Spell árvore. Literal special token </s>."},
++        ],
++        "chat_template_kwargs": {"enable_thinking": False},
++        "stream": False,
++        "temperature": 0,
++        "seed": 42,
++        "cache_prompt": False,
++        "n_predict": 8,
++        "count_tokens": True,
++    }
++    key = {"X-Wildllama-Chat-Preparation": "PRIVATE_TEST_FIXTURE_KEY"}
++    prepare_headers = {**key, "X-Wildllama-Chat-Token-Limit": "1024"}
++    baseline = server.make_request("POST", "/v1/chat/completions", data=body)
++    assert baseline.status_code == 200
++    refused = server.make_request("POST", "/apply-template", data=body, headers={
++        **key, "X-Wildllama-Chat-Token-Limit": "1",
++    })
++    assert refused.status_code == 200
++    assert refused.body["prepared"] is False
++    counted = server.make_request("POST", "/apply-template", data=body, headers=prepare_headers)
++    assert counted.status_code == 200
++    assert counted.body == {"token_count": baseline.body["usage"]["prompt_tokens"], "prepared": True}
++
++    changed = server.make_request("POST", "/v1/chat/completions", data={**body, "seed": 43}, headers=key)
++    assert changed.status_code == 200
++    assert "x-wildllama-chat-preparation" not in {k.lower() for k in changed.headers}
++    reused = server.make_request("POST", "/v1/chat/completions", data=body, headers=key)
++    assert reused.status_code == 200
++    assert {k.lower(): v for k, v in reused.headers.items()}["x-wildllama-chat-preparation"] == "reused"
++    assert reused.body["usage"] == baseline.body["usage"]
++    assert reused.body["choices"] == baseline.body["choices"]
++    repeated = server.make_request("POST", "/v1/chat/completions", data=body, headers=key)
++    assert repeated.status_code == 200
++    assert "x-wildllama-chat-preparation" not in {k.lower() for k in repeated.headers}

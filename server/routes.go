@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -653,7 +654,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					Shift:       req.Shift == nil || *req.Shift,
 					Logprobs:    req.Logprobs,
 					TopLogprobs: req.TopLogprobs,
-				}, genTruncate)
+				}, genTruncate, false)
 				if err != nil {
 					slog.Error("chat template prompt error", "error", err)
 					var serr api.StatusError
@@ -776,6 +777,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				Metrics: api.Metrics{
 					PromptEvalCount:           cr.PromptEvalCount,
 					PromptEvalCachedCount:     cr.PromptEvalCachedCount,
+					PromptCacheReuse:          cr.PromptCacheReuse,
 					PromptEvalDuration:        cr.PromptEvalDuration,
 					EvalCount:                 cr.EvalCount,
 					EvalDuration:              cr.EvalDuration,
@@ -3535,6 +3537,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				Metrics: api.Metrics{
 					PromptEvalCount:           r.PromptEvalCount,
 					PromptEvalCachedCount:     r.PromptEvalCachedCount,
+					PromptCacheReuse:          r.PromptCacheReuse,
 					PromptEvalDuration:        r.PromptEvalDuration,
 					EvalCount:                 r.EvalCount,
 					EvalDuration:              r.EvalDuration,
@@ -3648,9 +3651,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	writeChatResponse(c, req, ch)
 }
 
-func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, nativeReq llm.ChatRequest, truncate bool) (llm.ChatRequest, error) {
+func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, nativeReq llm.ChatRequest, truncate, allowPrepared bool) (llm.ChatRequest, error) {
+	if allowPrepared && truncate && len(nativeReq.Messages) > 1 && countChatImages(nativeReq.Messages) == 0 {
+		nativeReq.PreparedChat = crand.Text()
+	}
 	var err error
-	nativeReq.Messages, err = truncateNativeChatMessages(ctx, m, r, optionsForPrompt(opts, r), nativeReq, truncate)
+	nativeReq.Messages, err = truncateNativeChatMessages(ctx, m, r, optionsForPrompt(opts, r), &nativeReq, truncate)
 	return nativeReq, err
 }
 
@@ -3665,7 +3671,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		Shift:       req.Shift == nil || *req.Shift,
 		Logprobs:    req.Logprobs,
 		TopLogprobs: req.TopLogprobs,
-	}, truncate)
+	}, truncate, !req.DebugRenderOnly)
 	if err != nil {
 		slog.Error("chat template prompt error", "error", err)
 		var serr api.StatusError
@@ -3718,6 +3724,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 				Metrics: api.Metrics{
 					PromptEvalCount:           r.PromptEvalCount,
 					PromptEvalCachedCount:     r.PromptEvalCachedCount,
+					PromptCacheReuse:          r.PromptCacheReuse,
 					PromptEvalDuration:        r.PromptEvalDuration,
 					EvalCount:                 r.EvalCount,
 					EvalDuration:              r.EvalDuration,
@@ -3749,7 +3756,9 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 	writeChatResponse(c, req, ch)
 }
 
-func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, req llm.ChatRequest, truncate bool) ([]api.Message, error) {
+func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, req *llm.ChatRequest, truncate bool) ([]api.Message, error) {
+	prepareKey := req.PreparedChat
+	req.PreparedChat = ""
 	if !truncate || opts == nil || opts.NumCtx <= 0 || len(req.Messages) <= 1 {
 		return req.Messages, nil
 	}
@@ -3757,13 +3766,28 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 	var previousPrompt string
 	var previousTokenCount int
 	haveTokenCount := false
+	preparedStart := -1
+	preparer, canPrepare := r.(interface {
+		PrepareChatTemplateWithTokenCount(context.Context, llm.ChatRequest, int) (int, bool, error)
+	})
+	counter, canCount := r.(interface {
+		ApplyChatTemplateWithTokenCount(context.Context, llm.ChatRequest) (string, int, error)
+	})
 	currMsgIdx, err := fittingPromptStart(ctx, req.Messages, opts.NumCtx, monotonicPromptLimit(m, req.Messages, true), func(i int) (int, error) {
-		renderReq := req
+		renderReq := *req
 		renderReq.Messages = promptMessagesFrom(req.Messages, i)
 		var ctxLen int
-		if counter, ok := r.(interface {
-			ApplyChatTemplateWithTokenCount(context.Context, llm.ChatRequest) (string, int, error)
-		}); ok {
+		if canPrepare && prepareKey != "" {
+			renderReq.PreparedChat = prepareKey
+			count, prepared, err := preparer.PrepareChatTemplateWithTokenCount(ctx, renderReq, opts.NumCtx)
+			if err != nil {
+				return 0, err
+			}
+			ctxLen = count
+			if prepared {
+				preparedStart = i
+			}
+		} else if canCount {
 			_, count, err := counter.ApplyChatTemplateWithTokenCount(ctx, renderReq)
 			if err != nil {
 				return 0, err
@@ -3804,6 +3828,9 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 
 	if currMsgIdx > 0 {
 		slog.Debug("truncating native chat messages which exceed context length", "truncated", currMsgIdx)
+	}
+	if currMsgIdx == preparedStart {
+		req.PreparedChat = prepareKey
 	}
 
 	return promptMessagesFrom(req.Messages, currMsgIdx), nil

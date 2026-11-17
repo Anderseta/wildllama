@@ -89,6 +89,14 @@ it is not SSD/swap paging and does not reduce context or alter cache formats.
 
 ## Conversation checkpoints and carryover
 
+Native prompt timings expose an optional `cache_reuse` decision with the slot's
+retained and matching token counts. The Wildllama chat and generate responses
+forward it as `prompt_cache_reuse`. The reason can distinguish a changed prefix,
+an explicit idle-slot eviction under KV pressure, an unavailable or failed
+checkpoint, and missing MTP predecessor state. A cold slot means that the
+selected slot has no usable prefix at that boundary. The final reused-token
+count is authoritative, since reaching logits can require reevaluating a token.
+
 The target KV/recurrent state and the draft KV are not the complete MTP state.
 The head also carries a target hidden row into the next draft catch-up step.
 Restoring another conversation's KV while keeping the previous conversation's
