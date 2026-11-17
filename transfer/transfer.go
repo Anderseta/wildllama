@@ -61,13 +61,14 @@ type Blob struct {
 
 // DownloadOptions configures a parallel download operation.
 type DownloadOptions struct {
+	CheckSpace        func(context.Context, string, int64) error                         // Optional preflight for all remaining download bytes
 	ReserveSpace      func(context.Context, string, int64) (DiskReservation, error)      // optional destination-space admission
 	PermanentError    func(error) bool                                                   // optional non-retryable local failure classifier
 	Blobs             []Blob                                                             // Blobs to download
 	BaseURL           string                                                             // Registry base URL
 	DestDir           string                                                             // Destination directory for blobs
 	Repository        string                                                             // Repository path for blob URLs (e.g., "library/model")
-	Concurrency       int                                                                // Max parallel downloads (default DefaultDownloadConcurrency)
+	Concurrency       int                                                                // Max parallel downloads (0 uses DefaultDownloadConcurrency; negative serializes)
 	BodyConcurrency   int                                                                // Max simultaneous body-bearing transfers; 0 or negative serializes (capacity 1)
 	Progress          func(completed, total int64)                                       // Progress callback (optional)
 	Client            *http.Client                                                       // HTTP client (optional, uses default)
@@ -92,7 +93,7 @@ type UploadOptions struct {
 	Blobs             []Blob                                                             // Blobs to upload
 	BaseURL           string                                                             // Registry base URL
 	SrcDir            string                                                             // Source directory containing blobs
-	Concurrency       int                                                                // Max parallel uploads (default DefaultUploadConcurrency)
+	Concurrency       int                                                                // Max parallel uploads (0 uses DefaultUploadConcurrency; negative serializes)
 	BodyConcurrency   int                                                                // Max simultaneous body-bearing transfers; 0 or negative serializes (capacity 1)
 	Progress          func(completed, total int64)                                       // Progress callback (optional)
 	Client            *http.Client                                                       // HTTP client (optional, uses default)

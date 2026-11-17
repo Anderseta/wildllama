@@ -898,6 +898,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			}
 		}
 
+		if !r.Done {
+			c.JSON(http.StatusBadGateway, gin.H{"error": incompleteResponseMessage})
+			return
+		}
 		r.Thinking = sbThinking.String()
 		r.Response = sbContent.String()
 		r.Logprobs = allLogprobs
@@ -2731,9 +2735,11 @@ func Serve(ln net.Listener) error {
 	return nil
 }
 
+const incompleteResponseMessage = "response stream ended before completion"
+
 func waitForStream(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/json")
-	var latest api.ProgressResponse
+	var terminal api.ProgressResponse
 	for {
 		var resp any
 		var ok bool
@@ -2747,7 +2753,9 @@ func waitForStream(c *gin.Context, ch chan any) {
 		}
 		switch r := resp.(type) {
 		case api.ProgressResponse:
-			latest = r
+			if r.Status == "success" {
+				terminal = r
+			}
 		case gin.H:
 			status, ok := r["status"].(int)
 			if !ok {
@@ -2765,7 +2773,11 @@ func waitForStream(c *gin.Context, ch chan any) {
 		}
 	}
 
-	c.JSON(http.StatusOK, latest)
+	if terminal.Status == "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": incompleteResponseMessage})
+		return
+	}
+	c.JSON(http.StatusOK, terminal)
 }
 
 // A response consumer may return before its producer (disconnect, write
@@ -2785,6 +2797,7 @@ func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
 	ctx := c.Request.Context()
 	encoder := json.NewEncoder(c.Writer)
+	complete := false
 	c.Stream(func(_ io.Writer) bool {
 		var val any
 		var ok bool
@@ -2794,7 +2807,18 @@ func streamResponse(c *gin.Context, ch chan any) {
 		case val, ok = <-ch:
 		}
 		if !ok {
-			return false
+			if complete || ctx.Err() != nil {
+				return false
+			}
+			val = gin.H{"error": incompleteResponseMessage, "status": http.StatusBadGateway}
+		}
+		switch frame := val.(type) {
+		case api.ChatResponse:
+			complete = complete || frame.Done
+		case api.GenerateResponse:
+			complete = complete || frame.Done
+		case api.ProgressResponse:
+			complete = complete || frame.Status == "success"
 		}
 
 		// errors are provided as a gin.H with an "error" field and
@@ -3176,6 +3200,10 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 			}
 		}
 
+		if !resp.Done {
+			c.JSON(http.StatusBadGateway, gin.H{"error": incompleteResponseMessage})
+			return
+		}
 		resp.Message.Content = sbContent.String()
 		resp.Message.Thinking = sbThinking.String()
 		resp.Logprobs = allLogprobs

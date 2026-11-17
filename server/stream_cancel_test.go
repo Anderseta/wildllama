@@ -359,3 +359,28 @@ func TestStreamKeepsInferenceErrorDetails(t *testing.T) {
 		}
 	}
 }
+
+func TestIncompleteNativeResponses(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, partial := range []bool{false, true} {
+			r := gin.New()
+			r.POST("/", func(c *gin.Context) {
+				frames := make(chan any, 1)
+				if partial {
+					frames <- api.ChatResponse{Message: api.Message{Role: "assistant", Content: "partial"}}
+				}
+				close(frames)
+				writeChatResponse(c, api.ChatRequest{Stream: &stream}, frames)
+			})
+			w := NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/", nil))
+			want := http.StatusBadGateway
+			if stream && partial {
+				want = http.StatusOK
+			}
+			if w.Code != want || !strings.Contains(w.Body.String(), incompleteResponseMessage) {
+				t.Fatalf("stream=%t partial=%t status=%d body=%s", stream, partial, w.Code, w.Body.String())
+			}
+		}
+	}
+}

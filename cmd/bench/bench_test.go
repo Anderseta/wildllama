@@ -314,7 +314,7 @@ func TestBenchmarkModel_Timeout(t *testing.T) {
 	}
 }
 
-func TestBenchmarkModel_NoMetrics(t *testing.T) {
+func TestBenchmarkModel_IncompleteResponse(t *testing.T) {
 	fOpt := createTestFlagOptions()
 
 	server := createMockOllamaServer(t, mockServerOptions{
@@ -337,8 +337,8 @@ func TestBenchmarkModel_NoMetrics(t *testing.T) {
 		}
 	})
 
-	if !strings.Contains(output, "ERROR: No metrics received") {
-		t.Errorf("Expected no metrics error message, got: %s", output)
+	if !strings.Contains(output, "unexpected EOF") || strings.Contains(output, "step=generate") {
+		t.Errorf("Expected incomplete stream to be excluded from results, got: %s", output)
 	}
 }
 
@@ -536,7 +536,7 @@ func TestBenchmarkModel_TTFT(t *testing.T) {
 	fOpt := createTestFlagOptions()
 
 	server := createMockOllamaServer(t, mockServerOptions{
-		chatResponses: defaultChatResponses(),
+		chatResponses: append([]api.ChatResponse{{PromptProgress: &api.PromptProgress{}}}, defaultChatResponses()...),
 	})
 	defer server.Close()
 
@@ -549,7 +549,7 @@ func TestBenchmarkModel_TTFT(t *testing.T) {
 		}
 	})
 
-	if !strings.Contains(output, "step=ttft") {
+	if !strings.Contains(output, "step=ttft") || strings.Contains(output, "step=ttft 1 0 ns/op") {
 		t.Errorf("Expected TTFT metric in output, got: %s", output)
 	}
 }
@@ -1754,6 +1754,27 @@ func TestOutputFormatHeader(t *testing.T) {
 				if !strings.Contains(output, expected) {
 					t.Errorf("Expected output to contain %q, got: %s", expected, output)
 				}
+			}
+		})
+	}
+}
+
+func TestOpenAIBenchmarkStreamCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name, stream string
+		wantErr      bool
+	}{
+		{"truncated", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n", true},
+		{"server error", "data: {\"error\":{\"message\":\"runner stopped\"}}\n\ndata: [DONE]\n", true},
+		{"finish reason", "data:{\"choices\":[{\"finish_reason\":\"stop\"}]}\n", false},
+		{"long frame", `data: {"choices":[{"delta":{"content":"` + strings.Repeat("a", 70<<10) + `"}}]}` + "\n\ndata: [DONE]\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, tc.stream) }))
+			defer server.Close()
+			result, err := openaiGenerate(t.Context(), server.URL, "", "test", createTestFlagOptions(), 0, promptPlan{}, nil)
+			if (err != nil) != tc.wantErr || (result == nil) != tc.wantErr {
+				t.Fatalf("metrics=%v err=%v", result, err)
 			}
 		})
 	}

@@ -24,7 +24,7 @@ func TestNativeThinkingDiscoveryAndRequests(t *testing.T) {
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
 	t.Setenv("OLLAMA_GO_TEMPLATE", "0")
 	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
-	mock := mockRunner{ChatFn: func(_ context.Context, req llm.ChatRequest, fn func(llm.ChatResponse)) error {
+	mock := mockRunner{CompletionResponse: llm.CompletionResponse{Done: true, DoneReason: llm.DoneReasonStop}, ChatFn: func(_ context.Context, req llm.ChatRequest, fn func(llm.ChatResponse)) error {
 		fn(llm.ChatResponse{Message: api.Message{Role: "assistant", Content: "answer"}, Done: true, DoneReason: llm.DoneReasonStop})
 		return nil
 	}}

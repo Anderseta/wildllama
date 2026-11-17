@@ -222,17 +222,15 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 	}
 	defer response.Body.Close()
 
-	scanner := bufio.NewScanner(response.Body)
-	// increase the buffer size to avoid running out of space
-	scanBuf := make([]byte, 0, maxBufferSize)
-	scanner.Buffer(scanBuf, maxBufferSize)
-	for scanner.Scan() {
+	err = readStreamFrames(response.Body, response.ContentLength, func(bts []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var errorResponse struct {
 			Error     string `json:"error,omitempty"`
 			SigninURL string `json:"signin_url,omitempty"`
 		}
 
-		bts := scanner.Bytes()
 		if err := json.Unmarshal(bts, &errorResponse); err != nil {
 			if response.StatusCode >= http.StatusBadRequest {
 				return StatusError{
@@ -262,12 +260,9 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 			return errors.New(errorResponse.Error)
 		}
 
-		if err := fn(bts); err != nil {
-			return err
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
+		return fn(bts)
+	})
+	if err != nil {
 		return err
 	}
 	// An HTTP failure may legitimately have no body (e.g. a reverse proxy).
@@ -282,6 +277,76 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 	return nil
 }
 
+// Read short token frames with a small buffer. Promote only when a single line
+// fills it. Two growth steps avoid repeatedly copying large image/tool frames.
+func readStreamFrames(body io.Reader, length int64, visit func([]byte) error) error {
+	reader := bufio.NewReader(body)
+	for {
+		frame, err := reader.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			if reader.Size() == maxBufferSize {
+				return bufio.ErrTooLong
+			}
+			size := int(maxBufferSize)
+			if reader.Size() < bufio.MaxScanTokenSize {
+				size = bufio.MaxScanTokenSize
+			}
+			if length > int64(reader.Size()) && length < int64(size) {
+				size = int(length) + 1 // allow a final frame without a newline
+			}
+			reader = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(frame), reader), size)
+			continue
+		}
+		if len(frame) > 0 {
+			frame = bytes.TrimSuffix(frame, []byte{'\n'})
+			frame = bytes.TrimSuffix(frame, []byte{'\r'})
+			if visitErr := visit(frame); visitErr != nil {
+				return visitErr
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// A closed connection alone does not confirm that inference or a transfer finished.
+var errStreamComplete = errors.New("received terminal frame")
+
+func streamOperation[T any](ctx context.Context, client *Client, path string, request any, visit func(T) error, complete func(T) bool) error {
+	err := client.stream(ctx, http.MethodPost, path, request, func(frame []byte) error {
+		var response T
+		if err := json.Unmarshal(frame, &response); err != nil {
+			return err
+		}
+		if err := visit(response); err != nil {
+			return err
+		}
+		if complete(response) {
+			return errStreamComplete
+		}
+		return nil
+	})
+	switch err {
+	case errStreamComplete:
+		return nil
+	case nil:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("%s ended before completion: %w", path, io.ErrUnexpectedEOF)
+	default:
+		return err
+	}
+}
+
+func progressComplete(response ProgressResponse) bool {
+	return response.Status == "success"
+}
+
 // GenerateResponseFunc is a function that [Client.Generate] invokes every time
 // a response is received from the service. If this function returns an error,
 // [Client.Generate] will stop generating and return this error.
@@ -291,13 +356,8 @@ type GenerateResponseFunc func(GenerateResponse) error
 // be populated with prompt details. fn is called for each response (there may
 // be multiple responses, e.g. in case streaming is enabled).
 func (c *Client) Generate(ctx context.Context, req *GenerateRequest, fn GenerateResponseFunc) error {
-	return c.stream(ctx, http.MethodPost, "/api/generate", req, func(bts []byte) error {
-		var resp GenerateResponse
-		if err := json.Unmarshal(bts, &resp); err != nil {
-			return err
-		}
-
-		return fn(resp)
+	return streamOperation(ctx, c, "/api/generate", req, fn, func(response GenerateResponse) bool {
+		return response.Done || (req != nil && req.DebugRenderOnly && response.DebugInfo != nil)
 	})
 }
 
@@ -311,13 +371,8 @@ type ChatResponseFunc func(ChatResponse) error
 // fn is called for each response (there may be multiple responses, e.g. if case
 // streaming is enabled).
 func (c *Client) Chat(ctx context.Context, req *ChatRequest, fn ChatResponseFunc) error {
-	return c.stream(ctx, http.MethodPost, "/api/chat", req, func(bts []byte) error {
-		var resp ChatResponse
-		if err := json.Unmarshal(bts, &resp); err != nil {
-			return err
-		}
-
-		return fn(resp)
+	return streamOperation(ctx, c, "/api/chat", req, fn, func(response ChatResponse) bool {
+		return response.Done || (req != nil && req.DebugRenderOnly && response.DebugInfo != nil)
 	})
 }
 
@@ -330,14 +385,7 @@ type PullProgressFunc func(ProgressResponse) error
 // progress is made on the request and can be used to display a progress bar,
 // etc.
 func (c *Client) Pull(ctx context.Context, req *PullRequest, fn PullProgressFunc) error {
-	return c.stream(ctx, http.MethodPost, "/api/pull", req, func(bts []byte) error {
-		var resp ProgressResponse
-		if err := json.Unmarshal(bts, &resp); err != nil {
-			return err
-		}
-
-		return fn(resp)
-	})
+	return streamOperation(ctx, c, "/api/pull", req, fn, progressComplete)
 }
 
 // PushProgressFunc is a function that [Client.Push] invokes when progress is
@@ -349,14 +397,7 @@ type PushProgressFunc func(ProgressResponse) error
 // and adding a public key first. fn is called each time progress is made on
 // the request and can be used to display a progress bar, etc.
 func (c *Client) Push(ctx context.Context, req *PushRequest, fn PushProgressFunc) error {
-	return c.stream(ctx, http.MethodPost, "/api/push", req, func(bts []byte) error {
-		var resp ProgressResponse
-		if err := json.Unmarshal(bts, &resp); err != nil {
-			return err
-		}
-
-		return fn(resp)
-	})
+	return streamOperation(ctx, c, "/api/push", req, fn, progressComplete)
 }
 
 // CreateProgressFunc is a function that [Client.Create] invokes when progress
@@ -369,14 +410,7 @@ type CreateProgressFunc func(ProgressResponse) error
 //
 // [Modelfile]: https://github.com/ollama/ollama/blob/main/docs/modelfile.mdx
 func (c *Client) Create(ctx context.Context, req *CreateRequest, fn CreateProgressFunc) error {
-	return c.stream(ctx, http.MethodPost, "/api/create", req, func(bts []byte) error {
-		var resp ProgressResponse
-		if err := json.Unmarshal(bts, &resp); err != nil {
-			return err
-		}
-
-		return fn(resp)
-	})
+	return streamOperation(ctx, c, "/api/create", req, fn, progressComplete)
 }
 
 // List lists models that are available locally.

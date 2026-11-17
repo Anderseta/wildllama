@@ -154,7 +154,7 @@ func upload(ctx context.Context, opts UploadOptions) error {
 		} else {
 			// Upload the blobs the server doesn't already have. Concurrency
 			// caps blob-level parallelism.
-			concurrency := cmp.Or(opts.Concurrency, DefaultUploadConcurrency)
+			concurrency := max(1, cmp.Or(opts.Concurrency, DefaultUploadConcurrency))
 			sem := semaphore.NewWeighted(int64(concurrency))
 
 			start := time.Now()

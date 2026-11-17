@@ -67,7 +67,7 @@ func TestClientStreamEmptyHTTPStatus(t *testing.T) {
 
 func TestClientStreamPreservesLargeFramesAndLimit(t *testing.T) {
 	content := strings.Repeat("ação", 128*1024)
-	payload := `{"response":"` + content + `"}` + "\n"
+	payload := `{"done":true,"response":"` + content + `"}` + "\n"
 	body := &transportTestBody{reader: strings.NewReader(payload)}
 	var got GenerateResponse
 	err := transportTestClient(http.StatusOK, body).Generate(t.Context(), &GenerateRequest{}, func(r GenerateResponse) error { got = r; return nil })
@@ -166,4 +166,80 @@ func BenchmarkClientTransport(b *testing.B) {
 		})
 	}
 	b.Run("discard-8MiB", func(b *testing.B) { benchmarkClientTransport(b, strings.Repeat("x", 8<<20), false) })
+}
+
+func TestOperationStreamRequiresTerminalFrame(t *testing.T) {
+	callbackErr := errors.New("callback stopped")
+	for _, tc := range []struct {
+		name, partial, terminal string
+		run                     func(*Client, func() error) error
+	}{
+		{"chat", `{"message":{"content":"partial"}}`, `{"done":true}`, func(c *Client, visit func() error) error {
+			return c.Chat(t.Context(), &ChatRequest{}, func(ChatResponse) error { return visit() })
+		}},
+		{"generate", `{"response":"partial"}`, `{"done":true}`, func(c *Client, visit func() error) error {
+			return c.Generate(t.Context(), &GenerateRequest{}, func(GenerateResponse) error { return visit() })
+		}},
+		{"pull", `{"status":"pulling manifest"}`, `{"status":"success"}`, func(c *Client, visit func() error) error {
+			return c.Pull(t.Context(), &PullRequest{}, func(ProgressResponse) error { return visit() })
+		}},
+		{"push", `{"status":"uploading"}`, `{"status":"success"}`, func(c *Client, visit func() error) error {
+			return c.Push(t.Context(), &PushRequest{}, func(ProgressResponse) error { return visit() })
+		}},
+		{"create", `{"status":"creating"}`, `{"status":"success"}`, func(c *Client, visit func() error) error {
+			return c.Create(t.Context(), &CreateRequest{}, func(ProgressResponse) error { return visit() })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, test := range []struct {
+				input                string
+				calls                int
+				callbackErr, wantErr error
+			}{
+				{"", 0, nil, io.ErrUnexpectedEOF},
+				{tc.partial, 1, nil, io.ErrUnexpectedEOF},
+				{tc.partial + "\n" + tc.terminal + "\n", 2, nil, nil},
+				{tc.terminal + "\n", 1, callbackErr, callbackErr},
+			} {
+				reader := io.Reader(strings.NewReader(test.input))
+				if test.wantErr == nil {
+					reader = io.MultiReader(reader, &failingReader{err: errors.New("read past terminal frame")})
+				}
+				body := &transportTestBody{reader: reader}
+				calls := 0
+				err := tc.run(transportTestClient(http.StatusOK, body), func() error { calls++; return test.callbackErr })
+				if !errors.Is(err, test.wantErr) || calls != test.calls || !body.closed {
+					t.Errorf("input %q: err=%v calls=%d closed=%t", test.input, err, calls, body.closed)
+				}
+			}
+		})
+	}
+}
+
+func TestOperationStreamDebugAndBufferedCancellation(t *testing.T) {
+	for _, generate := range []bool{false, true} {
+		body := &transportTestBody{reader: strings.NewReader(`{"_debug_info":{"rendered_template":"hello"}}`)}
+		client := transportTestClient(http.StatusOK, body)
+		var err error
+		if generate {
+			err = client.Generate(t.Context(), &GenerateRequest{DebugRenderOnly: true}, func(GenerateResponse) error { return nil })
+		} else {
+			err = client.Chat(t.Context(), &ChatRequest{DebugRenderOnly: true}, func(ChatResponse) error { return nil })
+		}
+		if err != nil || !body.closed {
+			t.Fatalf("debug generate=%v: %v", generate, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	body := &transportTestBody{reader: strings.NewReader("{}\n{}\n{\"done\":true}\n")}
+	calls := 0
+	err := transportTestClient(http.StatusOK, body).Chat(ctx, &ChatRequest{}, func(ChatResponse) error {
+		calls++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("cancellation: %v, calls=%d", err, calls)
+	}
 }

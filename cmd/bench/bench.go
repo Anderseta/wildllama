@@ -697,7 +697,6 @@ func BenchmarkModel(fOpt flagOptions) error {
 			for attempt := range maxShortResponseRetries + 1 {
 				responseMetrics = nil
 				ttft = 0
-				var ttftOnce sync.Once
 
 				variation := benchmarkPromptVariation(*fOpt.warmup, *fOpt.epochs, epoch, attempt)
 				req := buildChatRequest(model, fOpt, imgData, variation, plan)
@@ -711,11 +710,9 @@ func BenchmarkModel(fOpt flagOptions) error {
 					}
 
 					// Capture TTFT on first content
-					ttftOnce.Do(func() {
-						if resp.Message.Content != "" || resp.Message.Thinking != "" {
-							ttft = time.Since(requestStart)
-						}
-					})
+					if ttft == 0 && (resp.Message.Content != "" || resp.Message.Thinking != "") {
+						ttft = time.Since(requestStart)
+					}
 
 					if resp.Done {
 						responseMetrics = &resp.Metrics
@@ -933,19 +930,26 @@ func openaiGenerate(ctx context.Context, baseURL, apiKey, model string, fOpt fla
 	chunkTokens := 0
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(nil, 8<<20)
+	finished := false
 	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		data, ok := bytes.CutPrefix(scanner.Bytes(), []byte("data:"))
+		if !ok {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
+		data = bytes.TrimSpace(data)
+		if bytes.Equal(data, []byte("[DONE]")) {
+			finished = true
 			break
 		}
 
 		var chunk struct {
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
 			Choices []struct {
-				Delta struct {
+				FinishReason string `json:"finish_reason"`
+				Delta        struct {
 					Content string `json:"content"`
 					// vLLM spells it "reasoning", Splash "reasoning_content".
 					Reasoning        string `json:"reasoning"`
@@ -986,11 +990,16 @@ func openaiGenerate(ctx context.Context, baseURL, apiKey, model string, fOpt fla
 				PredictedMS float64 `json:"predicted_ms"`
 			} `json:"timings"`
 		}
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		if err := json.Unmarshal(data, &chunk); err != nil {
 			continue
 		}
-
+		if chunk.Error != nil {
+			return nil, fmt.Errorf("benchmark stream error: %s", chunk.Error.Message)
+		}
 		if len(chunk.Choices) > 0 {
+			if chunk.Choices[0].FinishReason != "" {
+				finished = true
+			}
 			text := cmp.Or(chunk.Choices[0].Delta.Content, chunk.Choices[0].Delta.Reasoning, chunk.Choices[0].Delta.ReasoningContent)
 			if text != "" {
 				ttftOnce.Do(func() {
@@ -1039,6 +1048,12 @@ func openaiGenerate(ctx context.Context, baseURL, apiKey, model string, fOpt fla
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if !finished {
+		return nil, fmt.Errorf("benchmark stream ended before completion: %w", io.ErrUnexpectedEOF)
+	}
 	metrics.TotalDuration = time.Since(start)
 
 	if *fOpt.debug {

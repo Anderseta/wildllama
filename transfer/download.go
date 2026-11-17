@@ -96,31 +96,46 @@ func download(ctx context.Context, opts DownloadOptions) error {
 		return nil
 	}
 
-	// Calculate total from all blobs (for accurate progress reporting on resume)
-	var total int64
-	for _, b := range opts.Blobs {
-		total += b.Size
-	}
-
-	// Filter out already-downloaded blobs and track completed bytes
 	var blobs []Blob
-	var alreadyCompleted int64
-	for _, b := range opts.Blobs {
-		if fi, _ := os.Stat(filepath.Join(opts.DestDir, digestToPath(b.Digest))); fi != nil && fi.Size() == b.Size {
-			if opts.Logger != nil {
-				opts.Logger.Debug("blob already exists", "digest", b.Digest, "size", b.Size)
+	var total, alreadyCompleted, remaining int64
+	seen := make(map[string]int64, len(opts.Blobs))
+	for _, blob := range opts.Blobs {
+		if size, ok := seen[blob.Digest]; ok {
+			if size != blob.Size {
+				return fmt.Errorf("conflicting sizes for blob %s", blob.Digest)
 			}
-			alreadyCompleted += b.Size
 			continue
 		}
-		blobs = append(blobs, b)
+		if blob.Size < 0 || blob.Size > (1<<62)-total {
+			return errors.New("invalid model download size")
+		}
+		seen[blob.Digest] = blob.Size
+		total += blob.Size
+		path := filepath.Join(opts.DestDir, digestToPath(blob.Digest))
+		if fi, err := os.Stat(path); err == nil && fi.Mode().IsRegular() && fi.Size() == blob.Size {
+			alreadyCompleted += blob.Size
+			continue
+		}
+		blobs = append(blobs, blob)
+		if opts.CheckSpace != nil {
+			remaining += blob.Size
+			if blob.Size >= resumeThreshold {
+				if fi, err := os.Stat(path + ".tmp"); err == nil && fi.Mode().IsRegular() && fi.Size() <= blob.Size {
+					remaining -= fi.Size()
+				}
+			}
+		}
 	}
+	if remaining > 0 {
+		if err := opts.CheckSpace(ctx, opts.DestDir, remaining); err != nil {
+			return err
+		}
+	}
+	progress := newProgressTracker(total, opts.Progress)
+	progress.add(alreadyCompleted)
 	if len(blobs) == 0 {
 		return nil
 	}
-
-	progress := newProgressTracker(total, opts.Progress)
-	progress.add(alreadyCompleted) // Report already-downloaded bytes upfront
 
 	d := &downloader{
 		client:         cmp.Or(opts.Client, checkedClient(opts.BaseURL, opts.AllowPrivateHosts)),
@@ -141,7 +156,7 @@ func download(ctx context.Context, opts DownloadOptions) error {
 	// 0 or negative serializes; never unbounded.
 	d.bodySem = semaphore.NewWeighted(int64(max(1, opts.BodyConcurrency)))
 
-	concurrency := cmp.Or(opts.Concurrency, DefaultDownloadConcurrency)
+	concurrency := max(1, cmp.Or(opts.Concurrency, DefaultDownloadConcurrency))
 	sem := semaphore.NewWeighted(int64(concurrency))
 
 	start := time.Now()
@@ -189,9 +204,9 @@ func (d *downloader) download(ctx context.Context, blob Blob) error {
 			// Skip speed recording for tiny blobs — their transfer time is
 			// dominated by HTTP overhead, not throughput, and would pollute
 			// the median used for stall detection.
-			if blob.Size >= smallBlobSpeedThreshold {
+			if n >= smallBlobSpeedThreshold {
 				if s := time.Since(start).Seconds(); s > 0 {
-					d.speeds.record(float64(blob.Size) / s)
+					d.speeds.record(float64(n) / s)
 				}
 			}
 			return nil
@@ -245,26 +260,40 @@ func (d *downloader) downloadOnce(ctx context.Context, blob Blob) (int64, error)
 	}
 	defer release()
 
+	var existingSize int64
+	if blob.Size >= resumeThreshold {
+		dest := filepath.Join(d.destDir, digestToPath(blob.Digest))
+		tmp := dest + ".tmp"
+		fi, err := os.Stat(tmp)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return 0, err
+		case fi.Size() == blob.Size:
+			// A previous process may have finished writing just before publication.
+			valid, err := verifyCompletePartial(ctx, tmp, blob)
+			if err != nil {
+				return 0, err
+			}
+			if valid {
+				if err := os.Rename(tmp, dest); err != nil {
+					return 0, err
+				}
+				d.progress.add(blob.Size)
+				return 0, nil // no network bytes for the speed estimate
+			}
+			if err := os.Remove(tmp); err != nil {
+				return 0, err
+			}
+		case fi.Size() < blob.Size:
+			existingSize = fi.Size()
+		}
+	}
+
 	baseURL, _ := url.Parse(d.baseURL)
 	u, err := d.resolve(ctx, fmt.Sprintf("%s/v2/%s/blobs/%s", d.baseURL, d.repository, blob.Digest))
 	if err != nil {
 		return 0, err
-	}
-
-	// Check for existing partial .tmp file for resume
-	dest := filepath.Join(d.destDir, digestToPath(blob.Digest))
-	tmp := dest + ".tmp"
-	var existingSize int64
-	if blob.Size >= resumeThreshold {
-		if fi, statErr := os.Stat(tmp); statErr == nil {
-			if fi.Size() < blob.Size {
-				existingSize = fi.Size()
-			} else if fi.Size() > blob.Size {
-				// .tmp larger than expected — discard
-				os.Remove(tmp)
-			}
-			// fi.Size() == blob.Size handled in save (hash check + rename)
-		}
 	}
 
 	// The body read is cancelled through this context, so the stall watchdog in
@@ -298,7 +327,40 @@ func (d *downloader) downloadOnce(ctx context.Context, blob Blob) (int64, error)
 		return 0, err
 	}
 
-	return d.save(ctx, cancel, blob, resp.Body, existingSize)
+	n, err := d.save(ctx, cancel, blob, resp.Body, existingSize)
+	if err != nil {
+		return n, err // bytes credited to progress, to roll back on failure
+	}
+	return n - existingSize, nil
+}
+
+type partialFileReader struct {
+	ctx  context.Context
+	file *os.File
+}
+
+func (r partialFileReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.file.Read(p)
+}
+
+func verifyCompletePartial(ctx context.Context, path string, blob Blob) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, partialFileReader{ctx, f})
+	if err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return n == blob.Size && fmt.Sprintf("sha256:%x", h.Sum(nil)) == blob.Digest, nil
 }
 
 func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, blob Blob, r io.Reader, existingSize int64) (int64, error) {
@@ -314,39 +376,26 @@ func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, b
 	var f *os.File
 	var err error
 
-	if existingSize > 0 {
-		// Resume — re-hash existing partial data, then append
-		f, err = os.OpenFile(tmp, os.O_RDWR, 0o644)
-		if err != nil {
-			// Can't open partial file, start fresh
-			existingSize = 0
-		} else {
-			// Hash the existing data
-			if _, hashErr := io.CopyN(h, f, existingSize); hashErr != nil {
-				f.Close()
-				os.Remove(tmp)
-				existingSize = 0
-				h.Reset()
-			} else {
-				// Report resumed bytes as progress
-				d.progress.add(existingSize)
-			}
-		}
-	}
-
 	if d.reserveSpace != nil {
 		reservation, err = d.reserveSpace(ctx, tmp, max(0, blob.Size-existingSize))
 		if err != nil {
-			if f != nil {
-				f.Close()
-			}
 			return 0, err
 		}
 		if reservation != nil {
 			defer reservation.Close()
 		}
 	}
-	if existingSize == 0 {
+	if existingSize > 0 {
+		f, err = os.OpenFile(tmp, os.O_RDWR, 0)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := io.CopyN(h, partialFileReader{ctx, f}, existingSize); err != nil {
+			f.Close()
+			return 0, err // a range response cannot replace a missing prefix
+		}
+		d.progress.add(existingSize)
+	} else {
 		f, err = os.Create(tmp)
 		if err != nil {
 			return 0, err
@@ -364,7 +413,9 @@ func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, b
 		// Don't remove .tmp here — download() handles cleanup based on blob size
 		return existingSize + n, err
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return existingSize + n, err
+	}
 
 	if got := fmt.Sprintf("sha256:%x", h.Sum(nil)); got != blob.Digest {
 		os.Remove(tmp)

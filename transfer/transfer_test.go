@@ -2164,33 +2164,8 @@ func TestResumePartialFileExactSize(t *testing.T) {
 	var requestCount atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", blobSize))
-			w.WriteHeader(http.StatusOK)
-			return
-		}
 		requestCount.Add(1)
-
-		rng := r.Header.Get("Range")
-		if rng != "" {
-			var start int64
-			fmt.Sscanf(rng, "bytes=%d-", &start)
-			if start >= int64(blobSize) {
-				// Nothing to send
-				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-				return
-			}
-			if start > 0 {
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, blobSize-1, blobSize))
-				w.WriteHeader(http.StatusPartialContent)
-				w.Write(data[start:])
-				return
-			}
-		}
-
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", blobSize))
-		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		http.Error(w, "registry unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 
@@ -2206,9 +2181,16 @@ func TestResumePartialFileExactSize(t *testing.T) {
 		Blobs:   []Blob{blob},
 		BaseURL: server.URL,
 		DestDir: clientDir,
+		CheckSpace: func(context.Context, string, int64) error {
+			return errors.New("no space for another copy")
+		},
 	})
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
+	}
+
+	if got := requestCount.Load(); got != 0 {
+		t.Errorf("complete verified partial made %d network requests", got)
 	}
 
 	// Verify final file is correct

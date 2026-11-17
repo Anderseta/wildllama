@@ -2284,6 +2284,12 @@ func TestWaitForStream(t *testing.T) {
 			expectBody: `{"error":"unknown message type"}`,
 		},
 		{
+			name:       "missing terminal progress",
+			messages:   []any{api.ProgressResponse{Status: "pulling model"}},
+			expectCode: http.StatusBadGateway,
+			expectBody: `{"error":"response stream ended before completion"}`,
+		},
+		{
 			name: "progress success",
 			messages: []any{
 				api.ProgressResponse{Status: "success"},
@@ -2298,7 +2304,7 @@ func TestWaitForStream(t *testing.T) {
 				api.ProgressResponse{Status: "one more thing"},
 			},
 			expectCode: http.StatusOK,
-			expectBody: `{"status":"one more thing"}`,
+			expectBody: `{"status":"success"}`,
 		},
 	}
 

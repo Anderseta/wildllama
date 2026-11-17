@@ -1459,6 +1459,7 @@ func TestPushHandler(t *testing.T) {
 						{Status: "preparing manifest"},
 						{Digest: "sha256:abc123456789", Total: 100, Completed: 50},
 						{Digest: "sha256:abc123456789", Total: 100, Completed: 100},
+						{Status: "success"},
 					}
 
 					for _, resp := range responses {
@@ -3100,7 +3101,7 @@ func TestLoadOrUnloadModel_CloudModelAuth(t *testing.T) {
 						}
 					}
 				case "/api/generate":
-					w.WriteHeader(http.StatusOK)
+					json.NewEncoder(w).Encode(api.GenerateResponse{Done: true, DoneReason: "load"})
 				default:
 					http.NotFound(w, r)
 				}
