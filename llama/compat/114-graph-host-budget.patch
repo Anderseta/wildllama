@@ -1,0 +1,306 @@
+Account scheduler host reservations before allocating optional graph arenas.
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index d0ff5c0..57a57bc 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -335,6 +335,9 @@ extern "C" {
+     typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+ 
+     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
++    // Conservative host bookkeeping reservation, SIZE_MAX if dimensions overflow.
++    GGML_API size_t ggml_backend_sched_host_reservation(size_t graph_size, int n_backends, bool parallel);
++
+     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
+     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d7f8c02..906aaf8 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2079,6 +2079,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++// Conservative managed host reservation for an independent scheduler arena.
++// Includes tensor-copy context, four backend-ID arrays, hash tables, splits,
++// graph allocator bookkeeping and copy descriptors. Driver allocations are separate.
++size_t ggml_backend_sched_host_reservation(size_t graph_size, int n_backends, bool parallel) {
++    if (!graph_size || n_backends <= 0 || n_backends > GGML_SCHED_MAX_BACKENDS ||
++        graph_size > size_t(INT_MAX) / (1 + 2 * GGML_SCHED_MAX_SPLIT_INPUTS * GGML_SCHED_MAX_COPIES)) {
++        return SIZE_MAX;
++    }
++    const size_t copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
++    const size_t hash = ggml_hash_size(graph_size);
++    const size_t split_inputs = graph_size * GGML_SCHED_MAX_SPLIT_INPUTS;
++    const size_t nodes = graph_size + 2 * split_inputs * copies;
++    size_t bytes = sizeof(ggml_backend_sched);
++    auto add = [&](size_t count, size_t size) {
++        if (size && count > (SIZE_MAX - bytes) / size) { bytes = SIZE_MAX; return; }
++        bytes += count * size;
++    };
++    add(hash, sizeof(ggml_tensor *) * (1 + n_backends * copies) + sizeof(int) + sizeof(ggml_bitset_t));
++    add(nodes, 4 * sizeof(int) + 2 * sizeof(ggml_tensor *));
++    add(2 * split_inputs, sizeof(ggml_tensor));
++    add(1, ggml_graph_overhead_custom(graph_size, false));
++    add(std::max<size_t>(16, graph_size), sizeof(ggml_backend_sched_split));
++    add(split_inputs * copies, 2 * sizeof(ggml_tensor *));
++    // Conservative allowance for allocator records and bookkeeping. This is
++    // admission accounting, not a measurement of process RSS/driver memory.
++    add(nodes, (GGML_MAX_SRC + 4) * 64);
++    add(size_t(n_backends), 1024 * 1024);
++    return bytes;
++}
++
+ ggml_backend_sched_t ggml_backend_sched_new(
+         ggml_backend_t * backends,
+         ggml_backend_buffer_type_t * bufts,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index be7174f..cc7cced 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2389,6 +2389,7 @@ void llama_context::graph_variant_save() {
+     dst.results = std::move(gf_res_prev);
+     dst.active = gf_res_prev_active;
+     dst.bytes = graph_variant_bytes;
++    dst.host_bytes = graph_variant_host_bytes;
+     dst.last_used = graph_variant_last_used;
+     dst.shape = graph_variant_shape;
+     gf_res_prev_active = nullptr;
+@@ -2401,6 +2402,7 @@ void llama_context::graph_variant_restore(size_t index) {
+     gf_res_prev = std::move(src.results);
+     gf_res_prev_active = src.active;
+     graph_variant_bytes = src.bytes;
++    graph_variant_host_bytes = src.host_bytes;
+     graph_variant_last_used = src.last_used;
+     graph_variant_shape = src.shape;
+     graph_variant_active = index;
+@@ -2423,6 +2425,7 @@ void llama_context::graph_variant_evict(size_t index) {
+     }
+     variant.active = nullptr;
+     variant.bytes = 0;
++    variant.host_bytes = 0;
+     variant.shape = {};
+     // Keep metadata arenas in fixed slots, rather than allocating new metadata
+     // addresses (and therefore new potential CUDA graph keys) on every eviction.
+@@ -2444,6 +2447,7 @@ void llama_context::graph_variants_clear() {
+         graph_variant_evict(i);
+     }
+     graph_variant_bytes = 0;
++    graph_variant_host_bytes = 0;
+ }
+ 
+ size_t llama_context::graph_variant_retained_bytes() const {
+@@ -2573,6 +2577,13 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+         !llama_graph_variant_policy::add_size(metadata, max_nodes*ggml_tensor_overhead())) {
+         return graph_variant_selection::none;
+     }
++    const size_t scheduler_host = ggml_backend_sched_host_reservation(max_nodes, int(backend_ptrs.size()), false);
++    size_t initial_reservation = metadata;
++    if (!llama_graph_variant_policy::add_size(initial_reservation, scheduler_host) ||
++        !llama_graph_variant_policy::fits(graph_variant_budget, 0, initial_reservation)) {
++        graph_prefill_admission.deny(shape);
++        return graph_variant_selection::none;
++    }
+     const size_t retained_metadata = get_graph_variant_stats().metadata_bytes;
+     size_t chosen = 0;
+     for (size_t i = 1; i < graph_variants.size(); ++i) {
+@@ -2610,6 +2621,7 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+         sched.reset();
+         gf_res_prev_active = nullptr;
+         graph_variant_bytes = 0;
++    graph_variant_host_bytes = 0;
+         for (auto & result : gf_res_prev) { if (result) { result->reset(); } }
+         graph_variant_save();
+         graph_variant_restore(0);
+@@ -2623,8 +2635,12 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+             }
+         }
+         auto create = [&]() -> ggml_cgraph * {
++            if (!llama_graph_variant_policy::fits(graph_variant_budget, graph_variant_retained_bytes(), scheduler_host)) { return nullptr; }
+             output_overlap_checked = nullptr;
+             draft_overlap_checked = nullptr;
++            // Preflight has not submitted work; release its host arena before
++            // allocating the real one, avoiding a transient double reservation.
++            sched.reset();
+             sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
+                     backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+             if (!sched) { return nullptr; }
+@@ -2633,6 +2649,7 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+             ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+             auto & result = gf_res_prev[n_outputs > 0];
+             if (!result || result->get_max_nodes() < int64_t(max_nodes)) {
++                result.reset();
+                 result.reset(new llm_graph_result(max_nodes));
+             } else { result->reset(); }
+             auto * graph = model.build_graph(graph_params(result.get(), ubatch, mctx, gtype));
+@@ -2653,7 +2670,7 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+         // graph can rewrite its sources, so rebuild once after measurement.
+         std::vector<size_t> sizes(backend_ptrs.size(), 0);
+         ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
+-        size_t requested = 0;
++        size_t requested = scheduler_host;
+         bool valid = !ggml_backend_sched_get_error(sched.get())[0];
+         for (size_t bytes : sizes) { valid &= llama_graph_variant_policy::add_size(requested, bytes); }
+         if (!valid || !requested || requested > graph_variant_budget) {
+@@ -2681,7 +2698,7 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+         if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             restore_primary(); return graph_variant_selection::none;
+         }
+-        size_t actual = 0;
++        size_t actual = scheduler_host;
+         for (auto * backend : backend_ptrs) {
+             if (!llama_graph_variant_policy::add_size(actual, ggml_backend_sched_get_buffer_size(sched.get(), backend))) {
+                 restore_primary(); return graph_variant_selection::none;
+@@ -2691,6 +2708,7 @@ llama_context::graph_variant_selection llama_context::graph_variant_select(
+             restore_primary(); return graph_variant_selection::none;
+         }
+         graph_variant_bytes = actual;
++        graph_variant_host_bytes = scheduler_host;
+         graph_variant_last_used = ++graph_variant_clock;
+         graph_variant_shape = shape;
+         graph_execution_plan.prepared(shape, ggml_time_us() - plan_preparation_start_us);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index c7b4eed..a6c4abe 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -149,11 +149,13 @@ struct llama_context {
+         for (const auto & result : primary) { if (result) { stats.metadata_bytes += result->sampler_bindings_bytes; } }
+         if (graph_variant_active) {
+             ++stats.arenas;
+-            stats.compute_bytes += graph_variant_bytes;
++            stats.compute_bytes += graph_variant_bytes - graph_variant_host_bytes;
++            stats.metadata_bytes += graph_variant_host_bytes;
+             for (const auto & result : gf_res_prev) { if (result) { stats.metadata_bytes += result->metadata_bytes(); } }
+         }
+         for (size_t i = 1; i < graph_variants.size(); ++i) {
+-            if (graph_variants[i].sched) { ++stats.arenas; stats.compute_bytes += graph_variants[i].bytes; }
++            if (graph_variants[i].sched) { ++stats.arenas; stats.compute_bytes += graph_variants[i].bytes - graph_variants[i].host_bytes;
++                stats.metadata_bytes += graph_variants[i].host_bytes; }
+             for (const auto & result : graph_variants[i].results) { if (result) { stats.metadata_bytes += result->metadata_bytes(); } }
+         }
+         return stats;
+@@ -607,6 +609,7 @@ private:
+         std::array<llm_graph_result_ptr, 2> results;
+         llm_graph_result * active = nullptr;
+         size_t bytes = 0;
++        size_t host_bytes = 0;
+         uint64_t last_used = 0;
+         llama_execution_plan::shape shape = {};
+     };
+@@ -632,6 +635,7 @@ private:
+     llama_execution_plan::shape graph_variant_shape = {};
+     bool graph_sampler_bindings_failed = false;
+     size_t graph_variant_bytes = 0;
++    size_t graph_variant_host_bytes = 0;
+     uint64_t graph_variant_clock = 0;
+     uint64_t graph_variant_last_used = 0;
+ 
+diff --git a/tests/test-graph-variants.cpp b/tests/test-graph-variants.cpp
+index 30147ea..12cca15 100644
+--- a/tests/test-graph-variants.cpp
++++ b/tests/test-graph-variants.cpp
+@@ -26,6 +26,13 @@ static void budget_environment(const char * value) {
+ }
+ 
+ static void policy() {
++    const size_t small_host = ggml_backend_sched_host_reservation(128, 2, false);
++    const size_t large_host = ggml_backend_sched_host_reservation(8192, 2, false);
++    require(small_host > 128 * 30 * 2 * sizeof(ggml_tensor), "host reservation omits scheduler tensor arena");
++    require(large_host > small_host, "host reservation must scale with graph capacity");
++    require(ggml_backend_sched_host_reservation(128, 2, true) >= small_host, "parallel copies not accounted");
++    require(ggml_backend_sched_host_reservation(SIZE_MAX, 2, false) == SIZE_MAX, "overflow must reject admission");
++    require(ggml_backend_sched_host_reservation(128, 0, false) == SIZE_MAX, "invalid backend count must reject admission");
+     using namespace llama_graph_variant_policy;
+     require(parse_budget(nullptr) == 0 && parse_budget("") == 0 && parse_budget("0") == 0, "disabled budget");
+     require(parse_budget("1") == 1024*1024 && parse_budget("1024") == size_t(1024)*1024*1024, "valid budget");
+@@ -79,6 +86,8 @@ struct result {
+     uint64_t plans_preserved = 0;
+ };
+ 
++static bool cuda_fixture = false;
++
+ static result run(llama_model * model, const char * budget, bool invalidate, bool backend = false, bool prefill = false) {
+     budget_environment(budget);
+     auto params = llama_context_default_params();
+@@ -89,6 +98,7 @@ static result run(llama_model * model, const char * budget, bool invalidate, boo
+     params.n_threads = 2;
+     params.n_threads_batch = 2;
+     params.no_perf = false;
++    params.op_offload = cuda_fixture;
+     params.n_outputs_max = capacity;
+     params.n_outputs_max_per_seq = capacity;
+     auto * ctx = llama_init_from_model(model, params);
+@@ -99,9 +109,16 @@ static result run(llama_model * model, const char * budget, bool invalidate, boo
+     try {
+         if (backend) {
+             chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+-            llama_sampler_chain_add(chain, llama_sampler_init_top_k(20));
+-            llama_sampler_chain_add(chain, llama_sampler_init_temp(0.7f));
+-            llama_sampler_chain_add(chain, llama_sampler_init_dist(1234));
++            // The CUDA stochastic baseline itself is not replay-identical across
++            // independent contexts. Use a deterministic GPU oracle; retain the
++            // stronger seeded-RNG check for the CPU backend.
++            if (cuda_fixture) {
++                llama_sampler_chain_add(chain, llama_sampler_init_greedy());
++            } else {
++                llama_sampler_chain_add(chain, llama_sampler_init_top_k(20));
++                llama_sampler_chain_add(chain, llama_sampler_init_temp(0.7f));
++                llama_sampler_chain_add(chain, llama_sampler_init_dist(1234));
++            }
+             require(llama_set_sampler(ctx, 0, chain), "fixture cannot offload stochastic sampler");
+         }
+         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+@@ -186,6 +203,7 @@ int main(int argc, char ** argv) {
+         if (argc == 1) { return 0; }
+         const bool cuda = argc == 3 && std::strcmp(argv[1], "--cuda") == 0;
+         require(argc == 2 || cuda, "usage: test-graph-variants [--cuda] small-local.gguf");
++        cuda_fixture = cuda;
+         const char * fixture = argv[cuda ? 2 : 1];
+         // This test never downloads a model. The caller supplies a small local
+         // fixture; refuse larger files even when the wrong path is supplied.
+@@ -213,12 +231,17 @@ int main(int argc, char ** argv) {
+         require(model != nullptr, "fixture load failed");
+         try {
+             const auto baseline = run(model, "0", false);
+-            const auto cached = run(model, "64", false);
++            const auto cached = run(model, "512", false);
+             const auto limited = run(model, "1", false);
+-            const auto invalidated = run(model, "64", true);
++            const auto host_limited = run(model, "64", false);
++            require(host_limited.peak_arenas == 0, "small quota ignored scheduler host reservation");
++            require(host_limited.logits == baseline.logits, "host-budget fallback changed logits");
++            const auto invalidated = run(model, "512", true);
+             const auto malformed = run(model, "9999999999999999999", false);
+             const auto sampler_baseline = run(model, "0", false, true);
+-            const auto sampler_cached = run(model, "64", false, true);
++            const auto sampler_cached = run(model, "512", false, true);
++            const auto sampler_repeated = run(model, "0", false, true);
++            require(sampler_baseline.sampled == sampler_repeated.sampled, "baseline stochastic sampling is not repeatable");
+             require(baseline.logits == cached.logits, "retained graph changed CPU logits");
+             require(baseline.logits == limited.logits, "budget fallback changed CPU logits");
+             require(baseline.logits == invalidated.logits, "invalidation changed CPU logits");
+@@ -232,11 +255,11 @@ int main(int argc, char ** argv) {
+             require(sampler_cached.peak_arenas > 0, "backend sampler graph bindings were not retained");
+             require(sampler_cached.reused > sampler_baseline.reused, "backend sampler shapes were rebuilt rather than reused");
+             const auto prefill_baseline = run(model, "0", false, false, true);
+-            const auto prefill_cached = run(model, "128", false, false, true);
++            const auto prefill_cached = run(model, "512", false, false, true);
+             const auto prefill_limited = run(model, "1", false, false, true);
+-            const auto prefill_invalidated = run(model, "128", true, false, true);
++            const auto prefill_invalidated = run(model, "512", true, false, true);
+             const auto prefill_sampler_baseline = run(model, "0", false, true, true);
+-            const auto prefill_sampler_cached = run(model, "128", false, true, true);
++            const auto prefill_sampler_cached = run(model, "512", false, true, true);
+             require(prefill_baseline.logits == prefill_cached.logits, "larger retained graph changed logits");
+             require(prefill_baseline.logits == prefill_limited.logits, "larger budget fallback changed logits");
+             require(prefill_baseline.logits == prefill_invalidated.logits, "larger invalidation changed logits");
+@@ -246,7 +269,7 @@ int main(int argc, char ** argv) {
+                     "larger backend bindings changed RNG/token sequence");
+             require(prefill_sampler_cached.peak_arenas > 0 && prefill_sampler_cached.reused > prefill_sampler_baseline.reused,
+                     "larger backend sampler shapes were not retained/reused");
+-            std::printf("GRAPH_PREFILL_RUNTIME device=%s logits_exact=1 seeded_tokens_exact=1 tiny_quota_exact=1 invalidation_exact=1 reused=%d->%d peak_extra_compute_bytes=%zu peak_extra_total_bytes=%zu PASS\n",
++            std::printf("GRAPH_PREFILL_RUNTIME device=%s logits_exact=1 backend_tokens_exact=1 tiny_quota_exact=1 invalidation_exact=1 reused=%d->%d peak_extra_compute_bytes=%zu peak_extra_total_bytes=%zu PASS\n",
+                     cuda ? "CUDA" : "CPU", prefill_baseline.reused, prefill_cached.reused, prefill_cached.peak_compute_bytes, prefill_cached.peak_total_bytes);
+             std::printf("graph variants: PASS, reused %d -> %d; peak %zu arenas / %zu compute bytes\n",
+                     baseline.reused, cached.reused, cached.peak_arenas, cached.peak_compute_bytes);

@@ -83,6 +83,7 @@ target_include_directories(test-state-transfer PRIVATE "${WILDLLAMA_NATIVE}/src"
 validation_target(test-cuda-upload ggml)
 validation_target(test-cuda-host-op ggml)
 validation_target(test-cuda-dense ggml)
+validation_target(test-backend-ops ggml)
 target_include_directories(test-cuda-dense PRIVATE "${WILDLLAMA_NATIVE}/ggml/src")
 validation_target(test-dense-embedding llama)
 target_include_directories(test-dense-embedding PRIVATE "${WILDLLAMA_NATIVE}/src")
