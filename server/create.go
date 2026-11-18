@@ -145,7 +145,8 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		return
 	}
 
-	reqCtx := c.Request.Context()
+	reqCtx, stop := context.WithCancel(c.Request.Context())
+	defer stop()
 	ch := make(chan any)
 	go func() {
 		downloadCleanupGate.RLock()
@@ -160,6 +161,9 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		}
 		defer close(ch)
 		defer recoverCreatePanic(send)
+		if reqCtx.Err() != nil {
+			return
+		}
 
 		fn := func(resp api.ProgressResponse) {
 			send(resp)
@@ -168,7 +172,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		oldManifestDigests, _ := manifest.ReferencedBlobDigestsForName(name)
 
 		if len(r.List) > 0 {
-			if err := createManifestList(r, name, fn); err != nil {
+			if err := createManifestList(reqCtx, r, name, fn); err != nil {
 				status := http.StatusInternalServerError
 				var requestErr manifestListRequestError
 				if errors.As(err, &requestErr) {
@@ -237,11 +241,8 @@ func (s *Server) CreateHandler(c *gin.Context) {
 				config.RemoteHost = ru
 				remote = true
 			} else {
-				ctx, cancel := context.WithCancel(c.Request.Context())
-				defer cancel()
-
 				var baseConfig model.ConfigV2
-				baseLayers, baseConfig, err = parseFromModel(ctx, fromName, fn)
+				baseLayers, baseConfig, err = parseFromModel(reqCtx, fromName, fn)
 				if err != nil {
 					send(gin.H{"error": err.Error()})
 					return
@@ -946,7 +947,7 @@ func createModel(ctx context.Context, r api.CreateRequest, name model.Name, base
 	return nil
 }
 
-func createManifestList(r api.CreateRequest, name model.Name, fn func(resp api.ProgressResponse)) error {
+func createManifestList(ctx context.Context, r api.CreateRequest, name model.Name, fn func(resp api.ProgressResponse)) error {
 	if err := validateCreateManifestListRequest(r); err != nil {
 		return err
 	}
@@ -963,6 +964,9 @@ func createManifestList(r api.CreateRequest, name model.Name, fn func(resp api.P
 		}
 
 		fn(api.ProgressResponse{Status: fmt.Sprintf("reading manifest %s", ref)})
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		modelRef, err := parseAndValidateModelRef(ref)
 		if err != nil {
@@ -1046,6 +1050,9 @@ func createManifestList(r api.CreateRequest, name model.Name, fn func(resp api.P
 	warnManifestListDrift(signatures, fn)
 
 	fn(api.ProgressResponse{Status: "writing manifest list"})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	parentDigest, err := manifest.WriteManifestList(name, manifests)
 	if err != nil {
 		return err

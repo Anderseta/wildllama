@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -3298,7 +3299,7 @@ func driftWarnings(t *testing.T, name string, children []model.ConfigV2) []strin
 	}
 
 	var warnings []string
-	err := createManifestList(api.CreateRequest{Name: name, List: refs}, model.ParseName(name), func(resp api.ProgressResponse) {
+	err := createManifestList(t.Context(), api.CreateRequest{Name: name, List: refs}, model.ParseName(name), func(resp api.ProgressResponse) {
 		if strings.HasPrefix(resp.Status, "warning:") {
 			warnings = append(warnings, resp.Status)
 		}
@@ -3307,6 +3308,65 @@ func driftWarnings(t *testing.T, name string, children []model.ConfigV2) []strin
 		t.Fatalf("createManifestList() error = %v", err)
 	}
 	return warnings
+}
+
+func TestCreateAfterBasePullOnlyConfirmsDestination(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	layer, err := manifest.NewLayer(strings.NewReader(`{"model_format":"gguf"}`), "application/vnd.docker.container.image.v1+json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	registry := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/library/base/manifests/latest" {
+			http.NotFound(w, r)
+			return
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", manifest.MediaTypeManifest)
+		_ = json.NewEncoder(w).Encode(manifest.Manifest{SchemaVersion: 2, MediaType: manifest.MediaTypeManifest, Config: layer})
+	}))
+	defer registry.Close()
+	previous := http.DefaultTransport
+	http.DefaultTransport = registry.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	base := strings.TrimPrefix(registry.URL, "https://") + "/library/base:latest"
+	w := createRequest(t, (&Server{}).CreateHandler, api.CreateRequest{Model: "derived-invalid", From: base, Template: "{{"})
+	if strings.Contains(w.Body.String(), `"status":"success"`) || !strings.Contains(w.Body.String(), `"error"`) {
+		t.Fatalf("failed create emitted premature success: %s", w.Body.String())
+	}
+	w = createRequest(t, (&Server{}).CreateHandler, api.CreateRequest{Model: "derived-valid", From: base})
+	if strings.Count(w.Body.String(), `"status":"success"`) != 1 || strings.Contains(w.Body.String(), `"error"`) {
+		t.Fatalf("create did not confirm destination: %s", w.Body.String())
+	}
+	if _, err = manifest.ParseNamedManifest(model.ParseName("derived-valid")); err != nil || requests.Load() != 1 {
+		t.Fatalf("destination unavailable or base fetched again: %v, registry requests: %d", err, requests.Load())
+	}
+	w = createRequest(t, (&Server{}).CreateHandler, api.CreateRequest{Model: "wrong-origin", From: "another.invalid/library/base:latest"})
+	if !strings.Contains(w.Body.String(), "different or unknown origin") {
+		t.Fatalf("conflicting local base was not protected: %s", w.Body.String())
+	}
+}
+
+func TestCancelledManifestListDoesNotPublish(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	writeDriftVariant(t, "child", "gguf", model.ConfigV2{ModelFormat: "gguf"})
+	for _, phase := range []string{"reading manifest child", "writing manifest list"} {
+		ctx, cancel := context.WithCancel(t.Context())
+		name := model.ParseName("cancelled-list")
+		err := createManifestList(ctx, api.CreateRequest{List: []string{"child"}}, name, func(p api.ProgressResponse) {
+			if p.Status == phase {
+				cancel()
+			}
+		})
+		cancel()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel at %s: %v", phase, err)
+		}
+		if _, err := manifest.ReadManifestData(name); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cancel at %s published a manifest: %v", phase, err)
+		}
+	}
 }
 
 func TestCreateManifestListWarnsOnDrift(t *testing.T) {

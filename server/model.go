@@ -27,13 +27,33 @@ type modelLayer struct {
 func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressResponse)) ([]*modelLayer, model.ConfigV2, error) {
 	var config model.ConfigV2
 	m, err := manifest.ParseNamedManifest(name)
+	local := name.LocalName()
+	if errors.Is(err, os.ErrNotExist) && !local.EqualFold(name) {
+		// Pulls store the model under its host-free name. Reuse it only
+		// when its recorded registry agrees with the requested base.
+		cached, localErr := manifest.ParseNamedManifest(local)
+		switch {
+		case localErr == nil:
+			origin := manifest.ModelOrigin(local)
+			if origin == "" || !model.ParseName(origin).EqualFold(name) {
+				return nil, config, fmt.Errorf("local model %s already exists with a different or unknown origin; select the local base or pull the requested registry explicitly", local.DisplayShortest())
+			}
+			m, err = cached, nil
+		case !errors.Is(localErr, os.ErrNotExist):
+			return nil, config, localErr
+		}
+	}
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		if err := PullModel(ctx, name.String(), "", &registryOptions{}, fn); err != nil {
+		if err := PullModel(ctx, name.String(), "", &registryOptions{}, func(progress api.ProgressResponse) {
+			if progress.Status != "success" {
+				fn(progress)
+			}
+		}); err != nil {
 			return nil, config, err
 		}
 
-		m, err = manifest.ParseNamedManifest(name)
+		m, err = manifest.ParseNamedManifest(local)
 		if err != nil {
 			return nil, config, err
 		}
