@@ -254,6 +254,14 @@ func ValidateProfile(p Profile) error {
 }
 
 func ValidateRequest(p Profile, r Request) error {
+	if r.Inpaint != nil {
+		if len(r.ReferenceImages) == 0 {
+			return errors.New("inpaint requires a reference")
+		}
+		if err := r.Inpaint.Validate(); err != nil {
+			return err
+		}
+	}
 	if r.CPUOnly && !p.OffloadToCPU {
 		return errors.New("CPU image admission requires enabled RAM offload")
 	}
@@ -522,6 +530,13 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		return Result{}, err
 	}
 	defer os.RemoveAll(jobDir)
+	finalPath := output
+	if r.Inpaint != nil {
+		if err := r.Inpaint.writeMask(jobDir, p.Width, p.Height); err != nil {
+			return Result{}, err
+		}
+		output = filepath.Join(jobDir, "generated.png")
+	}
 	loraTags, err := prepareLoRAs(ctx, p.requestLoRAs(r.ReferenceImages), jobDir)
 	if err != nil {
 		return Result{}, err
@@ -612,6 +627,17 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			}
 			return Result{}, fmt.Errorf("runner did not produce a complete PNG with the requested dimensions: %w", err)
 		}
+	}
+	if r.Inpaint != nil {
+		if runErr != nil {
+			return Result{}, runErr
+		}
+		size, err := r.Inpaint.compose(ctx, r.ReferenceImages[0], output, finalPath)
+		if err != nil {
+			return Result{}, err
+		}
+		p.Width, p.Height = size.X, size.Y
+		output = finalPath
 	}
 	result := Result{Path: output, MIMEType: "image/png", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}
 	// A process can fail, or cancellation can arrive, immediately after it saves
@@ -728,6 +754,9 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 		"--cfg-scale", strconv.FormatFloat(p.CFGScale, 'g', -1, 64), "--sampling-method", p.Sampler, "--seed", strconv.FormatInt(seed, 10), "--output", output}
 	if p.Tokenizer != "" {
 		args = append(args, "--tokenizer", p.Tokenizer)
+	}
+	if r.Inpaint != nil {
+		args = append(args, "--init-img", r.ReferenceImages[0], "--mask", filepath.Join(jobDir, "mask.png"), "--strength", "1")
 	}
 	stage := "off"
 	if p.StageComponents {

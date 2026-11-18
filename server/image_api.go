@@ -63,23 +63,24 @@ type imageConfig struct {
 }
 
 type imageJobRequest struct {
-	RequestID        string   `json:"request_id,omitempty"`
-	SessionID        string   `json:"session_id,omitempty"`
-	ProfileID        string   `json:"profile_id,omitempty"`
-	Prompt           string   `json:"prompt"`
-	NegativePrompt   string   `json:"negative_prompt,omitempty"`
-	Width            int      `json:"width,omitempty"`
-	Height           int      `json:"height,omitempty"`
-	Seed             *int64   `json:"seed"`
-	Steps            int      `json:"steps,omitempty"`
-	CFGScale         *float64 `json:"cfg_scale,omitempty"`
-	Sampler          string   `json:"sampler,omitempty"`
-	ExecutionMode    string   `json:"execution_mode,omitempty"`
-	ReferenceImages  []string `json:"reference_images,omitempty"`
-	InputAssetID     string   `json:"input_asset_id,omitempty"`
-	Count            int      `json:"count,omitempty"`
-	DeferTextRestore bool     `json:"defer_text_restore,omitempty"`
-	ParentAssetID    string   `json:"parent_asset_id,omitempty"`
+	RequestID        string                `json:"request_id,omitempty"`
+	SessionID        string                `json:"session_id,omitempty"`
+	ProfileID        string                `json:"profile_id,omitempty"`
+	Prompt           string                `json:"prompt"`
+	NegativePrompt   string                `json:"negative_prompt,omitempty"`
+	Width            int                   `json:"width,omitempty"`
+	Height           int                   `json:"height,omitempty"`
+	Seed             *int64                `json:"seed"`
+	Steps            int                   `json:"steps,omitempty"`
+	CFGScale         *float64              `json:"cfg_scale,omitempty"`
+	Sampler          string                `json:"sampler,omitempty"`
+	ExecutionMode    string                `json:"execution_mode,omitempty"`
+	Inpaint          *imagegen.InpaintMask `json:"inpaint,omitempty"`
+	ReferenceImages  []string              `json:"reference_images,omitempty"`
+	InputAssetID     string                `json:"input_asset_id,omitempty"`
+	Count            int                   `json:"count,omitempty"`
+	DeferTextRestore bool                  `json:"defer_text_restore,omitempty"`
+	ParentAssetID    string                `json:"parent_asset_id,omitempty"`
 }
 
 type imageProgress struct {

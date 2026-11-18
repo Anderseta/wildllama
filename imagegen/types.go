@@ -97,13 +97,14 @@ type LocalInspection struct {
 }
 
 type Request struct {
-	Prompt          string   `json:"prompt"`
-	NegativePrompt  string   `json:"negative_prompt,omitempty"`
-	Width           int      `json:"width,omitempty"`
-	Height          int      `json:"height,omitempty"`
-	Seed            int64    `json:"seed"`
-	ReferenceImages []string `json:"reference_images,omitempty"`
-	OutputPath      string   `json:"output_path"`
+	Inpaint         *InpaintMask `json:"inpaint,omitempty"`
+	Prompt          string       `json:"prompt"`
+	NegativePrompt  string       `json:"negative_prompt,omitempty"`
+	Width           int          `json:"width,omitempty"`
+	Height          int          `json:"height,omitempty"`
+	Seed            int64        `json:"seed"`
+	ReferenceImages []string     `json:"reference_images,omitempty"`
+	OutputPath      string       `json:"output_path"`
 	// CPUOnly is an internal admission decision, never a client override.
 	CPUOnly bool `json:"-"`
 	// GPUResidentFailedAtMiB is a confirmed failure for the same batch inputs.

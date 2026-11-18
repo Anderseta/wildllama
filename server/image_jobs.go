@@ -434,7 +434,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	if err != nil {
 		return err
 	}
-	input := imagegen.Request{Prompt: generation.Prompt, NegativePrompt: generation.NegativePrompt, Width: profile.Width, Height: profile.Height, Seed: seed, OutputPath: filepath.Join(job.Config.OutputDir, job.ID, "image.png")}
+	input := imagegen.Request{Inpaint: request.Inpaint, Prompt: generation.Prompt, NegativePrompt: generation.NegativePrompt, Width: profile.Width, Height: profile.Height, Seed: seed, OutputPath: filepath.Join(job.Config.OutputDir, job.ID, "image.png")}
 	refs := generation.ReferenceAssetIDs
 	parent := request.ParentAssetID
 	if parent == "" && len(refs) > 0 {

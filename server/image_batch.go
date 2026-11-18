@@ -65,6 +65,15 @@ func imageGenerationFor(request imageJobRequest, profile imageProfile) (*imageGe
 	if len(refs) > 4 {
 		return nil, errors.New("at most four reference images are supported per job")
 	}
+	if request.Inpaint != nil {
+		if err := request.Inpaint.Validate(); err != nil {
+			return nil, err
+		}
+		if len(refs) == 0 || refs[0] != request.Inpaint.AssetID {
+			return nil, errors.New("inpaint requires the selected first reference")
+		}
+		profile.PreserveReferenceSize = true
+	}
 	preferReference := profile.PreserveReferenceSize && len(refs) > 0
 	if request.Width != 0 && !preferReference {
 		profile.Width = request.Width
