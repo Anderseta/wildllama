@@ -100,7 +100,7 @@ func TestEmbeddingBatchTokenWindowPreservesGlobalPacking(t *testing.T) {
 		}
 		return text, false, nil
 	}
-	result, count, used, err := prepareEmbeddingBatch(t.Context(), f, inputs, f.remember, f.clear, f.tokens, prepare, f.single)
+	result, count, used, err := prepareEmbeddingBatch(t.Context(), f, inputs, f.remember, f.clear, f.tokens, prepare, f.single, rawEmbedding)
 	if err != nil || !used {
 		t.Fatalf("used=%v err=%v", used, err)
 	}
@@ -162,7 +162,7 @@ func TestEmbeddingBatchTokenWindowReleasesOnFailure(t *testing.T) {
 				}
 				return f.prepare(text)
 			}
-			_, _, used, err := prepareEmbeddingBatch(ctx, f, inputs, f.remember, f.clear, f.tokens, prepare, f.single)
+			_, _, used, err := prepareEmbeddingBatch(ctx, f, inputs, f.remember, f.clear, f.tokens, prepare, f.single, rawEmbedding)
 			want := failure
 			if cancelRequest {
 				want = context.Canceled
@@ -186,7 +186,7 @@ func BenchmarkEmbeddingTokenRetention(b *testing.B) {
 	var last *embeddingRetentionFixture
 	for b.Loop() {
 		f := &embeddingRetentionFixture{cache: make(map[string][]int)}
-		result, _, used, err := prepareEmbeddingBatch(b.Context(), f, inputs, f.remember, f.clear, f.tokens, f.prepare, f.single)
+		result, _, used, err := prepareEmbeddingBatch(b.Context(), f, inputs, f.remember, f.clear, f.tokens, f.prepare, f.single, rawEmbedding)
 		if err != nil || !used || len(result) != len(inputs) {
 			b.Fatalf("invalid embedding result: used=%v err=%v", used, err)
 		}

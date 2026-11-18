@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/ollama/ollama/fs/gguf"
 )
@@ -19,6 +21,30 @@ type tensorDescriptor struct {
 	Offsets []int64 `json:"data_offsets"`
 }
 
+type inspectionKey struct{ path, role, stamp string }
+
+// Retain compact reports only. File change stamps invalidate edits and replacements.
+var inspections = struct {
+	sync.Mutex
+	entries map[inspectionKey]LocalInspection
+	order   []inspectionKey
+}{entries: make(map[inspectionKey]LocalInspection)}
+
+func rememberInspection(key inspectionKey, value LocalInspection) {
+	inspections.Lock()
+	defer inspections.Unlock()
+	if _, ok := inspections.entries[key]; ok {
+		return
+	}
+	if len(inspections.order) == 64 {
+		delete(inspections.entries, inspections.order[0])
+		inspections.order = append(inspections.order[:0], inspections.order[1:]...)
+	}
+	value.DTypes = maps.Clone(value.DTypes)
+	inspections.entries[key] = value
+	inspections.order = append(inspections.order, key)
+}
+
 // InspectLocalComponent reads bounded headers and tiny quantization metadata,
 // never tensor weight payloads. Compatibility describes the pinned runner's
 // recognized storage/key layout, not an empirical full-model generation test.
@@ -27,22 +53,48 @@ func InspectLocalComponent(path, role string) (LocalInspection, error) {
 	if role != "diffusion_model" && role != "text_encoder" && role != "vae" && role != "vision_encoder" && role != "lora" {
 		return result, errors.New("unknown image component role")
 	}
-	if err := validateModelFile(path); err != nil {
-		return result, err
-	}
-	f, err := os.Open(path)
+	f, info, err := openModelFile(path)
 	if err != nil {
 		return result, err
 	}
 	defer f.Close()
-	info, err := f.Stat()
+	stamp, reliable := conditioningFileStamp(f, info)
+	key := inspectionKey{path, role, stamp}
+	if reliable && conditioningStampCanReuse(stamp) {
+		inspections.Lock()
+		cached, ok := inspections.entries[key]
+		inspections.Unlock()
+		if ok {
+			cached.DTypes = maps.Clone(cached.DTypes)
+			return cached, nil
+		}
+	}
+	if err := validateModelHeader(f, info); err != nil {
+		return result, err
+	}
+	result, err = inspectModelHeader(f, info, result)
+	if err != nil || !reliable || result.Compatibility != "supported" {
+		return result, err
+	}
+	after, err := f.Stat()
 	if err != nil {
 		return result, err
 	}
+	if current, ok := conditioningFileStamp(f, after); !ok || current != stamp {
+		return result, errors.New("image component changed during inspection")
+	}
+	if conditioningStampCanReuse(stamp) {
+		rememberInspection(key, result)
+	}
+	return result, nil
+}
+
+func inspectModelHeader(f *os.File, info os.FileInfo, result LocalInspection) (LocalInspection, error) {
+	role := result.Role
 	result.Size = info.Size()
-	if strings.EqualFold(filepath.Ext(path), ".gguf") {
+	if strings.EqualFold(filepath.Ext(f.Name()), ".gguf") {
 		result.Format = "GGUF"
-		metadata, err := gguf.ReadFileMetadata(path, 32)
+		metadata, err := gguf.ReadMetadataFromFile(f, 32)
 		if err != nil {
 			return result, fmt.Errorf("invalid image GGUF metadata: %w", err)
 		}

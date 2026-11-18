@@ -175,3 +175,26 @@ func TestReadFileMetadataUsesUnsignedAlignment(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestReadMetadataFromFileLeavesHandleOpen(t *testing.T) {
+	path := writeMetadataFixture(t, gguftest.KV{"general.architecture": "llama"}, nil)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	m, err := gguf.ReadMetadataFromFile(f, 32)
+	if err != nil || m.Architecture() != "llama" {
+		t.Fatal(m, err)
+	}
+	if _, err := f.Seek(1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gguf.ReadMetadataFromFile(f, 32); err == nil {
+		t.Fatal("accepted misaligned header")
+	}
+	var magic [4]byte
+	if _, err := f.ReadAt(magic[:], 0); err != nil || string(magic[:]) != "GGUF" {
+		t.Fatal("caller no longer owns the file", err)
+	}
+}

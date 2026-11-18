@@ -3,10 +3,10 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/ollama/ollama/api"
@@ -142,29 +142,12 @@ func imageTaggedMessages(m *Model, msgs []api.Message, clearImages bool) ([]api.
 			return nil, nil, errors.New("this model only supports one image while more than one image requested")
 		}
 
-		var prefix string
-		prompt := msg.Content
-
-		for _, i := range msg.Images {
-			mediaData := llm.NewMediaData(len(media), i)
-			media = append(media, mediaData)
-
-			if m.Config.Renderer != "" {
-				continue
-			}
-
-			// The prompt marker is still image-named for compatibility with
-			// existing templates and llama-server media marker replacement.
-			imgTag := fmt.Sprintf("[img-%d]", mediaData.ID)
-			if !strings.Contains(prompt, "[img]") {
-				prefix += imgTag
-			} else {
-				prompt = strings.Replace(prompt, "[img]", imgTag, 1)
-			}
+		firstID := len(media)
+		for _, data := range msg.Images {
+			media = append(media, llm.NewMediaData(len(media), data))
 		}
-
-		if m.Config.Renderer == "" {
-			renderMsgs[cnt].Content = prefix + prompt
+		if m.Config.Renderer == "" && len(msg.Images) > 0 {
+			renderMsgs[cnt].Content = tagMediaPrompt(msg.Content, firstID, len(msg.Images))
 		}
 		if clearImages {
 			renderMsgs[cnt].Images = nil
@@ -172,6 +155,43 @@ func imageTaggedMessages(m *Model, msgs []api.Message, clearImages bool) ([]api.
 	}
 
 	return renderMsgs, media, nil
+}
+
+// Extra media go before the original prompt; numbered markers replace existing
+// [img] slots from left to right. Both passes are linear in the original text.
+func tagMediaPrompt(prompt string, firstID, count int) string {
+	const marker = "[img]"
+	rest := prompt
+	placed := 0
+	for placed < count {
+		_, tail, found := strings.Cut(rest, marker)
+		if !found {
+			break
+		}
+		placed++
+		rest = tail
+	}
+	var out strings.Builder
+	tagSize := len("[img-]") + len(strconv.Itoa(firstID+count-1))
+	out.Grow(len(prompt) - len(marker)*placed + tagSize*count)
+	writeTag := func(id int) {
+		var digits [20]byte
+		out.WriteString("[img-")
+		out.Write(strconv.AppendInt(digits[:0], int64(id), 10))
+		out.WriteByte(']')
+	}
+	for i := placed; i < count; i++ {
+		writeTag(firstID + i)
+	}
+	rest = prompt
+	for i := 0; i < placed; i++ {
+		head, tail, _ := strings.Cut(rest, marker)
+		out.WriteString(head)
+		writeTag(firstID + i)
+		rest = tail
+	}
+	out.WriteString(rest)
+	return out.String()
 }
 
 // Some native Qwen templates reject even a second leading instruction. Other

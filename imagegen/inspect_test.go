@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fixtureTensor struct {
@@ -122,5 +124,103 @@ func TestRuntimeLoRAAndRAMStageArguments(t *testing.T) {
 	disk := strings.Join(buildArguments(p, Request{}, job, "output.png", 42), "|")
 	if !strings.Contains(disk, "--params-backend|disk") || strings.Contains(disk, "--offload-to-cpu") {
 		t.Fatal("explicit disk-only mode changed", disk)
+	}
+}
+
+func TestInspectionCacheInvalidationAndOwnership(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "encoder.safetensors")
+	makeFixture := func(path, dtype string) {
+		writeSafeFixture(t, path, []fixtureTensor{
+			{"visual.patch_embed", dtype, []int64{1}, []byte{0, 0}},
+			{"visual.merger.linear_fc2", dtype, []int64{1}, []byte{0, 0}},
+		})
+	}
+	makeFixture(path, "F16")
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		time.Sleep(1100 * time.Millisecond)
+	} // allow NTFS change stamps to settle
+	first, err := InspectLocalComponent(path, "text_encoder")
+	if err != nil || !first.SupportsEditing || first.DTypes["F16"] != 2 {
+		t.Fatal(first, err)
+	}
+	first.DTypes["F16"] = 99
+	second, err := InspectLocalComponent(path, "text_encoder")
+	if err != nil || second.DTypes["F16"] != 2 {
+		t.Fatal(second, err)
+	}
+	second.DTypes["F16"] = 55
+	vae, err := InspectLocalComponent(path, "vae")
+	if err != nil || vae.SupportsEditing {
+		t.Fatal(vae, err)
+	}
+	makeFixture(path, "F32")
+	if err := os.Chtimes(path, stat.ModTime(), stat.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := InspectLocalComponent(path, "text_encoder")
+	if err != nil || got.DTypes["F32"] != 2 || got.DTypes["F16"] != 0 {
+		t.Fatal(got, err)
+	}
+	bad := filepath.Join(dir, "replacement.safetensors")
+	putModel(t, bad, make([]byte, stat.Size()))
+	if err := os.Chtimes(bad, stat.ModTime(), stat.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(bad, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectLocalComponent(path, "text_encoder"); err == nil {
+		t.Fatal("accepted invalid replacement")
+	}
+}
+func TestImageRunnerStatusChecksPinnedDigestAfterChange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runner.exe")
+	data := []byte("test runner")
+	putModel(t, path, data)
+	manifestPath := filepath.Join(dir, "wildimage-runtime.json")
+	manifest := func(hash, version string) {
+		b, err := json.Marshal(map[string]any{"revision": version, "features": map[string]bool{"ram_budget": true}, "files": []map[string]any{{"name": "runner.exe", "size": len(data), "sha256": hash}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		putModel(t, manifestPath, b)
+	}
+	manifest(digest(data), "v1")
+	info, err := os.Stat(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{config: Config{RunnerPath: path}}
+	if got := engine.Status(); !got.Ready || got.Revision != "v1" {
+		t.Fatal(got)
+	}
+	manifest(strings.Repeat("f", 64), "v2")
+	if err := os.Chtimes(manifestPath, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.Status(); got.Ready || !strings.Contains(got.Error, "SHA256") {
+		t.Fatal(got)
+	}
+	manifest(digest(data), "v2")
+	if got := engine.Status(); !got.Ready || got.Revision != "v2" {
+		t.Fatal(got)
+	}
+	binaryInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[0] ^= 1
+	putModel(t, path, data)
+	if err := os.Chtimes(path, binaryInfo.ModTime(), binaryInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.Status(); got.Ready || !strings.Contains(got.Error, "SHA256") {
+		t.Fatal(got)
 	}
 }

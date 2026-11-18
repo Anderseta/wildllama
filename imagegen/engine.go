@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,16 +28,12 @@ import (
 )
 
 type Engine struct {
-	config           Config
-	mu               sync.Mutex
-	closed           bool
-	pid              int
-	cancel           context.CancelFunc
-	done             chan struct{}
-	runtimeSize      int64
-	runtimeModified  int64
-	manifestModified int64
-	runtimeRevision  string
+	config Config
+	mu     sync.Mutex
+	closed bool
+	pid    int
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type imageMemoryMode int
@@ -87,7 +81,7 @@ func (e *Engine) Status() RunnerStatus {
 		return status
 	}
 	manifestPath := filepath.Join(filepath.Dir(e.config.RunnerPath), "wildimage-runtime.json")
-	if manifestInfo, err := os.Stat(manifestPath); err == nil {
+	if _, err := os.Stat(manifestPath); err == nil {
 		var manifest struct {
 			Revision string `json:"revision"`
 			Features struct {
@@ -131,25 +125,16 @@ func (e *Engine) Status() RunnerStatus {
 			status.Error = "runtime manifest does not include this executable"
 			return status
 		}
-		if e.runtimeSize != info.Size() || e.runtimeModified != info.ModTime().UnixNano() || e.manifestModified != manifestInfo.ModTime().UnixNano() {
-			f, err := os.Open(e.config.RunnerPath)
-			if err != nil {
-				status.Error = err.Error()
-				return status
-			}
-			hash := sha256.New()
-			_, err = io.Copy(hash, f)
-			f.Close()
-			if err != nil || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), executableHash) {
-				status.Error = "image runner SHA256 differs from its pinned manifest"
-				return status
-			}
-			e.runtimeSize = info.Size()
-			e.runtimeModified = info.ModTime().UnixNano()
-			e.manifestModified = manifestInfo.ModTime().UnixNano()
-			e.runtimeRevision = manifest.Revision
+		digest, err := conditioningFileIdentity(context.Background(), e.config.RunnerPath, true)
+		if err != nil {
+			status.Error = err.Error()
+			return status
 		}
-		status.Revision = e.runtimeRevision
+		if !strings.EqualFold(digest, executableHash) {
+			status.Error = "image runner SHA256 differs from its pinned manifest"
+			return status
+		}
+		status.Revision = manifest.Revision
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 		status.RAMBudgetSupported = manifest.Features.RAMBudget
 		status.MOSSEditSupported = manifest.Features.MOSSEdit
@@ -348,31 +333,45 @@ func validateImageInputs(p Profile, r Request) error {
 }
 
 func validateModelFile(path string) error {
-	if path == "" || !filepath.IsAbs(path) {
-		return errors.New("model component path must be absolute")
-	}
-	ext := strings.ToLower(filepath.Ext(path))
-	if ext != ".gguf" && ext != ".safetensors" {
-		return errors.New("expected a GGUF or safetensors component")
-	}
-	f, err := os.Open(path)
+	f, info, err := openModelFile(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	return validateModelHeader(f, info)
+}
+
+func openModelFile(path string) (*os.File, os.FileInfo, error) {
+	if !filepath.IsAbs(path) {
+		return nil, nil, errors.New("model component path must be absolute")
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != ".gguf" && ext != ".safetensors" {
+		return nil, nil, errors.New("expected a GGUF or safetensors component")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() < 16 {
-		return errors.New("model component is missing or truncated")
+		f.Close()
+		return nil, nil, errors.New("model component is missing or truncated")
 	}
-	header := make([]byte, 8)
-	if _, err := io.ReadFull(f, header); err != nil {
+	return f, info, nil
+}
+
+func validateModelHeader(f *os.File, info os.FileInfo) error {
+	var header [8]byte
+	if _, err := f.ReadAt(header[:], 0); err != nil {
 		return err
 	}
+	ext := strings.ToLower(filepath.Ext(f.Name()))
 	if ext == ".gguf" && string(header[:4]) != "GGUF" {
 		return errors.New("invalid GGUF header")
 	}
 	if ext == ".safetensors" {
-		n := binary.LittleEndian.Uint64(header)
+		n := binary.LittleEndian.Uint64(header[:])
 		if n < 2 || n > 256<<20 || n > uint64(info.Size()-8) {
 			return errors.New("invalid safetensors header length")
 		}

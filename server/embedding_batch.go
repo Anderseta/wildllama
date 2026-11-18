@@ -18,7 +18,7 @@ type embeddingInput struct {
 
 func prepareEmbeddingBatch(ctx context.Context, runner llm.LlamaServer, inputs []embeddingInput,
 	remember func(string, []int), releaseTokens func(), tokens func(string) ([]int, error),
-	prepare func(string) (string, bool, error), single func(embeddingInput) ([]float32, int, error),
+	prepare func(string) (string, bool, error), single func(embeddingInput) ([]float32, int, error), finish func([]float32) ([]float32, error),
 ) ([][]float32, int, bool, error) {
 	batcher, ok := runner.(llm.EmbeddingBatchRunner)
 	if !ok || len(inputs) < 2 {
@@ -146,11 +146,20 @@ func prepareEmbeddingBatch(ctx context.Context, runner llm.LlamaServer, inputs [
 			return nil, 0, true, fmt.Errorf("invalid embedding batch result")
 		}
 		for i, job := range group {
-			// The runner hands ownership of each result to the caller. Only
-			// repeated inputs need extra copies for independent normalization.
-			result[job.indices[0]] = vectors[i]
-			for _, index := range job.indices[1:] {
-				result[index] = slices.Clone(vectors[i])
+			if err := ctx.Err(); err != nil {
+				return nil, 0, true, err
+			}
+			vector, err := finish(vectors[i])
+			if err != nil {
+				return nil, 0, true, err
+			}
+			result[job.indices[0]] = vector
+			// A large identical-input batch can spend most of its time copying.
+			for n, index := range job.indices[1:] {
+				if n%64 == 0 && ctx.Err() != nil {
+					return nil, 0, true, ctx.Err()
+				}
+				result[index] = slices.Clone(vector)
 			}
 		}
 		total += count

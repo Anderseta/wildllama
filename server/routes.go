@@ -1406,67 +1406,39 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	embedPrepared := func(item embeddingInput) ([]float32, int, error) {
 		return embedWithRetry(item, true)
 	}
-	batched, batchTokens, usedBatch, batchErr := prepareEmbeddingBatch(ctx, r, input, rememberTokens, tokenCache.Clear, cachedTokenize, prepareBatchText, embedPrepared)
-	if batchErr != nil {
-		s.sched.expireRunnersForRuntimeOOM(m, batchErr)
-		var status api.StatusError
-		if errors.As(batchErr, &status) {
-			c.AbortWithStatusJSON(status.StatusCode, gin.H{"error": strings.TrimSpace(status.ErrorMessage)})
-			return
+	var trainedDimensions []int
+	if req.Dimensions > 0 {
+		if ed, ok := r.(interface{ EmbeddingDimensions() []int }); ok {
+			trainedDimensions = ed.EmbeddingDimensions()
 		}
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": batchErr.Error()})
-		return
 	}
-	g, groupContext := errgroup.WithContext(ctx)
-	ctx = groupContext
-	g.SetLimit(16)
-	embeddings := make([][]float32, len(input))
+	finish := func(vector []float32) ([]float32, error) {
+		return finalizeEmbedding(vector, req.Dimensions, trainedDimensions)
+	}
+	embeddings, batchTokens, usedBatch, err := prepareEmbeddingBatch(ctx, r, input, rememberTokens, tokenCache.Clear, cachedTokenize, prepareBatchText, embedPrepared, finish)
 	totalTokens := uint64(batchTokens)
-	for i, item := range input {
-		g.Go(func() error {
-			var embedding []float32
-			var tokenCount int
-			var err error
-			if usedBatch {
-				embedding = batched[i]
-			} else {
-				embedding, tokenCount, err = embedWithRetry(item, false)
-			}
-			if err != nil {
-				return err
-			}
-			// TODO: this first normalization should be done by the model
-			embedding, err = normalize(embedding)
-			if err != nil {
-				return err
-			}
-			if req.Dimensions > 0 {
-				if req.Dimensions > len(embedding) {
-					return fmt.Errorf("dimensions %d exceeds embedding length %d", req.Dimensions, len(embedding))
+	if err == nil && !usedBatch {
+		g, groupContext := errgroup.WithContext(ctx)
+		ctx = groupContext
+		g.SetLimit(16)
+		embeddings = make([][]float32, len(input))
+		for i, item := range input {
+			g.Go(func() error {
+				embedding, count, err := embedWithRetry(item, false)
+				if err != nil {
+					return err
 				}
-				// If the runner declares a trained matryoshka set, restrict to it.
-				if ed, ok := r.(interface{ EmbeddingDimensions() []int }); ok {
-					if valid := ed.EmbeddingDimensions(); len(valid) > 0 && !slices.Contains(valid, req.Dimensions) {
-						return api.StatusError{
-							StatusCode:   http.StatusBadRequest,
-							ErrorMessage: fmt.Sprintf("dimensions %d not supported by this model; valid values are %v", req.Dimensions, valid),
-						}
-					}
+				embeddings[i], err = finish(embedding)
+				if err != nil {
+					return err
 				}
-				if req.Dimensions < len(embedding) {
-					embedding, err = normalize(embedding[:req.Dimensions])
-					if err != nil {
-						return err
-					}
-				}
-			}
-			embeddings[i] = embedding
-			atomic.AddUint64(&totalTokens, uint64(tokenCount))
-			return nil
-		})
+				atomic.AddUint64(&totalTokens, uint64(count))
+				return nil
+			})
+		}
+		err = g.Wait()
 	}
-
-	if err := g.Wait(); err != nil {
+	if err != nil {
 		s.sched.expireRunnersForRuntimeOOM(m, err)
 		var serr api.StatusError
 		if errors.As(err, &serr) {
@@ -1501,6 +1473,25 @@ func writeModelResponse[T any](c *gin.Context, resp T) {
 		return
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// Normalize at full width before truncation to preserve the runner's existing
+// float32 rounding and reject nonfinite values even outside the requested prefix.
+func finalizeEmbedding(vector []float32, dimensions int, trained []int) ([]float32, error) {
+	vector, err := normalize(vector)
+	if err != nil || dimensions <= 0 {
+		return vector, err
+	}
+	if dimensions > len(vector) {
+		return nil, fmt.Errorf("dimensions %d exceeds embedding length %d", dimensions, len(vector))
+	}
+	if len(trained) > 0 && !slices.Contains(trained, dimensions) {
+		return nil, api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: fmt.Sprintf("dimensions %d not supported by this model; valid values are %v", dimensions, trained)}
+	}
+	if dimensions < len(vector) {
+		return normalize(vector[:dimensions:dimensions])
+	}
+	return vector, nil
 }
 
 func normalize(vec []float32) ([]float32, error) {

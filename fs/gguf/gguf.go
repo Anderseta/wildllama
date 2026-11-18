@@ -53,28 +53,26 @@ type File struct {
 	byteOrder    binary.ByteOrder
 }
 
-func Open(path string) (_ *File, err error) {
-	return open(path, -1)
-}
-
-func open(path string, maxArraySize int) (_ *File, err error) {
-	f := &File{bts: make([]byte, 4096), maxArraySize: maxArraySize}
-	f.file, err = os.Open(path)
+func Open(path string) (*File, error) {
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			if closeErr := f.close(); closeErr != nil {
-				err = errors.Join(err, closeErr)
-			}
+	f := &File{file: file, bts: make([]byte, 4096), maxArraySize: -1}
+	if err := f.readHeader(); err != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
 		}
-	}()
+		return nil, err
+	}
+	return f, nil
+}
 
+func (f *File) readHeader() (err error) {
 	f.reader = newBufferedReader(f.file, 32<<10)
 
 	if _, err := io.ReadFull(f.reader, f.Magic[:]); err != nil {
-		return nil, err
+		return err
 	}
 
 	switch {
@@ -83,20 +81,20 @@ func open(path string, maxArraySize int) (_ *File, err error) {
 	case bytes.Equal(f.Magic[:], []byte("FUGG")):
 		f.byteOrder = binary.BigEndian
 	default:
-		return nil, fmt.Errorf("%w file type %v", ErrUnsupported, f.Magic)
+		return fmt.Errorf("%w file type %v", ErrUnsupported, f.Magic)
 	}
 
 	if err := binary.Read(f.reader, f.byteOrder, &f.Version); err != nil {
-		return nil, err
+		return err
 	}
 
 	if f.Version < 1 {
-		return nil, fmt.Errorf("%w version %v", ErrUnsupported, f.Version)
+		return fmt.Errorf("%w version %v", ErrUnsupported, f.Version)
 	}
 
 	f.tensors, err = newLazy(f, f.readTensor)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	f.tensors.successFunc = func() error {
@@ -111,10 +109,10 @@ func open(path string, maxArraySize int) (_ *File, err error) {
 
 	f.keyValues, err = newLazy(f, f.readKeyValue)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return f, nil
+	return nil
 }
 
 func (f *File) alignment() (int64, error) {
@@ -418,17 +416,17 @@ func maxInt64() uint64 {
 	return 1<<63 - 1
 }
 
-func (f *File) Close() error {
-	return f.close()
-}
-
-func (f *File) close() error {
+func (f *File) stopReading() {
 	if f.keyValues != nil {
 		f.keyValues.stop()
 	}
 	if f.tensors != nil {
 		f.tensors.stop()
 	}
+}
+
+func (f *File) Close() error {
+	f.stopReading()
 	if f.file == nil {
 		return nil
 	}

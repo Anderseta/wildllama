@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"os"
 	"slices"
 	"strings"
 )
@@ -37,19 +38,30 @@ func (m *Metadata) TensorTypes() iter.Seq2[string, TensorType] {
 // than maxArraySize. Zero uses the runtime default and a negative value retains
 // all arrays.
 func ReadFileMetadata(path string, maxArraySize int) (_ *Metadata, err error) {
-	if maxArraySize == 0 {
-		maxArraySize = defaultMetadataArraySize
-	}
-	f, err := open(path, maxArraySize)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if closeErr := f.Close(); err == nil {
+		if closeErr := file.Close(); err == nil {
 			err = closeErr
 		}
 	}()
 
+	return ReadMetadataFromFile(file, maxArraySize)
+}
+
+// ReadMetadataFromFile consumes the GGUF header from a regular file positioned
+// at its start. The caller retains ownership of the file.
+func ReadMetadataFromFile(file *os.File, maxArraySize int) (*Metadata, error) {
+	if maxArraySize == 0 {
+		maxArraySize = defaultMetadataArraySize
+	}
+	f := &File{file: file, bts: make([]byte, 4096), maxArraySize: maxArraySize}
+	defer f.stopReading()
+	if err := f.readHeader(); err != nil {
+		return nil, err
+	}
 	m := &Metadata{values: make(map[string]Value)}
 	for _, kv := range f.KeyValues() {
 		m.values[kv.Key] = kv.Value
