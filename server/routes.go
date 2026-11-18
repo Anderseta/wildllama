@@ -739,8 +739,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	streamCtx, stopStream := context.WithCancel(c.Request.Context())
 	defer stopStream()
 	ch := make(chan any)
+	// Only the native generate API exposes continuation token IDs. The
+	// completions adapter never returns them, even for non-streaming requests.
+	_, openAICompletion := c.Writer.(*middleware.CompleteWriter)
+	returnContext := !req.Raw && !openAICompletion
 	go func() {
-		// TODO (jmorganca): avoid building the response twice both here and below
 		var sb strings.Builder
 		defer close(ch)
 
@@ -810,9 +813,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				res.Response = content
 			}
 
-			// Raw generation never returns a token context. Keep its output only
-			// in the response stream (or the non-streaming collector below).
-			if !req.Raw {
+			if returnContext {
 				sb.WriteString(cr.Content)
 			}
 
@@ -821,7 +822,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				res.TotalDuration = time.Since(checkpointStart)
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 
-				if !req.Raw {
+				if returnContext {
 					tokens, err := r.Tokenize(streamCtx, prompt+sb.String())
 					if err != nil {
 						sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
@@ -906,7 +907,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		r.Response = sbContent.String()
 		r.Logprobs = allLogprobs
 
-		c.JSON(http.StatusOK, r)
+		writeModelResponse(c, r)
 		return
 	}
 
@@ -1243,7 +1244,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	checkpointLoaded := time.Now()
 
 	if len(input) == 0 {
-		c.JSON(http.StatusOK, api.EmbedResponse{Model: req.Model, Embeddings: [][]float32{}})
+		writeModelResponse(c, api.EmbedResponse{Model: req.Model, Embeddings: [][]float32{}})
 		return
 	}
 
@@ -1487,6 +1488,17 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		TotalDuration:   time.Since(checkpointStart),
 		LoadDuration:    checkpointLoaded.Sub(checkpointStart),
 		PromptEvalCount: int(totalTokens),
+	}
+	writeModelResponse(c, resp)
+}
+
+func writeModelResponse[T any](c *gin.Context, resp T) {
+	if writer, ok := c.Writer.(interface{ WriteModelResponse(T) error }); ok && c.Writer.Status() == http.StatusOK {
+		if err := writer.WriteModelResponse(resp); err != nil {
+			_ = c.Error(err)
+			c.Abort()
+		}
+		return
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -2797,6 +2809,17 @@ func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
 	ctx := c.Request.Context()
 	encoder := json.NewEncoder(c.Writer)
+	// Preserve wrappers and their write/error behavior. Only a matching
+	// protocol adapter knows how to render its native frame directly.
+	chatWriter, _ := c.Writer.(*middleware.ChatWriter)
+	generateWriter, _ := c.Writer.(*middleware.CompleteWriter)
+	wroteFrame := func(err error) bool {
+		if err != nil {
+			slog.Info("streamResponse: writing frame failed", "error", err)
+			return false
+		}
+		return true
+	}
 	complete := false
 	c.Stream(func(_ io.Writer) bool {
 		var val any
@@ -2815,8 +2838,14 @@ func streamResponse(c *gin.Context, ch chan any) {
 		switch frame := val.(type) {
 		case api.ChatResponse:
 			complete = complete || frame.Done
+			if chatWriter != nil && chatWriter.Status() == http.StatusOK {
+				return wroteFrame(chatWriter.WriteModelResponse(frame))
+			}
 		case api.GenerateResponse:
 			complete = complete || frame.Done
+			if generateWriter != nil && generateWriter.Status() == http.StatusOK {
+				return wroteFrame(generateWriter.WriteModelResponse(frame))
+			}
 		case api.ProgressResponse:
 			complete = complete || frame.Status == "success"
 		}
@@ -2845,13 +2874,7 @@ func streamResponse(c *gin.Context, ch chan any) {
 			}
 		}
 
-		// Encode writes the complete NDJSON frame and its delimiter together.
-		if err := encoder.Encode(val); err != nil {
-			slog.Info("streamResponse: writing JSON frame failed", "error", err)
-			return false
-		}
-
-		return true
+		return wroteFrame(encoder.Encode(val))
 	})
 }
 
@@ -3212,7 +3235,7 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 			resp.Message.ToolCalls = toolCalls
 		}
 
-		c.JSON(http.StatusOK, resp)
+		writeModelResponse(c, resp)
 		return
 	}
 

@@ -63,6 +63,7 @@ type mockRunner struct {
 	Template      string
 	TemplateFn    func(context.Context, llm.ChatRequest) (string, error)
 	DetokenizeFn  func(context.Context, []int) (string, error)
+	TokenizeFn    func(context.Context, string) ([]int, error)
 	contextLength int
 }
 
@@ -99,7 +100,10 @@ func (m *mockRunner) Detokenize(ctx context.Context, tokens []int) (string, erro
 	return "", nil
 }
 
-func (mockRunner) Tokenize(_ context.Context, s string) (tokens []int, err error) {
+func (m mockRunner) Tokenize(ctx context.Context, s string) (tokens []int, err error) {
+	if m.TokenizeFn != nil {
+		return m.TokenizeFn(ctx, s)
+	}
 	for range strings.Fields(s) {
 		tokens = append(tokens, len(tokens))
 	}

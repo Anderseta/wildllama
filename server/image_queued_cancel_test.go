@@ -98,13 +98,17 @@ func TestImageQueuedCancelReclaimsFullQueueWithoutReorderingSurvivors(t *testing
 	replacement, err := service.enqueue(imageLifecycleJob(service, ""))
 	require.NoError(t, err, "canceling a queued request must reclaim capacity before the active image finishes")
 	close(release)
-	waitImageBatchTerminal(t, service, replacement)
+	// Apply the existing per-job deadline to each survivor. Persisting a
+	// full queue can take longer than one job on a busy disk.
+	waitImageBatchTerminal(t, service, first)
 	expected := []string{first.ID}
 	for i, job := range queued {
 		if i != cancelled {
+			waitImageBatchTerminal(t, service, job)
 			expected = append(expected, job.ID)
 		}
 	}
+	waitImageBatchTerminal(t, service, replacement)
 	expected = append(expected, replacement.ID)
 	runner.mu.Lock()
 	actual := make([]string, len(runner.calls))

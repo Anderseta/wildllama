@@ -293,7 +293,7 @@ func (t *ToolCallFunctionArguments) String() string {
 	if t == nil || t.om == nil {
 		return "{}"
 	}
-	bts, _ := json.Marshal(t.om)
+	bts, _ := t.MarshalJSON()
 	return string(bts)
 }
 
@@ -371,7 +371,7 @@ func (t ToolCallFunctionArguments) MarshalJSON() ([]byte, error) {
 	if t.om == nil {
 		return []byte("{}"), nil
 	}
-	return json.Marshal(t.om)
+	return t.om.MarshalJSON()
 }
 
 type Tool struct {
@@ -479,12 +479,16 @@ func (t ToolPropertiesMap) MarshalJSON() ([]byte, error) {
 	if t.om == nil {
 		return []byte("null"), nil
 	}
-	return json.Marshal(t.om)
+	return t.om.MarshalJSON()
 }
 
 func (t *ToolPropertiesMap) UnmarshalJSON(data []byte) error {
-	t.om = orderedmap.New[string, ToolProperty]()
-	return json.Unmarshal(data, t.om)
+	var properties orderedmap.Map[string, ToolProperty]
+	if err := properties.UnmarshalJSON(data); err != nil {
+		return err
+	}
+	t.om = &properties
+	return nil
 }
 
 type ToolProperty struct {

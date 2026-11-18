@@ -1921,8 +1921,6 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
 	memoryVersion := s.status.memoryFailureVersion()
 
-	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
-
 	status, err := s.getServerStatusRetry(ctx)
 	if err != nil {
 		return err
@@ -1944,7 +1942,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		CachePrompt:         true,
 		ReturnProgress:      true,
 		ResponseFields:      []string{"content", "stop", "stop_type", "timings", "completion_probabilities", "prompt_progress", "error"},
-		NPredict:            req.Options.NumPredict,
+		NPredict:            boundedNumPredict(req.Options.NumPredict, s.options.NumCtx),
 		NKeep:               req.Options.NumKeep,
 		Temperature:         req.Options.Temperature,
 		TopK:                req.Options.TopK,
@@ -2899,7 +2897,7 @@ func llamaServerChatToolCalls(tcs []api.ToolCall) ([]llamaServerChatToolCall, er
 		toolCalls[i].Type = "function"
 		toolCalls[i].Function.Name = tc.Function.Name
 
-		args, err := json.Marshal(tc.Function.Arguments)
+		args, err := tc.Function.Arguments.MarshalJSON()
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal tool call arguments for %q: %w", tc.Function.Name, err)
 		}

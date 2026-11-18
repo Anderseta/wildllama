@@ -80,7 +80,10 @@ type EmbedWriter struct {
 }
 
 func (w *BaseWriter) writeError(data []byte) (int, error) {
-	var serr api.StatusError
+	var serr struct {
+		api.StatusError
+		Code *string `json:"code"`
+	}
 	if err := json.Unmarshal(data, &serr); err != nil {
 		// If the error response isn't valid JSON, use the raw bytes as the
 		// error message rather than surfacing a confusing JSON parse error.
@@ -88,29 +91,70 @@ func (w *BaseWriter) writeError(data []byte) (int, error) {
 	}
 
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w.ResponseWriter).Encode(openai.NewError(w.ResponseWriter.Status(), serr.Error())); err != nil {
+	response := openai.NewError(w.ResponseWriter.Status(), serr.Error())
+	response.Error.Code = serr.Code
+	if err := json.NewEncoder(w.ResponseWriter).Encode(response); err != nil {
 		return 0, err
 	}
 
 	return len(data), nil
 }
 
-func (w *ChatWriter) writeResponse(data []byte) (int, error) {
-	var chatResponse api.ChatResponse
-	err := json.Unmarshal(data, &chatResponse)
+// A runner can fail after HTTP 200 and partial output have already been sent.
+type completionStreamError struct {
+	Error *string `json:"error"`
+	Code  *string `json:"code"`
+}
+
+func (e completionStreamError) write(w gin.ResponseWriter) error {
+	response := openai.NewError(http.StatusInternalServerError, *e.Error)
+	response.Error.Code = e.Code
+	w.Header().Set("Content-Type", "text/event-stream")
+	return writeCompletionEvent(w, response)
+}
+
+func writeCompletionEvent(w io.Writer, value any) error {
+	payload, err := json.Marshal(value)
 	if err != nil {
+		return err
+	}
+	const prefix = "data: "
+	frame := make([]byte, 0, len(prefix)+len(payload)+2)
+	frame = append(frame, prefix...)
+	frame = append(frame, payload...)
+	frame = append(frame, '\n', '\n')
+	_, err = w.Write(frame)
+	return err
+}
+
+func (w *ChatWriter) writeResponse(data []byte) (int, error) {
+	var frame struct {
+		api.ChatResponse
+		completionStreamError
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
 		return 0, err
 	}
+	if w.stream && frame.Error != nil {
+		if err := frame.write(w.ResponseWriter); err != nil {
+			return 0, err
+		}
+	} else if err := w.WriteModelResponse(frame.ChatResponse); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
 
+func (w *ChatWriter) WriteModelResponse(chatResponse api.ChatResponse) error {
 	// chat chunk
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 
 		if isGenerationProgressOnly(chatResponse) {
 			if err := writeGenerationProgressComment(w.ResponseWriter); err != nil {
-				return 0, err
+				return err
 			}
-			return len(data), nil
+			return nil
 		}
 
 		// OpenAI stamps one created value on every chunk in a stream; pin the
@@ -138,16 +182,11 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 			includeRole := !w.firstChunkSent
 			chunks := openai.ToStreamChunks(w.id, chatResponse, includeRole)
 			for _, c := range chunks {
-				d, err := json.Marshal(c)
-				if err != nil {
-					return 0, err
-				}
 				if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
 					w.toolCallSent = true
 				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-				if err != nil {
-					return 0, err
+				if err := writeCompletionEvent(w.ResponseWriter, c); err != nil {
+					return err
 				}
 			}
 
@@ -157,13 +196,8 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 
 		if chatResponse.Done {
 			finishChunk := openai.FinishChunk(w.id, chatResponse, w.toolCallSent)
-			d, err := json.Marshal(finishChunk)
-			if err != nil {
-				return 0, err
-			}
-			_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-			if err != nil {
-				return 0, err
+			if err := writeCompletionEvent(w.ResponseWriter, finishChunk); err != nil {
+				return err
 			}
 
 			if w.streamOptions != nil && w.streamOptions.IncludeUsage {
@@ -171,32 +205,22 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 				finishChunk.Usage = &u
 				finishChunk.Timings = openai.ToTimings(chatResponse.Metrics)
 				finishChunk.Choices = []openai.ChunkChoice{}
-				d, err := json.Marshal(finishChunk)
-				if err != nil {
-					return 0, err
-				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-				if err != nil {
-					return 0, err
+				if err := writeCompletionEvent(w.ResponseWriter, finishChunk); err != nil {
+					return err
 				}
 			}
-			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
+			_, err := w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
 			if err != nil {
-				return 0, err
+				return err
 			}
 		}
 
-		return len(data), nil
+		return nil
 	}
 
 	// chat completion
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(openai.ToChatCompletion(w.id, chatResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
+	return json.NewEncoder(w.ResponseWriter).Encode(openai.ToChatCompletion(w.id, chatResponse))
 }
 
 func (w *ChatWriter) Write(data []byte) (int, error) {
@@ -209,27 +233,34 @@ func (w *ChatWriter) Write(data []byte) (int, error) {
 }
 
 func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
-	var generateResponse api.GenerateResponse
-	err := json.Unmarshal(data, &generateResponse)
-	if err != nil {
+	var frame struct {
+		api.GenerateResponse
+		completionStreamError
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
 		return 0, err
 	}
+	if w.stream && frame.Error != nil {
+		if err := frame.write(w.ResponseWriter); err != nil {
+			return 0, err
+		}
+	} else if err := w.WriteModelResponse(frame.GenerateResponse); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
 
+func (w *CompleteWriter) WriteModelResponse(generateResponse api.GenerateResponse) error {
 	// completion chunk
 	if w.stream {
 		c := openai.ToCompleteChunk(w.id, generateResponse)
 		if w.streamOptions != nil && w.streamOptions.IncludeUsage {
 			c.Usage = &openai.Usage{}
 		}
-		d, err := json.Marshal(c)
-		if err != nil {
-			return 0, err
-		}
 
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-		if err != nil {
-			return 0, err
+		if err := writeCompletionEvent(w.ResponseWriter, c); err != nil {
+			return err
 		}
 
 		if generateResponse.Done {
@@ -238,32 +269,22 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 				c.Usage = &u
 				c.Timings = openai.ToTimings(generateResponse.Metrics)
 				c.Choices = []openai.CompleteChunkChoice{}
-				d, err := json.Marshal(c)
-				if err != nil {
-					return 0, err
-				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-				if err != nil {
-					return 0, err
+				if err := writeCompletionEvent(w.ResponseWriter, c); err != nil {
+					return err
 				}
 			}
-			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
+			_, err := w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
 			if err != nil {
-				return 0, err
+				return err
 			}
 		}
 
-		return len(data), nil
+		return nil
 	}
 
 	// completion
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(openai.ToCompletion(w.id, generateResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
+	return json.NewEncoder(w.ResponseWriter).Encode(openai.ToCompletion(w.id, generateResponse))
 }
 
 func (w *CompleteWriter) Write(data []byte) (int, error) {
@@ -328,18 +349,18 @@ func (w *RetrieveWriter) Write(data []byte) (int, error) {
 
 func (w *EmbedWriter) writeResponse(data []byte) (int, error) {
 	var embedResponse api.EmbedResponse
-	err := json.Unmarshal(data, &embedResponse)
-	if err != nil {
+	if err := json.Unmarshal(data, &embedResponse); err != nil {
 		return 0, err
 	}
-
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(openai.ToEmbeddingList(w.model, embedResponse, w.encodingFormat))
-	if err != nil {
+	if err := w.WriteModelResponse(embedResponse); err != nil {
 		return 0, err
 	}
-
 	return len(data), nil
+}
+
+func (w *EmbedWriter) WriteModelResponse(resp api.EmbedResponse) error {
+	w.ResponseWriter.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w.ResponseWriter).Encode(openai.ToEmbeddingList(w.model, resp, w.encodingFormat))
 }
 
 func (w *EmbedWriter) Write(data []byte) (int, error) {
