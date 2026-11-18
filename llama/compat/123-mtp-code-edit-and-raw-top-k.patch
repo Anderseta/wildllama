@@ -119,7 +119,7 @@ index 0000000..bbaa478
 +    return true;
 +}
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 57432f5..b1204a7 100644
+index 57432f5..d9454e4 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -11,6 +11,7 @@
@@ -130,16 +130,17 @@ index 57432f5..b1204a7 100644
  
  #include "ggml.h"
  
-@@ -201,6 +202,8 @@ struct common_sampler {
+@@ -201,6 +202,9 @@ struct common_sampler {
      common_sampler_ptr block_preview;
      std::vector<std::pair<llama_token, double>> block_residual;
      std::vector<llama_token_data> block_unmasked;
 +    int block_raw_top_k = 0;
++    unsigned block_raw_misses = 0;
 +    unsigned block_raw_retry = 0;
      uint64_t gpu_distribution_rows = 0;
      bool block_preview_enabled = [] {
          const char * value = std::getenv("WILDLLAMA_MTP_BLOCK_PREVIEW");
-@@ -625,9 +628,20 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+@@ -625,9 +629,20 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
      return common_sampler_clone_impl(gsmpl, true);
  }
  
@@ -161,7 +162,7 @@ index 57432f5..b1204a7 100644
      } else {
          auto * preview = source->block_preview.get();
          llama_sampler_copy(source->grmr, preview->grmr);
-@@ -1060,7 +1074,26 @@ static void common_sampler_block_distribution(common_sampler * preview, llama_co
+@@ -1060,7 +1075,31 @@ static void common_sampler_block_distribution(common_sampler * preview, llama_co
      // The preview computes both branches of grammar-last when needed. A compact
      // prefilter cannot represent its grammar-first retry, so use the raw row.
      if (output.raw_logits) { output.sampled_logits = nullptr; output.sampled_probs = nullptr; output.candidates = nullptr; }
@@ -177,7 +178,12 @@ index 57432f5..b1204a7 100644
 +            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
 +            compact = common_mtp_raw_top_k(output.raw_logits, n_vocab, preview->block_raw_top_k, preview->cur);
 +            // Heavily tied rows should normally pay for just the reference path.
-+            if (!compact) { preview->block_raw_retry = 16; }
++            if (compact) {
++                preview->block_raw_misses = 0;
++            } else if (++preview->block_raw_misses == 3) {
++                preview->block_raw_misses = 0;
++                preview->block_raw_retry = 16;
++            }
 +        }
 +    }
 +    if (compact) {
@@ -189,7 +195,7 @@ index 57432f5..b1204a7 100644
      auto & current = preview->cur_p;
      llama_sampler_apply(preview->rbudget, &current);
      const bool grammar = grammar_should_apply(preview) && !llama_sampler_grammar_awaiting_trigger(preview->grmr);
-@@ -1194,7 +1227,7 @@ static std::vector<llama_token> common_sampler_verify_block(
+@@ -1194,7 +1233,7 @@ static std::vector<llama_token> common_sampler_verify_block(
      const bool use_preview = sampler->block_preview_enabled && llama_sampler_can_preview_distribution(sampler->chain);
      common_sampler_ptr legacy_preview;
      if (!use_preview) { legacy_preview.reset(common_sampler_clone(sampler)); }

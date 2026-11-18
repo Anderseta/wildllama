@@ -125,6 +125,6 @@ When the first effective filter is top-k, it reads the scores once into a
 bounded selection heap and passes the surviving IDs and original scores to
 the regular sampling chain. The extra candidate detects a tie at the cutoff.
 Ties within the selection, nonfinite scores, active grammar constraints and
-forced reasoning tokens use the full row. After an ambiguous row the verifier
+forced reasoning tokens use the full row. After three consecutive ambiguous rows the verifier
 waits 16 eligible rows before trying again. This path uses host memory only
 and requires no additional GPU buffers.
