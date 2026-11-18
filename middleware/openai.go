@@ -583,25 +583,30 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 		return 0, err
 	}
 
+	err := w.WriteModelResponse(chatResponse)
+	if w.stream && err != nil {
+		return 0, err
+	}
+	return len(data), err
+}
+
+func (w *ResponsesWriter) WriteModelResponse(chatResponse api.ChatResponse) error {
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 
 		if isGenerationProgressOnly(chatResponse) {
 			// SSE comments carry liveness without creating response events or
 			// consuming converter sequence numbers. The source bounds frequency.
-			if err := writeGenerationProgressComment(w.ResponseWriter); err != nil {
-				return 0, err
-			}
-			return len(data), nil
+			return writeGenerationProgressComment(w.ResponseWriter)
 		}
 
 		events := w.converter.Process(chatResponse)
 		for _, event := range events {
 			if err := w.writeEvent(event.Event, event.Data); err != nil {
-				return 0, err
+				return err
 			}
 		}
-		return len(data), nil
+		return nil
 	}
 
 	// Non-streaming response
@@ -609,7 +614,7 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 	response := openai.ToResponse(w.model, w.responseID, w.itemID, chatResponse, w.request)
 	completedAt := time.Now().Unix()
 	response.CompletedAt = &completedAt
-	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
+	return json.NewEncoder(w.ResponseWriter).Encode(response)
 }
 
 // Once HTTP 200 is committed, native generation failures arrive in-band.
@@ -723,7 +728,7 @@ func (w *WebSearchResponsesWriter) Write(data []byte) (int, error) {
 			w.webSearchPending = true
 		}
 		if !w.webSearchPending && len(response.Message.ToolCalls) == 0 {
-			if _, err := w.inner.writeResponse(data); err != nil {
+			if err := w.inner.WriteModelResponse(response); err != nil {
 				return 0, err
 			}
 			if response.Message.Content != "" || response.Message.Thinking != "" {
@@ -743,11 +748,7 @@ func (w *WebSearchResponsesWriter) Write(data []byte) (int, error) {
 			streamed := response
 			streamed.Message.ToolCalls = nil
 			streamed.Done = false
-			streamedData, err := json.Marshal(streamed)
-			if err != nil {
-				return 0, err
-			}
-			if _, err := w.inner.writeResponse(streamedData); err != nil {
+			if err := w.inner.WriteModelResponse(streamed); err != nil {
 				return 0, err
 			}
 			w.streamedInitialOutput = true
@@ -781,11 +782,7 @@ func (w *WebSearchResponsesWriter) Write(data []byte) (int, error) {
 				return len(data), w.finishStream()
 			}
 			response.Message = api.Message{}
-			terminal, err := json.Marshal(response)
-			if err != nil {
-				return 0, err
-			}
-			if _, err := w.inner.writeResponse(terminal); err != nil {
+			if err := w.inner.WriteModelResponse(response); err != nil {
 				return 0, err
 			}
 			w.buffered = nil
@@ -796,7 +793,7 @@ func (w *WebSearchResponsesWriter) Write(data []byte) (int, error) {
 
 	call, found, mixed := findWebSearchToolCall(response.Message.ToolCalls)
 	if !found {
-		return w.inner.writeResponse(data)
+		return len(data), w.inner.WriteModelResponse(response)
 	}
 	if mixed {
 		slog.Debug("preferring web_search tool call over client tool calls in mixed Responses response")

@@ -1122,17 +1122,18 @@ func convertInputMessage(m ResponsesInputMessage) (api.Message, error) {
 }
 
 func convertResponsesContent(contents []ResponsesContent) (string, []api.ImageData, error) {
-	var content string
+	var short [8]string
+	parts := short[:0]
 	var images []api.ImageData
 
 	for _, c := range contents {
 		switch v := c.(type) {
 		case ResponsesTextContent:
-			content += v.Text
+			parts = append(parts, v.Text)
 		case ResponsesOutputTextContent:
-			content += v.Text
+			parts = append(parts, v.Text)
 		case ResponsesEncryptedContent:
-			content += v.EncryptedContent
+			parts = append(parts, v.EncryptedContent)
 		case ResponsesImageContent:
 			if v.ImageURL == "" {
 				continue // Skip if no URL (FileID not supported)
@@ -1149,7 +1150,7 @@ func convertResponsesContent(contents []ResponsesContent) (string, []api.ImageDa
 		}
 	}
 
-	return content, images, nil
+	return strings.Join(parts, ""), images, nil
 }
 
 // Response types for the Responses API

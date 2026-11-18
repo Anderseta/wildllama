@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +152,78 @@ func TestCompatEmbeddingResponseMatchesByteAdapter(t *testing.T) {
 		}
 		if output[0] != output[1] {
 			t.Fatalf("%s: byte and typed responses differ", format)
+		}
+	}
+}
+
+// The wrapper exposes only Gin's writer methods and forces the byte adapter.
+type compatByteOnlyWriter struct{ gin.ResponseWriter }
+
+func TestNativeMessageProtocolsMatchByteAdapter(t *testing.T) {
+	requestID := regexp.MustCompile(`"(resp_|msg_|rs_|fc_)[a-zA-Z0-9_]+"`)
+	timestamp := regexp.MustCompile(`("(?:created_at|completed_at)":)[0-9]+`)
+	for _, p := range []struct {
+		name, request, keepalive, done, failed string
+		middleware                             gin.HandlerFunc
+	}{
+		{"Responses", `{"model":"test","input":"olá","stream":%t}`, ": generation_progress", "response.completed", "response.failed", middleware.ResponsesMiddleware()},
+		{"Messages", `{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"olá"}],"stream":%t}`, "event: ping", "event: message_stop", "event: error", middleware.AnthropicMessagesMiddleware()},
+	} {
+		for _, mode := range []string{"stream", "failure", "complete"} {
+			t.Run(p.name+"/"+mode, func(t *testing.T) {
+				args := api.NewToolCallFunctionArguments()
+				args.Set("id", int64(9007199254740993))
+				end := api.ChatResponse{
+					Model: "test", CreatedAt: time.Unix(100, 0), Done: true, DoneReason: "stop",
+					Message: api.Message{Role: "assistant", ToolCalls: []api.ToolCall{
+						{ID: "call_fixed", Function: api.ToolCallFunction{Name: "pesquisar", Arguments: args}},
+					}},
+					Metrics: api.Metrics{PromptEvalCount: 7, EvalCount: 3},
+				}
+				var outputs [2]string
+				for i := range outputs {
+					router := gin.New()
+					router.POST("/", p.middleware, func(c *gin.Context) {
+						if i == 1 {
+							c.Writer = compatByteOnlyWriter{c.Writer}
+						}
+						if mode == "complete" {
+							writeModelResponse(c, end)
+							return
+						}
+						frames := make(chan any, 4)
+						frames <- api.ChatResponse{Model: "test", GenerationProgress: &api.GenerationProgress{Phase: "tool_call"}}
+						frames <- api.ChatResponse{Model: "test", Message: api.Message{Role: "assistant", Thinking: "pensando"}}
+						frames <- api.ChatResponse{Model: "test", Message: api.Message{Role: "assistant", Content: "ação & café"}}
+						if mode == "failure" {
+							frames <- gin.H{"error": "falha controlada", "status": 503}
+						} else {
+							frames <- end
+						}
+						close(frames)
+						streamResponse(c, frames)
+					})
+					w := NewRecorder()
+					router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(fmt.Sprintf(p.request, mode != "complete"))))
+					body := w.Body.String()
+					if w.Code != 200 || (mode != "complete" && (!strings.Contains(body, p.keepalive) || !strings.Contains(body, "pensando") || !strings.Contains(body, "caf"))) {
+						t.Fatalf("invalid response: %d %s", w.Code, body)
+					}
+					if mode == "failure" {
+						if !strings.Contains(body, p.failed) || !strings.Contains(body, "falha controlada") {
+							t.Fatal(body)
+						}
+					} else if !strings.Contains(body, "pesquisar") || !strings.Contains(body, "9007199254740993") || (mode == "stream" && !strings.Contains(body, p.done)) {
+						t.Fatal(body)
+					}
+					// Request IDs and wall-clock timestamps are generated independently.
+					body = requestID.ReplaceAllString(body, `"${1}id"`)
+					outputs[i] = timestamp.ReplaceAllString(body, `${1}0`)
+				}
+				if outputs[0] != outputs[1] {
+					t.Fatalf("native and byte responses differ:\n%s\n%s", outputs[0], outputs[1])
+				}
+			})
 		}
 	}
 }

@@ -69,34 +69,41 @@ func (w *AnthropicWriter) writeResponse(data []byte) (int, error) {
 	if w.stream && chunk.Error != "" {
 		return w.writeError(data)
 	}
-	chatResponse := chunk.ChatResponse
+	err := w.WriteModelResponse(chunk.ChatResponse)
+	if w.stream && err != nil {
+		return 0, err
+	}
+	return len(data), err
+}
 
+func (w *AnthropicWriter) WriteModelResponse(chatResponse api.ChatResponse) error {
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 
 		if isGenerationProgressOnly(chatResponse) {
 			// A ping is transport activity, not the beginning or end of a
 			// message or content block. The source bounds its frequency.
-			if err := w.writeEvent("ping", anthropic.PingEvent{Type: "ping"}); err != nil {
-				return 0, err
-			}
-			return len(data), nil
+			return w.writeEvent("ping", anthropic.PingEvent{Type: "ping"})
 		}
 
 		events := w.converter.Process(chatResponse)
-		logutil.Trace("anthropic middleware: stream chunk", "resp", anthropic.TraceChatResponse(chatResponse), "events", len(events))
+		if logutil.TraceEnabled(context.Background()) {
+			logutil.Trace("anthropic middleware: stream chunk", "resp", anthropic.TraceChatResponse(chatResponse), "events", len(events))
+		}
 		for _, event := range events {
 			if err := w.writeEvent(event.Event, event.Data); err != nil {
-				return 0, err
+				return err
 			}
 		}
-		return len(data), nil
+		return nil
 	}
 
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
 	response := anthropic.ToMessagesResponse(w.id, chatResponse)
-	logutil.Trace("anthropic middleware: converted response", "resp", anthropic.TraceMessagesResponse(response))
-	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic middleware: converted response", "resp", anthropic.TraceMessagesResponse(response))
+	}
+	return json.NewEncoder(w.ResponseWriter).Encode(response)
 }
 
 func (w *AnthropicWriter) Write(data []byte) (int, error) {
@@ -198,11 +205,13 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	}
 
 	webSearchCall, hasWebSearch, hasOtherTools := findWebSearchToolCall(chatResponse.Message.ToolCalls)
-	logutil.Trace("anthropic middleware: upstream chunk",
-		"resp", anthropic.TraceChatResponse(chatResponse),
-		"web_search", hasWebSearch,
-		"other_tools", hasOtherTools,
-	)
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic middleware: upstream chunk",
+			"resp", anthropic.TraceChatResponse(chatResponse),
+			"web_search", hasWebSearch,
+			"other_tools", hasOtherTools,
+		)
+	}
 	if hasWebSearch && hasOtherTools {
 		// Prefer web_search if both server and client tools are present in one chunk.
 		slog.Debug("preferring web_search tool call over client tool calls in mixed tool response")
@@ -215,15 +224,17 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 			}
 			return len(data), nil
 		}
-		return w.inner.writeResponse(data)
+		return len(data), w.inner.WriteModelResponse(chatResponse)
 	}
 
 	if w.stream {
 		// Let the original generation continue to completion while web search runs in parallel.
-		logutil.Trace("anthropic middleware: starting async web_search loop",
-			"tool_call", anthropic.TraceToolCall(webSearchCall),
-			"resp", anthropic.TraceChatResponse(chatResponse),
-		)
+		if logutil.TraceEnabled(context.Background()) {
+			logutil.Trace("anthropic middleware: starting async web_search loop",
+				"tool_call", anthropic.TraceToolCall(webSearchCall),
+				"resp", anthropic.TraceChatResponse(chatResponse),
+			)
+		}
 		w.startLoopWorker(chatResponse, webSearchCall)
 		if chatResponse.Done {
 			if err := w.writeLoopResult(); err != nil {
@@ -237,11 +248,13 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	defer cancel()
 
 	initialUsage := w.usageWithObservedMetrics(chatResponse.Metrics)
-	logutil.Trace("anthropic middleware: starting sync web_search loop",
-		"tool_call", anthropic.TraceToolCall(webSearchCall),
-		"resp", anthropic.TraceChatResponse(chatResponse),
-		"usage", initialUsage,
-	)
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic middleware: starting sync web_search loop",
+			"tool_call", anthropic.TraceToolCall(webSearchCall),
+			"resp", anthropic.TraceChatResponse(chatResponse),
+			"usage", initialUsage,
+		)
+	}
 	response, loopErr := w.runWebSearchLoop(loopCtx, chatResponse, webSearchCall, initialUsage)
 	if loopErr != nil {
 		return len(data), w.sendError(loopErr.code, loopErr.query, loopErr.usage)
@@ -268,13 +281,15 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 
 	followUpTools := append(api.Tools(nil), w.chatReq.Tools...)
 	usage := initialUsage
-	logutil.TraceContext(ctx, "anthropic middleware: web_search loop init",
-		"model", w.req.Model,
-		"tool_call", anthropic.TraceToolCall(initialToolCall),
-		"messages", len(followUpMessages),
-		"tools", len(followUpTools),
-		"max_loops", maxLoops,
-	)
+	if logutil.TraceEnabled(ctx) {
+		logutil.TraceContext(ctx, "anthropic middleware: web_search loop init",
+			"model", w.req.Model,
+			"tool_call", anthropic.TraceToolCall(initialToolCall),
+			"messages", len(followUpMessages),
+			"tools", len(followUpTools),
+			"max_loops", maxLoops,
+		)
+	}
 
 	currentResponse := initialResponse
 	currentToolCall := initialToolCall
@@ -283,11 +298,13 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 
 	for loop := 1; loop <= maxLoops; loop++ {
 		query := extractQueryFromToolCall(&currentToolCall)
-		logutil.TraceContext(ctx, "anthropic middleware: web_search loop iteration",
-			"loop", loop,
-			"query", anthropic.TraceTruncateString(query),
-			"messages", len(followUpMessages),
-		)
+		if logutil.TraceEnabled(ctx) {
+			logutil.TraceContext(ctx, "anthropic middleware: web_search loop iteration",
+				"loop", loop,
+				"query", anthropic.TraceTruncateString(query),
+				"messages", len(followUpMessages),
+			)
+		}
 		if query == "" {
 			return anthropic.MessagesResponse{}, &webSearchLoopError{
 				code:  "invalid_request",
@@ -354,10 +371,12 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 				err:   err,
 			}
 		}
-		logutil.TraceContext(ctx, "anthropic middleware: followup response",
-			"loop", loop,
-			"resp", anthropic.TraceChatResponse(followUpResponse),
-		)
+		if logutil.TraceEnabled(ctx) {
+			logutil.TraceContext(ctx, "anthropic middleware: followup response",
+				"loop", loop,
+				"resp", anthropic.TraceChatResponse(followUpResponse),
+			)
+		}
 
 		followUpUsage := anthropic.UsageFromMetrics(followUpResponse.Metrics)
 		usage.InputTokens += followUpUsage.InputTokens
@@ -372,10 +391,12 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 
 		if !hasWebSearch {
 			finalResponse := w.combineServerAndFinalContent(serverContent, followUpResponse, usage)
-			logutil.TraceContext(ctx, "anthropic middleware: web_search loop complete",
-				"loop", loop,
-				"resp", anthropic.TraceMessagesResponse(finalResponse),
-			)
+			if logutil.TraceEnabled(ctx) {
+				logutil.TraceContext(ctx, "anthropic middleware: web_search loop complete",
+					"loop", loop,
+					"resp", anthropic.TraceMessagesResponse(finalResponse),
+				)
+			}
 			return finalResponse, nil
 		}
 
@@ -411,9 +432,11 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 		StopReason: "end_turn",
 		Usage:      usage,
 	}
-	logutil.TraceContext(ctx, "anthropic middleware: web_search loop max reached",
-		"resp", anthropic.TraceMessagesResponse(maxResponse),
-	)
+	if logutil.TraceEnabled(ctx) {
+		logutil.TraceContext(ctx, "anthropic middleware: web_search loop max reached",
+			"resp", anthropic.TraceMessagesResponse(maxResponse),
+		)
+	}
 	return maxResponse, nil
 }
 
@@ -428,10 +451,12 @@ func (w *WebSearchAnthropicWriter) startLoopWorker(initialResponse api.ChatRespo
 	w.loopBaseOutputTok = initialUsage.OutputTokens
 	w.loopResultCh = make(chan webSearchLoopResult, 1)
 	w.loopInFlight = true
-	logutil.Trace("anthropic middleware: loop worker started",
-		"usage", initialUsage,
-		"tool_call", anthropic.TraceToolCall(initialToolCall),
-	)
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic middleware: loop worker started",
+			"usage", initialUsage,
+			"tool_call", anthropic.TraceToolCall(initialToolCall),
+		)
+	}
 
 	go func() {
 		ctx, cancel := w.startLoopContext()
@@ -464,7 +489,9 @@ func (w *WebSearchAnthropicWriter) writeLoopResult() error {
 		w.applyObservedUsageDeltaToUsage(&usage)
 		return w.sendError(result.loopErr.code, result.loopErr.query, usage)
 	}
-	logutil.Trace("anthropic middleware: loop worker done", "resp", anthropic.TraceMessagesResponse(result.response))
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic middleware: loop worker done", "resp", anthropic.TraceMessagesResponse(result.response))
+	}
 
 	w.applyObservedUsageDelta(&result.response)
 	return w.writeTerminalResponse(result.response)

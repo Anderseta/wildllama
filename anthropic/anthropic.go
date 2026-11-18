@@ -321,7 +321,9 @@ type StreamErrorEvent struct {
 // FromMessagesRequest converts an Anthropic MessagesRequest to an Ollama api.ChatRequest.
 // An optional thinking descriptor preserves model-defined effort names for rendering.
 func FromMessagesRequest(r MessagesRequest, thinking ...*model.Thinking) (*api.ChatRequest, error) {
-	logutil.Trace("anthropic: converting request", "req", TraceMessagesRequest(r))
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic: converting request", "req", TraceMessagesRequest(r))
+	}
 
 	var messages []api.Message
 
@@ -392,7 +394,9 @@ func FromMessagesRequest(r MessagesRequest, thinking ...*model.Thinking) (*api.C
 		// If a user-defined tool also uses that name in the same request, drop the
 		// user-defined one to avoid ambiguous tool-call routing.
 		if hasBuiltinWebSearch && !strings.HasPrefix(t.Type, "web_search") && t.Name == "web_search" {
-			logutil.Trace("anthropic: dropping colliding custom web_search tool", "tool", TraceTool(t))
+			if logutil.TraceEnabled(context.Background()) {
+				logutil.Trace("anthropic: dropping colliding custom web_search tool", "tool", TraceTool(t))
+			}
 			continue
 		}
 
@@ -437,7 +441,9 @@ func FromMessagesRequest(r MessagesRequest, thinking ...*model.Thinking) (*api.C
 		Tools:    tools,
 		Think:    think,
 	}
-	logutil.Trace("anthropic: converted request", "req", TraceChatRequest(convertedRequest))
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic: converted request", "req", TraceChatRequest(convertedRequest))
+	}
 
 	return convertedRequest, nil
 }
@@ -563,19 +569,21 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	if role != "user" || len(toolResults) == 0 {
 		messages = append(messages, toolResults...)
 	}
-	logutil.Trace("anthropic: converted block message",
-		"role", role,
-		"blocks", len(msg.Content),
-		"text", textBlocks,
-		"image", imageBlocks,
-		"tool_use", toolUseBlocks,
-		"tool_result", toolResultBlocks,
-		"server_tool_use", serverToolUseBlocks,
-		"web_search_result", webSearchToolResultBlocks,
-		"thinking", thinkingBlocks,
-		"unknown", unknownBlocks,
-		"messages", TraceAPIMessages(messages),
-	)
+	if logutil.TraceEnabled(context.Background()) {
+		logutil.Trace("anthropic: converted block message",
+			"role", role,
+			"blocks", len(msg.Content),
+			"text", textBlocks,
+			"image", imageBlocks,
+			"tool_use", toolUseBlocks,
+			"tool_result", toolResultBlocks,
+			"server_tool_use", serverToolUseBlocks,
+			"web_search_result", webSearchToolResultBlocks,
+			"thinking", thinkingBlocks,
+			"unknown", unknownBlocks,
+			"messages", TraceAPIMessages(messages),
+		)
+	}
 
 	return messages, nil
 }
@@ -1248,11 +1256,13 @@ func WebSearch(ctx context.Context, query string, maxResults int) (*OllamaWebSea
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse web search URL: %w", err)
 	}
-	logutil.TraceContext(ctx, "anthropic: web search request",
-		"query", TraceTruncateString(query),
-		"max_results", maxResults,
-		"url", searchURL.String(),
-	)
+	if logutil.TraceEnabled(ctx) {
+		logutil.TraceContext(ctx, "anthropic: web search request",
+			"query", TraceTruncateString(query),
+			"max_results", maxResults,
+			"url", searchURL.String(),
+		)
+	}
 
 	q := searchURL.Query()
 	q.Set("ts", strconv.FormatInt(time.Now().Unix(), 10))

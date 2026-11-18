@@ -1506,18 +1506,23 @@ func writeModelResponse[T any](c *gin.Context, resp T) {
 func normalize(vec []float32) ([]float32, error) {
 	var sum float32
 	for _, v := range vec {
-		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-			return nil, errors.New("embedding contains NaN or Inf values")
-		}
 		sum += v * v
 	}
 
+	// A nonfinite component always propagates to the sum of squares.
+	// Only the exceptional path needs to distinguish it from finite overflow.
+	if math.IsNaN(float64(sum)) {
+		return nil, errors.New("embedding contains NaN or Inf values")
+	}
 	if math.IsInf(float64(sum), 1) {
 		// Finite components can overflow the float32 sum of squares. Keep the
 		// ordinary arithmetic unchanged, but avoid turning these vectors into zero.
 		var wideSum float64
 		for _, v := range vec {
 			value := float64(v)
+			if math.IsInf(value, 0) {
+				return nil, errors.New("embedding contains NaN or Inf values")
+			}
 			wideSum += value * value
 		}
 		norm := 1.0 / max(math.Sqrt(wideSum), 1e-12)
@@ -2811,7 +2816,15 @@ func streamResponse(c *gin.Context, ch chan any) {
 	encoder := json.NewEncoder(c.Writer)
 	// Preserve wrappers and their write/error behavior. Only a matching
 	// protocol adapter knows how to render its native frame directly.
-	chatWriter, _ := c.Writer.(*middleware.ChatWriter)
+	var chatWriter interface{ WriteModelResponse(api.ChatResponse) error }
+	switch writer := c.Writer.(type) {
+	case *middleware.ChatWriter:
+		chatWriter = writer
+	case *middleware.ResponsesWriter:
+		chatWriter = writer
+	case *middleware.AnthropicWriter:
+		chatWriter = writer
+	}
 	generateWriter, _ := c.Writer.(*middleware.CompleteWriter)
 	wroteFrame := func(err error) bool {
 		if err != nil {
@@ -2838,7 +2851,7 @@ func streamResponse(c *gin.Context, ch chan any) {
 		switch frame := val.(type) {
 		case api.ChatResponse:
 			complete = complete || frame.Done
-			if chatWriter != nil && chatWriter.Status() == http.StatusOK {
+			if chatWriter != nil && c.Writer.Status() == http.StatusOK {
 				return wroteFrame(chatWriter.WriteModelResponse(frame))
 			}
 		case api.GenerateResponse:

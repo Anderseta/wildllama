@@ -32,17 +32,24 @@ func NewLogger(w io.Writer, level slog.Level) *slog.Logger {
 	}))
 }
 
-type key string
+// TraceEnabled lets callers skip constructing expensive diagnostic fields.
+func TraceEnabled(ctx context.Context) bool {
+	return slog.Default().Enabled(ctx, LevelTrace)
+}
 
 func Trace(msg string, args ...any) {
-	TraceContext(context.WithValue(context.TODO(), key("skip"), 1), msg, args...)
+	trace(context.Background(), msg, args...)
 }
 
 func TraceContext(ctx context.Context, msg string, args ...any) {
+	trace(ctx, msg, args...)
+}
+
+func trace(ctx context.Context, msg string, args ...any) {
 	if logger := slog.Default(); logger.Enabled(ctx, LevelTrace) {
-		skip, _ := ctx.Value(key("skip")).(int)
-		pc, _, _, _ := runtime.Caller(1 + skip)
-		record := slog.NewRecord(time.Now(), LevelTrace, msg, pc)
+		var pcs [1]uintptr
+		runtime.Callers(3, pcs[:]) // Skip Callers, trace and the public wrapper.
+		record := slog.NewRecord(time.Now(), LevelTrace, msg, pcs[0])
 		record.Add(args...)
 		logger.Handler().Handle(ctx, record)
 	}
