@@ -23,6 +23,29 @@ type generationProgressProtocol struct {
 	writer                                                    func(gin.ResponseWriter, bool) io.Writer
 }
 
+type shortEventWriter struct{}
+
+func (shortEventWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
+
+func TestEventFramePreservesWireAndReportsShortWrite(t *testing.T) {
+	for _, name := range []string{"", "response.output_text.delta"} {
+		var out strings.Builder
+		if err := writeEventFrame(&out, name, "line\n<"); err != nil {
+			t.Fatal(err)
+		}
+		want := "data: \"line\\n\\u003c\"\n\n"
+		if name != "" {
+			want = "event: " + name + "\n" + want
+		}
+		if got := out.String(); got != want {
+			t.Fatalf("frame = %q, want %q", got, want)
+		}
+		if err := writeEventFrame(shortEventWriter{}, name, 1); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("short write: %v", err)
+		}
+	}
+}
+
 func generationProgressProtocols() []generationProgressProtocol {
 	return []generationProgressProtocol{
 		{

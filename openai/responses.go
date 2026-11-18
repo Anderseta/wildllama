@@ -1470,12 +1470,12 @@ type ResponsesStreamConverter struct {
 	contentIndex    int
 	contentStarted  bool
 	toolCallsSent   bool
-	accumulatedText string
+	accumulatedText strings.Builder
 	sequenceNumber  int
 	terminated      bool
 
 	// Reasoning/thinking state
-	accumulatedThinking string
+	accumulatedThinking strings.Builder
 	reasoningItemID     string
 	reasoningStarted    bool
 
@@ -1678,7 +1678,7 @@ func (c *ResponsesStreamConverter) processThinking(thinking string) []ResponsesS
 	}
 
 	// Accumulate thinking
-	c.accumulatedThinking += thinking
+	c.accumulatedThinking.WriteString(thinking)
 
 	// Emit delta
 	events = append(events, c.newEvent("response.reasoning_summary_text.delta", map[string]any{
@@ -1702,7 +1702,7 @@ func (c *ResponsesStreamConverter) finishReasoning() []ResponsesStreamEvent {
 	}
 
 	itemID := c.reasoningItemID
-	thinking := c.accumulatedThinking
+	thinking := c.accumulatedThinking.String()
 	outputIndex := c.outputIndex
 	item := map[string]any{
 		"id":                itemID,
@@ -1711,7 +1711,7 @@ func (c *ResponsesStreamConverter) finishReasoning() []ResponsesStreamEvent {
 		"encrypted_content": thinking,
 	}
 	c.completedItems = append(c.completedItems, item)
-	c.accumulatedThinking = ""
+	c.accumulatedThinking.Reset()
 	c.reasoningItemID = ""
 	c.reasoningStarted = false
 	c.outputIndex++
@@ -1925,8 +1925,8 @@ func (c *ResponsesStreamConverter) finishMessageItem(status string) []ResponsesS
 	}
 
 	c.contentStarted = false
-	text := c.accumulatedText
-	c.accumulatedText = ""
+	text := c.accumulatedText.String()
+	c.accumulatedText.Reset()
 	c.contentIndex = 0
 
 	itemID := c.itemID
@@ -2017,7 +2017,7 @@ func (c *ResponsesStreamConverter) processTextContent(content string) []Response
 	}
 
 	// Accumulate text
-	c.accumulatedText += content
+	c.accumulatedText.WriteString(content)
 
 	// Emit content delta
 	events = append(events, c.newEvent("response.output_text.delta", map[string]any{
@@ -2042,7 +2042,7 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 			"role":   "assistant",
 			"content": []map[string]any{{
 				"type":        "output_text",
-				"text":        c.accumulatedText,
+				"text":        c.accumulatedText.String(),
 				"annotations": []any{},
 				"logprobs":    []any{},
 			}},
@@ -2065,7 +2065,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 			"item_id":       c.itemID,
 			"output_index":  c.outputIndex,
 			"content_index": 0,
-			"text":          c.accumulatedText,
+			"text":          c.accumulatedText.String(),
 			"logprobs":      []any{},
 		}))
 
@@ -2076,7 +2076,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 			"content_index": 0,
 			"part": map[string]any{
 				"type":        "output_text",
-				"text":        c.accumulatedText,
+				"text":        c.accumulatedText.String(),
 				"annotations": []any{},
 				"logprobs":    []any{},
 			},
@@ -2092,7 +2092,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 				"role":   "assistant",
 				"content": []map[string]any{{
 					"type":        "output_text",
-					"text":        c.accumulatedText,
+					"text":        c.accumulatedText.String(),
 					"annotations": []any{},
 					"logprobs":    []any{},
 				}},

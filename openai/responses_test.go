@@ -10,6 +10,25 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
+func BenchmarkResponsesLongStream(b *testing.B) {
+	thinking := api.ChatResponse{Message: api.Message{Thinking: "evaluando "}}
+	text := api.ChatResponse{Message: api.Message{Content: "resposta "}}
+	b.ReportAllocs()
+	for b.Loop() {
+		c := NewResponsesStreamConverter("r", "i", "test", ResponsesRequest{})
+		for range 4096 {
+			c.Process(thinking)
+		}
+		for range 4096 {
+			c.Process(text)
+		}
+		events := c.Process(api.ChatResponse{Done: true})
+		if len(events) == 0 || events[len(events)-1].Event != "response.completed" {
+			b.Fatal("incomplete stream")
+		}
+	}
+}
+
 func TestResponsesInputMessage_UnmarshalJSON(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -114,16 +114,32 @@ func (e completionStreamError) write(w gin.ResponseWriter) error {
 }
 
 func writeCompletionEvent(w io.Writer, value any) error {
+	return writeEventFrame(w, "", value)
+}
+
+func writeEventFrame(w io.Writer, event string, value any) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 	const prefix = "data: "
-	frame := make([]byte, 0, len(prefix)+len(payload)+2)
+	size := len(prefix) + len(payload) + 2
+	if event != "" {
+		size += len("event: ") + len(event) + 1
+	}
+	frame := make([]byte, 0, size)
+	if event != "" {
+		frame = append(frame, "event: "...)
+		frame = append(frame, event...)
+		frame = append(frame, '\n')
+	}
 	frame = append(frame, prefix...)
 	frame = append(frame, payload...)
 	frame = append(frame, '\n', '\n')
-	_, err = w.Write(frame)
+	n, err := w.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -545,18 +561,7 @@ type ResponsesWriter struct {
 }
 
 func (w *ResponsesWriter) writeEvent(eventType string, data any) error {
-	d, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, d)))
-	if err != nil {
-		return err
-	}
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-	return nil
+	return writeSSE(w.ResponseWriter, eventType, data)
 }
 
 func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {

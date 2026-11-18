@@ -74,8 +74,8 @@ func detectImageReferenceAdapter(path string) *imageReferenceAdapter {
 		if err != nil {
 			return nil
 		}
-		for _, tensor := range metadata.TensorInfos() {
-			observe(tensor.Name)
+		for name := range metadata.TensorTypes() {
+			observe(name)
 		}
 	case ".safetensors":
 		tensors, err := safetensors.OpenForExtraction(path)

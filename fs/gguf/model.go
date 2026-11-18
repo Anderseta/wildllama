@@ -2,7 +2,6 @@ package gguf
 
 import (
 	"fmt"
-	"maps"
 	"math"
 	"os"
 	"slices"
@@ -47,9 +46,8 @@ func ReadModel(path string, maxArraySize int, shards ...string) (*Model, error) 
 		}
 		fileSize += uint64(info.Size())
 		if i == 0 {
-			kvCopy := *metadata
-			kvCopy.values = maps.Clone(metadata.values)
-			kv = &kvCopy
+			kv = metadata
+			tensors = metadata.tensors
 			architecture = metadata.Architecture()
 			fileType = metadata.FileType()
 		} else {
@@ -77,7 +75,9 @@ func ReadModel(path string, maxArraySize int, shards ...string) (*Model, error) 
 				return nil, fmt.Errorf("%w GGUF tensor sizes overflow", ErrUnsupported)
 			}
 			tensorBytes += uint64(size)
-			tensors = append(tensors, cloneTensorInfo(tensor))
+		}
+		if i > 0 {
+			tensors = append(tensors, metadata.tensors...)
 		}
 	}
 
@@ -128,6 +128,11 @@ func (m *Model) Tensors() Tensors {
 type Tensors struct {
 	items []TensorInfo
 	size  uint64
+}
+
+// HasPrefix reports whether a matching tensor exists without copying its shape.
+func (t Tensors) HasPrefix(prefix string) bool {
+	return slices.ContainsFunc(t.items, func(item TensorInfo) bool { return strings.HasPrefix(item.Name, prefix) })
 }
 
 // Items returns all tensors, or tensors whose names start with prefix.

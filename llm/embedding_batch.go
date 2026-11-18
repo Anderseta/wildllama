@@ -77,14 +77,14 @@ func (s *llamaServerRunner) EmbeddingBatch(ctx context.Context, inputs []string)
 	}
 	defer s.sem.Release(int64(len(inputs)))
 	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
-	request := map[string]any{"input": inputs}
+	request := map[string]any{"input": inputs, "encoding_format": "base64"}
 	if s.rawEmbeddings {
 		request["embd_normalize"] = -1
 	}
 	var response struct {
 		Data []struct {
-			Embedding []float32 `json:"embedding"`
-			Index     int       `json:"index"`
+			Embedding nativeEmbeddingVector `json:"embedding"`
+			Index     int                   `json:"index"`
 		} `json:"data"`
 		Usage struct {
 			Tokens int `json:"prompt_tokens"`

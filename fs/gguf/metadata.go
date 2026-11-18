@@ -2,6 +2,7 @@ package gguf
 
 import (
 	"fmt"
+	"iter"
 	"math"
 	"slices"
 	"strings"
@@ -16,6 +17,20 @@ type Metadata struct {
 	tensors        []TensorInfo
 	omitted        []string
 	parameterCount uint64
+}
+
+// TensorTypes iterates names and storage types in file order without exposing
+// mutable tensor shapes or allocating a copy of the descriptor table.
+func (m *Metadata) TensorTypes() iter.Seq2[string, TensorType] {
+	return func(yield func(string, TensorType) bool) {
+		if m != nil {
+			for _, tensor := range m.tensors {
+				if !yield(tensor.Name, tensor.Type) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // ReadFileMetadata reads one GGUF file without retaining array values larger
@@ -42,16 +57,18 @@ func ReadFileMetadata(path string, maxArraySize int) (_ *Metadata, err error) {
 			m.omitted = append(m.omitted, kv.Key)
 		}
 	}
-	for _, tensor := range f.TensorInfos() {
-		m.tensors = append(m.tensors, tensor)
+	if err := f.validateTensorData(); err != nil {
+		return nil, err
+	}
+	// The file is private to this call. Its fully parsed table remains valid
+	// after Close and can be owned directly by Metadata.
+	m.tensors = f.tensors.values
+	for _, tensor := range m.tensors {
 		n := tensor.NumValues()
 		if n < 0 || uint64(n) > math.MaxUint64-m.parameterCount {
 			return nil, fmt.Errorf("%w parameter count overflows", ErrUnsupported)
 		}
 		m.parameterCount += uint64(n)
-	}
-	if err := f.validateTensorData(); err != nil {
-		return nil, err
 	}
 	return m, nil
 }

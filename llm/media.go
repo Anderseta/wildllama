@@ -2,9 +2,24 @@ package llm
 
 import (
 	"bytes"
+	"encoding/base64"
 	"net/http"
 	"strings"
 )
+
+// Write the prefix and encoded image into the same string allocation.
+func imageDataURL(mime string, data []byte) string {
+	var url strings.Builder
+	url.Grow(len("data:;base64,") + len(mime) + base64.StdEncoding.EncodedLen(len(data)))
+	url.WriteString("data:")
+	url.WriteString(mime)
+	url.WriteString(";base64,")
+	enc := base64.NewEncoder(base64.StdEncoding, &url)
+	// strings.Builder writes always succeed. Close flushes the final 1–2 bytes.
+	_, _ = enc.Write(data)
+	_ = enc.Close()
+	return url.String()
+}
 
 func NewMediaData(id int, data []byte) MediaData {
 	return MediaData{

@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2898,8 +2899,13 @@ func TestHasLegacyQwenMTPDraft(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := hasLegacyQwenMTPDraft(tt.arch, tt.tensors); got != tt.want {
-				t.Fatalf("hasLegacyQwenMTPDraft() = %v, want %v", got, tt.want)
+			var tensors []*gguftest.Tensor
+			for _, tensor := range tt.tensors {
+				tensors = append(tensors, testGGUFTensor(tensor.Name, gguf.TensorTypeF32, []uint64{1}))
+			}
+			_, model := writeTestGGUF(t, gguftest.KV{"general.architecture": tt.arch}, tensors)
+			if got := hasMTPDraft(model); got != tt.want {
+				t.Fatalf("hasMTPDraft() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -4019,8 +4025,9 @@ func TestLlamaServerChatMessageConvertsMediaParts(t *testing.T) {
 		if audio["format"] != want {
 			t.Fatalf("expected %s format, got %#v", want, audio["format"])
 		}
-		if audio["data"] == "" {
-			t.Fatalf("expected base64 audio data for %s", want)
+		wire, err := json.Marshal(audio["data"])
+		if err != nil || string(wire) != strconv.Quote(base64.StdEncoding.EncodeToString([][]byte{wav, mp3}[i])) {
+			t.Fatalf("incorrect encoded audio data for %s: %s (%v)", want, wire, err)
 		}
 	}
 }

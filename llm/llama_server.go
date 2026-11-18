@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1032,13 +1031,9 @@ func hasMTPDraft(f *gguf.Model) bool {
 	if f.KV().Uint("nextn_predict_layers") > 0 {
 		return true
 	}
-	return hasLegacyQwenMTPDraft(f.KV().Architecture(), f.Tensors().Items("mtp."))
-}
-
-func hasLegacyQwenMTPDraft(arch string, tensors []gguf.TensorInfo) bool {
-	switch arch {
+	switch f.KV().Architecture() {
 	case "qwen35", "qwen35moe":
-		return len(tensors) > 0
+		return f.Tensors().HasPrefix("mtp.")
 	default:
 		return false
 	}
@@ -1109,9 +1104,7 @@ func NewLlamaServerRunner(
 		"nemotron_h_omni": true,
 		// Add entries as llama/compat grows clip handlers.
 	}
-	if len(projectors) == 0 &&
-		len(f.Tensors().Items("v.")) > 0 &&
-		compatClipArches[arch] {
+	if len(projectors) == 0 && compatClipArches[arch] && f.Tensors().HasPrefix("v.") {
 		projectors = []string{modelPath}
 	}
 	mmprojMemory, err := mmprojMemoryRequirement(modelPath, f, projectors)
@@ -1793,7 +1786,7 @@ func leadingSpecialTokenCandidate(tag string) string {
 // llama-server's /completion endpoint accepts this as the "prompt" field.
 type llamaServerMultimodalPrompt struct {
 	PromptString   string   `json:"prompt_string"`
-	MultimodalData []string `json:"multimodal_data"`
+	MultimodalData [][]byte `json:"multimodal_data"`
 }
 
 // llamaServerCompletionResponse is the response format from llama-server's /completion endpoint.
@@ -2001,7 +1994,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	// llama-server media marker and package the matching payloads as base64.
 	if len(req.Media) > 0 {
 		promptStr := lsReq.Prompt.(string)
-		var mediaData []string
+		mediaData := make([][]byte, 0, len(req.Media))
 		for _, media := range req.Media {
 			marker := fmt.Sprintf("[img-%d]", media.ID)
 			promptStr = strings.Replace(promptStr, marker, s.llamaServerMediaMarker(), 1)
@@ -2009,7 +2002,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 			if err != nil {
 				return err
 			}
-			mediaData = append(mediaData, base64.StdEncoding.EncodeToString(data))
+			mediaData = append(mediaData, data)
 		}
 		lsReq.Prompt = llamaServerMultimodalPrompt{
 			PromptString:   promptStr,
@@ -2856,7 +2849,7 @@ func llamaServerChatMediaPart(media MediaData) (map[string]any, error) {
 		return map[string]any{
 			"type": "input_audio",
 			"input_audio": map[string]any{
-				"data":   base64.StdEncoding.EncodeToString(media.Data),
+				"data":   media.Data,
 				"format": format,
 			},
 		}, nil
@@ -2873,12 +2866,16 @@ func llamaServerChatMediaPart(media MediaData) (map[string]any, error) {
 	return map[string]any{
 		"type": "image_url",
 		"image_url": map[string]any{
-			"url": "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data),
+			"url": imageDataURL(mime, data),
 		},
 	}, nil
 }
 
 func llamaServerMediaBytes(data []byte) ([]byte, error) {
+	// Empty media has always been serialized as an empty base64 string.
+	if data == nil {
+		return []byte{}, nil
+	}
 	if http.DetectContentType(data) != "image/webp" {
 		return data, nil
 	}
@@ -2957,7 +2954,7 @@ func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [
 			if err != nil {
 				return nil, 0, api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: err.Error()}
 			}
-			multimodal.MultimodalData = append(multimodal.MultimodalData, base64.StdEncoding.EncodeToString(data))
+			multimodal.MultimodalData = append(multimodal.MultimodalData, data)
 		}
 		prompt = multimodal
 	}
@@ -2971,7 +2968,7 @@ func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [
 
 	// Use "input" field (not "content") to get the OAI-compatible response format
 	// which includes tokens_evaluated for prompt token counting
-	req := map[string]any{"input": prompt}
+	req := map[string]any{"input": prompt, "encoding_format": "base64"}
 	if s.rawEmbeddings {
 		req["embd_normalize"] = -1
 	}
@@ -3035,11 +3032,10 @@ func decodeEmbeddingResponse(body []byte) ([]float32, int, error) {
 			}
 		}
 	} else {
-		// Numeric components are decoded directly into the owned output slice.
 		var response struct {
 			Data []struct {
-				Embedding       []float32 `json:"embedding"`
-				TokensEvaluated int       `json:"tokens_evaluated"`
+				Embedding       nativeEmbeddingVector `json:"embedding"`
+				TokensEvaluated int                   `json:"tokens_evaluated"`
 			} `json:"data"`
 			Usage struct {
 				PromptTokens int `json:"prompt_tokens"`

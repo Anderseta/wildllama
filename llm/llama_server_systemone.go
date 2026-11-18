@@ -3,7 +3,6 @@ package llm
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,7 +34,7 @@ func (s *llamaServerRunner) SystemOne(ctx context.Context, state, questions json
 		if err != nil {
 			return nil, nil, api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: err.Error()}
 		}
-		request.Images = append(request.Images, "data:"+http.DetectContentType(data)+";base64,"+base64.StdEncoding.EncodeToString(data))
+		request.Images = append(request.Images, imageDataURL(http.DetectContentType(data), data))
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err

@@ -237,7 +237,7 @@ func read[T any](f *File) (t T, err error) {
 }
 
 func readString(f *File) (string, error) {
-	n, err := read[uint64](f)
+	n, err := f.reader.uint64(f.byteOrder)
 	if err != nil {
 		return "", err
 	}
@@ -258,7 +258,6 @@ func readString(f *File) (string, error) {
 	if _, err := io.ReadFull(f.reader, bts); err != nil {
 		return "", err
 	}
-	defer clear(bts)
 	if f.Version == 1 {
 		if bts[length-1] != 0 {
 			return "", fmt.Errorf("%w version 1 string is not null terminated", ErrUnsupported)
@@ -322,23 +321,25 @@ func readArrayData[T any](f *File, n uint64) (any, error) {
 	if f.maxArraySize >= 0 && size > f.maxArraySize {
 		var value T
 		width := binary.Size(value)
-		if width <= 0 || size > int(maxInt64())/width {
+		if width <= 0 || size > maxInt()/width {
 			return nil, fmt.Errorf("array byte size overflows")
 		}
-		if _, err := io.CopyN(io.Discard, f.reader, int64(size*width)); err != nil {
+		if err := f.reader.discard(size * width); err != nil {
 			return nil, err
 		}
 		return skippedArray{size: size}, nil
 	}
 
 	s := make([]T, 0, min(size, 4096))
-	for range size {
-		e, err := read[T](f)
-		if err != nil {
+	// Grow only as the file supplies data. A short header can declare millions
+	// of elements, so reserving the whole array here would waste memory.
+	for len(s) < size {
+		start := len(s)
+		count := min(4096, size-start)
+		s = slices.Grow(s, count)[:start+count]
+		if err := binary.Read(f.reader, f.byteOrder, s[start:]); err != nil {
 			return nil, err
 		}
-
-		s = append(s, e)
 	}
 
 	return s, nil
@@ -372,7 +373,7 @@ func readArrayString(f *File, n uint64) (any, error) {
 }
 
 func skipString(f *File) error {
-	length, err := read[uint64](f)
+	length, err := f.reader.uint64(f.byteOrder)
 	if err != nil {
 		return err
 	}
@@ -384,7 +385,7 @@ func skipString(f *File) error {
 		if n == 0 {
 			return fmt.Errorf("%w version 1 string has zero length", ErrUnsupported)
 		}
-		if _, err := io.CopyN(io.Discard, f.reader, int64(n-1)); err != nil {
+		if err := f.reader.discard(n - 1); err != nil {
 			return err
 		}
 		terminator, err := read[uint8](f)
@@ -396,8 +397,7 @@ func skipString(f *File) error {
 		}
 		return nil
 	}
-	_, err = io.CopyN(io.Discard, f.reader, int64(n))
-	return err
+	return f.reader.discard(n)
 }
 
 func checkedLength(n uint64, kind string, max uint64) (int, error) {

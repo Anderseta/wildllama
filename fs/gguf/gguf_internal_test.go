@@ -3,10 +3,48 @@ package gguf
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
 )
+
+func TestBufferedMetadataAcrossBoundaries(t *testing.T) {
+	for _, order := range []binary.ByteOrder{binary.BigEndian, binary.LittleEndian} {
+		var data bytes.Buffer
+		const width = 40003 // continues past the reader buffer
+		_ = binary.Write(&data, order, uint64(width))
+		data.Write(bytes.Repeat([]byte{'x'}, width-1))
+		data.WriteByte(0)
+		const count = 4099 // includes a partial numeric batch
+		for i := range count {
+			_ = binary.Write(&data, order, int16(i-100))
+		}
+		f := testFile(data.Bytes())
+		f.Version, f.byteOrder, f.maxArraySize = 1, order, -1
+		if err := skipString(f); err != nil {
+			t.Fatal(err)
+		}
+		values, err := readArrayData[int16](f, count)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, v := range values.([]int16) {
+			if v != int16(i-100) {
+				t.Fatalf("element %d = %d", i, v)
+			}
+		}
+		if f.reader.offset != int64(data.Len()) {
+			t.Fatalf("offset = %d, want %d", f.reader.offset, data.Len())
+		}
+		truncated := testFile(data.Bytes()[:8+width-2])
+		truncated.Version, truncated.byteOrder = 1, order
+		if err := skipString(truncated); !errors.Is(err, io.EOF) || truncated.reader.offset != 8+width-2 {
+			t.Fatalf("short discard: offset %d, err %v", truncated.reader.offset, err)
+		}
+	}
+}
 
 func TestReadStringRejectsOversizedLength(t *testing.T) {
 	var b bytes.Buffer

@@ -896,11 +896,7 @@ func isCloudModelName(name string) bool {
 
 // writeSSE writes a Server-Sent Event
 func writeSSE(w http.ResponseWriter, eventType string, data any) error {
-	d, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, d); err != nil {
+	if err := writeEventFrame(w, eventType, data); err != nil {
 		return err
 	}
 	if f, ok := w.(http.Flusher); ok {

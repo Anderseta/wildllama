@@ -47,12 +47,12 @@ func InspectLocalComponent(path, role string) (LocalInspection, error) {
 			return result, fmt.Errorf("invalid image GGUF metadata: %w", err)
 		}
 		patch, merger := false, false
-		for _, tensor := range metadata.TensorInfos() {
+		for name, storage := range metadata.TensorTypes() {
 			result.TensorCount++
-			result.DTypes[fmt.Sprint(tensor.Type)]++
-			if strings.Contains(tensor.Name, "visual.") {
-				patch = patch || strings.Contains(tensor.Name, "patch_embed")
-				merger = merger || strings.Contains(tensor.Name, "merger.linear_fc2") || strings.Contains(tensor.Name, "merger.mlp.2")
+			result.DTypes[storage.String()]++
+			if strings.Contains(name, "visual.") {
+				patch = patch || strings.Contains(name, "patch_embed")
+				merger = merger || strings.Contains(name, "merger.linear_fc2") || strings.Contains(name, "merger.mlp.2")
 			}
 		}
 		result.SupportsEditing = role == "text_encoder" && patch && merger
