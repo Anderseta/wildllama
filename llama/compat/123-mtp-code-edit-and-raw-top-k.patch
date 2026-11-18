@@ -1,0 +1,318 @@
+diff --git a/common/mtp-edit-lookup.h b/common/mtp-edit-lookup.h
+index 91f19e9..e6864c2 100644
+--- a/common/mtp-edit-lookup.h
++++ b/common/mtp-edit-lookup.h
+@@ -15,6 +15,12 @@ class common_mtp_edit_lookup {
+     std::vector<uint16_t> offsets;
+     tokens source;
+ 
++    // A prior source match is only a hint. Verify the accepted history again:
++    // rejected proposals, repeated boilerplate and slot rewinds can all diverge.
++    size_t last_history_size = 0;
++    size_t last_source_end = 0;
++    size_t last_draft_size = 0;
++
+     template<class At> static size_t bucket(At at) {
+         uint32_t hash = 2166136261u;
+         for (size_t i = 0; i < anchor; ++i) { hash = (hash ^ uint32_t(at(i))) * 16777619u; }
+@@ -23,6 +29,7 @@ class common_mtp_edit_lookup {
+ 
+ public:
+     void begin(const tokens & prompt) {
++        last_source_end = 0;
+         offsets.clear();
+         source.clear();
+         if (prompt.size() < anchor + 2) { return; }
+@@ -34,18 +41,42 @@ public:
+         }
+     }
+ 
+-    bool propose(const tokens & history, int32_t last, size_t maximum, tokens & result) const {
+-        if (maximum < 2 || offsets.empty() || history.size() < anchor - 1 || !result.empty()) { return false; }
+-        const auto at = [&](size_t i) {
+-            return i == anchor - 1 ? last : history[history.size() - (anchor - 1) + i];
+-        };
+-        const size_t end = offsets[bucket(at)];
+-        if (end == 0) { return false; }
+-        for (size_t i = 0; i < anchor; ++i) {
+-            if (source[end - anchor + i] != at(i)) { return false; }
++    bool propose(const tokens & history, int32_t last, size_t maximum, tokens & result) {
++        if (maximum < 2 || offsets.empty() || history.size() < anchor - 1 || !result.empty()) {
++            last_source_end = 0;
++            return false;
++        }
++
++        size_t end = 0;
++        if (last_source_end && history.size() > last_history_size) {
++            const size_t advance = history.size() - last_history_size;
++            // The target may also commit one token beyond the previous draft.
++            if (advance - 1 <= last_draft_size && advance <= source.size() - last_source_end) {
++                const size_t next = last_source_end + advance;
++                const size_t known = anchor + advance - 1;
++                if (source.size() - next >= 2 && source[next - 1] == last &&
++                        std::equal(source.begin() + last_source_end - anchor, source.begin() + next - 1,
++                                   history.end() - known)) {
++                    end = next;
++                }
++            }
++        }
++        if (!end) {
++            last_source_end = 0;
++            const auto at = [&](size_t i) {
++                return i == anchor - 1 ? last : history[history.size() - (anchor - 1) + i];
++            };
++            end = offsets[bucket(at)];
++            if (end == 0) { return false; }
++            for (size_t i = 0; i < anchor; ++i) {
++                if (source[end - anchor + i] != at(i)) { return false; }
++            }
+         }
+         const size_t count = std::min(maximum, source.size() - end);
+         result.assign(source.begin() + end, source.begin() + end + count);
++        last_source_end = end;
++        last_history_size = history.size();
++        last_draft_size = count;
+         return true;
+     }
+ };
+diff --git a/common/mtp-raw-top-k.h b/common/mtp-raw-top-k.h
+new file mode 100644
+index 0000000..bbaa478
+--- /dev/null
++++ b/common/mtp-raw-top-k.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include "llama.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <vector>
++
++// An exact shortlist for chains that begin with top-k. Keep a witness just
++// outside the cutoff so ties there can fall back to the original CPU ordering.
++inline bool common_mtp_raw_top_k(const float * logits, int n, int k, std::vector<llama_token_data> & out) {
++    if (!logits || k < 1 || k >= 128 || n < 4096) { return false; }
++    const auto descending = [](const auto & a, const auto & b) { return a.logit > b.logit; };
++    std::array<llama_token_data, 128> heap;
++    const auto end = heap.begin() + k + 1;
++    for (int i = 0; i <= k; ++i) {
++        if (!std::isfinite(logits[i])) { return false; }
++        heap[i] = {i, logits[i], 0.0f};
++    }
++    std::make_heap(heap.begin(), end, descending);
++    for (int i = k + 1; i < n; ++i) {
++        const float score = logits[i];
++        if (!std::isfinite(score)) { return false; }
++        if (score > heap.front().logit) {
++            std::pop_heap(heap.begin(), end, descending);
++            heap[k] = {i, score, 0.0f};
++            std::push_heap(heap.begin(), end, descending);
++        }
++    }
++    std::sort_heap(heap.begin(), end, descending);
++    for (int i = 1; i <= k; ++i) {
++        if (heap[i].logit == heap[i - 1].logit) { return false; }
++    }
++    out.assign(heap.begin(), end - 1);
++    return true;
++}
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 57432f5..b1204a7 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -11,6 +11,7 @@
+ #include "fit.h"
+ #include "log.h"
+ #include "reasoning-budget.h"
++#include "mtp-raw-top-k.h"
+ 
+ #include "ggml.h"
+ 
+@@ -201,6 +202,8 @@ struct common_sampler {
+     common_sampler_ptr block_preview;
+     std::vector<std::pair<llama_token, double>> block_residual;
+     std::vector<llama_token_data> block_unmasked;
++    int block_raw_top_k = 0;
++    unsigned block_raw_retry = 0;
+     uint64_t gpu_distribution_rows = 0;
+     bool block_preview_enabled = [] {
+         const char * value = std::getenv("WILDLLAMA_MTP_BLOCK_PREVIEW");
+@@ -625,9 +628,20 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+     return common_sampler_clone_impl(gsmpl, true);
+ }
+ 
+-static common_sampler * common_sampler_block_preview(common_sampler * source) {
++static common_sampler * common_sampler_block_preview(common_sampler * source, llama_context * ctx) {
+     if (!source->block_preview) {
+         source->block_preview.reset(common_sampler_clone_impl(source, false));
++        // Query the actual first effective stage once. The existing prefilter
++        // contains just top-(k+1); applying it to an already sorted view only
++        // sets its size. This also works when a caller supplies a custom chain.
++        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++        llama_sampler_ptr probe(llama_sampler_init_thinking_prefilter(source->chain, n_vocab));
++        if (probe && n_vocab >= 4096) {
++            llama_token_data dummy[128] = {};
++            llama_token_data_array view = {dummy, 128, -1, true};
++            llama_sampler_apply(probe.get(), &view);
++            source->block_preview->block_raw_top_k = int(view.size) - 1;
++        }
+     } else {
+         auto * preview = source->block_preview.get();
+         llama_sampler_copy(source->grmr, preview->grmr);
+@@ -1060,7 +1074,26 @@ static void common_sampler_block_distribution(common_sampler * preview, llama_co
+     // The preview computes both branches of grammar-last when needed. A compact
+     // prefilter cannot represent its grammar-first retry, so use the raw row.
+     if (output.raw_logits) { output.sampled_logits = nullptr; output.sampled_probs = nullptr; output.candidates = nullptr; }
+-    preview->set_logits(ctx, output);
++    // Grammar and forced reasoning tokens can promote IDs outside top-k.
++    // Keep the full row available for both grammar-first and grammar-last.
++    bool compact = false;
++    if (preview->block_raw_top_k && !grammar_active && output.raw_logits &&
++            common_reasoning_budget_get_state(preview->rbudget) != REASONING_BUDGET_FORCING) {
++        if (preview->block_raw_retry) {
++            --preview->block_raw_retry;
++        } else {
++            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++            compact = common_mtp_raw_top_k(output.raw_logits, n_vocab, preview->block_raw_top_k, preview->cur);
++            // Heavily tied rows should normally pay for just the reference path.
++            if (!compact) { preview->block_raw_retry = 16; }
++        }
++    }
++    if (compact) {
++        preview->cur_p = {preview->cur.data(), preview->cur.size(), -1, true};
++        ++preview->candidate_rows;
++    } else {
++        preview->set_logits(ctx, output);
++    }
+     auto & current = preview->cur_p;
+     llama_sampler_apply(preview->rbudget, &current);
+     const bool grammar = grammar_should_apply(preview) && !llama_sampler_grammar_awaiting_trigger(preview->grmr);
+@@ -1194,7 +1227,7 @@ static std::vector<llama_token> common_sampler_verify_block(
+     const bool use_preview = sampler->block_preview_enabled && llama_sampler_can_preview_distribution(sampler->chain);
+     common_sampler_ptr legacy_preview;
+     if (!use_preview) { legacy_preview.reset(common_sampler_clone(sampler)); }
+-    auto * prefix_sampler = use_preview ? common_sampler_block_preview(sampler) : legacy_preview.get();
++    auto * prefix_sampler = use_preview ? common_sampler_block_preview(sampler, ctx) : legacy_preview.get();
+     auto rng = sampler->rng;
+     std::uniform_real_distribution<double> uniform(0.0, 1.0);
+     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+diff --git a/tests/test-mtp-raw-top-k.cpp b/tests/test-mtp-raw-top-k.cpp
+new file mode 100644
+index 0000000..4af20ff
+--- /dev/null
++++ b/tests/test-mtp-raw-top-k.cpp
+@@ -0,0 +1,79 @@
++#include "../common/mtp-raw-top-k.h"
++#include "../src/llama-sampler.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include <numeric>
++#include <random>
++static void check(bool ok) {
++    if (!ok) {
++        std::fputs("top-k oracle mismatch\n", stderr);
++        std::exit(1);
++    }
++}
++int main() {
++    std::mt19937 rng(713);
++    std::vector<llama_token_data> got;
++    for (int size : {4096, 248320}) {
++        std::vector<float> row(size);
++        std::iota(row.begin(), row.end(), float(-size / 2));
++        for (int round = 0; round < 4; ++round) {
++            std::shuffle(row.begin(), row.end(), rng);
++            for (int k : {1, 2, 20, 64, 127}) {
++                std::vector<llama_token_data> ref(size);
++                for (int i = 0; i < size; ++i) {
++                    ref[i] = {i, row[i], 0.0f};
++                }
++                auto original = ref;
++                std::partial_sort(ref.begin(), ref.begin() + k, ref.end(),
++                                  [](const auto & a, const auto & b) { return a.logit > b.logit; });
++                check(common_mtp_raw_top_k(row.data(), size, k, got) && got.size() == size_t(k));
++                for (int i = 0; i < k; ++i) {
++                    check(ref[i].id == got[i].id && ref[i].logit == got[i].logit && got[i].p == 0.0f);
++                }
++                // Compare the actual filtering chain, including float probabilities.
++                for (auto & t : original) {
++                    t.logit *= 1.0f / 8192;
++                }
++                for (auto & t : got) {
++                    t.logit *= 1.0f / 8192;
++                }
++                auto chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
++                llama_sampler_chain_add(chain, llama_sampler_init_top_k(k));
++                llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95f, 1));
++                llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.02f, 1));
++                llama_sampler_chain_add(chain, llama_sampler_init_temp(0.83f));
++                llama_sampler_chain_add(chain, llama_sampler_init_dist(42));
++                llama_token_data_array full = {original.data(), original.size(), -1, false};
++                llama_token_data_array compact = {got.data(), got.size(), -1, true};
++                check(llama_sampler_preview_distribution(chain, &full));
++                check(llama_sampler_preview_distribution(chain, &compact));
++                check(full.size == compact.size);
++                for (size_t i = 0; i < full.size; ++i) {
++                    check(full.data[i].id == compact.data[i].id && full.data[i].p == compact.data[i].p);
++                }
++                llama_sampler_free(chain);
++            }
++        }
++        std::iota(row.begin(), row.end(), 0.f);
++        row[size - 21] = row[size - 20];
++        check(!common_mtp_raw_top_k(row.data(), size, 20, got));
++        row[size - 21] = 0.f;
++        row.back() = row[size - 2];
++        check(!common_mtp_raw_top_k(row.data(), size, 20, got));
++        row.back() = float(size);
++        for (auto v : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
++                       -std::numeric_limits<float>::infinity()}) {
++            row[0] = v;
++            check(!common_mtp_raw_top_k(row.data(), size, 20, got));
++            row[0] = 0;
++            row[size / 2] = v;
++            check(!common_mtp_raw_top_k(row.data(), size, 20, got));
++            row[size / 2] = 0;
++        }
++        check(!common_mtp_raw_top_k(row.data(), size, 128, got) && !common_mtp_raw_top_k(row.data(), size, 0, got));
++    }
++    std::puts(
++        "PASS CPU shortlist: full-sort IDs and native probabilities, bounds, top and boundary ties, nonfinite rows");
++}
+diff --git a/tests/test-server-mtp-depth.cpp b/tests/test-server-mtp-depth.cpp
+index a0700e9..0ae648f 100644
+--- a/tests/test-server-mtp-depth.cpp
++++ b/tests/test-server-mtp-depth.cpp
+@@ -70,5 +70,28 @@ int main() {
+     check(!lookup.propose(history,15,1,result), "single-token ceiling ignored");
+     lookup.begin({});
+     check(!lookup.propose(history,15,2,result), "prompt crossed requests");
++    // Both functions have identical boilerplate followed by different literals.
++    source = {91,92,93,94,95,96, 1,2,3,4,5,6,7, 111,112,113,
++              81,82,83,84,85,86, 1,2,3,4,5,6,7, 211,212,213};
++    lookup.begin(source);
++    auto query = [&](size_t last, int maximum) {
++        history.assign(source.begin(), source.begin() + last);
++        result.clear();
++        return lookup.propose(history, source[last], maximum, result);
++    };
++    check(query(5, 4), "missing first unique anchor");
++    check(query(10, 4), "failed to follow verified bonus token");
++    check(query(12, 4) && result.front() == 111 && result.size() == 4,
++          "jumped to a different occurrence of the boilerplate");
++    check(query(28, 2) && result.front() == 211, "accepted history gap as a continuation");
++    check(query(12, 2) && result.front() == 211, "reused cursor after rewind");
++    lookup.begin(source);
++    check(query(9, 4), "missing unique anchor before divergence");
++    history.assign(source.begin(), source.begin() + 12);
++    history[9] = 999;
++    result.clear();
++    check(!lookup.propose(history, source[12], 2, result), "continued after rejected source tokens");
++    lookup.begin(source);
++    check(query(12, 2) && result.front() == 211, "new request inherited cursor preference");
+     std::puts("PASS adaptive MTP depth: request ceiling, cost, context isolation and recovery");
+ }

@@ -112,3 +112,19 @@ Both accept an explicit runner override of `0`. The target weights, logits
 and sampling settings stay in use. With stochastic sampling, different
 proposal sequences can consume random draws in a different order. Peak VRAM
 also depends on the configured maximum rollback depth.
+
+During a code edit, the lookup keeps its position in the source while the
+target continues to confirm the same tokens. Before reusing the position,
+it checks the anchor and every newly committed token, including a possible
+bonus token. A mismatch or a rewind sends the lookup back to the index.
+This keeps repeated function bodies and route definitions aligned with the
+occurrence being edited. The cursor uses three machine words per lookup.
+
+The CPU block verifier also has a shorter path for large raw logit rows.
+When the first effective filter is top-k, it reads the scores once into a
+bounded selection heap and passes the surviving IDs and original scores to
+the regular sampling chain. The extra candidate detects a tie at the cutoff.
+Ties within the selection, nonfinite scores, active grammar constraints and
+forced reasoning tokens use the full row. After an ambiguous row the verifier
+waits 16 eligible rows before trying again. This path uses host memory only
+and requires no additional GPU buffers.
