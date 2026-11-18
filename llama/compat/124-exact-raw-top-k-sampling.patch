@@ -1,0 +1,309 @@
+diff --git a/common/mtp-raw-top-k.h b/common/mtp-raw-top-k.h
+index bbaa478..ac19969 100644
+--- a/common/mtp-raw-top-k.h
++++ b/common/mtp-raw-top-k.h
+@@ -5,8 +5,13 @@
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <limits>
+ #include <vector>
+ 
++#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
++#include <emmintrin.h>
++#endif
++
+ // An exact shortlist for chains that begin with top-k. Keep a witness just
+ // outside the cutoff so ties there can fall back to the original CPU ordering.
+ inline bool common_mtp_raw_top_k(const float * logits, int n, int k, std::vector<llama_token_data> & out) {
+@@ -19,7 +24,7 @@ inline bool common_mtp_raw_top_k(const float * logits, int n, int k, std::vector
+         heap[i] = {i, logits[i], 0.0f};
+     }
+     std::make_heap(heap.begin(), end, descending);
+-    for (int i = k + 1; i < n; ++i) {
++    const auto consider = [&](int i) {
+         const float score = logits[i];
+         if (!std::isfinite(score)) { return false; }
+         if (score > heap.front().logit) {
+@@ -27,6 +32,27 @@ inline bool common_mtp_raw_top_k(const float * logits, int n, int k, std::vector
+             heap[k] = {i, score, 0.0f};
+             std::push_heap(heap.begin(), end, descending);
+         }
++        return true;
++    };
++    int i = k + 1;
++#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
++    const __m128 lowest = _mm_set1_ps(-std::numeric_limits<float>::max());
++    for (; i <= n - 16; i += 16) {
++        const __m128 threshold = _mm_set1_ps(heap.front().logit);
++        const auto outside = [&](int offset) {
++            const __m128 v = _mm_loadu_ps(logits + i + offset);
++            // Ordered range comparisons also reject NaN and both infinities.
++            return _mm_and_ps(_mm_cmple_ps(v, threshold), _mm_cmpge_ps(v, lowest));
++        };
++        const __m128 all = _mm_and_ps(_mm_and_ps(outside(0), outside(4)), _mm_and_ps(outside(8), outside(12)));
++        if (_mm_movemask_ps(all) == 15) { continue; }
++        for (int j = i; j < i + 16; ++j) {
++            if (!consider(j)) { return false; }
++        }
++    }
++#endif
++    for (; i < n; ++i) {
++        if (!consider(i)) { return false; }
+     }
+     std::sort_heap(heap.begin(), end, descending);
+     for (int i = 1; i <= k; ++i) {
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index d9454e4..635fe81 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -202,9 +202,8 @@ struct common_sampler {
+     common_sampler_ptr block_preview;
+     std::vector<std::pair<llama_token, double>> block_residual;
+     std::vector<llama_token_data> block_unmasked;
+-    int block_raw_top_k = 0;
+-    unsigned block_raw_misses = 0;
+-    unsigned block_raw_retry = 0;
++    unsigned raw_top_k_misses = 0;
++    unsigned raw_top_k_retry = 0;
+     uint64_t gpu_distribution_rows = 0;
+     bool block_preview_enabled = [] {
+         const char * value = std::getenv("WILDLLAMA_MTP_BLOCK_PREVIEW");
+@@ -629,20 +628,9 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+     return common_sampler_clone_impl(gsmpl, true);
+ }
+ 
+-static common_sampler * common_sampler_block_preview(common_sampler * source, llama_context * ctx) {
++static common_sampler * common_sampler_block_preview(common_sampler * source) {
+     if (!source->block_preview) {
+         source->block_preview.reset(common_sampler_clone_impl(source, false));
+-        // Query the actual first effective stage once. The existing prefilter
+-        // contains just top-(k+1); applying it to an already sorted view only
+-        // sets its size. This also works when a caller supplies a custom chain.
+-        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+-        llama_sampler_ptr probe(llama_sampler_init_thinking_prefilter(source->chain, n_vocab));
+-        if (probe && n_vocab >= 4096) {
+-            llama_token_data dummy[128] = {};
+-            llama_token_data_array view = {dummy, 128, -1, true};
+-            llama_sampler_apply(probe.get(), &view);
+-            source->block_preview->block_raw_top_k = int(view.size) - 1;
+-        }
+     } else {
+         auto * preview = source->block_preview.get();
+         llama_sampler_copy(source->grmr, preview->grmr);
+@@ -826,6 +814,34 @@ static bool use_thinking_prefilter(common_sampler * sampler, llama_context * ctx
+     return true;
+ }
+ 
++// Keep the raw row for forced tokens, grammar retries and probability reports.
++static bool try_raw_top_k(common_sampler * sampler, llama_context * ctx, const llama_sampler_output & output,
++                          bool grammar_active) {
++    if (!output.raw_logits || output.sampled_logits || output.sampled_probs || grammar_active ||
++            sampler->params.n_probs != 0 || common_reasoning_budget_get_state(sampler->rbudget) == REASONING_BUDGET_FORCING) {
++        return false;
++    }
++    const int k = llama_sampler_leading_top_k(sampler->chain);
++    if (k <= 0 || k >= 128) { return false; }
++    if (sampler->raw_top_k_retry) {
++        --sampler->raw_top_k_retry;
++        return false;
++    }
++    const int n = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++    if (n < 4096) { return false; }
++    if (!common_mtp_raw_top_k(output.raw_logits, n, k, sampler->cur)) {
++        if (++sampler->raw_top_k_misses == 3) {
++            sampler->raw_top_k_misses = 0;
++            sampler->raw_top_k_retry = 16;
++        }
++        return false;
++    }
++    sampler->raw_top_k_misses = 0;
++    sampler->cur_p = {sampler->cur.data(), sampler->cur.size(), -1, true};
++    ++sampler->candidate_rows;
++    return true;
++}
++
+ static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first,
+         llama_sampler_output * deferred_backend = nullptr) {
+     grammar_first=grammar_first || gsmpl->params.grammar_first;
+@@ -908,7 +924,8 @@ static llama_token common_sampler_sample_synchronized(struct common_sampler * gs
+     }
+ 
+     flush_backend();
+-    if (!compact_thinking_candidates) {
++    if (!compact_thinking_candidates && !try_raw_top_k(gsmpl, ctx, output, grammar_should_apply(gsmpl) &&
++            !llama_sampler_grammar_awaiting_trigger(gsmpl->grmr))) {
+         gsmpl->set_logits(ctx, output);
+     }
+ 
+@@ -1077,27 +1094,7 @@ static void common_sampler_block_distribution(common_sampler * preview, llama_co
+     if (output.raw_logits) { output.sampled_logits = nullptr; output.sampled_probs = nullptr; output.candidates = nullptr; }
+     // Grammar and forced reasoning tokens can promote IDs outside top-k.
+     // Keep the full row available for both grammar-first and grammar-last.
+-    bool compact = false;
+-    if (preview->block_raw_top_k && !grammar_active && output.raw_logits &&
+-            common_reasoning_budget_get_state(preview->rbudget) != REASONING_BUDGET_FORCING) {
+-        if (preview->block_raw_retry) {
+-            --preview->block_raw_retry;
+-        } else {
+-            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+-            compact = common_mtp_raw_top_k(output.raw_logits, n_vocab, preview->block_raw_top_k, preview->cur);
+-            // Heavily tied rows should normally pay for just the reference path.
+-            if (compact) {
+-                preview->block_raw_misses = 0;
+-            } else if (++preview->block_raw_misses == 3) {
+-                preview->block_raw_misses = 0;
+-                preview->block_raw_retry = 16;
+-            }
+-        }
+-    }
+-    if (compact) {
+-        preview->cur_p = {preview->cur.data(), preview->cur.size(), -1, true};
+-        ++preview->candidate_rows;
+-    } else {
++    if (!try_raw_top_k(preview, ctx, output, grammar_active)) {
+         preview->set_logits(ctx, output);
+     }
+     auto & current = preview->cur_p;
+@@ -1233,7 +1230,7 @@ static std::vector<llama_token> common_sampler_verify_block(
+     const bool use_preview = sampler->block_preview_enabled && llama_sampler_can_preview_distribution(sampler->chain);
+     common_sampler_ptr legacy_preview;
+     if (!use_preview) { legacy_preview.reset(common_sampler_clone(sampler)); }
+-    auto * prefix_sampler = use_preview ? common_sampler_block_preview(sampler, ctx) : legacy_preview.get();
++    auto * prefix_sampler = use_preview ? common_sampler_block_preview(sampler) : legacy_preview.get();
+     auto rng = sampler->rng;
+     std::uniform_real_distribution<double> uniform(0.0, 1.0);
+     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index b232304..9ecbc28 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1666,29 +1666,26 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
+     );
+ }
+ 
+-llama_sampler * llama_sampler_init_thinking_prefilter(const llama_sampler * sampler, int32_t n_vocab) {
+-    if (!sampler || !llama_sampler_is_chain(sampler) || n_vocab > 262144) {
+-        return nullptr;
+-    }
+-    const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
+-    for (const auto & entry : chain->samplers) {
+-        if (entry.ptr->iface == &llama_sampler_empty_i) {
+-            continue;
+-        }
+-        // Any active sampler before top-k could change which candidates survive.
+-        if (entry.ptr->iface != &llama_sampler_top_k_i) {
+-            return nullptr;
+-        }
+-        const int32_t k = static_cast<const llama_sampler_top_k *>(entry.ptr->ctx)->k;
+-        if (k <= 0 || k >= 128 || k >= n_vocab) {
+-            return nullptr;
++int32_t llama_sampler_leading_top_k(const llama_sampler * sampler) {
++    if (sampler && llama_sampler_is_chain(sampler)) {
++        const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
++        for (const auto & entry : chain->samplers) {
++            if (entry.ptr->iface == &llama_sampler_empty_i) { continue; }
++            // Even a user-defined sampler with the name "top-k" can change scores.
++            return entry.ptr->iface == &llama_sampler_top_k_i ?
++                static_cast<const llama_sampler_top_k *>(entry.ptr->ctx)->k : 0;
+         }
+-        llama_sampler_ptr prefilter(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+-        llama_sampler_chain_add(prefilter.get(), llama_sampler_init_top_k(k + 1));
+-        static_cast<llama_sampler_chain *>(prefilter->ctx)->thinking_prefilter = true;
+-        return prefilter.release();
+     }
+-    return nullptr;
++    return 0;
++}
++
++llama_sampler * llama_sampler_init_thinking_prefilter(const llama_sampler * sampler, int32_t n_vocab) {
++    const int32_t k = llama_sampler_leading_top_k(sampler);
++    if (k <= 0 || k >= 128 || k >= n_vocab || n_vocab > 262144) { return nullptr; }
++    llama_sampler_ptr prefilter(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++    llama_sampler_chain_add(prefilter.get(), llama_sampler_init_top_k(k + 1));
++    static_cast<llama_sampler_chain *>(prefilter->ctx)->thinking_prefilter = true;
++    return prefilter.release();
+ }
+ 
+ bool llama_sampler_backend_thinking_prefilter(const llama_sampler * sampler) {
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+index 3338786..ea09227 100644
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -65,6 +65,7 @@ LLAMA_API bool llama_sampler_backend_set_selected_only(llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only(const llama_sampler * sampler);
+ LLAMA_API bool llama_sampler_backend_selected_only_ready(const llama_sampler * sampler);
+ // Stateless top-k+1 with raw logits retained for grammar and budget fallback.
++LLAMA_API int32_t llama_sampler_leading_top_k(const llama_sampler * chain);
+ LLAMA_API llama_sampler * llama_sampler_init_thinking_prefilter(const llama_sampler * chain, int32_t n_vocab);
+ LLAMA_API llama_sampler * llama_sampler_init_gpu_distribution(const llama_sampler * chain, int32_t n_vocab);
+ LLAMA_API bool llama_sampler_is_gpu_distribution(const llama_sampler * sampler);
+diff --git a/tests/test-mtp-raw-top-k.cpp b/tests/test-mtp-raw-top-k.cpp
+index 4af20ff..d77d4d3 100644
+--- a/tests/test-mtp-raw-top-k.cpp
++++ b/tests/test-mtp-raw-top-k.cpp
+@@ -1,5 +1,6 @@
+ #include "../common/mtp-raw-top-k.h"
+ #include "../src/llama-sampler.h"
++#include "llama-cpp.h"
+ 
+ #include <cstdio>
+ #include <cstdlib>
+@@ -13,9 +14,20 @@ static void check(bool ok) {
+     }
+ }
+ int main() {
++    auto * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
++    check(llama_sampler_leading_top_k(chain) == 0);
++    llama_sampler_chain_add(chain, llama_sampler_init_penalties(4096, 0, 1.f, 0.f, 0.f));
++    llama_sampler_chain_add(chain, llama_sampler_init_top_k(20));
++    check(llama_sampler_leading_top_k(chain) == 20);
++    llama_sampler_free(llama_sampler_chain_remove(chain, 1));
++    llama_sampler_chain_add(chain, llama_sampler_init_temp(.5f));
++    llama_sampler_chain_add(chain, llama_sampler_init_top_k(12));
++    check(llama_sampler_leading_top_k(chain) == 0);
++    llama_sampler_free(chain);
++
+     std::mt19937 rng(713);
+     std::vector<llama_token_data> got;
+-    for (int size : {4096, 248320}) {
++    for (int size : {4096, 4111, 248320}) {
+         std::vector<float> row(size);
+         std::iota(row.begin(), row.end(), float(-size / 2));
+         for (int round = 0; round < 4; ++round) {
+@@ -47,6 +59,16 @@ int main() {
+                 llama_sampler_chain_add(chain, llama_sampler_init_dist(42));
+                 llama_token_data_array full = {original.data(), original.size(), -1, false};
+                 llama_token_data_array compact = {got.data(), got.size(), -1, true};
++                // A fixed-seed draw through the normal sampler must also select the same token.
++                auto full_draw = original;
++                auto compact_draw = got;
++                llama_token_data_array a = {full_draw.data(), full_draw.size(), -1, false};
++                llama_token_data_array b = {compact_draw.data(), compact_draw.size(), -1, true};
++                llama_sampler_ptr twin(llama_sampler_clone(chain));
++                llama_sampler_apply(twin.get(), &a);
++                llama_sampler_apply(chain, &b);
++                check(a.selected >= 0 && b.selected >= 0 && a.data[a.selected].id == b.data[b.selected].id);
++
+                 check(llama_sampler_preview_distribution(chain, &full));
+                 check(llama_sampler_preview_distribution(chain, &compact));
+                 check(full.size == compact.size);
+@@ -65,12 +87,12 @@ int main() {
+         row.back() = float(size);
+         for (auto v : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                        -std::numeric_limits<float>::infinity()}) {
+-            row[0] = v;
+-            check(!common_mtp_raw_top_k(row.data(), size, 20, got));
+-            row[0] = 0;
+-            row[size / 2] = v;
+-            check(!common_mtp_raw_top_k(row.data(), size, 20, got));
+-            row[size / 2] = 0;
++            for (int pos : {0, 21, 22, 24, 29, 36, 37, size / 2, size - 1}) {
++                const float saved = row[pos];
++                row[pos] = v;
++                check(!common_mtp_raw_top_k(row.data(), size, 20, got));
++                row[pos] = saved;
++            }
+         }
+         check(!common_mtp_raw_top_k(row.data(), size, 128, got) && !common_mtp_raw_top_k(row.data(), size, 0, got));
+     }
