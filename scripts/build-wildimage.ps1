@@ -20,7 +20,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 . (Join-Path $PSScriptRoot 'cuda-toolkit.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
-$runtimeRevision = 'b9d7176-wildllama-h3-4'
+$runtimeRevision = 'b9d7176-wildllama-h3-5'
 $originalOutputEncoding = [Console]::OutputEncoding
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
@@ -51,6 +51,43 @@ function Assert-DataPath([string]$Value) {
 function Assert-Tool([string]$Value) {
     if (-not (Test-Path -LiteralPath $Value -PathType Leaf)) { throw "Required existing tool not found: $Value" }
     return $Value
+}
+
+# Later overlays may change the context of earlier ones. Verify those earlier
+# patches on private copies without reversing edits in the user's source tree.
+function Test-OverlaidPatch([string[]]$Patches) {
+    if ($Patches.Count -lt 2) { return $false }
+    $probe = Join-Path $temporaryDirectory ([guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $probe
+    try {
+        & git -C $probe init --quiet
+        if ($LASTEXITCODE) { return $false }
+        $stats = @(& git -C $SourceDirectory apply --numstat @Patches)
+        if ($LASTEXITCODE) { return $false }
+        foreach ($line in $stats) {
+            $name = ($line -split "`t", 3)[2]
+            if (-not $name -or $name -notmatch '^[\w./-]+$' -or $name -match '(^/|(^|/)\.\.(/|$))') { return $false }
+            $source = Join-Path $SourceDirectory $name
+            $copy = Join-Path $probe $name
+            if ((Test-Path -LiteralPath $source -PathType Leaf) -and !(Test-Path -LiteralPath $copy)) {
+                $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $copy))
+                [IO.File]::Copy($source, $copy)
+            }
+        }
+        for ($i = $Patches.Count - 1; $i -gt 0; $i--) {
+            & git -C $probe apply --reverse --check $Patches[$i] 2>$null
+            if (!$LASTEXITCODE) {
+                & git -C $probe apply --reverse $Patches[$i] 2>$null
+                if ($LASTEXITCODE) { return $false }
+            }
+        }
+        & git -C $probe apply --reverse --check $Patches[0] 2>$null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        if ((Resolve-Path -LiteralPath $probe).Path -eq $probe -and (Split-Path -Parent $probe) -eq $temporaryDirectory) {
+            [IO.Directory]::Delete($probe, $true)
+        }
+    }
 }
 
 function Invoke-Checked([string]$Executable, [string[]]$Arguments, [string]$Log) {
@@ -276,15 +313,19 @@ int main() {
         Copy-ReplacingFile $header (Join-Path $SourceDirectory $target)
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
-    foreach($patchName in @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch','0008-moss-edit.patch')) {
-        $patch = Join-Path $repository "third_party/wildimage/patches/$patchName"
+    $patches = @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch','0008-moss-edit.patch','0009-minimax-views-and-weight-io.patch','0010-lazy-graph-cut-planning.patch') | ForEach-Object { Join-Path $repository "third_party/wildimage/patches/$_" }
+    for ($i = 0; $i -lt $patches.Count; $i++) {
+        $patch = $patches[$i]
+        $patchName = [IO.Path]::GetFileName($patch)
         if(-not (Test-Path -LiteralPath $patch)) {throw "Native patch is absent: $patch"}
         & git -C $SourceDirectory apply --check $patch 2>$null
         if ($LASTEXITCODE -eq 0) {
             Invoke-Checked 'git' @('-C', $SourceDirectory, 'apply', $patch) (Join-Path $BuildDirectory ($patchName+'.log')) | Out-Null
         } else {
             & git -C $SourceDirectory apply --reverse --check $patch 2>$null
-            if ($LASTEXITCODE -ne 0) { throw "Native patch cannot be applied or verified as already applied: $patchName" }
+            if ($LASTEXITCODE -ne 0 -and !(Test-OverlaidPatch $patches[$i..($patches.Count - 1)])) {
+                throw "Native patch cannot be applied or verified as already applied: $patchName"
+            }
         }
         $sourceInputs += File-Record $patch "third_party/wildimage/patches/$patchName"
     }

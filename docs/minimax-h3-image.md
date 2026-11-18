@@ -44,6 +44,21 @@ their existing placement policy; recognition uses tensor signatures, not names.
 Tensor loading wakes its progress reporter on completion instead of paying a
 fixed polling delay for each small block.
 
+Inside the denoiser, modulation vectors are views into the current layer's
+projection. The image model's last transformer block keeps full attention over
+the prompt, references and target. After attention, only the target needs the
+output projection and feed-forward network. The PDD head also skips unit
+multiplications. These changes use the existing weights and six-step schedule
+and release components at the same stage boundaries.
+
+For independent named tensors in ordinary weight files, the native loader
+dispatches reads in file-offset order and reuses each worker's scratch space
+until the load ends. The reported `mean_step_seconds_after_first` in the native
+benchmark separates steady sampling from the first step's weight loading.
+The executor constructs a split plan when weights or workspace exceed the
+planning budget, or when multi-device layer placement needs it. Workspace
+admission and allocation use the executor's live measurements for each device.
+
 Use `scripts/benchmark-wildimage.py --segmented
 --minimax-attention-budget-mib 32` with a MiniMax profile to measure this path.
 The report separates device-wide VRAM from native-process RAM on Windows:

@@ -1,0 +1,159 @@
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -577,8 +577,16 @@
+                                                 projection,
+                                                 hidden_size * expand,
+                                                 timestep_rows * modalities);
+-        auto selected         = ggml_ext_slice(runner_ctx, reshaped, 1, row, row + 1);
+-        return ggml_ext_chunk(runner_ctx, selected, expand, 0);
++        // Each modulation channel occupies one contiguous vector in this row.
++        // Expose it directly instead of copying the row and each of its channels.
++        GGML_ASSERT(row >= 0 && row < reshaped->ne[1]);
++        std::vector<ggml_tensor*> channels;
++        channels.reserve(expand);
++        for (int i = 0; i < expand; ++i) {
++            const size_t offset = row * reshaped->nb[1] + i * hidden_size * reshaped->nb[0];
++            channels.push_back(ggml_view_1d(ctx, reshaped, hidden_size, offset));
++        }
++        return channels;
+     }
+ 
+     struct TransformerBlock : public GGMLBlock {
+@@ -609,7 +617,8 @@
+                              ggml_tensor* x,
+                              ggml_tensor* t_emb,
+                              const std::vector<TokenModulationSpan>& segments,
+-                             ggml_tensor* pe) {
++                             ggml_tensor* pe,
++                             size_t first_output) {
+             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
+             auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
+             auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
+@@ -632,14 +641,15 @@
+             });
+             auto attended = attn->attend(ctx, qkv, pe);
+             std::vector<ggml_tensor*> projections;
+-            for (const auto& segment : segments) {
++            for (size_t i = first_output; i < segments.size(); ++i) {
++                const auto& segment = segments[i];
+                 auto part = ggml_ext_slice(ctx, attended, 1, segment.start, segment.end, false);
+                 projections.push_back(attn->project_output(ctx, part));
+             }
+             ggml_tensor* output = nullptr;
+-            for (size_t i = 0; i < segments.size(); ++i) {
++            for (size_t i = first_output; i < segments.size(); ++i) {
+                 auto residual = ggml_add(ctx->ggml_ctx, inputs[i],
+-                                         ggml_mul(ctx->ggml_ctx, projections[i], rows[i][2]));
++                                         ggml_mul(ctx->ggml_ctx, projections[i - first_output], rows[i][2]));
+                 auto h        = modulate(norm2->forward(ctx, residual), rows[i], 3, 4);
+                 h             = ggml_add(ctx->ggml_ctx, residual, ggml_mul(ctx->ggml_ctx, mlp->forward(ctx, h), rows[i][5]));
+                 output        = output == nullptr ? h : ggml_concat(ctx->ggml_ctx, output, h, 1);
+@@ -712,11 +722,14 @@
+                 GGML_ASSERT(std::isfinite(sigma_next));
+                 auto weights      = pdd_head_weights(sigma, sigma_next);
+                 const int64_t dim = prediction->ne[0] / config.pdd_num_inference_steps;
+-                auto blended      = ggml_ext_scale(ctx, ggml_ext_slice(ctx, prediction, 0, 0, dim), weights[0]);
++                auto blended      = ggml_ext_slice(ctx, prediction, 0, 0, dim);  // The PDD base head always has unit weight.
+                 for (int64_t i = 1; i < config.pdd_num_inference_steps; ++i) {
+                     if (weights[i] != 0.f) {
+                         auto offset = ggml_ext_slice(ctx, prediction, 0, i * dim, (i + 1) * dim);
+-                        blended     = ggml_add(ctx->ggml_ctx, blended, ggml_ext_scale(ctx, offset, weights[i]));
++                        if (weights[i] != 1.f) {
++                            offset = ggml_ext_scale(ctx, offset, weights[i]);
++                        }
++                        blended = ggml_add(ctx->ggml_ctx, blended, offset);
+                     }
+                 }
+                 prediction = blended;
+@@ -954,17 +967,29 @@
+                                         curve_indices,
+                                         curve_upper_indices,
+                                         curve_fractions);
+-            auto pe    = build_rope(ctx, position_ids);
++            auto pe = build_rope(ctx, position_ids);
++            auto final_video = video_segment;
+             for (int64_t i = 0; i < config.num_layers; ++i) {
+                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
+-                h          = block->forward(ctx, h, t_emb, segments, pe);
++                // The image head only consumes the target span. The last block
++                // still attends to every token; operations after attention act
++                // independently on each segment and only the target is needed.
++                size_t first_output = 0;
++                if (i + 1 == config.num_layers && config.audio_latent_channels == 0 &&
++                    !segments.empty() && segments.back().start == video_segment.start &&
++                    segments.back().end == video_segment.end) {
++                    first_output = segments.size() - 1;
++                    final_video.end -= final_video.start;
++                    final_video.start = 0;
++                }
++                h = block->forward(ctx, h, t_emb, segments, pe, first_output);
+                 sd::ggml_graph_cut::mark_graph_cut(h,
+                                                    "minimax_h3.blocks." + std::to_string(i),
+                                                    "hidden_states");
+             }
+ 
+             auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
+-            auto output      = final_layer->forward(ctx, h, t_emb, video_segment, audio_segment, sigma, sigma_next);
++            auto output      = final_layer->forward(ctx, h, t_emb, final_video, audio_segment, sigma, sigma_next);
+             auto video_out   = DiT::unpatchify_3d(ctx,
+                                                   output.first,
+                                                   video->ne[2] / config.patch_t,
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -1164,6 +1164,12 @@
+         }
+         if (tensors_to_process.empty()) {
+             continue;
++        }
++        // Named inference destinations are independent. Dispatch reads in file
++        // order so workers do not seek back and forth between transformer layers.
++        if (target_tensor_names && !fdata.is_zip && !fdata.mmapped) {
++            std::sort(tensors_to_process.begin(), tensors_to_process.end(),
++                      [](const TensorStorage* a, const TensorStorage* b) { return a->offset < b->offset; });
+         }
+         if (log_progress) {
+             LOG_VERBOSE("loading %zu/%zu tensors from %s",
+@@ -1316,6 +1322,13 @@
+                         return true;
+                     };
+ 
++                    // Reads and conversions overwrite their whole byte range. Keep
++                    // the high-water size instead of zero-filling reused capacity.
++                    auto grow_scratch = [](auto& storage, size_t bytes) {
++                        if (bytes > storage.size()) {
++                            storage.resize(bytes);
++                        }
++                    };
+                     char* read_buf    = nullptr;
+                     char* target_buf  = nullptr;
+                     char* convert_buf = nullptr;
+@@ -1323,25 +1336,25 @@
+                         if (tensor_storage.type == dst_tensor->type) {
+                             GGML_ASSERT(ggml_nbytes(dst_tensor) == tensor_storage.nbytes());
+                             if (tensor_storage.is_f64 || tensor_storage.is_i64) {
+-                                read_buffer.resize(tensor_storage.nbytes_to_read());
++                                grow_scratch(read_buffer, tensor_storage.nbytes_to_read());
+                                 read_buf = (char*)read_buffer.data();
+                             } else {
+                                 read_buf = (char*)dst_tensor->data;
+                             }
+                             target_buf = (char*)dst_tensor->data;
+                         } else {
+-                            read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
++                            grow_scratch(read_buffer, std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
+                             read_buf    = (char*)read_buffer.data();
+                             target_buf  = read_buf;
+                             convert_buf = (char*)dst_tensor->data;
+                         }
+                     } else {
+-                        read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
++                        grow_scratch(read_buffer, std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
+                         read_buf   = (char*)read_buffer.data();
+                         target_buf = read_buf;
+ 
+                         if (tensor_storage.type != dst_tensor->type) {
+-                            convert_buffer.resize(ggml_nbytes(dst_tensor));
++                            grow_scratch(convert_buffer, ggml_nbytes(dst_tensor));
+                             convert_buf = (char*)convert_buffer.data();
+                         }
+                     }

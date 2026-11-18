@@ -35,6 +35,7 @@ NATIVE_TIMES = re.compile(
     r"(encode_first_stage|get_learned_condition|sampling|decode_first_stage) "
     r"completed, taking ([\d.]+)s", re.I
 )
+SAMPLER_TICK = re.compile(r"\|\s*(\d+)/(\d+)\s+-\s*[\d.]+\s*(?:s/it|it/s)\b")
 
 
 def absolute_path(value):
@@ -289,6 +290,7 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
     Path(env["CUDA_CACHE_PATH"]).mkdir(exist_ok=True)
     samples, memory_samples, errors, phases, native = [], [], [], [(0.0, "loading")], {}
     phase_cursor = 0
+    first_step_at = last_step_at = None
     cpu_seconds = None
     stop, timed_out = threading.Event(), threading.Event()
     start = time.perf_counter()
@@ -330,6 +332,13 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
                 marker = NATIVE_TIMES.search(line)
                 if marker:
                     native[marker.group(1).lower()] = float(marker.group(2))
+                if phases[-1][1] == "sampling":
+                    tick = SAMPLER_TICK.search(line)
+                    if tick and int(tick[2]) == profile["steps"]:
+                        if int(tick[1]) == 1 and first_step_at is None:
+                            first_step_at = elapsed
+                        elif int(tick[1]) == profile["steps"]:
+                            last_step_at = elapsed
             code = child.wait()
             elapsed = time.perf_counter() - start
             if os.name == "nt":
@@ -354,6 +363,11 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
         "command": command, "seconds": round(elapsed, 4), "exit_code": code,
         "timed_out": timed_out.is_set(), "log": str(directory / "runner.log"),
         "wall_phase_seconds": phase_times, "native_phase_seconds": native,
+        # The first step may include loading the entire denoiser from disk.
+        "mean_step_seconds_after_first": (
+            round((last_step_at - first_step_at) / (profile["steps"] - 1), 5)
+            if first_step_at is not None and last_step_at is not None and profile["steps"] > 1 else None
+        ),
         "gpu": gpu_summary(initial, samples, phases, errors),
         "memory": memory_summary(memory_samples, phases),
         "cpu_seconds": None if cpu_seconds is None else round(cpu_seconds, 4),
