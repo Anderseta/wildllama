@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
@@ -254,22 +255,33 @@ func ValidateProfile(p Profile) error {
 }
 
 func ValidateRequest(p Profile, r Request) error {
+	_, _, err := prepareImageRequest(p, r)
+	return err
+}
+
+func prepareImageRequest(p Profile, r Request) (Profile, *image.Gray, error) {
+	var mask *image.Gray
+	var err error
 	if r.Inpaint != nil {
 		if len(r.ReferenceImages) == 0 {
-			return errors.New("inpaint requires a reference")
+			return p, nil, errors.New("inpaint requires a reference")
 		}
-		if err := r.Inpaint.Validate(); err != nil {
-			return err
+		mask, err = r.Inpaint.bitmap()
+		if err != nil {
+			return p, nil, err
 		}
 	}
 	if r.CPUOnly && !p.OffloadToCPU {
-		return errors.New("CPU image admission requires enabled RAM offload")
+		return p, nil, errors.New("CPU image admission requires enabled RAM offload")
 	}
-	var err error
 	p, err = ResolveProfileDimensions(p, r)
 	if err != nil {
-		return err
+		return p, nil, err
 	}
+	return p, mask, validateImageInputs(p, r)
+}
+
+func validateImageInputs(p Profile, r Request) error {
 	if err := ValidateProfile(p); err != nil {
 		return err
 	}
@@ -454,11 +466,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if p.UsesMOSSEdit() && len(r.ReferenceImages) > 0 && !runnerStatus.MOSSEditSupported {
 		return Result{}, errors.New("the image runner does not support MOSS edits")
 	}
-	if err := ValidateRequest(p, r); err != nil {
-		return Result{}, err
-	}
-	var err error
-	p, err = ResolveProfileDimensions(p, r)
+	p, mask, err := prepareImageRequest(p, r)
 	if err != nil {
 		return Result{}, err
 	}
@@ -532,7 +540,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	defer os.RemoveAll(jobDir)
 	finalPath := output
 	if r.Inpaint != nil {
-		if err := r.Inpaint.writeMask(jobDir, p.Width, p.Height); err != nil {
+		if err := writeInpaintMask(mask, jobDir, p.Width, p.Height); err != nil {
 			return Result{}, err
 		}
 		output = filepath.Join(jobDir, "generated.png")
@@ -568,7 +576,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		log.emit(Progress{Phase: "ram_offload", Message: "Reutilizando a execução em GPU com apoio da RAM, validada neste lote."}, true)
 	}
 	var runErr error
-	outputValidated := false
+	var decoded image.Image
 	eagerCUDA := false
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
@@ -587,8 +595,8 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if !retryCUDA && !retryMemory {
 			break
 		}
-		outputValidated = validateOutputPNG(output, p.Width, p.Height) == nil
-		if outputValidated {
+		decoded, _ = decodeOutputPNG(output, p.Width, p.Height)
+		if decoded != nil {
 			break
 		}
 		// The failed process and its CPU/GPU resources have been fully closed.
@@ -618,21 +626,23 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	} else if err != nil {
 		runErr = err
 	}
-	if !outputValidated {
+	if decoded == nil {
 		log.emit(Progress{Phase: "validating_output", Message: "Verificando o PNG salvo"}, true)
-		if err := validateOutputPNG(output, p.Width, p.Height); err != nil {
+		var decodeErr error
+		decoded, decodeErr = decodeOutputPNG(output, p.Width, p.Height)
+		if decodeErr != nil {
 			_ = os.Remove(output)
 			if runErr != nil {
 				return Result{}, runErr
 			}
-			return Result{}, fmt.Errorf("runner did not produce a complete PNG with the requested dimensions: %w", err)
+			return Result{}, fmt.Errorf("runner did not produce a complete PNG with the requested dimensions: %w", decodeErr)
 		}
 	}
 	if r.Inpaint != nil {
 		if runErr != nil {
 			return Result{}, runErr
 		}
-		size, err := r.Inpaint.compose(ctx, r.ReferenceImages[0], output, finalPath)
+		size, err := composeInpaint(ctx, mask, r.ReferenceImages[0], decoded, finalPath)
 		if err != nil {
 			return Result{}, err
 		}

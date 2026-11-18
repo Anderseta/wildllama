@@ -343,8 +343,6 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 			}
 		}
 		if !allDone() {
-			slog.Debug("unable to refresh all GPUs with existing runners, performing bootstrap discovery")
-
 			// Bootstrapping may take longer in some cases (AMD windows), but we
 			// would rather use stale free data to get the model running sooner
 			rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -354,6 +352,10 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 			// and keep remapped IDs aligned.
 			devFilter := ml.GetDevicesEnv(devices)
 
+			if refreshCUDAMemory(rctx, devices, updated, devFilter) {
+				return append([]ml.DeviceInfo{}, devices...)
+			}
+			slog.Debug("refreshing outstanding GPU memory with full device discovery")
 			for dir := range libDirs {
 				updatedDevices := bootstrapDevicesWithMetalRetry(rctx, ctx, 3*time.Second, []string{ml.LibOllamaPath, dir}, devFilter)
 				for _, u := range updatedDevices {
@@ -382,6 +384,9 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 func sameRefreshDevice(updated, existing ml.DeviceInfo) bool {
 	if updated.Library != existing.Library {
 		return false
+	}
+	if updated.PhysicalUUID != "" && existing.PhysicalUUID != "" {
+		return strings.EqualFold(updated.PhysicalUUID, existing.PhysicalUUID)
 	}
 	if updated.PCIID != "" && existing.PCIID != "" {
 		return strings.EqualFold(updated.PCIID, existing.PCIID)

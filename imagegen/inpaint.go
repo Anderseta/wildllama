@@ -54,11 +54,7 @@ func (m *InpaintMask) bitmap() (*image.Gray, error) {
 	return mask, nil
 }
 func (m *InpaintMask) Validate() error { _, err := m.bitmap(); return err }
-func (m *InpaintMask) writeMask(dir string, w, h int) error {
-	mask, err := m.bitmap()
-	if err != nil {
-		return err
-	}
+func writeInpaintMask(mask *image.Gray, dir string, w, h int) error {
 	scaled := image.NewGray(image.Rect(0, 0, w, h))
 	xdraw.NearestNeighbor.Scale(scaled, scaled.Bounds(), mask, mask.Bounds(), draw.Src, nil)
 	f, err := os.Create(filepath.Join(dir, "mask.png"))
@@ -76,17 +72,16 @@ func readInpaintImage(path string) (image.Image, error) {
 	img, _, err := image.Decode(f)
 	return img, err
 }
-func (m *InpaintMask) compose(ctx context.Context, reference, generated, output string) (image.Point, error) {
+
+// maskEdge returns the first output pixel whose center maps to this mask
+// column (or row). A half-pixel tie belongs to the following mask cell.
+func maskEdge(cell, cells, pixels int) int {
+	return int((2*int64(cell)*int64(pixels) + int64(cells) - 1) / (2 * int64(cells)))
+}
+
+func composeInpaint(ctx context.Context, mask *image.Gray, reference string, edited image.Image, output string) (image.Point, error) {
 	var zero image.Point
-	mask, err := m.bitmap()
-	if err != nil {
-		return zero, err
-	}
 	original, err := readInpaintImage(reference)
-	if err != nil {
-		return zero, err
-	}
-	edited, err := readInpaintImage(generated)
 	if err != nil {
 		return zero, err
 	}
@@ -110,28 +105,8 @@ func (m *InpaintMask) compose(ctx context.Context, reference, generated, output 
 		}
 		draw.Draw(dst, b, original, b.Min, draw.Src)
 	}
-	if edited.Bounds() != b {
-		scaled := image.NewNRGBA(b)
-		xdraw.BiLinear.Scale(scaled, b, edited, edited.Bounds(), draw.Src, nil)
-		edited = scaled
-	}
-	for y := 0; y < b.Dy(); y++ {
-		if err = ctx.Err(); err != nil {
-			return zero, err
-		}
-		my := (2*y + 1) * mask.Rect.Dy() / (2 * b.Dy())
-		row := mask.Pix[my*mask.Stride:]
-		start := 0
-		for x := 0; x <= b.Dx(); x++ {
-			if x < b.Dx() && row[(2*x+1)*mask.Rect.Dx()/(2*b.Dx())] != 0 {
-				continue
-			}
-			if start < x {
-				rect := image.Rect(start, y, x, y+1).Add(b.Min)
-				draw.Draw(dst, rect, edited, rect.Min, draw.Src)
-			}
-			start = x + 1
-		}
+	if err := overlayInpaint(ctx, dst, edited, mask); err != nil {
+		return zero, err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(output), ".inpaint-*.png")
 	if err != nil {
@@ -148,4 +123,58 @@ func (m *InpaintMask) compose(ctx context.Context, reference, generated, output 
 		return zero, err
 	}
 	return b.Size(), nil
+}
+
+// Keep the full bilinear coordinate transform. Restrict the destination
+// allocation and writes to the bounding rectangle of the selected mask cells.
+func overlayInpaint(ctx context.Context, dst draw.Image, edited image.Image, mask *image.Gray) error {
+	b := dst.Bounds()
+	mw, mh := mask.Bounds().Dx(), mask.Bounds().Dy()
+	region := image.Rectangle{}
+	if edited.Bounds() != b {
+		for y := 0; y < mh; y++ {
+			row := mask.Pix[y*mask.Stride : y*mask.Stride+mw]
+			x := bytes.IndexByte(row, 255)
+			if x >= 0 {
+				region = region.Union(image.Rect(x, y, bytes.LastIndexByte(row, 255)+1, y+1))
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rect := image.Rect(maskEdge(region.Min.X, mw, b.Dx()), maskEdge(region.Min.Y, mh, b.Dy()), maskEdge(region.Max.X, mw, b.Dx()), maskEdge(region.Max.Y, mh, b.Dy())).Add(b.Min)
+		if rect.Empty() {
+			return nil
+		}
+		scaled := image.NewNRGBA(rect)
+		xdraw.BiLinear.Scale(scaled, b, edited, edited.Bounds(), draw.Src, nil)
+		edited = scaled
+	} else {
+		region = image.Rect(0, 0, mw, mh)
+	}
+	for y := region.Min.Y; y < region.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		y0, y1 := maskEdge(y, mh, b.Dy()), maskEdge(y+1, mh, b.Dy())
+		if y0 == y1 {
+			continue
+		}
+		row := mask.Pix[y*mask.Stride : y*mask.Stride+region.Max.X]
+		for x := region.Min.X; x < len(row); {
+			offset := bytes.IndexByte(row[x:], 255)
+			if offset < 0 {
+				break
+			}
+			x += offset
+			end := len(row)
+			if gap := bytes.IndexByte(row[x:], 0); gap >= 0 {
+				end = x + gap
+			}
+			rect := image.Rect(maskEdge(x, mw, b.Dx()), y0, maskEdge(end, mw, b.Dx()), y1).Add(b.Min)
+			draw.Draw(dst, rect, edited, rect.Min, draw.Src)
+			x = end
+		}
+	}
+	return ctx.Err()
 }

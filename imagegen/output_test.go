@@ -15,6 +15,11 @@ import (
 	"time"
 )
 
+func validateOutputPNG(path string, w, h int) error {
+	_, err := decodeOutputPNG(path, w, h)
+	return err
+}
+
 func TestOutputPNGRejectsTruncationAndCorruption(t *testing.T) {
 	var encoded bytes.Buffer
 	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 64, 64))); err != nil {

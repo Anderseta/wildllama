@@ -36,6 +36,7 @@ type nativeProbeDevice struct {
 	IntegratedKnown     bool                   `json:"integrated_known"`
 	TotalMemory         uint64                 `json:"total_memory,omitempty"`
 	FreeMemory          uint64                 `json:"free_memory,omitempty"`
+	MemoryReported      bool                   `json:"memory_reported,omitempty"` // GGML queried free memory, including a real zero.
 	ComputeMajor        int                    `json:"compute_major,omitempty"`
 	ComputeMinor        int                    `json:"compute_minor,omitempty"`
 	CUDADriverMajor     int                    `json:"cuda_driver_major,omitempty"`

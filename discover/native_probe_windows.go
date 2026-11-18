@@ -127,8 +127,9 @@ func probeGGMLDevicesWindows(libDirs []string) ([]nativeProbeDevice, error) {
 				Integrated:          ggmlDeviceTypeIntegrated(props.Type),
 				IntegratedKnown: props.Type == ggmlBackendDeviceTypeGPU ||
 					props.Type == ggmlBackendDeviceTypeIGPU,
-				TotalMemory: uint64(props.MemoryTotal),
-				FreeMemory:  uint64(props.MemoryFree),
+				TotalMemory:    uint64(props.MemoryTotal),
+				FreeMemory:     uint64(props.MemoryFree),
+				MemoryReported: true,
 			})
 			slog.Debug("GGML GPU device type", "library", library, "index", i, "ggml_type", props.Type, "integrated", ggmlDeviceTypeIntegrated(props.Type))
 		}
