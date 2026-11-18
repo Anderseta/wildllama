@@ -87,3 +87,28 @@ and compact recurrent verification. They do not incorporate a trained external
 draft model, a packed asynchronous NanoSpec cache, a fully device-resident p/q
 verifier or a tree/WY decoder. Experimental fused normalization and static GDN
 unrolling that regressed local measurements are excluded from the runtime.
+
+## Adaptive four-token MTP and code editing
+
+With a single compatible MTP slot, set `draft_num_predict` to 4 and
+`speculative_adaptive` to true to compare two and four proposals within each
+request. The controller starts at two and measures elapsed time per committed
+token, including rejected drafts and rollback. It briefly probes the other
+depth throughout generation and switches when the measured cost is at least
+5% lower. Evidence is kept separately for different context lengths. The
+server checks rollback support and the available rollback depth before using
+this policy. With `WILDLLAMA_CUDA_SYNC_TRACE=1`, the end-of-request log
+includes the number of measured rounds at each depth.
+
+For single-slot Qwen35 MTP on SM120 with Q8_0 KV and the adaptive four-token
+profile, the launcher also enables these native runner options:
+
+| Runner environment option | Effect |
+| --- | --- |
+| `WILDLLAMA_MTP_EDIT_LOOKUP` | Matches six confirmed tokens against the last 32,768 text prompt tokens and proposes a matching continuation. The target verifies each proposed token with its actual deterministic proposal probability. Cost is up to 144 KiB of host index and token storage per eligible slot. |
+| `WILDLLAMA_MTP_REUSE_TARGET_FENCE` | Reuses an immediately preceding target synchronization when the MTP consumer reads already-ready host embeddings. Other backends and state layouts retain their required waits. |
+
+Both accept an explicit runner override of `0`. The target weights, logits
+and sampling settings stay in use. With stochastic sampling, different
+proposal sequences can consume random draws in a different order. Peak VRAM
+also depends on the configured maximum rollback depth.

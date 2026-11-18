@@ -540,8 +540,14 @@ func setCUDAKernelDefaults(environment map[string]string, launch llamaServerLaun
 	if draftType == draftTypeMTP && launch.opts.DraftNumPredict > 0 {
 		defaults = append(defaults, "WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP",
 			"WILDLLAMA_CUDA_GDN_GATHER", "WILDLLAMA_GDN_REUSE_REPLAY")
-		if launch.numParallel == 1 && launch.modelArch == "qwen35" && launch.kvCacheType == "q8_0" && launch.opts.DraftNumPredict == 2 {
-			defaults = append(defaults, "WILDLLAMA_CUDA_TARGET_BLOCKING", "WILDLLAMA_CUDA_PREFILL_BLOCKING", "WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING")
+		if launch.numParallel == 1 && launch.modelArch == "qwen35" && launch.kvCacheType == "q8_0" {
+			adaptiveFour := launch.opts.DraftNumPredict == 4 && launch.opts.SpeculativeAdaptive != nil && *launch.opts.SpeculativeAdaptive
+			if launch.opts.DraftNumPredict == 2 || adaptiveFour {
+				defaults = append(defaults, "WILDLLAMA_CUDA_TARGET_BLOCKING", "WILDLLAMA_CUDA_PREFILL_BLOCKING", "WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING")
+			}
+			if adaptiveFour {
+				defaults = append(defaults, "WILDLLAMA_MTP_EDIT_LOOKUP", "WILDLLAMA_MTP_REUSE_TARGET_FENCE")
+			}
 		}
 	}
 	for _, name := range defaults {

@@ -1322,8 +1322,9 @@ func TestCUDAKernelDefaults(t *testing.T) {
 	const fastSign = "WILDLLAMA_CUDA_IQ3_FAST_SIGN"
 	const replay = "WILDLLAMA_GDN_REUSE_REPLAY"
 	waits := []string{"WILDLLAMA_CUDA_TARGET_BLOCKING", "WILDLLAMA_CUDA_PREFILL_BLOCKING", "WILDLLAMA_CUDA_DRAFT_OUTPUT_BLOCKING"}
+	edit := []string{"WILDLLAMA_MTP_EDIT_LOOKUP", "WILDLLAMA_MTP_REUSE_TARGET_FENCE"}
 	names := []string{"WILDLLAMA_CUDA_GQA_Q8_VERIFY", "GGML_CUDA_Q4_HEAD_WARP", "WILDLLAMA_CUDA_GDN_GATHER", fastSign, replay}
-	for _, name := range slices.Concat(names, waits) {
+	for _, name := range slices.Concat(names, waits, edit) {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -1342,6 +1343,23 @@ func TestCUDAKernelDefaults(t *testing.T) {
 	for _, name := range slices.Concat(names, waits) {
 		if environment[name] != "1" {
 			t.Fatalf("missing default for %s", name)
+		}
+	}
+	for _, adaptive := range []bool{false, true} {
+		four := launch
+		four.opts.DraftNumPredict = 4
+		four.opts.SpeculativeAdaptive = &adaptive
+		env := map[string]string{}
+		setCUDAKernelDefaults(env, four)
+		for _, key := range slices.Concat(waits, edit) {
+			if (env[key] == "1") != adaptive {
+				t.Fatalf("four proposals, adaptive=%t: %s=%q", adaptive, key, env[key])
+			}
+		}
+		env = map[string]string{edit[0]: "0", edit[1]: "0"}
+		setCUDAKernelDefaults(env, four)
+		if env[edit[0]] != "0" || env[edit[1]] != "0" {
+			t.Fatal("runner overrides must survive adaptive defaults")
 		}
 	}
 	t.Setenv(names[0], "0")

@@ -1,0 +1,419 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 684390c..87bbe91 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/common/mtp-edit-lookup.h b/common/mtp-edit-lookup.h
+new file mode 100644
+index 0000000..91f19e9
+--- /dev/null
++++ b/common/mtp-edit-lookup.h
+@@ -0,0 +1,51 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// Immutable, request-local source. A collision can only miss an opportunity:
++// check every anchor token before using its continuation as a draft.
++class common_mtp_edit_lookup {
++    using tokens = std::vector<int32_t>;
++    static constexpr size_t anchor = 6;
++    static constexpr size_t slots = 8192;
++    static constexpr size_t limit = 32768;
++    std::vector<uint16_t> offsets;
++    tokens source;
++
++    template<class At> static size_t bucket(At at) {
++        uint32_t hash = 2166136261u;
++        for (size_t i = 0; i < anchor; ++i) { hash = (hash ^ uint32_t(at(i))) * 16777619u; }
++        return hash % slots;
++    }
++
++public:
++    void begin(const tokens & prompt) {
++        offsets.clear();
++        source.clear();
++        if (prompt.size() < anchor + 2) { return; }
++        const size_t count = std::min(limit, prompt.size());
++        source.assign(prompt.end() - count, prompt.end());
++        offsets.assign(slots, 0);
++        for (size_t end = anchor; end + 2 <= count; ++end) {
++            offsets[bucket([&](size_t i) { return source[end - anchor + i]; })] = uint16_t(end);
++        }
++    }
++
++    bool propose(const tokens & history, int32_t last, size_t maximum, tokens & result) const {
++        if (maximum < 2 || offsets.empty() || history.size() < anchor - 1 || !result.empty()) { return false; }
++        const auto at = [&](size_t i) {
++            return i == anchor - 1 ? last : history[history.size() - (anchor - 1) + i];
++        };
++        const size_t end = offsets[bucket(at)];
++        if (end == 0) { return false; }
++        for (size_t i = 0; i < anchor; ++i) {
++            if (source[end - anchor + i] != at(i)) { return false; }
++        }
++        const size_t count = std::min(maximum, source.size() - end);
++        result.assign(source.begin() + end, source.begin() + end + count);
++        return true;
++    }
++};
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 6fd1f95..7e4f2ac 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,4 +1,5 @@
+ #include "speculative.h"
++#include "mtp-edit-lookup.h"
+ #include "mtp-state.h"
+ #include "mtp-device-state.h"
+ #include "speculative-input.h"
+@@ -1570,6 +1571,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     int32_t draft_vocab_size = 0;
+     bool draft_vocab_active = false;
+     bool draft_vocab_contextual = false;
++    std::unique_ptr<common_mtp_edit_lookup> edit_lookup;
++    uint64_t edit_rounds = 0;
+     bool tune_proposals = false;
+     std::vector<common_mtp_proposal_policy> proposal_policy;
+     std::vector<common_mtp_proposal_feedback> proposal_feedback;
+@@ -1734,6 +1737,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+ 
+ 
++        const char * edit = std::getenv("WILDLLAMA_MTP_EDIT_LOOKUP");
++        if (edit && std::strcmp(edit, "1") == 0 && n_seq == 1 && !chain_heads && !is_mem_shared &&
++                this->params.n_min <= 1 && this->params.n_max >= 2 && !tune_proposals && !draft_vocab_active) {
++            edit_lookup = std::make_unique<common_mtp_edit_lookup>();
++        }
+         state.assign(n_seq, common_mtp_state(uint32_t(n_embd)));
+         const char * selective_catchup = std::getenv("WILDLLAMA_MTP_SELECTIVE_CATCHUP");
+         selective_catchup_enabled = selective_catchup && std::strcmp(selective_catchup, "1") == 0 &&
+@@ -1769,6 +1777,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+     ~common_speculative_impl_draft_mtp() override {
+         auto * ctx_dft = this->params.ctx_dft;
++        if (edit_rounds) { SPC_INF("MTP edit lookup supplied %llu draft blocks\n", (unsigned long long) edit_rounds); }
+         if (ctx_dft && draft_vocab_size) { llama_set_mtp_draft_vocab(ctx_dft, 0); }
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+@@ -1789,6 +1798,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        if (edit_lookup) { edit_lookup->begin(prompt); }
+         if (tune_proposals) { proposal_policy[seq_id] = {}; proposal_feedback[seq_id] = {}; }
+         if (draft_vocab_size && seq_id == 0) {
+             draft_vocab_active = llama_set_mtp_draft_vocab(params.ctx_dft, draft_vocab_size);
+@@ -1841,7 +1851,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         return process_prefix(batch_in, batch_in.size());
+     }
+ 
+-    bool process_prefix(const common_batch & batch_in, int32_t n_tokens) {
++    bool process_prefix(const common_batch & batch_in, int32_t n_tokens, bool target_ready = false) {
+         GGML_ASSERT(n_tokens >= 0 && n_tokens <= batch_in.size());
+         if (n_tokens == 0) {
+             return true;
+@@ -1914,7 +1924,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // The constructor configures unmasked nextn output: all raw target
+         // rows are dense. Synchronize/reorder once, then keep this target-owned
+         // host view while the separate draft context performs catch-up.
+-        const float * h_tgt = device_state_enabled ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
++        const float * h_tgt = device_state_enabled ? nullptr :
++                (target_ready ? llama_get_embeddings_nextn_synchronized(ctx_tgt) : llama_get_embeddings_nextn(ctx_tgt));
+         if ((!device_state_enabled && !h_tgt) || uint64_t(n_tokens) > llama_n_batch(ctx_tgt)) {
+             SPC_ERR("invalid target nextn rows for MTP catch-up: %d\n", n_tokens);
+             return false;
+@@ -2039,6 +2050,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 continue;
+             }
+ 
++            if (edit_lookup && dp.edit_history && edit_lookup->propose(*dp.edit_history, dp.id_last,
++                    common_speculative_draft_limit(params.n_max, dp.n_max), *dp.result)) {
++                auto & result = *dp.result;
++                const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
++                result.erase(std::find_if(result.begin(), result.end(), [&](llama_token id) {
++                    return id < 0 || llama_vocab_is_control(vocab, id) || llama_vocab_is_eog(vocab, id);
++                }), result.end());
++                if (result.size() >= 2) {
++                    if (dp.result_q) {
++                        // The proposal is deterministic. The target verifier needs its actual q.
++                        for (const auto id : result) { dp.result_q->push_back({{id, 0.f, 1.f}}); }
++                    }
++                    ++edit_rounds;
++                    continue;
++                }
++                result.clear();
++            }
+             n_drafting++;
+             drafting[seq_id] = true;
+             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
+@@ -3372,6 +3400,29 @@ static common_speculative_impl_draft_mtp * common_speculative_single_mtp(const c
+     return static_cast<common_speculative_impl_draft_mtp *>(spec->impls.front().get());
+ }
+ 
++bool common_speculative_is_single_mtp(const common_speculative * spec) {
++    return common_speculative_single_mtp(spec) != nullptr;
++}
++
++bool common_speculative_uses_edit_lookup(const common_speculative * spec) {
++    const auto * mtp = common_speculative_single_mtp(spec);
++    return mtp && mtp->edit_lookup && spec->synth_probs.empty();
++}
++
++bool common_speculative_process_after_forward(common_speculative * spec, const common_batch & batch, llama_context * fenced) {
++    auto * mtp = common_speculative_single_mtp(spec);
++    // Only the host-row path may borrow the proof of completion. Switching from
++    // device rows can materialize new state and must use the ordinary fence.
++    static const bool reuse = [] {
++        const char * option = std::getenv("WILDLLAMA_MTP_REUSE_TARGET_FENCE");
++        return option && std::strcmp(option, "1") == 0;
++    }();
++    if (reuse && mtp && fenced && fenced == mtp->params.ctx_tgt && !mtp->device_state_enabled) {
++        return mtp->process_prefix(batch, batch.size(), true);
++    }
++    return common_speculative_process(spec, batch);
++}
++
+ bool common_speculative_mtp_can_defer_catchup(const common_speculative * spec, const common_batch & batch) {
+     const auto * mtp = common_speculative_single_mtp(spec);
+     return mtp && mtp->can_defer_catchup(batch);
+diff --git a/common/speculative.h b/common/speculative.h
+index 6fb3bde..59596e8 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -111,6 +111,8 @@ struct common_speculative_draft_params {
+     float    temp = 1.0f;
+     uint32_t seed = LLAMA_DEFAULT_SEED;
+     common_mtp_proposal_feedback * proposal_feedback = nullptr;
++    // Borrowed only for this draft call; media and other proposers never use it.
++    const llama_tokens * edit_history = nullptr;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+@@ -120,6 +122,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+ 
+ // process the batch and update the internal state of the speculative context
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch);
++// fenced is the target just synchronized by the submitting server thread, or null.
++bool common_speculative_process_after_forward(common_speculative * spec, const common_batch & batch, llama_context * fenced);
++bool common_speculative_is_single_mtp(const common_speculative * spec);
++bool common_speculative_uses_edit_lookup(const common_speculative * spec);
+ 
+ // Single-head MTP may wait until verification selects the committed prefix.
+ // The caller must keep the target output rows available until prefix processing.
+diff --git a/tests/test-server-mtp-depth.cpp b/tests/test-server-mtp-depth.cpp
+index ac1be5a..a0700e9 100644
+--- a/tests/test-server-mtp-depth.cpp
++++ b/tests/test-server-mtp-depth.cpp
+@@ -1,3 +1,4 @@
++#include "../common/mtp-edit-lookup.h"
+ #include "../tools/server/server-mtp-depth.h"
+ 
+ #include <cstdio>
+@@ -34,7 +35,7 @@ int main() {
+     }
+     check(depth.choose(800, 2) == 2, "periodic probes failed to recover a faster depth");
+     check(depth.choose(800, 1) <= 1, "lowered ceiling was ignored");
+-    check(depth.choose(800, 4) == 0, "unsupported depth was admitted");
++    check(depth.choose(800, 5) == 0, "unsupported depth was admitted");
+ 
+     server_mtp_depth third;
+     for (int round = 0; round < 24; ++round) {
+@@ -43,5 +44,31 @@ int main() {
+         third.observe(10, uint64_t(proposal_limit + 1));
+     }
+     check(third.choose(32000, 3) == 3, "fast third proposal was not selected");
++    server_mtp_depth pair;
++    for (int phase = 0; phase < 2; ++phase) {
++        int faster_late = 0;
++        const int faster = phase == 0 ? 4 : 2;
++        for (int round = 0; round < 512; ++round) {
++            const int selected = pair.choose(4096, 4);
++            check(selected == 2 || selected == 4, "four-wide probing exceeded selected arms");
++            check(phase || round || selected == 2, "four-wide controller did not start at two");
++            const uint64_t committed = selected == 2 ? 2 : 3;
++            pair.observe((selected == faster ? 10.0 : 16.0) * committed, committed);
++            if (round >= 400 && selected == faster) { ++faster_late; }
++        }
++        check(faster_late >= 85, "controller did not follow workload change");
++    }
++
++    common_mtp_edit_lookup lookup;
++    std::vector<int32_t> source = {10,11,12,13,14,15,16,17,18,19};
++    std::vector<int32_t> history = {90,91,10,11,12,13,14};
++    std::vector<int32_t> result;
++    lookup.begin(source);
++    check(lookup.propose(history,15,2,result) && result == std::vector<int32_t>({16,17}), "wrong source span");
++    result.clear();
++    check(!lookup.propose(history,99,4,result), "nonmatching suffix used");
++    check(!lookup.propose(history,15,1,result), "single-token ceiling ignored");
++    lookup.begin({});
++    check(!lookup.propose(history,15,2,result), "prompt crossed requests");
+     std::puts("PASS adaptive MTP depth: request ceiling, cost, context isolation and recovery");
+ }
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 74e3898..fabcc05 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -231,6 +231,7 @@ public:
+ 
+     // for compatibility with speculative decoding, ctx shift
+     const llama_tokens & get_tokens() const;
++    const llama_tokens * text_view() const { return has_media() ? nullptr : &tokens; }
+ 
+     llama_tokens get_text_tokens() const;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 49a5a92..407da5e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -766,6 +766,11 @@ struct server_slot {
+ 
+             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+ 
++            const auto & measured = spec_control.mtp_depth.pair_rounds();
++            if ((measured[0] || measured[1]) && std::getenv("WILDLLAMA_CUDA_SYNC_TRACE")) {
++                SLT_INF(*this, "MTP adaptive rounds: two=%llu four=%llu\n",
++                    (unsigned long long) measured[0], (unsigned long long) measured[1]);
++            }
+             t_last_used = ggml_time_us();
+ 
+             state = SLOT_STATE_IDLE;
+@@ -2217,14 +2222,13 @@ private:
+         if (slot.spec_control.enabled && slot.can_speculate()) {
+             // Short probes can lose solely to fixed recurrent-checkpoint costs.
+             slot.spec_control.ceiling = std::max(1, common_speculative_n_max(slot.spec));
+-            const auto & types = params_base.speculative.types;
+             const auto depth = slot.spec_control.ceiling;
+             const auto can_rollback = [depth](llama_context * ctx, common_context_seq_rm_type type) {
+                 return ctx && (type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                         (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx) >= uint32_t(depth)));
+             };
+-            slot.spec_control.short_mtp = slots.size() == 1 && depth <= 3 && types.size() == 1 &&
+-                types.front() == COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
++            slot.spec_control.short_mtp = slots.size() == 1 && depth <= 4 &&
++                common_speculative_is_single_mtp(slot.spec) &&
+                 params_base.speculative.draft.n_min <= 1 && !decode_overlap_enabled &&
+                 common_speculative_get_synth_probs(slot.spec).empty() &&
+                 can_rollback(ctx_tgt, ctx_tgt_seq_rm_type) && can_rollback(ctx_dft, ctx_dft_seq_rm_type);
+@@ -4333,6 +4337,9 @@ private:
+                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                             /* .temp     = */ slot.task->params.sampling.temp,
+                             /* .seed     = */ slot.task->params.sampling.seed,
++                            /* .proposal_feedback = */ nullptr,
++                            /* .edit_history = */ common_speculative_uses_edit_lookup(spec.get()) ?
++                                slot.prompt.tokens.text_view() : nullptr,
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -5497,7 +5504,7 @@ private:
+                     // It must not silently retain additional draft graph arenas.
+                     server_cuda_wait_trace::scope wait(cuda_wait_trace, server_cuda_wait_trace::draft_catchup);
+                     server_prefill_reuse_scope<llama_context> reuse_only(ctx_dft, ctx_dft && prefill_round_reuse_only);
+-                    ok = common_speculative_process(spec.get(), batch.view);
++                    ok = common_speculative_process_after_forward(spec.get(), batch.view, target_fenced ? ctx_tgt : nullptr);
+                 }
+                 if (observe_memory) {
+                     const auto after = ctx_dft->get_graph_variant_admission_stats();
+diff --git a/tools/server/server-mtp-depth.h b/tools/server/server-mtp-depth.h
+index 43db1c6..41ac059 100644
+--- a/tools/server/server-mtp-depth.h
++++ b/tools/server/server-mtp-depth.h
+@@ -26,7 +26,11 @@ class server_mtp_depth {
+     };
+ 
+     struct history {
+-        std::array<cost, 4> depths{};
++        std::array<cost, 5> depths{};
++        // Keep the two-vs-four experiment independent of the general controller.
++        int pair_rounds = 0;
++        int pair_arm = 2;
++        int pair_best = 2;
+         int preferred = -1;
+         int until_refresh = refresh_interval;
+         int refresh_depth = 0;
+@@ -37,10 +41,14 @@ class server_mtp_depth {
+     int active_history = -1;
+     int active_depth = -1;
+     bool warmup = true;
++    bool pair_mode = false;
++    std::array<uint64_t, 2> measured_pair_rounds{};
+ 
+ public:
++    const std::array<uint64_t, 2> & pair_rounds() const { return measured_pair_rounds; }
++
+     int choose(uint64_t context_tokens, int ceiling) {
+-        if (ceiling < 1 || ceiling > 3) {
++        if (ceiling < 1 || ceiling > 4) {
+             active_depth = -1;
+             return 0;
+         }
+@@ -49,7 +57,9 @@ public:
+         auto & h = histories[bucket];
+         // Start with the configured depth before probing alternatives.
+         int selected = ceiling;
+-        if (h.depths[ceiling].samples >= minimum_samples) {
++        if (ceiling == 4) {
++            selected = h.pair_arm;
++        } else if (h.depths[ceiling].samples >= minimum_samples) {
+             selected = 0;
+             while (selected < ceiling && h.depths[selected].samples >= minimum_samples) {
+                 ++selected;
+@@ -66,9 +76,10 @@ public:
+                 selected = h.until_refresh > 0 ? h.preferred : h.refresh_depth % (ceiling + 1);
+             }
+         }
+-        if (bucket != active_history || selected != active_depth) {
++        if (bucket != active_history || selected != active_depth || pair_mode != (ceiling == 4)) {
+             warmup = true; // discard the graph transition from the measurement
+         }
++        pair_mode = ceiling == 4;
+         active_history = bucket;
+         active_depth = selected;
+         return selected;
+@@ -78,12 +89,33 @@ public:
+         if (active_depth < 0 || us <= 0 || committed == 0) {
+             return;
+         }
+-        if (warmup) {
++        if (warmup && !pair_mode) {
+             warmup = false;
+             return;
+         }
+         auto & h = histories[active_history];
+         h.depths[active_depth].add(us, committed);
++        if (pair_mode) {
++            ++measured_pair_rounds[active_depth == 4];
++            // Compare complete rounds, including graph transitions for four.
++            // Start cheap, then briefly probe the other arm every 24 normal rounds.
++            const int window = h.depths[4].samples < minimum_samples ||
++                    active_depth != h.pair_best ? minimum_samples : 24;
++            if (++h.pair_rounds >= window) {
++                h.pair_rounds = 0;
++                if (h.depths[4].samples < minimum_samples) {
++                    h.pair_arm = 4;
++                } else if (active_depth == h.pair_best) {
++                    h.pair_arm = 6 - h.pair_best;
++                } else {
++                    if (h.depths[active_depth].us_per_token() < .95 * h.depths[h.pair_best].us_per_token()) {
++                        h.pair_best = active_depth;
++                    }
++                    h.pair_arm = h.pair_best;
++                }
++            }
++            return;
++        }
+         if (h.preferred < 0) {
+             return;
+         }
