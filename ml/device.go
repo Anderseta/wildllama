@@ -102,6 +102,10 @@ type SystemInfo struct {
 	// FreeMemory is the amount of memory currently available on the system for loading models
 	FreeMemory uint64 `json:"free_memory,omitempty"`
 
+	// Windows commit limit and remaining commitment available to the calling process.
+	CommitLimit     uint64 `json:"commit_limit,omitempty"`
+	CommitAvailable uint64 `json:"commit_available,omitempty"`
+
 	// FreeSwap is the amount of system swap space reported as available
 	FreeSwap uint64 `json:"free_swap,omitempty"`
 }

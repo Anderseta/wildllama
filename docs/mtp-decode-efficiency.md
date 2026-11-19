@@ -131,3 +131,15 @@ Ties in the selection, nonfinite scores, active grammar constraints, forced
 reasoning tokens and requests for token probabilities take the full-row path.
 After three consecutive ambiguous rows the sampler waits 16 eligible rows
 before trying again. The selection uses host memory only.
+
+For edit drafts, a request-local index retains the two latest positions per
+anchor bucket. It verifies the six anchor tokens and compares up to 32 earlier
+tokens for ambiguous matches. The target still verifies the resulting proposal.
+
+CUDA runners can opt into exact single-row top-k readback using
+`WILDLLAMA_EXACT_GPU_TOP_K=1` in the runner environment. With a supported leading
+top-k from 1 through 127 the CPU samples original scores gathered from the GPU.
+Ties, unsupported sampler chains, probability requests and uncertain scores use
+the full-row path. Set `WILDLLAMA_TRACE_READBACK=1` to log cumulative raw score
+bytes transferred eagerly, deferred and subsequently materialized. Benchmark
+with the intended model and sampling settings before enabling the option.

@@ -11,9 +11,11 @@ import (
 )
 
 type memInfo struct {
-	TotalMemory uint64 `json:"total_memory,omitempty"`
-	FreeMemory  uint64 `json:"free_memory,omitempty"`
-	FreeSwap    uint64 `json:"free_swap,omitempty"` // TODO split this out for system only
+	TotalMemory     uint64 `json:"total_memory,omitempty"`
+	FreeMemory      uint64 `json:"free_memory,omitempty"`
+	CommitLimit     uint64
+	CommitAvailable uint64
+	FreeSwap        uint64 `json:"free_swap,omitempty"` // TODO split this out for system only
 }
 
 func LogDetails(devices []ml.DeviceInfo) {

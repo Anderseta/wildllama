@@ -195,6 +195,7 @@ type llamaServerRunner struct {
 }
 
 type llamaServerLaunchConfig struct {
+	handoff              *imageHandoffConfig
 	modelPath            string
 	modelArch            string
 	draftType            string
@@ -407,7 +408,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		port = rand.Intn(65535-49152) + 49152
 	}
 
-	// Build CLI flags — minimal set, let llama-server auto-detect the rest
+	// Build CLI flags â€” minimal set, let llama-server auto-detect the rest
 	params := []string{
 		"--model", launch.modelPath,
 		"--port", strconv.Itoa(port),
@@ -463,7 +464,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
 
-	// GPU layer offloading — only pass if user explicitly set it (non-default).
+	// GPU layer offloading â€” only pass if user explicitly set it (non-default).
 	// Default behavior: let llama-server auto-detect via -ngl auto.
 	if launch.opts.NumGPU > 0 {
 		params = append(params, "-ngl", strconv.Itoa(launch.opts.NumGPU))
@@ -473,7 +474,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	}
 	// NumGPU == -1 (default): don't pass -ngl, let llama-server auto-detect
 
-	// Thread count — only pass if user explicitly set it.
+	// Thread count â€” only pass if user explicitly set it.
 	// Default behavior: let llama-server auto-detect.
 	if launch.opts.NumThread > 0 {
 		params = append(params, "-t", strconv.Itoa(launch.opts.NumThread))
@@ -488,6 +489,9 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	params = appendContextShiftArgs(params, launch.opts, launch.config.ContextShift)
 
 	// Set up library paths for GPU backend discovery
+	if launch.handoff != nil {
+		params = append(params, "--slot-save-path", launch.handoff.directory)
+	}
 	cmd = exec.Command(exe, params...)
 
 	if out != nil {
@@ -498,6 +502,9 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	}
 	cmd.SysProcAttr = LlamaServerSysProcAttr
 	childEnvs := cloneStringMap(launch.extraEnvsForStart())
+	if launch.handoff != nil {
+		childEnvs["WILDLLAMA_IMAGE_HANDOFF_AUTH"] = launch.handoff.auth
+	}
 	projectorLifecycleSupported := len(launch.projectors) > 0 && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, projectorOnDemandEnvironment)
 	setProjectorLifecycleEnvironment(childEnvs, launch.projectors, projectorLifecycleSupported)
 	adaptivePrefixRequested := adaptivePrefixCacheRequested(launch.opts, launch.decision)
@@ -635,8 +642,8 @@ func llamaServerLibraryPaths(exe string, gpuLibs []string, envUpdates map[string
 	}
 
 	// Library path ordering:
-	// 1. llama-server's own directory — ggml-base, ggml-cpu, libllama
-	// 2. GPU variant directories — cublas, cudart, backend DLL/.so
+	// 1. llama-server's own directory â€” ggml-base, ggml-cpu, libllama
+	// 2. GPU variant directories â€” cublas, cudart, backend DLL/.so
 	// 3. User/system library path
 	addPath(llamaDir)
 	for _, dir := range gpuLibs {
@@ -1179,6 +1186,7 @@ func NewLlamaServerRunner(
 		extraEnvs:    cloneStringMap(serverEnvs),
 	}
 
+	launch.handoff = newImageHandoff(launch, len(splitModel.dirs) > 0)
 	s := &llamaServerRunner{
 		client:           newLlamaServerHTTPClient(),
 		status:           status,
@@ -1289,6 +1297,22 @@ func (s *llamaServerRunner) Load(ctx context.Context, systemInfo ml.SystemInfo, 
 	if err := s.removeSplitDirs(); err != nil {
 		slog.Debug("split GGUF alias cleanup deferred until runner shutdown", "error", err)
 	}
+	if err := s.restoreImageHandoff(ctx); err != nil {
+		// A failed clear leaves an indeterminate native slot. Use a fresh runner.
+		if stop := s.stopProcess(); stop != nil {
+			return nil, errors.Join(err, stop)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		s.resetLoadAccounting()
+		if err := s.startProcess(); err != nil {
+			return nil, err
+		}
+		if err := s.WaitUntilRunning(ctx); err != nil {
+			return nil, err
+		}
+	}
 	s.rememberPlacement()
 
 	// Verify that buffer size parsing captured GPU allocations.
@@ -1297,7 +1321,7 @@ func (s *llamaServerRunner) Load(ctx context.Context, systemInfo ml.SystemInfo, 
 	if len(s.gpus) > 0 && !s.hasParsedVRAM() {
 		slog.Warn("llama-server VRAM tracking: no per-device buffer sizes were parsed from "+
 			"llama-server logs. VRAM accounting will be inaccurate. This may indicate a "+
-			"change in llama-server's log format — check for 'buffer size' lines in the output.",
+			"change in llama-server's log format â€” check for 'buffer size' lines in the output.",
 			"model", s.modelPath, "gpus", len(s.gpus))
 	}
 
@@ -1558,6 +1582,8 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 	loadDeadline := lastActivity.Add(stallTimeout)
 
 	slog.Info("waiting for llama-server to start responding")
+	var headroom loadHeadroom
+	defer headroom.report()
 	var lastStatus ServerStatus = -1
 
 	for {
@@ -1591,6 +1617,14 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 		default:
 		}
 
+		if runtime.GOOS == "windows" && time.Since(headroom.last) >= 250*time.Millisecond {
+			activity := s.RuntimeActivity()
+			phase := activity.Stage
+			if phase == "" {
+				phase = activity.Phase
+			}
+			headroom.observe(phase)
+		}
 		if activity := s.lastLoadActivity(); activity.After(lastActivity) {
 			lastActivity = activity
 			loadDeadline = lastActivity.Add(stallTimeout)
@@ -3267,7 +3301,7 @@ func (s *llamaServerRunner) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo 
 			}
 		}
 
-		// Take the minimum — never optimistic
+		// Take the minimum â€” never optimistic
 		infos[i].FreeMemory = min(accountedFree, systemFree)
 	}
 	return infos
@@ -3387,7 +3421,7 @@ var (
 
 // isGPUBuffer returns true if the backend buffer name represents GPU memory.
 // CPU, BLAS, and host-pinned buffers (*_Host) are not GPU memory.
-// Device-mapped buffers (e.g., MTL0_Mapped) ARE GPU memory — they're model
+// Device-mapped buffers (e.g., MTL0_Mapped) ARE GPU memory â€” they're model
 // weights in device-accessible memory. Only CPU_Mapped is CPU memory.
 func isGPUBuffer(name string) bool {
 	if name == "CPU" || name == "BLAS" || strings.HasPrefix(name, "CPU_") {

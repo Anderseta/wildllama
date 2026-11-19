@@ -70,6 +70,9 @@ func (b *schedulerImageText) Suspend(ctx context.Context) ([]imageTextState, err
 		}
 		saved = append(saved, imageTextState{model: runner.model.Load(), options: options, duration: runner.sessionDuration,
 			numCtxAuto: runner.numCtxAuto, numBatchAuto: runner.numBatchAuto, useMMapAuto: runner.useMMapAuto, shift: runner.contextShift, key: runner.modelKey, pid: runner.pid})
+		if native, ok := runner.llama.(interface{ SaveImageHandoff(context.Context) }); ok {
+			native.SaveImageHandoff(ctx)
+		}
 		runner.sessionDuration = 0
 		if runner.expireTimer != nil {
 			runner.expireTimer.Stop()

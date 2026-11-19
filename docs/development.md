@@ -276,3 +276,9 @@ Adding models reuses `/api/images/models/install`, `/import` (manifest reference
 `/api/images/loras/install`. This library does not advertise architecture support
 beyond the existing pinned runner. CPU regression checks:
 `go test -race ./server -run '^TestImage' -count=1`.
+
+Windows text-runner load logs report the minimum observed physical and commit
+headroom per stage in MiB. Commit headroom measures how much additional memory
+Windows can promise the process. Use page-out counters to diagnose actual
+paging. Under host pressure the native loader bounds advisory file prefetch;
+model mapping, context length and GPU layer placement keep their configured values.

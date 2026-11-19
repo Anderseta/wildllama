@@ -969,8 +969,11 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 	systemTotalMemory := systemInfo.TotalMemory
 	systemFreeMemory := systemInfo.FreeMemory
-	systemSwapFreeMemory := systemInfo.FreeSwap
-	slog.Info("system memory", "total", format.HumanBytes2(systemTotalMemory), "free", format.HumanBytes2(systemFreeMemory), "free_swap", format.HumanBytes2(systemSwapFreeMemory))
+	if systemInfo.CommitLimit > 0 {
+		slog.Info("system memory", "total", format.HumanBytes2(systemTotalMemory), "free", format.HumanBytes2(systemFreeMemory), "commit_limit", format.HumanBytes2(systemInfo.CommitLimit), "commit_available", format.HumanBytes2(systemInfo.CommitAvailable))
+	} else {
+		slog.Info("system memory", "total", format.HumanBytes2(systemTotalMemory), "free", format.HumanBytes2(systemFreeMemory), "free_swap", format.HumanBytes2(systemInfo.FreeSwap))
+	}
 
 	for _, gpu := range loadGpus {
 		available := gpu.FreeMemory - envconfig.GpuOverhead() - gpu.MinimumMemory()

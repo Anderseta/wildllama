@@ -31,9 +31,11 @@ func GetSystemInfo() ml.SystemInfo {
 	}
 
 	return ml.SystemInfo{
-		TotalMemory: memInfo.TotalMemory,
-		FreeMemory:  memInfo.FreeMemory,
-		FreeSwap:    memInfo.FreeSwap,
+		TotalMemory:     memInfo.TotalMemory,
+		FreeMemory:      memInfo.FreeMemory,
+		FreeSwap:        memInfo.FreeSwap,
+		CommitLimit:     memInfo.CommitLimit,
+		CommitAvailable: memInfo.CommitAvailable,
 	}
 }
 

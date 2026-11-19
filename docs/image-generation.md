@@ -348,3 +348,15 @@ from the asset catalog, independently of recent jobs. Add `day=YYYY-MM-DD`
 (or `day=undated`) for the latest 20 results in a group, and pass its nonempty
 `next` as `before` to continue. Results contain asset metadata; open originals
 and generation parameters through the existing asset endpoints.
+
+## Resuming a text conversation after GPU switching
+
+When an exclusive image job suspends a single-slot text model, WildLlama can
+save its idle native prompt state under `OLLAMA_MODELS/.image-handoff`. The
+server keeps at most one checkpoint, expires it after 30 minutes and removes it
+after use. Set `WILDLLAMA_IMAGE_HANDOFF_MIB` in the service environment to set
+the disk budget (default 1024 MiB, zero disables). Short prefixes, inexpensive
+prefills, explicitly managed slot directories and unsupported runners skip the
+checkpoint. A compatible runner verifies the file and reuses matching prompt
+tokens. The next chat request can always recompute its history. Restarting the
+whole service invalidates pending checkpoints.

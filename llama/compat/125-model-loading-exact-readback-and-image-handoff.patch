@@ -1,0 +1,500 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 87bbe91..8f0defd 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1473,5 +1473,5 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_IMAGE_HANDOFF_MIB","WILDLLAMA_EXACT_GPU_TOP_K","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE"]})json");
+             exit(0);
+         }
+diff --git a/common/mtp-edit-lookup.h b/common/mtp-edit-lookup.h
+index e6864c2..e111fe5 100644
+--- a/common/mtp-edit-lookup.h
++++ b/common/mtp-edit-lookup.h
+@@ -13,5 +13,6 @@ class common_mtp_edit_lookup {
+     static constexpr size_t slots = 8192;
+     static constexpr size_t limit = 32768;
+-    std::vector<uint16_t> offsets;
++    struct positions { uint16_t newest, previous; };
++    std::vector<positions> offsets;
+     tokens source;
+ 
+@@ -36,7 +37,8 @@ public:
+         const size_t count = std::min(limit, prompt.size());
+         source.assign(prompt.end() - count, prompt.end());
+-        offsets.assign(slots, 0);
++        offsets.assign(slots, {});
+         for (size_t end = anchor; end + 2 <= count; ++end) {
+-            offsets[bucket([&](size_t i) { return source[end - anchor + i]; })] = uint16_t(end);
++            auto & entry = offsets[bucket([&](size_t i) { return source[end - anchor + i]; })];
++            entry = {uint16_t(end), entry.newest};
+         }
+     }
+@@ -67,9 +69,25 @@ public:
+                 return i == anchor - 1 ? last : history[history.size() - (anchor - 1) + i];
+             };
+-            end = offsets[bucket(at)];
+-            if (end == 0) { return false; }
+-            for (size_t i = 0; i < anchor; ++i) {
+-                if (source[end - anchor + i] != at(i)) { return false; }
++            const auto entry = offsets[bucket(at)];
++            auto matches = [&](size_t pos) {
++                return pos && source[pos - 1] == last && std::equal(source.begin() + pos - anchor,
++                    source.begin() + pos - 1, history.end() - (anchor - 1));
++            };
++            const bool newest = matches(entry.newest);
++            const bool previous = matches(entry.previous);
++            end = newest ? entry.newest : previous ? entry.previous : 0;
++            if (newest && previous) {
++                // Extend only ambiguous matches. Equal suffix lengths prefer the newest.
++                for (size_t back = anchor; back < anchor + 32 && back <= history.size(); ++back) {
++                    const auto token = history[history.size() - back];
++                    const bool a = entry.newest > back && source[entry.newest - 1 - back] == token;
++                    const bool b = entry.previous > back && source[entry.previous - 1 - back] == token;
++                    if (!a || !b) {
++                        if (b) { end = entry.previous; }
++                        break;
++                    }
++                }
+             }
++            if (!end) { return false; }
+         }
+         const size_t count = std::min(maximum, source.size() - end);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 635fe81..106d507 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -489,4 +489,6 @@ struct common_sampler * common_sampler_init(
+ 
+     llama_sampler_ptr thinking_prefilter;
++    const char * exact_env = std::getenv("WILDLLAMA_EXACT_GPU_TOP_K");
++    const bool exact = exact_env && std::strcmp(exact_env, "1") == 0;
+     const char * thinking_prefilter_env = std::getenv("WILDLLAMA_GPU_THINKING_SAMPLE");
+     const char * distribution_env = std::getenv("WILDLLAMA_MTP_GPU_DISTRIBUTION");
+@@ -499,6 +501,6 @@ struct common_sampler * common_sampler_init(
+         thinking_prefilter.reset(llama_sampler_init_gpu_distribution(chain.get(), llama_vocab_n_tokens(vocab)));
+     }
+-    if (!thinking_prefilter && (!grmr || params.grammar_lazy) && params.n_probs == 0 && thinking_prefilter_env &&
+-            std::strcmp(thinking_prefilter_env, "1") == 0) {
++    if (!thinking_prefilter && (!grmr || params.grammar_lazy) && params.n_probs == 0 &&
++            (exact || (thinking_prefilter_env && std::strcmp(thinking_prefilter_env, "1") == 0))) {
+         thinking_prefilter.reset(llama_sampler_init_thinking_prefilter(chain.get(), llama_vocab_n_tokens(vocab)));
+     }
+@@ -859,9 +861,35 @@ static llama_token common_sampler_sample_synchronized(struct common_sampler * gs
+     // Borrow after the existing fence/timer boundary: output reordering remains
+     // included in sampler CPU time while GPU waits remain excluded.
+-    auto output = llama_get_sampler_output_ith_synchronized(ctx, idx);
++    llama_sampler_output output{};
++    bool certified = false;
++    if (gsmpl->thinking_prefilter && !gsmpl->grmr && !gsmpl->params.n_probs &&
++            common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING &&
++            llama_exact_candidates_after_sync(ctx, idx, output)) {
++        const int k = llama_sampler_leading_top_k(gsmpl->chain);
++        const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++        if (k > 0 && k < 128 && int(output.candidates_count) == k + 1) {
++            gsmpl->set_logits(ctx, output);
++            auto & row = gsmpl->cur;
++            certified = std::all_of(row.begin(), row.end(), [vocab](const auto & token) {
++                return token.id >= 0 && token.id < vocab && std::isfinite(token.logit);
++            });
++            if (certified) {
++                std::sort(row.begin(), row.end(), [](const auto & a, const auto & b) { return a.logit > b.logit; });
++                certified = std::adjacent_find(row.begin(), row.end(), [](const auto & a, const auto & b) {
++                    return a.logit == b.logit;
++                }) == row.end();
++            }
++            if (certified) {
++                gsmpl->cur_p.size = k;
++                gsmpl->cur_p.sorted = true;
++                ++gsmpl->thinking_prefilter_rows;
++            }
++        }
++    }
++    if (!certified) { output = llama_get_sampler_output_ith_synchronized(ctx, idx); }
+     if (output.raw_logits && llama_sampler_is_gpu_distribution(gsmpl->thinking_prefilter.get())) {
+         output.sampled_logits = nullptr; output.sampled_probs = nullptr; output.candidates = nullptr;
+     }
+-    bool compact_thinking_candidates = false;
++    bool compact_thinking_candidates = certified;
+     // Only an attached prefilter publishes both original logits and a compact
+     // view. The MTP drafter's independently attached top-k output is complete.
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d386f23..191137d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -690,4 +690,8 @@ llama_context::llama_context(
+ 
+ llama_context::~llama_context() {
++    if (trace_readback) {
++        LLAMA_LOG_INFO("raw score readback bytes: eager=%llu deferred=%llu materialized=%llu\n",
++            (unsigned long long) raw_bytes, (unsigned long long) deferred_exact_bytes, (unsigned long long) fallback_exact_bytes);
++    }
+     if (device_verify_owner) { device_verify_owner->context = nullptr; }
+     if (auto parent = device_verify_parent.lock()) {
+@@ -1656,4 +1660,11 @@ bool llama_context::defer_sampler_outputs(const llm_graph_result * result, uint3
+ 
+ bool llama_context::materialize_block_logits() {
++    if (exact_raw) {
++        const size_t bytes = ggml_nbytes(exact_raw);
++        ggml_backend_tensor_get_async(exact_backend, exact_raw, logits.data, 0, bytes);
++        if (trace_readback) { fallback_exact_bytes += bytes; }
++        exact_raw = nullptr;
++        return true;
++    }
+     auto * tensor = deferred_block_logits;
+     if (!tensor) {
+@@ -2954,4 +2965,5 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
+     // reserve output buffer
+     deferred_sampler_rows.clear(); device_verify_ordered = false;
++    exact_raw = nullptr;
+     deferred_block_logits = nullptr;
+     if (output_reserve(n_tokens) < n_tokens) {
+@@ -3347,4 +3359,5 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     // reserve output buffer
+     deferred_sampler_rows.clear(); device_verify_ordered = false;
++    exact_raw = nullptr;
+     deferred_block_logits = nullptr;
+     if (output_reserve(n_outputs_all) < n_outputs_all) {
+@@ -3443,5 +3456,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                const size_t bytes = size_t(n_outputs) * n_vocab * sizeof(float);
++                if (res->t_exact_sum && n_outputs_all == 1 && n_tokens_all == ubatch.n_tokens &&
++                        !cparams.pipeline_parallel && !cparams.training &&
++                        ggml_backend_sched_get_tensor_backend(sched.get(), res->t_exact_sum) == backend_res &&
++                        ggml_backend_dev_type(ggml_backend_get_device(backend_res)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                    exact_raw = t_logits;
++                    exact_backend = backend_res;
++                    ggml_backend_tensor_get_async(backend_res, res->t_exact_sum, &exact_sum, 0, sizeof(exact_sum));
++                    if (trace_readback) { deferred_exact_bytes += bytes; }
++                } else {
++                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, bytes);
++                    if (trace_readback) { raw_bytes += bytes; }
++                }
++                if (trace_readback && (readback_samples++ % 64) == 0) {
++                    LLAMA_LOG_INFO("raw score readback bytes: eager=%llu deferred=%llu materialized=%llu\n",
++                        (unsigned long long) raw_bytes, (unsigned long long) deferred_exact_bytes, (unsigned long long) fallback_exact_bytes);
++                }
+             }
+         }
+@@ -6205,4 +6234,18 @@ void llama_synchronize_sampler_outputs(llama_context * ctx) {
+ }
+ 
++bool llama_context::exact_candidates(int32_t idx, llama_sampler_output & output) {
++    if (!exact_raw || !std::isfinite(exact_sum) || n_outputs != 1 || output_resolve_row(idx) != 0) { return false; }
++    output.sampled_logits = get_sampled_logits_ith(idx);
++    output.candidates = get_sampled_candidates_ith(idx);
++    output.sampled_logits_count = get_sampled_logits_count(idx);
++    output.candidates_count = get_sampled_candidates_count(idx);
++    output.sampled_token = LLAMA_TOKEN_NULL;
++    return output.sampled_logits && output.candidates && output.sampled_logits_count == output.candidates_count;
++}
++
++bool llama_exact_candidates_after_sync(llama_context * ctx, int32_t idx, llama_sampler_output & output) {
++    return ctx->exact_candidates(idx, output);
++}
++
+ bool llama_context::has_thinking_prefilter() const {
+     return sampling.samplers.size() == 1 && llama_sampler_backend_thinking_prefilter(sampling.samplers.begin()->second);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index a6c4abe..60e2115 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -20,4 +20,5 @@
+ #include <array>
+ #include <cstdlib>
++#include <cstring>
+ #include <limits>
+ #include <map>
+@@ -200,4 +201,5 @@ struct llama_context {
+     llama_token * get_sampled_tokens() const;
+     bool has_thinking_prefilter() const;
++    bool exact_candidates(int32_t idx, llama_sampler_output & output);
+     void synchronize_sampler_outputs();
+     bool verify_draft_device(const std::vector<int> & indexes, const std::vector<llama_token> & draft,
+@@ -509,4 +511,15 @@ private:
+     std::vector<deferred_sampler_row> deferred_sampler_rows;
+     ggml_tensor * deferred_block_logits = nullptr;
++    ggml_tensor * exact_raw = nullptr;
++    ggml_backend_t exact_backend = nullptr;
++    float exact_sum = 0;
++    uint64_t raw_bytes = 0;
++    uint64_t readback_samples = 0;
++    uint64_t deferred_exact_bytes = 0;
++    uint64_t fallback_exact_bytes = 0;
++    bool trace_readback = [] {
++        const char * flag = std::getenv("WILDLLAMA_TRACE_READBACK");
++        return flag && std::strcmp(flag, "1") == 0;
++    }();
+     bool device_verify_ordered = false;
+     bool device_verify_preflight_known = false;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 382ddab..fc09753 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -40,4 +40,5 @@ LLAMA_API bool llama_memory_prefix_restore(
+ // It performs no synchronization. General callers must use the safe public
+ // llama_get_sampler_output_ith instead. Borrowed pointer lifetime is unchanged.
++LLAMA_API bool llama_exact_candidates_after_sync(llama_context * ctx, int32_t idx, llama_sampler_output & output);
+ LLAMA_API llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i);
+ // Host batch verification consumes every candidate row. Queue any deferred
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index bec9733..bc8d024 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1533,4 +1533,5 @@ void llm_graph_result::reset() {
+     t_sampled.clear();
+     t_sampled_probs.clear();
++    t_exact_sum = nullptr;
+     t_sampled_logits.clear();
+     t_candidates.clear();
+@@ -4827,4 +4828,17 @@ void llm_graph_context::build_sampling() const {
+             };
+ 
++            // A finite sum certifies that every input was finite. Overflow
++            // merely causes a full-row fallback. Leave the gathered scores intact.
++            static const bool exact_top_k = [] {
++                const char * flag = std::getenv("WILDLLAMA_EXACT_GPU_TOP_K");
++                return flag && std::strcmp(flag, "1") == 0;
++            }();
++            if (exact_top_k && active && n_rows == 1 && samplers.size() == 1 &&
++                    llama_sampler_backend_thinking_prefilter(sampler) && !llama_sampler_is_gpu_distribution(sampler)) {
++                res->t_exact_sum = ggml_sum(ctx0, logits_seq);
++                ggml_set_output(res->t_exact_sum);
++                ggml_set_output(res->t_logits);
++                ggml_build_forward_expand(gf, res->t_exact_sum);
++            }
+             assert(sampler->iface->backend_apply);
+             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 4b27d95..bf54eb5 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1020,4 +1020,5 @@ public:
+     std::vector<ggml_tensor *> t_sampled;
+     std::vector<ggml_tensor *> t_sampled_probs;
++    ggml_tensor * t_exact_sum = nullptr;
+     std::vector<ggml_tensor *> t_sampled_logits;
+     std::vector<ggml_tensor *> t_candidates;
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 4d1cd31..38037de 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -617,6 +617,19 @@ struct llama_mmap::impl {
+ 
+             if (pPrefetchVirtualMemory) {
++                // A file mapping remains demand-paged. Avoid asking Windows to bring
++                // an entire large file into RAM as device buffers are being allocated.
++                MEMORYSTATUSEX memory = {};
++                memory.dwLength = sizeof(memory);
++                size_t requested = std::min(size, prefetch);
++                if (GlobalMemoryStatusEx(&memory)) {
++                    const uint64_t available = std::min(memory.ullAvailPhys, memory.ullAvailPageFile);
++                    if (requested > available / 2) {
++                        requested = std::min<uint64_t>(requested, std::min<uint64_t>(64ull << 20, available / 16));
++                        LLAMA_LOG_INFO("%s: limiting advisory model prefetch to %zu MiB under host memory pressure\n",
++                                __func__, requested >> 20);
++                    }
++                }
+                 std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+-                for (const auto & range : ranges_complement(lazy_ranges, std::min(size, prefetch))) {
++                for (const auto & range : ranges_complement(lazy_ranges, requested)) {
+                     WIN32_MEMORY_RANGE_ENTRY entry;
+                     entry.VirtualAddress = (char *) addr + range.first;
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+index 5ec8f56..0ecb2dd 100644
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -1137,4 +1137,8 @@ static void selected_only_outputs(llama_model * model, common_params_sampling pa
+ }
+ 
++// Admission also charges host graph and scheduler metadata. On Windows a
++// retained arena can exceed 64 MiB even for a tiny model.
++static constexpr int fixture_graph_mib = 512;
++
+ static void graph_binding_budget(const char * value) {
+ #ifdef _WIN32
+@@ -1193,5 +1197,5 @@ static void graph_owned_sampler_variants(llama_model * model, bool penalties, bo
+         require(bool(context), "graph binding context unavailable"); return context;
+     };
+-    auto left = make_context("0"), right = make_context("64");
++    auto left = make_context("0"), right = make_context(std::to_string(fixture_graph_mib).c_str());
+     std::vector<llama_sampler_ptr> a, b;
+     for (int seq = 0; seq < 2; ++seq) {
+@@ -1262,5 +1266,5 @@ static void graph_owned_sampler_variants(llama_model * model, bool penalties, bo
+         const auto stats=right->get_graph_variant_stats();
+         arenas=std::max(arenas,stats.arenas);
+-        require(stats.compute_bytes+stats.metadata_bytes<=64*1024*1024,"sampler bindings escaped graph retention quota");
++        require(stats.compute_bytes+stats.metadata_bytes<=size_t(fixture_graph_mib)*1024*1024,"sampler bindings escaped graph retention quota");
+     }
+     if (partial) { require(arenas==0,"partial/custom chain retained graph bindings"); }
+@@ -1398,5 +1402,5 @@ static void grammar_mask_equivalence(llama_model * model) {
+ }
+ 
+-static void grammar_first_backend(llama_model * model,bool compact,int output_limit=1) {
++static void grammar_first_backend(llama_model * model,bool compact,int output_limit=1,int budget_mib=fixture_graph_mib) {
+     common_params_sampling aparams;
+     aparams.seed=424242;aparams.temp=.7f;aparams.top_k=20;aparams.top_p=.9f;
+@@ -1414,5 +1418,5 @@ static void grammar_first_backend(llama_model * model,bool compact,int output_li
+     struct restore_budget {std::string value;~restore_budget(){graph_binding_budget(value.c_str());}} restore{old_budget};
+     graph_binding_budget("0");llama_context_ptr left(llama_init_from_model(model,params));
+-    graph_binding_budget("64");llama_context_ptr right(llama_init_from_model(model,params));
++    graph_binding_budget(std::to_string(budget_mib).c_str());llama_context_ptr right(llama_init_from_model(model,params));
+     require(left && right,"grammar-first contexts unavailable");
+     auto * backend=compact ? common_sampler_get_backend_selected_only(next.get()) : common_sampler_get_backend(next.get());
+@@ -1454,5 +1458,5 @@ static void grammar_first_backend(llama_model * model,bool compact,int output_li
+         arenas=std::max(arenas,right->get_graph_variant_stats().arenas);
+     }
+-    require(output_limit>1 ? arenas==0 : arenas>0,"grammar-first graph-cache/fallback path not exercised");
++    require((output_limit>1 || budget_mib==1) ? arenas==0 : arenas>0,"grammar-first graph-cache/fallback path not exercised");
+     auto default_params=aparams;default_params.grammar_first=false;default_params.backend_sampling=true;
+     common_sampler_ptr default_order(common_sampler_init(model,default_params));
+@@ -1685,4 +1689,5 @@ int main(int argc, char ** argv) {
+         grammar_first_backend(model.get(),true);
+         grammar_first_backend(model.get(),false,3);
++        grammar_first_backend(model.get(),false,1,1);
+         grammar_constraint_errors(model.get());
+         raw_candidate_constraint_contract();
+diff --git a/tests/test-server-mtp-depth.cpp b/tests/test-server-mtp-depth.cpp
+index 0ae648f..2f3cdfa 100644
+--- a/tests/test-server-mtp-depth.cpp
++++ b/tests/test-server-mtp-depth.cpp
+@@ -85,5 +85,5 @@ int main() {
+           "jumped to a different occurrence of the boilerplate");
+     check(query(28, 2) && result.front() == 211, "accepted history gap as a continuation");
+-    check(query(12, 2) && result.front() == 211, "reused cursor after rewind");
++    check(query(12, 2) && result.front() == 111, "rewind chose the wrong surrounding context");
+     lookup.begin(source);
+     check(query(9, 4), "missing unique anchor before divergence");
+@@ -93,5 +93,14 @@ int main() {
+     check(!lookup.propose(history, source[12], 2, result), "continued after rejected source tokens");
+     lookup.begin(source);
+-    check(query(12, 2) && result.front() == 211, "new request inherited cursor preference");
++    check(query(12, 2) && result.front() == 111, "ambiguous anchor ignored earlier context");
++    lookup.begin(source);
++    history = {2,3,4,5,6};
++    result.clear();
++    check(lookup.propose(history, 7, 2, result) && result.front() == 211, "equal suffixes did not prefer newest");
++    // An 8192 delta in one token collides in this 8192-bucket FNV index.
++    lookup.begin({1,2,3,4,5,6,91,92,8193,2,3,4,5,6,81,82});
++    history = {1,2,3,4,5};
++    result.clear();
++    check(lookup.propose(history, 6, 2, result) && result.front() == 91, "hash collision hid verified older anchor");
+     std::puts("PASS adaptive MTP depth: request ceiling, cost, context isolation and recovery");
+ }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 407da5e..505138e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -555,4 +555,7 @@ struct server_slot {
+ 
+         // note: callback_on_reset() must have run before this, see release()
++        if (stats.n_prompt_processed > 0 && stats.t_prompt_ms() > 0) {
++            image_prefill_ms_per_token = stats.t_prompt_per_token_ms();
++        }
+         stats = {};
+         n_accepted_per_pos.clear();
+@@ -761,4 +764,6 @@ struct server_slot {
+     }
+ 
++    double image_prefill_ms_per_token = 0.0;
++
+     void release() {
+         if (is_processing()) {
+@@ -3199,13 +3204,15 @@ private:
+ 
+     // returns false if the draft state could not be written completely
+-    bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
++    bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written,
++                         std::vector<uint8_t> data_spec = {}, bool have_spec = false) const {
+         n_written = 0;
+         std::vector<uint8_t> data_dft;
+-        std::vector<uint8_t> data_spec;
+         if (ctx_dft != nullptr) {
+             data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+-            llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            if (llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != data_dft.size()) {
++                return false;
++            }
+         }
+-        common_speculative_get_state(spec.get(), slot.id, data_spec);
++        if (!have_spec) { common_speculative_get_state(spec.get(), slot.id, data_spec); }
+         if (data_dft.empty() && data_spec.empty()) {
+             return true;
+@@ -3515,4 +3522,35 @@ private:
+ 
+                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
++                    std::vector<uint8_t> draft_state;
++                    if (const uint64_t budget = task.slot_action.image_budget) {
++                        // Bound every component before opening the destination. Header
++                        // allowances cover the length prefixes of the on-disk format.
++                        uint64_t left = budget;
++                        auto fits = [&](uint64_t bytes) {
++                            if (bytes > left) { return false; }
++                            left -= bytes;
++                            return true;
++                        };
++                        bool ok = slot->prompt.tokens.size() >= 1024 && fits(64) && fits(packed.size()) &&
++                            fits(llama_state_seq_get_size_ext(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE));
++                        if (ok && ctx_dft) {
++                            ok = fits(llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE));
++                        }
++                        for (const auto & ck : slot->prompt.checkpoints) {
++                            if (!(ok = ok && fits(64) && fits(ck.data_tgt.size()) && fits(ck.data_dft.size()) && fits(ck.data_spec.size()))) { break; }
++                        }
++                        if (ok) {
++                            common_speculative_get_state(spec.get(), slot->id, draft_state);
++                            ok = fits(draft_state.size());
++                        }
++                        // Estimate the round-trip I/O at 256 MiB/s and add a small
++                        // fixed cost. Keep short/cheap prompts on the normal path.
++                        const double io_ms = 50.0 + (budget - left) * (2000.0 / (256u << 20));
++                        const double recompute_ms = slot->image_prefill_ms_per_token * slot->prompt.tokens.size();
++                        if (!ok || !(recompute_ms > io_ms)) {
++                            send_error(task, "Image handoff skipped: prefix too small, cheap or over budget", ERROR_TYPE_INVALID_REQUEST);
++                            break;
++                        }
++                    }
+                     const size_t nwrite = llama_state_seq_save_file(
+                         ctx_tgt, filepath.c_str(), slot->id,
+@@ -3530,5 +3568,5 @@ private:
+ 
+                     size_t nwrite_dft = 0;
+-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
++                    if (!save_slot_draft(filepath, *slot, nwrite_dft, std::move(draft_state), task.slot_action.image_budget != 0)) {
+                         send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                         break;
+@@ -6794,4 +6832,14 @@ void server_routes::init_routes() {
+         }
+ 
++        // This mode is private to the text/image handoff. Existing explicitly
++        // configured slot-access directories keep their original interface.
++        if (const char * secret = std::getenv("WILDLLAMA_IMAGE_HANDOFF_AUTH")) {
++            const auto body = json::parse(req.body);
++            if (!body.is_object() || body.value("handoff_auth", std::string()) != secret ||
++                    body.value("filename", std::string()) != "resume.bin") {
++                res->error(format_error_response("Invalid handoff request", ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++        }
+         std::string id_slot_str = req.get_param("id_slot");
+ 
+@@ -7770,4 +7818,5 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
+     {
+         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
++        task.slot_action.image_budget = request_data.value("image_budget", uint64_t(0));
+         task.id = rd.get_new_id();
+         task.slot_action.id_slot  = id_slot;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index adc9205..d208736 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -204,4 +204,5 @@ struct server_task {
+         std::string filename;
+         std::string filepath;
++        uint64_t image_budget = 0;
+     };
+     slot_action slot_action;
