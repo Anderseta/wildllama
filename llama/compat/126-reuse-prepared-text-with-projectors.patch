@@ -1,0 +1,121 @@
+diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
+index eb29e10..ab4a76d 100644
+--- a/tests/test-server-component.cpp
++++ b/tests/test-server-component.cpp
+@@ -59,4 +59,16 @@ static void test_server_tokens_pos(testing & t) {
+     t.assert_equal("size_up_to_pos(3)", (size_t) 3, st.size_up_to_pos(3));
+     t.assert_equal("size_up_to_pos clamps", (size_t) 5, st.size_up_to_pos(100));
++
++    server_tokens text(llama_tokens{1, 2, 3, 4, 5}, true);
++    t.assert_equal("projector text full position", (llama_pos) 5, text.pos_next());
++    t.assert_equal("projector text start", (llama_pos) 0, text.pos_next(0));
++    t.assert_equal("projector text prefix", (llama_pos) 3, text.pos_next(3));
++    t.assert_equal("projector text negative bound", (size_t) 1, text.size_up_to_pos(-1));
++    t.assert_equal("projector text zero bound", (size_t) 1, text.size_up_to_pos(0));
++    t.assert_equal("projector text prefix size", (size_t) 3, text.size_up_to_pos(3));
++    t.assert_equal("projector text end", (size_t) 5, text.size_up_to_pos(5));
++    t.assert_equal("projector text past end", (size_t) 5, text.size_up_to_pos(100));
++    server_tokens empty(llama_tokens{}, true);
++    t.assert_equal("projector empty", (size_t) 0, empty.size_up_to_pos(0));
+ }
+ 
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index dca6e7a..59bab19 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -541,4 +541,8 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
+     GGML_ASSERT(n_tokens <= (int64_t)tokens.size());
+ 
++    if (map_idx_to_media.empty()) {
++        return static_cast<llama_pos>(n_tokens);
++    }
++
+     while (idx < n_tokens) {
+         const auto media_it = map_idx_to_media.find(idx);
+@@ -563,4 +567,8 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
+         return std::min((size_t)max_pos, tokens.size());
+     }
++    if (map_idx_to_media.empty()) {
++        // The media-aware traversal consumes the first token before testing max_pos.
++        return std::min(tokens.size(), static_cast<size_t>(std::max<llama_pos>(1, max_pos)));
++    }
+ 
+     size_t idx = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 505138e..cd55af0 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6238,5 +6238,5 @@ std::string_view prepared_chat_request_header(const server_http_req & req, std::
+ std::string prepared_chat_key(const server_http_req & req) {
+     const auto key = prepared_chat_request_header(req, prepared_chat_header);
+-    if (key.size() < 16 || key.size() > 64 || req.body.size() > prepared_chat_max_bytes ||
++    if (key.size() < 16 || key.size() > 64 ||
+         key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string_view::npos) {
+         return {};
+@@ -6998,5 +6998,5 @@ void server_routes::init_routes() {
+         std::vector<raw_buffer> files;
+         const auto key = prepared_chat_key(req);
+-        if (!key.empty()) {
++        if (!key.empty() && req.body.size() <= prepared_chat_max_bytes) {
+             if (auto prepared = take_prepared_chat(key, req.body)) {
+                 auto response = handle_completions_impl(req, SERVER_TASK_TYPE_COMPLETION, prepared->data,
+@@ -7358,16 +7358,23 @@ void server_routes::init_routes() {
+         if (limit && files.empty() && json_value(body, "count_tokens", false)) {
+             std::vector<server_tokens> inputs;
++            const auto prompt = data.at("prompt").get<std::string>();
+             size_t count;
+-            if (ctx_server.mctx != nullptr) {
+-                // Preserve the existing /tokenize sizing policy. Generation
+-                // still uses process_mtmd_prompt on the prepared text.
++            if (ctx_server.mctx && prompt.find(mtmd_get_marker(ctx_server.mctx)) != std::string::npos) {
++                // A literal marker can disappear when Go truncates the history.
++                // Preserve sizing and let generation validate any surviving marker.
+                 count = tokenize_mixed(ctx_server.vocab, data.at("prompt"), true, true).size();
+             } else {
+-                inputs = tokenize_input_prompts(ctx_server.vocab, nullptr, data.at("prompt"), true, true, ctx_server.init_opt);
++                if (ctx_server.mctx) {
++                    inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt, files, ctx_server.init_opt));
++                } else {
++                    inputs = tokenize_input_prompts(ctx_server.vocab, nullptr, data.at("prompt"), true, true, ctx_server.init_opt);
++                }
+                 GGML_ASSERT(inputs.size() == 1);
+                 count = inputs.front().size();
+             }
+-            const bool prepared = count <= limit && !req.should_stop() &&
+-                data.at("prompt").get<std::string>().size() <= prepared_chat_max_bytes &&
++            // Oversize candidates still get a count-only response. Neither their
++            // body nor their rendered prompt is retained in the prepared cache.
++            const bool prepared = count <= limit && !inputs.empty() && !req.should_stop() &&
++                req.body.size() <= prepared_chat_max_bytes && prompt.size() <= prepared_chat_max_bytes &&
+                 session.grammar().size() <= prepared_chat_max_bytes;
+             if (prepared) {
+diff --git a/tools/server/tests/unit/test_template.py b/tools/server/tests/unit/test_template.py
+index b9ab803..bc624b2 100644
+--- a/tools/server/tests/unit/test_template.py
++++ b/tools/server/tests/unit/test_template.py
+@@ -128,5 +128,10 @@ def test_apply_template_exact_text_token_count(thinking: bool):
+ 
+ 
+-def test_prepared_chat_reuses_only_one_exact_request():
++@pytest.mark.parametrize("with_projector", [False, True])
++def test_prepared_chat_reuses_only_one_exact_request(with_projector: bool):
++    global server
++    if with_projector:
++        server = ServerPreset.tinygemma3()
++        server.n_slots = 1
+     server.jinja = True
+     server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
+@@ -169,2 +174,13 @@ def test_prepared_chat_reuses_only_one_exact_request():
+     assert repeated.status_code == 200
+     assert "x-wildllama-chat-preparation" not in {k.lower() for k in repeated.headers}
++
++    # Large request metadata does not enlarge the cache or echo the rendered
++    # template. The actual conversation and token count remain unchanged.
++    large = dict(body, unused_padding="x" * (1 << 20))
++    oversized = server.make_request("POST", "/apply-template", data=large, headers=prepare_headers)
++    assert oversized.status_code == 200
++    assert oversized.body == {"token_count": counted.body["token_count"], "prepared": False}
++    missed = server.make_request("POST", "/v1/chat/completions", data=large, headers=key)
++    assert missed.status_code == 200
++    assert "x-wildllama-chat-preparation" not in {k.lower() for k in missed.headers}
++    assert missed.body["choices"] == baseline.body["choices"]

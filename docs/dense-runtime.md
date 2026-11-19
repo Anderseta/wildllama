@@ -210,21 +210,23 @@ local trained-model comparison are recorded below.
 - Removing only preserved system messages does not trigger another identical
   sizing attempt. Generic fallback preparation retains at most one exact
   prompt/count locally, without hashing or caching prompts across requests.
-- The additive `/apply-template` request field `count_tokens: true` returns
-  `token_count` for eligible text-only runners. It renders and counts the entire
-  prompt in one request, using generation's BOS and special-token parsing policy
-  without exporting a potentially large token-ID array. Older payloads fall
-  back to separate whole-prompt tokenization. Projector/media runners retain
-  their separate accounting path and existing media heuristic.
+- The additive `/apply-template` request field `count_tokens: true` enables
+  whole-prompt sizing with the model's BOS and special-token policy. Older
+  native payloads can fall back to a separate tokenization request.
 
-Whole-prompt counts preserve the effects of Jinja control flow, tools, schema,
-thinking and delimiters. For compatible requests without media, the server can
-keep the candidate that fits together with its parser and grammar. It also
-keeps token IDs on runners without a projector. Projector runners use the
-existing text count for sizing and the existing multimodal tokenizer for
-generation. The count response omits the rendered text. Generation consumes
-the preparation once when the private request key and exact body match.
-Prompt truncation continues to count each distinct candidate when needed.
+For a text-only chat with a private preparation key, the server runs the same
+tokenizer used by generation, including when a vision projector is loaded.
+The count covers the rendered history, tools, schema and reasoning directives.
+If the candidate fits, the server retains the tokens, parsed request and grammar
+for one generation with the same key and exact request body. Each distinct
+truncation candidate gets its own count. The response contains the count and
+a reuse flag even when the body exceeds the cache size limit.
+
+Requests with image or audio attachments follow the media path. A literal
+reserved media marker in plain text can be counted for truncation and is
+validated at generation if it survives. For projector-enabled slots containing
+only text, converting a prefix length into a position takes constant time.
+Actual media chunks continue to use their model-specific positions.
 
 The runner keeps up to four preparations in memory for reuse within 30 seconds.
 A preparation is limited to a 1 MiB request, a 1 MiB rendered prompt, a 1 MiB
