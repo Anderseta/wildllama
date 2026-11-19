@@ -51,6 +51,13 @@ func newImageHandoff(launch llamaServerLaunchConfig, split bool) *imageHandoffCo
 	if !filepath.IsAbs(dir) || os.MkdirAll(dir, 0700) != nil {
 		return nil
 	}
+	if checkpointBudget() > 0 {
+		// Create the ownership namespace before accepting opt-in requests, so
+		// an offline client can fence even a generation queued at deletion.
+		if err := os.MkdirAll(filepath.Join(filepath.Dir(dir), ".chat-checkpoints"), 0700); err != nil {
+			slog.Debug("chat checkpoint directory unavailable", "error", err)
+		}
+	}
 	cfg := &imageHandoffConfig{directory: dir, auth: rand.Text(), budget: mib << 20}
 	// A service that crashed cannot restore its in-memory receipt. Only the
 	// lock owner can remove a stale checkpoint, including across processes.
@@ -126,8 +133,12 @@ func (s *llamaServerRunner) imageKey() ([32]byte, nativeRuntimeFeatureIdentity, 
 }
 
 func (s *llamaServerRunner) handoffAction(ctx context.Context, action string) (int64, error) {
+	return s.handoffActionBudget(ctx, action, s.launch.handoff.budget)
+}
+
+func (s *llamaServerRunner) handoffActionBudget(ctx context.Context, action string, budget int64) (int64, error) {
 	cfg := s.launch.handoff
-	body, _ := json.Marshal(map[string]any{"filename": handoffFile, "handoff_auth": cfg.auth, "image_budget": cfg.budget})
+	body, _ := json.Marshal(map[string]any{"filename": handoffFile, "handoff_auth": cfg.auth, "image_budget": budget})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/slots/0?action=%s", s.port, action), bytes.NewReader(body))
 	if err != nil {
 		return 0, err

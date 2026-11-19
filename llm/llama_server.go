@@ -141,6 +141,9 @@ func boundedNumPredict(numPredict, numCtx int) int {
 // llamaServerRunner wraps an upstream llama-server process and implements the LlamaServer interface.
 // It communicates with llama-server over HTTP.
 type llamaServerRunner struct {
+	checkpointResident     string // single-slot runners only; protected by sem
+	checkpointTime         time.Time
+	checkpointTokens       int
 	port                   int
 	cmd                    *exec.Cmd
 	done                   chan struct{}
@@ -1950,6 +1953,9 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		return err
 	}
 	defer s.sem.Release(1)
+	if s.launch.handoff != nil {
+		s.checkpointResident = ""
+	}
 	defer s.status.beginRuntimeRequest(api.RequestID(ctx))()
 	speculativeGeneration := s.status.beginSpeculativeGeneration()
 	memoryVersion := s.status.memoryFailureVersion()
@@ -2328,7 +2334,7 @@ func (s *llamaServerRunner) PrepareChatSnapshot(ctx context.Context, req ChatReq
 		return count, nil, err
 	}
 	// Capture the wire bytes and the decoding option, never the original history.
-	decode := ChatRequest{TopLogprobs: req.TopLogprobs}
+	decode := ChatRequest{TopLogprobs: req.TopLogprobs, CheckpointSession: req.CheckpointSession}
 	submit := func(ctx context.Context, fn func(ChatResponse)) error {
 		slog.Debug("submitting prepared llama-server chat", "bytes", len(body))
 		return s.chat(ctx, decode, fn, key, body)
@@ -2443,6 +2449,10 @@ func (s *llamaServerRunner) chat(ctx context.Context, req ChatRequest, fn func(C
 		return fmt.Errorf("unexpected server status: %s", status)
 	}
 
+	checkpoint, err := s.beginChatCheckpoint(ctx, req.CheckpointSession)
+	if err != nil {
+		return err
+	}
 	if wire == nil {
 		req.Options = s.boundedChatOptions(req.Options)
 		data, err := s.llamaServerChatRequest(req, true)
@@ -2623,6 +2633,10 @@ func (s *llamaServerRunner) chat(ctx context.Context, req ChatRequest, fn func(C
 
 		s.status.observeSpeculativeGeneration(speculativeGeneration, finalResp.SpeculativeDraftTokens, finalResp.SpeculativeAcceptedTokens)
 		fn(finalResp)
+		if checkpoint != nil {
+			s.finishChatCheckpoint(ctx, checkpoint, finalResp.PromptEvalCount+finalResp.EvalCount)
+		}
+
 		return nil
 	}
 

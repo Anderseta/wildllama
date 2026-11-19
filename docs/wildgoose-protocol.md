@@ -90,3 +90,22 @@ pulls/imports with HTTP 409, waits briefly for canceled writers to close, and
 fails closed on invalid retention metadata. Repeating a successful cleanup is
 safe; resuming afterwards redownloads removed files while reusing retained ones.
 
+
+## Local chat checkpoints
+
+When the server advertises `chat_checkpoints` in the protocol features, a local
+client can supply `X-WildLlama-Chat-Session` on text-only native chat requests.
+Use a stable identifier of up to 128 ASCII letters, digits, dots, hyphens or
+underscores. The managed Wildgoose provider supplies its session identifier.
+Compatible single-slot runners save long, expensive prefixes under
+`OLLAMA_MODELS/.chat-checkpoints`. The native format includes supported draft
+and recurrent state. The runner checks runtime identity, settings and file
+integrity before asking the model to reuse a matching prefix. A changed
+conversation still undergoes native token-prefix validation.
+
+The disk pool defaults to 2 GiB. Set `WILDLLAMA_CHAT_CHECKPOINT_MIB=0` to
+disable it or give a positive size in MiB. Snapshots share the native slot-save
+lock with image handoff. Short, inexpensive and over-budget prefixes use normal
+prefill. Deleting the conversation in Wildgoose revokes its cached state even
+while WildLlama is offline. Model files and conversation history have separate
+lifetimes.

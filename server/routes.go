@@ -3723,14 +3723,15 @@ func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
 	truncate := req.Truncate == nil || *req.Truncate
 	nativeReq, prepared, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
-		Messages:    msgs,
-		Tools:       req.Tools,
-		Format:      req.Format,
-		Options:     opts,
-		Think:       req.Think,
-		Shift:       req.Shift == nil || *req.Shift,
-		Logprobs:    req.Logprobs,
-		TopLogprobs: req.TopLogprobs,
+		CheckpointSession: localCheckpointSession(c, msgs),
+		Messages:          msgs,
+		Tools:             req.Tools,
+		Format:            req.Format,
+		Options:           opts,
+		Think:             req.Think,
+		Shift:             req.Shift == nil || *req.Shift,
+		Logprobs:          req.Logprobs,
+		TopLogprobs:       req.TopLogprobs,
 	}, truncate, !req.DebugRenderOnly)
 	if err != nil {
 		slog.Error("chat template prompt error", "error", err)

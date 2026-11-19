@@ -239,12 +239,13 @@ type CompletionRequest struct {
 }
 
 type ChatRequest struct {
-	Messages []api.Message
-	Tools    api.Tools
-	Format   json.RawMessage
-	Options  *api.Options
-	Think    *api.ThinkValue
-	Shift    bool
+	CheckpointSession string // private local session ownership, never serialized to the native model
+	Messages          []api.Message
+	Tools             api.Tools
+	Format            json.RawMessage
+	Options           *api.Options
+	Think             *api.ThinkValue
+	Shift             bool
 
 	// Native preparation key for callers using the count-and-key API.
 	PreparedChat string

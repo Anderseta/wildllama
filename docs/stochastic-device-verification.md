@@ -12,8 +12,11 @@ probabilities and random draws are unchanged. Acceptance commits one existing
 distribution draw per accepted row; rejected rows do not advance the committed
 stream. The EOG and bonus-token rules remain unchanged.
 
-This does not turn p/q rejection sampling into token matching. Rejection sampling
-still uses its target/draft probabilities and residual distribution on the host.
+This does not turn p/q rejection sampling into token matching. A compatible CUDA runner can also verify p/q rejection with
+`WILDLLAMA_MTP_GPU_VERIFY=1` and a positive `WILDLLAMA_VERIFY_DEVICE_MIB`.
+It checks up to four proposals plus the bonus row and samples a residual token
+at the first rejection. Adaptive proposal tuning reads compact target IDs and
+probabilities within the same fence. Ineligible requests use host rejection.
 Before that path, or a device-verifier fallback, deferred candidate transfers are
 queued together and completed with one fence instead of one fence per lazy row.
 The final public candidate view remains available.
@@ -33,8 +36,8 @@ transfers. Unsupported backends continue to use host verification.
   stochastic verification intent enabled. The host path retains one batch fence.
 - `test-device-verification`: policy and unsupported-chain tests run on CPU.
   Its optional `--cuda` mode also compares actual tiny stochastic MTP results,
-  checks a device-verifier hit for matching, and proves that p/q rejection keeps
-  its host algorithm and materializes all deferred candidates.
+  checks a device-verifier hit for matching, and checks the host fallback. Use `--block` to compare CPU and CUDA
+  rejection, corrections, adaptive feedback, subsequent RNG and forced reasoning stops.
 
 These are correctness and transfer-work checks. They do not establish a trained
 model tokens-per-second improvement; that requires a controlled GPU comparison.
