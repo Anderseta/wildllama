@@ -141,6 +141,7 @@ func boundedNumPredict(numPredict, numCtx int) int {
 // llamaServerRunner wraps an upstream llama-server process and implements the LlamaServer interface.
 // It communicates with llama-server over HTTP.
 type llamaServerRunner struct {
+	checkpointRuntime      string // immutable after the first opted-in request on this runner
 	checkpointResident     string // single-slot runners only; protected by sem
 	checkpointTime         time.Time
 	checkpointTokens       int

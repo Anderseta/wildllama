@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/version"
 )
 
 const checkpointBudgetEnv = "WILDLLAMA_CHAT_CHECKPOINT_MIB"
@@ -54,21 +56,65 @@ func (s *llamaServerRunner) checkpoint(id string) *chatCheckpoint {
 	if limit <= 0 {
 		return nil
 	}
+	if s.checkpointRuntime == "" {
+		runtime, err := s.checkpointRuntimeKey()
+		if err != nil {
+			return nil
+		}
+		s.checkpointRuntime = runtime
+	}
+	return &chatCheckpoint{directory: filepath.Join(filepath.Dir(cfg.directory), ".chat-checkpoints"),
+		owner: fmt.Sprintf("%x", sha256.Sum256([]byte(id))), runtime: s.checkpointRuntime,
+		budget: limit, maxFile: min(cfg.budget, limit/3)}
+}
+
+// A runner's loaded weights, libraries and launch configuration are immutable.
+// Fingerprint them once per runner so ordinary turns never scan installation directories.
+func (s *llamaServerRunner) checkpointRuntimeKey() (string, error) {
 	key, identity, err := s.imageKey()
 	if err != nil {
-		return nil
+		return "", err
 	}
 	hash := sha256.New()
 	hash.Write(key[:])
-	fmt.Fprintf(hash, "\x00%s:%d:%d", s.cmd.Path, identity.executable.Size(), identity.executable.ModTime().UnixNano())
+	fmt.Fprintf(hash, "\x00%s\x00%s:%d:%d", version.Version, s.cmd.Path, identity.executable.Size(), identity.executable.ModTime().UnixNano())
+	seen := map[string]bool{}
+	dirs := append([]string{filepath.Dir(s.cmd.Path)}, s.launch.gpuLibs...)
 	for _, lib := range identity.implementation {
 		if lib.info != nil {
-			fmt.Fprintf(hash, "\x00%s:%d:%d", lib.path, lib.info.Size(), lib.info.ModTime().UnixNano())
+			dirs = append(dirs, filepath.Dir(lib.path))
 		}
 	}
-	return &chatCheckpoint{directory: filepath.Join(filepath.Dir(cfg.directory), ".chat-checkpoints"),
-		owner: fmt.Sprintf("%x", sha256.Sum256([]byte(id))), runtime: hex.EncodeToString(hash.Sum(nil)),
-		budget: limit, maxFile: min(cfg.budget, limit/3)}
+	for _, dir := range dirs {
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		for _, entry := range entries {
+			name := strings.ToLower(entry.Name())
+			base := strings.TrimPrefix(name, "lib")
+			if !(strings.HasPrefix(base, "llama") || strings.HasPrefix(base, "ggml") || strings.HasPrefix(base, "mtmd")) ||
+				!(strings.HasSuffix(name, ".dll") || strings.HasSuffix(name, ".dylib") || strings.HasSuffix(name, ".so") || strings.Contains(name, ".so.")) {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			info, err := os.Stat(path)
+			if err != nil {
+				return "", err
+			}
+			if info.Mode().IsRegular() {
+				fmt.Fprintf(hash, "\x00%s:%d:%d", path, info.Size(), info.ModTime().UnixNano())
+			}
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (c *chatCheckpoint) prefix() string { return c.owner + "." + c.runtime + "." }

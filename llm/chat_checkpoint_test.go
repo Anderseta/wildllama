@@ -81,6 +81,18 @@ func TestChatCheckpointRestartIsolationAndDeletion(t *testing.T) {
 	if restores != 0 {
 		t.Fatal("incompatible or already warm restore")
 	}
+	// Replacing just the native core must invalidate disk state across launches.
+	lib := filepath.Join(root, "llama.dll")
+	if err := os.WriteFile(lib, []byte("new core"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	begin(runner("a"), "project")
+	if restores != 0 {
+		t.Fatal("restored state from a different native core")
+	}
+	if err := os.Remove(lib); err != nil {
+		t.Fatal(err)
+	}
 	r = runner("a")
 	begin(r, "project")
 	if restores != 1 {
