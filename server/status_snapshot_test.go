@@ -79,7 +79,8 @@ func loadingStatusFixture(t *testing.T, duringLoad ...bool) (*Scheduler, *status
 		"tokenizer.ggml.tokens": []string{" "}, "tokenizer.ggml.scores": []float32{0}, "tokenizer.ggml.token_type": []int32{0},
 	}, []*gguftest.Tensor{{Name: "output.weight", Type: gguf.TensorTypeF32, Shape: []uint64{1, 1, 1, 1}, WriterTo: bytes.NewReader(make([]byte, 4))}})
 	ctx, cancel := context.WithCancel(t.Context())
-	s := InitScheduler(ctx)
+	// Finishing this request leaves the server running to publish its idle status.
+	s := InitScheduler(t.Context())
 	fake := &statusWaitingLlama{waiting: make(chan struct{}), ready: make(chan struct{})}
 	fake.cancel = cancel
 	waiting := fake.waiting
