@@ -309,11 +309,14 @@ func TestImageRequestIdempotenceAndCancelBeforeSubmission(t *testing.T) {
 	require.Len(t, service.jobs, 1)
 }
 
-func TestImageConfigRevisionAndSeedSurviveRestart(t *testing.T) {
+func TestImageConfigRevisionSeedAndLoRADescriptionSurviveRestart(t *testing.T) {
 	_, service, router, _, _ := newImageTestService(t)
 	config := cloneImageConfig(service.config)
 	seed := int64(0)
 	config.Profiles[0].Seed = &seed
+	config.Profiles[0].LoRAs = []imagegen.LoRA{
+		{Path: filepath.Join(t.TempDir(), "adapter.safetensors"), Scale: 1, Description: "Retratos\nIntensidade sugerida: 0,8"},
+	}
 	data, err := json.Marshal(config)
 	require.NoError(t, err)
 	response := imageTestHTTP(router, "PATCH", "/api/images/config", data, "application/json")
@@ -327,6 +330,7 @@ func TestImageConfigRevisionAndSeedSurviveRestart(t *testing.T) {
 	require.Equal(t, config.Revision+1, loaded.config.Revision)
 	require.NotNil(t, loaded.config.Profiles[0].Seed)
 	require.Equal(t, int64(0), *loaded.config.Profiles[0].Seed)
+	require.Equal(t, config.Profiles[0].LoRAs, loaded.config.Profiles[0].LoRAs)
 	seed = 123
 	require.Equal(t, int64(0), *loaded.config.Profiles[0].Seed)
 }

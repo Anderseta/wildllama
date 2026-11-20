@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ollama/ollama/internal/cudaload"
 	_ "golang.org/x/image/webp"
@@ -187,6 +188,9 @@ func ValidateProfile(p Profile) error {
 	}
 	if p.MOSSEditLoRA != nil {
 		edit := *p.MOSSEditLoRA
+		if utf8.RuneCountInString(edit.Description) > 500 {
+			return errors.New("LoRA descriptions must be at most 500 characters")
+		}
 		if p.ModelID != MOSSRecipeID || !filepath.IsAbs(edit.Path) ||
 			strings.ContainsAny(edit.Path, "\x00\r\n") || !strings.EqualFold(filepath.Ext(edit.Path), ".safetensors") ||
 			math.IsNaN(edit.Scale) || math.IsInf(edit.Scale, 0) || edit.Scale < 0 || edit.Scale > 4 {
@@ -202,6 +206,9 @@ func ValidateProfile(p Profile) error {
 		}
 	}
 	for _, lora := range p.LoRAs {
+		if utf8.RuneCountInString(lora.Description) > 500 {
+			return errors.New("LoRA descriptions must be at most 500 characters")
+		}
 		if math.IsNaN(lora.Scale) || math.IsInf(lora.Scale, 0) || lora.Scale < -4 || lora.Scale > 4 {
 			return errors.New("LoRA scale must be finite and between -4 and 4")
 		}

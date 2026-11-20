@@ -81,8 +81,9 @@ func (p *Profile) UnmarshalJSON(data []byte) error {
 }
 
 type LoRA struct {
-	Path  string  `json:"path"`
-	Scale float64 `json:"scale"`
+	Path        string  `json:"path"`
+	Scale       float64 `json:"scale"`
+	Description string  `json:"description,omitempty"`
 }
 type LocalInspection struct {
 	Path            string         `json:"path"`

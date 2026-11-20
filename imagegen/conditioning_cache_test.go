@@ -21,6 +21,9 @@ func envValue(env []string, key string) string {
 func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesInputs(t *testing.T) {
 	dir := t.TempDir()
 	profile := testProfile(t, dir)
+	lora := filepath.Join(dir, "adapter.gguf")
+	putModel(t, lora, modelBytes())
+	profile.LoRAs = []LoRA{{Path: lora, Scale: 1}}
 	config := Config{WorkDir: filepath.Join(dir, "work"), ConditioningCacheMiB: 256}
 	request := Request{Prompt: "first prompt", Seed: 1, OutputPath: filepath.Join(dir, "one.png")}
 	first, err := conditioningCacheEnvironment(context.Background(), config, profile, request, "native-v1")
@@ -48,6 +51,7 @@ func TestConditioningCacheNamespacePreservesSamplingIndependenceAndInvalidatesIn
 		"vram-margin":    func(p *Profile) { p.VRAMReserveMiB++ },
 		"profile-id":     func(p *Profile) { p.ID += "-copy" },
 		"model-id":       func(p *Profile) { p.ModelID += "-copy" },
+		"lora-note":      func(p *Profile) { p.LoRAs = []LoRA{{Path: lora, Scale: 1, Description: "Nota local"}} },
 	} {
 		t.Run("sampling-"+name, func(t *testing.T) {
 			next := profile

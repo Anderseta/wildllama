@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
@@ -203,8 +204,17 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 	// Native code additionally hashes every actual ConditionerParams field and
 	// reference tensor before accepting any serialized conditioning result.
 	conditioningProfile := profile
+	// Profile notes do not affect conditioning. Clear them on a copy.
+	conditioningProfile.LoRAs = slices.Clone(profile.LoRAs)
+	for i := range conditioningProfile.LoRAs {
+		conditioningProfile.LoRAs[i].Description = ""
+	}
 	if len(request.ReferenceImages) == 0 {
 		conditioningProfile.MOSSEditLoRA = nil
+	} else if profile.MOSSEditLoRA != nil {
+		edit := *profile.MOSSEditLoRA
+		edit.Description = ""
+		conditioningProfile.MOSSEditLoRA = &edit
 	}
 	conditioningProfile.Steps = 0
 	conditioningProfile.CFGScale = 0
