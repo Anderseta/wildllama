@@ -172,18 +172,19 @@ func (c *chatCheckpoint) files() ([]checkpointFile, int64, error) {
 // The runner semaphore protects the single native slot. The interprocess handoff
 // lock protects its fixed scratch filename across daemon and image transitions.
 // A timeout may leave the native writer running until the process exits.
-func (s *llamaServerRunner) checkpointIO(ctx context.Context, action string, maxFile int64, lock *os.File, scratch string) (int64, error) {
+func (s *llamaServerRunner) checkpointIO(ctx context.Context, action string, maxFile int64, lock *os.File, scratch, base string) (int64, error) {
 	child, cancel := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second)
 	defer cancel()
-	n, err := s.handoffActionBudget(child, action, maxFile)
+	n, err := s.handoffActionWithBase(child, action, maxFile, base)
 	if err != nil && child.Err() != nil && s.done != nil {
-		go func() { <-s.done; os.Remove(scratch); lock.Close() }()
+		go func() { <-s.done; os.Remove(scratch); os.Remove(scratch + ".base"); lock.Close() }()
 		return 0, errCheckpointWriterActive
 	}
 	return n, err
 }
 
 var errCheckpointWriterActive = errors.New("checkpoint operation is still finishing")
+var errCheckpointDeltaSave = errors.New("native incremental save did not complete")
 
 func (s *llamaServerRunner) beginChatCheckpoint(ctx context.Context, id string) (*chatCheckpoint, error) {
 	if s.launch.handoff == nil {
@@ -212,10 +213,11 @@ func (s *llamaServerRunner) beginChatCheckpoint(ctx context.Context, id string) 
 	defer func() {
 		if release {
 			os.Remove(scratch)
+			os.Remove(scratch + ".base")
 			lock.Close()
 		}
 	}()
-	files, _, err := c.files()
+	files, used, err := c.files()
 	if err != nil {
 		return c, nil
 	}
@@ -233,15 +235,19 @@ func (s *llamaServerRunner) beginChatCheckpoint(ctx context.Context, id string) 
 			return nil, nil
 		}
 		os.Remove(scratch)
-		if os.Link(source, scratch) != nil {
-			return c, nil
+		logical, err := c.materialize(source, scratch, f.size, c.budget-used)
+		if err != nil {
+			continue
 		}
-		n, err := s.checkpointIO(ctx, "restore", c.maxFile, lock, scratch)
+		if c.revoked() {
+			return nil, nil
+		}
+		n, err := s.checkpointIO(ctx, "restore", c.maxFile, lock, scratch, "")
 		if errors.Is(err, errCheckpointWriterActive) {
 			release = false
 			return nil, err
 		}
-		if err != nil || n != f.size {
+		if err != nil || n != logical {
 			os.Remove(source)
 			if _, clearErr := s.handoffAction(ctx, "erase"); clearErr != nil {
 				return nil, fmt.Errorf("reset failed chat restore: %w", clearErr)
@@ -274,6 +280,7 @@ func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatChe
 	defer func() {
 		if release {
 			os.Remove(scratch)
+			os.Remove(scratch + ".base")
 			lock.Close()
 		}
 	}()
@@ -284,13 +291,11 @@ func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatChe
 	if err != nil {
 		return
 	}
-	// Keep space for a new snapshot without exceeding the total disk budget.
-	for i := len(files) - 1; used > c.budget-c.maxFile && i >= 0; i-- {
-		if os.Remove(filepath.Join(c.directory, files[i].name)) != nil {
-			return
-		}
-		used -= files[i].size
+	if !c.reserveSaveSpace(files, used) {
+		return
 	}
+	os.Remove(scratch + ".base")
+	base := c.linkDeltaBase(files, scratch)
 	os.Remove(scratch)
 	f, err := os.OpenFile(scratch, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -299,7 +304,12 @@ func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatChe
 	f.Close()
 	s.checkpointTime = time.Now()
 	s.checkpointTokens = tokens
-	n, err := s.checkpointIO(ctx, "save", c.maxFile, lock, scratch)
+	n, err := s.checkpointIO(ctx, "save", c.maxFile, lock, scratch, base)
+	if errors.Is(err, errCheckpointDeltaSave) && !c.revoked() {
+		// Encoded literals and record headers can exceed the cap even when the raw slot fits.
+		base = ""
+		n, err = s.checkpointIO(ctx, "save", c.maxFile, lock, scratch, base)
+	}
 	if errors.Is(err, errCheckpointWriterActive) {
 		release = false
 		return
@@ -310,6 +320,14 @@ func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatChe
 	sum, err := handoffChecksum(scratch, n)
 	if err != nil {
 		return
+	}
+	storedBase, err := checkpointBase(scratch)
+	if err != nil || storedBase != "" && storedBase != base {
+		return
+	}
+	baseName := ""
+	if storedBase != "" {
+		baseName = c.prefix() + storedBase + ".slot"
 	}
 	name := c.prefix() + hex.EncodeToString(sum[:]) + ".slot"
 	dest := filepath.Join(c.directory, name)
@@ -322,7 +340,7 @@ func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatChe
 		return
 	}
 	for _, f := range files {
-		if f.name != name && strings.HasPrefix(f.name, c.prefix()) {
+		if f.name != name && f.name != baseName && strings.HasPrefix(f.name, c.prefix()) {
 			os.Remove(filepath.Join(c.directory, f.name))
 		}
 	}

@@ -1,0 +1,892 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 8f0defd31df157cf463f906ae63cfed52ff07b20..b119bf6868c55799d7c17cd9b1eb86d87183a19c 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_IMAGE_HANDOFF_MIB","WILDLLAMA_EXACT_GPU_TOP_K","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_IMAGE_HANDOFF_MIB","WILDLLAMA_EXACT_GPU_TOP_K","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE","WILDLLAMA_MTP_RESPONSE_LOOKUP","WILDLLAMA_MTP_AUTO_STRATEGY","WILDLLAMA_MTP_EARLY_STOP"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/common/mtp-round-policy.h b/common/mtp-round-policy.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..789b8bcb5c1e47ab067d1c029417fbdc3de3f004
+--- /dev/null
++++ b/common/mtp-round-policy.h
+@@ -0,0 +1,125 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// Only confirmed history is indexed. Offsets refer to the caller's token vector;
++// collisions and rewinds are harmless because each match is verified in full.
++class common_mtp_response_lookup {
++    static constexpr size_t anchor = 6, buckets = 4096, window = 16384;
++    std::vector<uint32_t> offsets;
++    size_t start = 0, next = 0, last_size = 0;
++    template <class At> static size_t bucket(At at) {
++        uint32_t h = 2166136261u;
++        for (size_t i = 0; i < anchor; ++i) {
++            h = (h ^ uint32_t(at(i))) * 16777619u;
++        }
++        return h % buckets;
++    }
++
++  public:
++    void begin(size_t prompt) {
++        start = last_size = prompt;
++        next = prompt;
++        offsets.clear();
++    }
++    bool propose(const std::vector<int32_t> &h, int32_t last, size_t max, std::vector<int32_t> &out) {
++        if (h.size() < last_size) {
++            begin(h.size());
++        }
++        last_size = h.size();
++        if (max < 2 || !out.empty() || h.size() > UINT32_MAX || h.size() - start < anchor + 2) {
++            return false;
++        }
++        if (offsets.empty()) {
++            offsets.resize(buckets);
++        }
++        const size_t oldest = std::max(start, h.size() > window ? h.size() - window : 0);
++        next = std::max(next, oldest + anchor);
++        for (; next <= h.size() - 2; ++next) {
++            offsets[bucket([&](size_t i) { return h[next - anchor + i]; })] = uint32_t(next);
++        }
++        const auto at = [&](size_t i) { return i + 1 == anchor ? last : h[h.size() - (anchor - 1) + i]; };
++        const size_t pos = offsets[bucket(at)];
++        if (pos < oldest + anchor || pos > h.size() - 2) {
++            return false;
++        }
++        for (size_t i = 0; i < anchor; ++i) {
++            if (at(i) != h[pos - anchor + i]) {
++                return false;
++            }
++        }
++        const size_t count = std::min(max, h.size() - pos);
++        out.assign(h.begin() + pos, h.begin() + pos + count);
++        return true;
++    }
++};
++
++class common_mtp_round_policy {
++  public:
++    enum arm { normal, temperature, shortlist };
++
++  private:
++    std::array<double, 3> elapsed{}, tokens{};
++    double cost(arm a) const { return elapsed[a] / tokens[a]; }
++    std::array<unsigned, 3> samples{};
++    arm best = normal, active = normal;
++    unsigned in_window = 0, next_probe = 0;
++    bool allow_shortlist = true;
++    // Successful extensions beyond two tokens, counted only in uncut trials.
++    unsigned trials = 0, successes = 0, cuts = 0;
++
++  public:
++    arm selected() const { return active; }
++    void disable_shortlist() {
++        allow_shortlist = false;
++        if (best == shortlist) {
++            best = normal;
++        }
++        active = best;
++        in_window = 0;
++    }
++    void observe(int64_t us, unsigned committed) {
++        if (us <= 0 || committed == 0) {
++            return;
++        }
++        elapsed[active] = .75 * elapsed[active] + us;
++        tokens[active] = .75 * tokens[active] + committed;
++        ++samples[active];
++        if (++in_window < (active == best && samples[active] >= 4 ? 20u : 4u)) {
++            return;
++        }
++        in_window = 0;
++        if (active != best) {
++            if (cost(active) < .94 * cost(best)) {
++                best = active;
++            }
++            active = best;
++            return;
++        }
++        do {
++            next_probe = (next_probe + 1) % (allow_shortlist ? 3u : 2u);
++        } while (next_probe == unsigned(best));
++        active = arm(next_probe);
++    }
++    void extension_result(unsigned proposed, unsigned accepted) {
++        if (proposed < 3) {
++            return;
++        }
++        if (trials == 16) {
++            trials /= 2;
++            successes /= 2;
++        }
++        ++trials;
++        successes += accepted >= 3;
++    }
++    bool stop_after_two(float confidence) {
++        if (trials < 4 || successes * 2 >= trials || !(confidence >= 0 && confidence < .65f)) {
++            return false;
++        }
++        // Periodically measure a full round to detect a change in workload.
++        return ++cuts % 4 != 0;
++    }
++};
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 7e4f2ac814aa182bb85973219cce9a0d4a05d1dc..0c574ee4815852aefa22e5fac75b56d67db6b17f 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,5 +1,6 @@
+ #include "speculative.h"
+ #include "mtp-edit-lookup.h"
++#include "mtp-round-policy.h"
+ #include "mtp-state.h"
+ #include "mtp-device-state.h"
+ #include "speculative-input.h"
+@@ -1573,6 +1574,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     bool draft_vocab_contextual = false;
+     std::unique_ptr<common_mtp_edit_lookup> edit_lookup;
+     uint64_t edit_rounds = 0;
++    std::unique_ptr<common_mtp_response_lookup> response_lookup;
++    common_mtp_round_policy round_policy;
++    bool auto_strategy = false, early_stop = false;
++    int64_t round_start = 0;
++    uint32_t proposed = 0, last_committed = 0;
++    llama_pos round_pos = -1;
+     bool tune_proposals = false;
+     std::vector<common_mtp_proposal_policy> proposal_policy;
+     std::vector<common_mtp_proposal_feedback> proposal_feedback;
+@@ -1742,6 +1749,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 this->params.n_min <= 1 && this->params.n_max >= 2 && !tune_proposals && !draft_vocab_active) {
+             edit_lookup = std::make_unique<common_mtp_edit_lookup>();
+         }
++        const auto enabled = [](const char * key) {
++            const char * value = std::getenv(key);
++            return value && std::strcmp(value, "1") == 0;
++        };
++        const bool single = n_seq == 1 && !chain_heads && !is_mem_shared && this->params.n_min <= 1;
++        if (single && enabled("WILDLLAMA_MTP_RESPONSE_LOOKUP") && !tune_proposals && !draft_vocab_active) {
++            response_lookup = std::make_unique<common_mtp_response_lookup>();
++        }
++        // Automatic mode may probe normally-off features. A forced strategy or fixed shortlist wins.
++        auto_strategy = single && this->params.block_verification && (!shortlist || !*shortlist) && !tune_proposals && !contextual &&
++                !enabled("WILDLLAMA_MTP_PACKED_HEAD") &&
++                enabled("WILDLLAMA_MTP_AUTO_STRATEGY");
++        early_stop = single && stochastic && this->params.n_max >= 3 && enabled("WILDLLAMA_MTP_EARLY_STOP");
++        if (auto_strategy) { proposal_policy.resize(1); proposal_feedback.resize(1); }
+         state.assign(n_seq, common_mtp_state(uint32_t(n_embd)));
+         const char * selective_catchup = std::getenv("WILDLLAMA_MTP_SELECTIVE_CATCHUP");
+         selective_catchup_enabled = selective_catchup && std::strcmp(selective_catchup, "1") == 0 &&
+@@ -1778,7 +1799,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     ~common_speculative_impl_draft_mtp() override {
+         auto * ctx_dft = this->params.ctx_dft;
+         if (edit_rounds) { SPC_INF("MTP edit lookup supplied %llu draft blocks\n", (unsigned long long) edit_rounds); }
+-        if (ctx_dft && draft_vocab_size) { llama_set_mtp_draft_vocab(ctx_dft, 0); }
++        if (ctx_dft && (draft_vocab_size || (auto_strategy && draft_vocab_active))) { llama_set_mtp_draft_vocab(ctx_dft, 0); }
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+                 continue;
+@@ -1798,6 +1819,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        if (response_lookup) { response_lookup->begin(prompt.size()); }
++        if (auto_strategy || early_stop) {
++            round_policy = {}; round_start = 0; last_committed = proposed = 0;
++            if (auto_strategy) {
++                if (draft_vocab_active) { llama_set_mtp_draft_vocab(params.ctx_dft, 0); draft_vocab_active = false; }
++                tune_proposals = false; proposal_policy[0] = {}; proposal_feedback[0] = {};
++            }
++        }
+         if (edit_lookup) { edit_lookup->begin(prompt); }
+         if (tune_proposals) { proposal_policy[seq_id] = {}; proposal_feedback[seq_id] = {}; }
+         if (draft_vocab_size && seq_id == 0) {
+@@ -2050,8 +2079,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 continue;
+             }
+ 
+-            if (edit_lookup && dp.edit_history && edit_lookup->propose(*dp.edit_history, dp.id_last,
+-                    common_speculative_draft_limit(params.n_max, dp.n_max), *dp.result)) {
++            if (auto_strategy) {
++                dp.proposal_feedback = nullptr;
++                const int64_t now = ggml_time_us();
++                if (round_start && last_committed && dp.pos0 == round_pos + int64_t(last_committed)) {
++                    round_policy.observe(now - round_start, last_committed);
++                }
++                round_start = 0; last_committed = 0;
++            }
++            proposed = 0;
++            const size_t maximum = common_speculative_draft_limit(params.n_max, dp.n_max);
++            if (dp.edit_history && ((edit_lookup && edit_lookup->propose(*dp.edit_history, dp.id_last, maximum, *dp.result)) ||
++                    (response_lookup && response_lookup->propose(*dp.edit_history, dp.id_last, maximum, *dp.result)))) {
+                 auto & result = *dp.result;
+                 const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
+                 result.erase(std::find_if(result.begin(), result.end(), [&](llama_token id) {
+@@ -2074,6 +2113,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 dp.result_q = nullptr;
+             }
+ 
++            if (auto_strategy) {
++                const bool eligible = dp.edit_history && dp.result_q && dp.temp > 0;
++                if (eligible) { round_start = ggml_time_us(); round_pos = dp.pos0; }
++                const auto arm = eligible ? round_policy.selected() : common_mtp_round_policy::normal;
++                tune_proposals = arm == common_mtp_round_policy::temperature;
++                const bool use_shortlist = arm == common_mtp_round_policy::shortlist;
++                if (use_shortlist != draft_vocab_active) {
++                    if (llama_set_mtp_contextual_vocab(ctx_dft, use_shortlist ? 4096 : 0)) {
++                        draft_vocab_active = draft_vocab_contextual = use_shortlist;
++                        if (use_shortlist) {
++                            vocab_rounds = vocab_accepted = 0;
++                            if (dp.edit_history && !dp.edit_history->empty()) {
++                                const size_t recent = std::min<size_t>(4096, dp.edit_history->size());
++                                llama_mtp_draft_vocab_observe(ctx_dft,
++                                        dp.edit_history->data() + (dp.edit_history->size() - recent), recent);
++                            }
++                            llama_mtp_draft_vocab_observe(ctx_dft, &dp.id_last, 1);
++                        }
++                    } else { round_policy.disable_shortlist(); round_start = 0; }
++                }
++            }
+             // result_q is only set when the caller wants rejection, so it also gates the retune
+             if (dp.result_q) {
+                 float factor = 1.f;
+@@ -2083,7 +2143,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     proposal_feedback[seq_id].factor = factor;
+                     dp.proposal_feedback = &proposal_feedback[seq_id];
+                 }
+-                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp * factor, dp.seed, tune_proposals);
++                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp * factor, dp.seed, tune_proposals || auto_strategy);
+             }
+ 
+             // a reset reseeds the chain, which breaks probabilistic drafting
+@@ -2174,7 +2234,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                 }
+ 
+-                if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
++                if (early_stop && dp.result_q) { proposed = uint32_t(result.size()); }
++                const bool stop = early_stop && dp.result_q && result.size() == 2 &&
++                    common_speculative_draft_limit(params.n_max, dp.n_max) > 2 &&
++                    round_policy.stop_after_two(cur_p->data[0].p);
++                if (stop || result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
+                     llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+@@ -2229,7 +2293,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) { return; }
+-        if (tune_proposals) {
++        if (round_start) { last_committed = uint32_t(n_accepted) + 1; }
++        if (early_stop) { round_policy.extension_result(proposed, n_accepted); proposed = 0; }
++        if (tune_proposals && (!auto_strategy || round_start)) {
+             const auto previous = proposal_policy[seq_id].arm;
+             proposal_policy[seq_id].update(proposal_feedback[seq_id]);
+             if (previous != proposal_policy[seq_id].arm) {
+@@ -2249,6 +2315,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 (vocab_rounds == 32 && vocab_accepted < 8)) {
+                 llama_set_mtp_draft_vocab(params.ctx_dft, 0);
+                 draft_vocab_active = false;
++                if (auto_strategy) { round_policy.disable_shortlist(); round_start = 0; }
+                 SPC_WRN("%s", "draft vocabulary coverage low; restoring the complete proposal head\n");
+             }
+         }
+@@ -3406,7 +3473,7 @@ bool common_speculative_is_single_mtp(const common_speculative * spec) {
+ 
+ bool common_speculative_uses_edit_lookup(const common_speculative * spec) {
+     const auto * mtp = common_speculative_single_mtp(spec);
+-    return mtp && mtp->edit_lookup && spec->synth_probs.empty();
++    return mtp && (mtp->edit_lookup || mtp->response_lookup || mtp->auto_strategy) && spec->synth_probs.empty();
+ }
+ 
+ bool common_speculative_process_after_forward(common_speculative * spec, const common_batch & batch, llama_context * fenced) {
+diff --git a/include/llama.h b/include/llama.h
+index 88c2d59453cb2a852881f6bcbc68cfe30ae9fd92..37557aa0170bc1ede2d6fa3518e9956ac1b75caa 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -972,6 +972,10 @@ extern "C" {
+                           size_t   size,
+                     llama_seq_id   dest_seq_id);
+ 
++    typedef bool (*llama_state_sink)(void * user, const void * data, size_t size);
++    LLAMA_API size_t llama_state_seq_write_stream(struct llama_context * ctx, llama_seq_id seq_id,
++            const llama_token * tokens, size_t count, llama_state_sink sink, void * user);
++
+     LLAMA_API size_t llama_state_seq_save_file(
+             struct llama_context * ctx,
+                       const char * filepath,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a384b6363da311ded6347bea5bfbaee0bf90bf96..f7a2b4c69d1f147683a2d485268cf30d2f636ddf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2182,7 +2182,7 @@ bool llama_context::refresh_mtp_packed_head() {
+     return true;
+ }
+ 
+-bool llama_context::set_mtp_draft_vocab(int32_t count) {
++bool llama_context::set_mtp_draft_vocab(int32_t count, bool contextual_override) {
+     if (!count) {
+         mtp_draft_vocab_enabled = false;
+         mtp_pack_source = nullptr;
+@@ -2206,7 +2206,7 @@ bool llama_context::set_mtp_draft_vocab(int32_t count) {
+     try {
+         if (!mtp_draft_vocab.reset(model.vocab.n_tokens(), count)) { return false; }
+         const char * contextual = std::getenv("WILDLLAMA_MTP_DYNAMIC_VOCAB");
+-        mtp_draft_vocab.contextual = contextual && std::strcmp(contextual, "1") == 0;
++        mtp_draft_vocab.contextual = contextual_override || (contextual && std::strcmp(contextual, "1") == 0);
+     } catch (const std::bad_alloc &) { return false; }
+     const char * packed = std::getenv("WILDLLAMA_MTP_PACKED_HEAD");
+     const bool pack_requested = packed && std::strcmp(packed, "1") == 0 &&
+@@ -2232,6 +2232,10 @@ void llama_mtp_draft_vocab_observe(llama_context * ctx, const llama_token * toke
+     }
+ }
+ 
++bool llama_set_mtp_contextual_vocab(llama_context * ctx, int32_t count) {
++    return ctx && ctx->set_mtp_draft_vocab(count, true);
++}
++
+ bool llama_set_mtp_draft_vocab(llama_context * ctx, int32_t count) {
+     return ctx && ctx->set_mtp_draft_vocab(count);
+ }
+@@ -4635,8 +4639,14 @@ class llama_io_write_file : public llama_io_write_i {
+ public:
+     llama_io_write_file(llama_file * f) : file(f) {}
+ 
++    llama_io_write_file(llama_state_sink callback, void * opaque) : file(nullptr), sink(callback), user(opaque) {}
++
+     void write(const void * src, size_t size) override {
+-        file->write_raw(src, size);
++        if (sink) {
++            if (!sink(user, src, size)) { throw std::runtime_error("sequence state sink failed"); }
++        } else {
++            file->write_raw(src, size);
++        }
+         size_written += size;
+     }
+ 
+@@ -4657,6 +4667,8 @@ public:
+ 
+ private:
+     llama_file * file;
++    llama_state_sink sink = nullptr;
++    void * user = nullptr;
+     size_t size_written = 0;
+     std::vector<uint8_t> temp_buffer;
+ };
+@@ -5309,6 +5321,28 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
+     return file.tell();
+ }
+ 
++size_t llama_context::state_seq_write_stream(llama_seq_id seq_id, const llama_token * tokens,
++        size_t count, llama_state_sink sink, void * user) {
++    if (!sink || count > UINT32_MAX) { return 0; }
++    llama_io_write_file io(sink, user);
++    const uint32_t header[] = {LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, uint32_t(count)};
++    io.write(header, sizeof(header));
++    io.write(tokens, count * sizeof(llama_token));
++    state_seq_write_data(io, seq_id, 0);
++    return io.n_bytes();
++}
++
++size_t llama_state_seq_write_stream(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens,
++        size_t count, llama_state_sink sink, void * user) {
++    try {
++        ctx->synchronize();
++        return ctx->state_seq_write_stream(seq_id, tokens, count, sink, user);
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: %s\\n", __func__, e.what());
++        return 0;
++    }
++}
++
+ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+     llama_file file(filepath, "wb");
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index dc18600c4d335c671e7712e1344e34152df1afb5..8b1c1e7a0cf706f656713e86eb7cc3aa2ce4c851 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -235,7 +235,7 @@ struct llama_context {
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+-    bool set_mtp_draft_vocab(int32_t count);
++    bool set_mtp_draft_vocab(int32_t count, bool contextual_override = false);
+     llama_draft_vocab mtp_draft_vocab;
+     bool mtp_draft_vocab_enabled = false;
+     std::unique_ptr<llama_packed_draft_head> mtp_packed_head;
+@@ -308,6 +308,9 @@ struct llama_context {
+                 size_t   n_token_capacity,
+                 size_t * n_token_count_out);
+ 
++    size_t state_seq_write_stream(llama_seq_id seq_id, const llama_token * tokens, size_t count,
++                                  llama_state_sink sink, void * user);
++
+     size_t state_seq_save_file(
+           llama_seq_id   seq_id,
+             const char * filepath,
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index e9d2450bae13535ae71f5711cd6806b948db6caa..6fef3bd510b6256bd6e943c88472ff4d7515d82a 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -8,6 +8,7 @@
+ 
+ // Restrict only MTP proposals. Zero disables; target verification remains full-vocabulary.
+ LLAMA_API bool llama_set_mtp_draft_vocab(struct llama_context * ctx, int32_t count);
++LLAMA_API bool llama_set_mtp_contextual_vocab(struct llama_context * ctx, int32_t count);
+ LLAMA_API void llama_mtp_draft_vocab_observe(struct llama_context * ctx, const llama_token * tokens, size_t count);
+ LLAMA_API bool llama_mtp_draft_vocab_seed(struct llama_context * ctx, const float * logits, size_t count);
+ #include "llama-nextn-device.h"
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+index a9e797c30322b46bfe79d7237e797d32e144b5f8..da8b03438ec32dd2028efbe764eebc364525a5ab 100644
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -201,7 +201,7 @@ struct session {
+     common_speculative_ptr spec;
+     bool target_nextn_required = true;
+     explicit session(llama_model * model, uint32_t sequences = 1, llama_model * head = nullptr,
+-                     common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
++                     common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP, bool routed = false) {
+         target_nextn_required = type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+         auto cp = llama_context_default_params();
+         cp.n_ctx = 128*sequences; cp.n_batch = cp.n_ubatch = 64; cp.n_seq_max = sequences; cp.n_rs_seq = 2;
+@@ -217,6 +217,7 @@ struct session {
+         cfg.types = {type};
+         cfg.draft.ctx_tgt = target.get(); cfg.draft.ctx_dft = draft.get();
+         cfg.draft.n_max = 2; cfg.draft.n_min = 0; cfg.draft.p_min = 0; cfg.draft.backend_sampling = false;
++        if (routed) { cfg.draft.n_max = 4; cfg.draft.block_verification = true; }
+         spec.reset(common_speculative_init(cfg, sequences));
+         require(bool(spec), "MTP implementation unavailable");
+     }
+@@ -452,6 +453,65 @@ int main(int argc, char ** argv) {
+         }
+         auto model = tiny_model();
+         require(llama_model_size(model.get()) < 4*1024*1024, "fixture exceeds 4 MiB");
++        // Exercise the public draft API on a real small recurrent model. The
++        // response source proposes a point mass, including for stochastic targets.
++        {
++            for (const char * key : {"WILDLLAMA_MTP_RESPONSE_LOOKUP","WILDLLAMA_MTP_AUTO_STRATEGY","WILDLLAMA_MTP_EARLY_STOP"}) {
++#ifdef _WIN32
++                _putenv_s(key,"1");
++#else
++                setenv(key,"1",1);
++#endif
++            }
++            session routed(model.get(),1,nullptr,COMMON_SPECULATIVE_TYPE_DRAFT_MTP,true);
++            llama_tokens prompt = {11,12,13};
++            routed.prefill(prompt);
++            common_speculative_begin(routed.spec.get(),0,prompt);
++            llama_tokens history = prompt;
++            history.insert(history.end(),{1,2,3,4,5,6,21,22,23,1,2,3,4,5});
++            routed.prefill(history,prompt.size());
++            llama_tokens proposals;
++            std::vector<std::vector<llama_token_data>> q;
++            auto & dp = common_speculative_get_draft_params(routed.spec.get(),0);
++            dp.drafting = true; dp.n_max = 3; dp.pos0 = llama_pos(history.size()); dp.id_last = 6;
++            dp.temp = 1; dp.seed = 19; dp.result = &proposals; dp.result_q = &q; dp.edit_history = &history;
++            common_speculative_draft(routed.spec.get());
++            require(proposals == llama_tokens({21,22,23}) && q.size() == 3, "response proposal not used by the MTP runtime");
++            for (size_t i=0; i<q.size(); ++i) {
++                require(q[i].size()==1 && q[i][0].id==proposals[i] && q[i][0].p==1.f,"wrong lookup probability");
++            }
++            session live(model.get(),1,nullptr,COMMON_SPECULATIVE_TYPE_DRAFT_MTP,true);
++            history = prompt;
++            live.prefill(history);
++            common_speculative_begin(live.spec.get(),0,prompt);
++            bool probed_tuning = false, stopped_early = false;
++            for (unsigned round=0; round<90; ++round) {
++                // Supply a different correction on each round. This produces
++                // real CPU draft probabilities and makes long drafts unprofitable.
++                const int id = int((round*17 + round/9) % 61);
++                const auto pos = llama_pos(history.size());
++                auto & request = common_speculative_get_draft_params(live.spec.get(),0);
++                proposals.clear(); q.clear(); request={};
++                request.drafting=true; request.n_max=4; request.pos0=pos; request.id_last=id;
++                request.temp=1; request.seed=19; request.result=&proposals; request.result_q=&q; request.edit_history=&history;
++                common_speculative_draft(live.spec.get());
++                require(!proposals.empty() && proposals.size()<=4 && proposals.size()==q.size(),"invalid stochastic proposal");
++                probed_tuning |= request.proposal_feedback != nullptr;
++                stopped_early |= proposals.size()==2 && q[0].size()>1;
++                require(llama_memory_seq_rm(llama_get_memory(live.draft.get()),0,pos,-1),"cannot clear rejected tail");
++                live.process(id,pos);
++                common_speculative_accept(live.spec.get(),0,0);
++                history.push_back(id);
++            }
++            require(probed_tuning && stopped_early,"runtime did not exercise tuning and confidence-based verification");
++            for (const char * key : {"WILDLLAMA_MTP_RESPONSE_LOOKUP","WILDLLAMA_MTP_AUTO_STRATEGY","WILDLLAMA_MTP_EARLY_STOP"}) {
++#ifdef _WIN32
++                _putenv_s(key,"");
++#else
++                unsetenv(key);
++#endif
++            }
++        }
+         step("selective MTP catch-up: accept none, part, or all");
+         test_selective_catchup(model.get());
+         const llama_tokens a = {3,4,5,6}, b = {17,18,19,20};
+diff --git a/tests/test-server-mtp-depth.cpp b/tests/test-server-mtp-depth.cpp
+index 2f3cdfae7abe609c34775f45f766b673e0317c6f..eb0adda76fd634b828e112aa7881293d60bfdeb3 100644
+--- a/tests/test-server-mtp-depth.cpp
++++ b/tests/test-server-mtp-depth.cpp
+@@ -1,4 +1,5 @@
+ #include "../common/mtp-edit-lookup.h"
++#include "../common/mtp-round-policy.h"
+ #include "../tools/server/server-mtp-depth.h"
+ 
+ #include <cstdio>
+@@ -102,5 +103,39 @@ int main() {
+     history = {1,2,3,4,5};
+     result.clear();
+     check(lookup.propose(history, 6, 2, result) && result.front() == 91, "hash collision hid verified older anchor");
++    common_mtp_response_lookup output;
++    output.begin(3);
++    history = {50,51,52,1,2,3,4,5,6,77,88,99,1,2,3,4,5};
++    result.clear();
++    check(output.propose(history,6,2,result) && result==std::vector<int32_t>({77,88}),
++          "committed response continuation was not proposed");
++    result.clear();
++    check(!output.propose(history,7,2,result), "response hash admitted a wrong token");
++    history.resize(6);
++    check(!output.propose(history,6,2,result), "rewound response reused a stale index");
++    output.begin(history.size());
++    check(!output.propose(history,6,2,result), "lookup crossed requests");
++
++    common_mtp_round_policy policy;
++    int used[3]{};
++    for (int i=0;i<400;++i) {
++        auto arm=policy.selected();
++        if (i>200) { ++used[arm]; }
++        policy.observe(arm==policy.shortlist ? 20 : 50, 2);
++    }
++    check(used[policy.shortlist]>125, "cheapest arm did not win");
++    policy.disable_shortlist();
++    for (int i=0;i<180;++i) {
++        check(policy.selected()!=policy.shortlist,"unsupported shortlist retried");
++        policy.observe(100,2);
++    }
++    check(!policy.stop_after_two(.1f), "shortened before measuring");
++    for (int i=0;i<8;++i) { policy.extension_result(4,1); }
++    check(!policy.stop_after_two(.99f), "shortened a confident draft");
++    int cuts=0;
++    for (int i=0;i<8;++i) { cuts+=policy.stop_after_two(.3f); }
++    check(cuts==6, "missing recovery probes");
++    for (int i=0;i<30;++i) { policy.extension_result(4,4); }
++    check(!policy.stop_after_two(.3f), "failed to resume normal depth");
+     std::puts("PASS adaptive MTP depth: request ceiling, cost, context isolation and recovery");
+ }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index cd55af0db9db75230fa9d94e5e57a95308660f2c..f23de038e6387157b7f11f88caa9524a46f60a2f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,3 +1,4 @@
++#include "server-slot-delta.h"
+ #include "server-context.h"
+ #include "server-admission.h"
+ #include "server-decode-overlap.h"
+@@ -3090,12 +3091,12 @@ private:
+         return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
+     }
+ 
+-    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
++    static void ckpt_write(std::ostream & ofs, const void * src, size_t size, size_t & n_written) {
+         ofs.write((const char *) src, size);
+         n_written += size;
+     }
+ 
+-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
++    static void ckpt_write_buf(std::ostream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+         const uint64_t n = buf.size();
+         ckpt_write(ofs, &n, sizeof(n), n_written);
+         if (n > 0) {
+@@ -3104,12 +3105,14 @@ private:
+     }
+ 
+     // returns false if the appendix could not be written completely
+-    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
++    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written, std::ostream * sink = nullptr) const {
+         n_written = 0;
+         if (slot.prompt.checkpoints.empty()) {
+             return true;
+         }
+-        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
++        std::ofstream file;
++        if (!sink) { file.open(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app); }
++        std::ostream & ofs = sink ? *sink : file;
+         if (!ofs) {
+             SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
+             return false;
+@@ -3204,7 +3207,7 @@ private:
+ 
+     // returns false if the draft state could not be written completely
+     bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written,
+-                         std::vector<uint8_t> data_spec = {}, bool have_spec = false) const {
++                         std::vector<uint8_t> data_spec = {}, bool have_spec = false, std::ostream * sink = nullptr) const {
+         n_written = 0;
+         std::vector<uint8_t> data_dft;
+         if (ctx_dft != nullptr) {
+@@ -3217,7 +3220,9 @@ private:
+         if (data_dft.empty() && data_spec.empty()) {
+             return true;
+         }
+-        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
++        std::ofstream file;
++        if (!sink) { file.open(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app); }
++        std::ostream & ofs = sink ? *sink : file;
+         if (!ofs) {
+             SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
+             return false;
+@@ -3552,23 +3557,29 @@ private:
+                             break;
+                         }
+                     }
+-                    const size_t nwrite = llama_state_seq_save_file(
+-                        ctx_tgt, filepath.c_str(), slot->id,
+-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+-                    if (nwrite == 0) {
+-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+-                        break;
+-                    }
+-
+-                    size_t nwrite_ckpt = 0;
+-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
+-                        break;
+-                    }
+-
+-                    size_t nwrite_dft = 0;
+-                    if (!save_slot_draft(filepath, *slot, nwrite_dft, std::move(draft_state), task.slot_action.image_budget != 0)) {
+-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
++                    size_t stored = 0;
++                    try {
++                        std::unique_ptr<server_slot_delta> delta;
++                        if (!task.slot_action.checkpoint_base.empty()) {
++                            delta = std::make_unique<server_slot_delta>(std::filesystem::u8path(filepath),
++                                    task.slot_action.checkpoint_base, task.slot_action.image_budget);
++                        }
++                        std::ostream stream(delta.get());
++                        auto * sink = delta ? &stream : nullptr;
++                        const auto * ids = reinterpret_cast<const llama_token *>(packed.data());
++                        const auto count = packed.size() / sizeof(llama_token);
++                        const size_t nwrite = sink ? llama_state_seq_write_stream(ctx_tgt, slot->id, ids, count,
++                            [](void * user,const void * data,size_t n) {
++                                return bool(static_cast<std::ostream *>(user)->write(static_cast<const char *>(data),n));
++                            }, sink) : llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, ids, count);
++                        size_t checkpoints = 0, draft = 0;
++                        if (!nwrite || !save_slot_checkpoints(filepath,*slot,checkpoints,sink) ||
++                            !save_slot_draft(filepath,*slot,draft,std::move(draft_state),task.slot_action.image_budget != 0,sink)) {
++                            throw std::runtime_error("Incomplete slot checkpoint");
++                        }
++                        stored = delta ? delta->finish() : nwrite + checkpoints + draft;
++                    } catch (const std::exception & e) {
++                        send_error(task,e.what(),ERROR_TYPE_SERVER);
+                         break;
+                     }
+ 
+@@ -3581,7 +3592,7 @@ private:
+                     res->filename = filename;
+                     res->is_save  = true;
+                     res->n_tokens = slot->prompt.tokens.size();
+-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
++                    res->n_bytes  = stored;
+                     res->t_ms     = t_save_ms;
+                     queue_results.send(std::move(res));
+                 } break;
+@@ -7825,6 +7836,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
+     {
+         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
+         task.slot_action.image_budget = request_data.value("image_budget", uint64_t(0));
++        if (request_data.contains("checkpoint_base")) {
++            const std::string digest = request_data.value("checkpoint_base", std::string());
++            if (!std::getenv("WILDLLAMA_IMAGE_HANDOFF_AUTH") || !task.slot_action.image_budget ||
++                    digest.size() != 64 || digest.find_first_not_of("0123456789abcdef") != std::string::npos) {
++                res->error(format_error_response("Invalid incremental checkpoint", ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++            task.slot_action.checkpoint_base = digest;
++        }
+         task.id = rd.get_new_id();
+         task.slot_action.id_slot  = id_slot;
+         task.slot_action.filename = filename;
+diff --git a/tools/server/server-slot-delta.h b/tools/server/server-slot-delta.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbe78db4f285107c55d38574b1256f198dfac3f0
+--- /dev/null
++++ b/tools/server/server-slot-delta.h
+@@ -0,0 +1,155 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <limits>
++#include <stdexcept>
++#include <streambuf>
++#include <vector>
++
++// One immutable base, one bounded stream of copy/literal records. Content
++// anchors find blocks displaced by growing token arrays or tensor lengths.
++// A full byte comparison is mandatory even if the anchor hash matches.
++class server_slot_delta final : public std::streambuf {
++    static constexpr size_t block = 65536;
++    std::ifstream base;
++    std::ofstream out;
++    struct anchor {
++        uint64_t signature = 0, offset = UINT64_MAX;
++    };
++    static constexpr size_t stride = block / 4;
++    std::vector<anchor> anchors = std::vector<anchor>(32768);
++    std::vector<char> buffer = std::vector<char>(block), reference = std::vector<char>(block);
++    uint64_t predicted = 0, base_size = 0, logical = 0, physical = 0, limit;
++    size_t used = 0;
++
++    static uint64_t signature(const char *bytes) {
++        uint64_t value;
++        std::memcpy(&value, bytes, sizeof(value));
++        return value;
++    }
++    anchor &entry(uint64_t value) {
++        value ^= value >> 31;
++        return anchors[(value * UINT64_C(11400714819323198485)) >> 49];
++    }
++    void emit(const char *data, size_t size) {
++        if (size > limit - physical) {
++            throw std::runtime_error("checkpoint delta exceeds budget");
++        }
++        out.write(data, size);
++        if (!out) {
++            throw std::runtime_error("checkpoint delta write failed");
++        }
++        physical += size;
++    }
++    void integer(uint64_t n, size_t bytes) {
++        char data[8];
++        for (size_t i = 0; i < bytes; ++i) {
++            data[i] = char(n >> (8 * i));
++        }
++        emit(data, bytes);
++    }
++    bool matches(uint64_t pos) {
++        if (pos > base_size || used > base_size - pos) {
++            return false;
++        }
++        base.clear();
++        base.seekg(static_cast<std::streamoff>(pos));
++        base.read(reference.data(), used);
++        return base && !std::memcmp(reference.data(), buffer.data(), used);
++    }
++    void record() {
++        if (!used) {
++            return;
++        }
++        if (used > limit - logical) {
++            throw std::runtime_error("checkpoint state exceeds budget");
++        }
++        uint64_t found = predicted;
++        bool copy = matches(found);
++        if (!copy) {
++            unsigned comparisons = 0;
++            // Only search after a displacement changes. Fixed base anchors
++            // also work for float and quantized data with a biased byte alphabet.
++            for (size_t i = 0; i + sizeof(uint64_t) <= used; ++i) {
++                const auto sig = signature(buffer.data() + i);
++                const auto a = entry(sig);
++                if (a.signature != sig || a.offset == UINT64_MAX || a.offset < i || a.offset - i == predicted) {
++                    continue;
++                }
++                if (matches(a.offset - i)) {
++                    found = a.offset - i;
++                    copy = true;
++                    break;
++                }
++                if (++comparisons == 8) {
++                    break;
++                }
++            }
++        }
++        // 0 = end, 1 = literal, 2 = base span. All integers little endian.
++        integer(copy ? 2 : 1, 1);
++        integer(used, 4);
++        if (copy) {
++            integer(found, 8);
++            predicted = found + used;
++        } else {
++            emit(buffer.data(), used);
++            predicted += used;
++        }
++        logical += used;
++        used = 0;
++    }
++
++  protected:
++    std::streamsize xsputn(const char *data, std::streamsize size) override {
++        std::streamsize done = 0;
++        while (done < size) {
++            const size_t n = std::min<size_t>(block - used, size_t(size - done));
++            std::memcpy(buffer.data() + used, data + done, n);
++            done += n;
++            used += n;
++            if (used == block) {
++                record();
++            }
++        }
++        return done;
++    }
++
++  public:
++    server_slot_delta(const std::filesystem::path &path, const std::string &digest, uint64_t max_bytes)
++        : base(std::filesystem::path(path).concat(".base"), std::ios::binary),
++          out(path, std::ios::binary | std::ios::trunc), limit(max_bytes) {
++        if (!base || !out || digest.size() != 64) {
++            throw std::runtime_error("checkpoint delta files unavailable");
++        }
++        while (base.read(reference.data(), block) || base.gcount() > 0) {
++            const size_t n = size_t(base.gcount());
++            if (n > limit - base_size) {
++                throw std::runtime_error("checkpoint base exceeds budget");
++            }
++            for (size_t i = 0; i + sizeof(uint64_t) <= n; i += stride) {
++                const auto sig = signature(reference.data() + i);
++                entry(sig) = {sig, base_size + i};
++            }
++            base_size += n;
++        }
++        if (!base.eof()) {
++            throw std::runtime_error("checkpoint base read failed");
++        }
++        emit("WLDDEL01", 8);
++        emit(digest.data(), digest.size());
++    }
++    uint64_t finish() {
++        record();
++        integer(0, 1);
++        out.close();
++        if (!out) {
++            throw std::runtime_error("checkpoint delta close failed");
++        }
++        return physical;
++    }
++};
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index d208736d0d6f8688698783512089a663acdb07f7..ce3a88eca010e1c59ce3fddc3f4238120eda3ebb 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -204,6 +204,7 @@ struct server_task {
+         std::string filename;
+         std::string filepath;
+         uint64_t image_budget = 0;
++        std::string checkpoint_base;
+     };
+     slot_action slot_action;
+ 

@@ -52,3 +52,22 @@ The following existing targets cover the new behavior without a model or GPU:
 
 The tests establish fewer retained writer tickets and no duplicate writes in
 those cycles. They do not establish trained-model tokens/s or SGLang parity.
+
+## Incremental local chat checkpoints
+
+Set `WILDLLAMA_CHAT_CHECKPOINT_INCREMENTAL=1` on the WildLlama daemon to enable
+incremental saves for eligible local chat sessions. The default is 0. The first
+save writes a regular keyframe. Later saves stream the target, recurrent
+checkpoints, draft and speculative state to a bounded encoder. Each record
+contains either original bytes or an exactly compared span of the keyframe.
+A changing header or tensor length can move a reusable span within the file.
+The encoder uses about 640 KiB of host buffers and index storage.
+
+Each published delta references one immutable SHA-256-named keyframe for that
+session and runtime. The existing disk and per-snapshot limits apply. Restore
+validates both files, expands into a temporary ordinary slot within the disk
+budget, and calls the same native restore used for full snapshots. A large
+delta triggers rotation to a full keyframe on the next eligible save.
+Disabling incremental writes still allows existing deltas to be restored.
+Incremental saving trades CPU comparisons and keyframe reads for fewer bytes
+written. Restoration needs temporary disk space and a complete slot write.

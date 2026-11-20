@@ -143,3 +143,18 @@ Ties, unsupported sampler chains, probability requests and uncertain scores use
 the full-row path. Set `WILDLLAMA_TRACE_READBACK=1` to log cumulative raw score
 bytes transferred eagerly, deferred and subsequently materialized. Benchmark
 with the intended model and sampling settings before enabling the option.
+
+## Experimental per-request MTP controls
+
+Single-sequence MTP can opt into three independent runner environment settings.
+All default to 0. The target sampler still verifies proposals with their actual
+distribution. Changing a proposal may change a seeded output.
+
+| Runner environment setting | Effect of setting it to 1 |
+| --- | --- |
+| `WILDLLAMA_MTP_RESPONSE_LOOKUP` | Indexes six-token anchors in the last 16,384 confirmed response tokens on demand. The index uses 16 KiB of host storage and reads the existing token history. Prompt matches retain priority. Slot rewinds and new requests reset the index. |
+| `WILDLLAMA_MTP_AUTO_STRATEGY` | For eligible text requests with stochastic block verification, compares the ordinary MTP proposal, proposal-temperature tuning and a contextual 4,096-token shortlist. Uses elapsed time per committed token across consecutive rounds. A candidate must beat the incumbent by 6% in the moving estimate. The shortlist uses the existing CUDA Q4_K-head admission checks. A fixed shortlist or a forced temperature, dynamic vocabulary or packed-head mode takes precedence. |
+| `WILDLLAMA_MTP_EARLY_STOP` | May verify after two proposals when confidence is low and recent uncut blocks rarely yielded a third accepted token. Every fourth eligible decision probes the full depth again. Uses probabilities already available on the host and respects the configured maximum. |
+
+The last two switches need independent and combined measurements on the intended
+model. The response lookup does not require a GPU index or new weights.

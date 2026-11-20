@@ -63,6 +63,7 @@ func newImageHandoff(launch llamaServerLaunchConfig, split bool) *imageHandoffCo
 	// lock owner can remove a stale checkpoint, including across processes.
 	if lock, err := cfg.lock(); err == nil {
 		os.Remove(filepath.Join(dir, handoffFile))
+		os.Remove(filepath.Join(dir, handoffFile+".base"))
 		lock.Close()
 	}
 	return cfg
@@ -137,8 +138,16 @@ func (s *llamaServerRunner) handoffAction(ctx context.Context, action string) (i
 }
 
 func (s *llamaServerRunner) handoffActionBudget(ctx context.Context, action string, budget int64) (int64, error) {
+	return s.handoffActionWithBase(ctx, action, budget, "")
+}
+
+func (s *llamaServerRunner) handoffActionWithBase(ctx context.Context, action string, budget int64, base string) (int64, error) {
 	cfg := s.launch.handoff
-	body, _ := json.Marshal(map[string]any{"filename": handoffFile, "handoff_auth": cfg.auth, "image_budget": budget})
+	fields := map[string]any{"filename": handoffFile, "handoff_auth": cfg.auth, "image_budget": budget}
+	if base != "" {
+		fields["checkpoint_base"] = base
+	}
+	body, _ := json.Marshal(fields)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/slots/0?action=%s", s.port, action), bytes.NewReader(body))
 	if err != nil {
 		return 0, err
@@ -150,6 +159,9 @@ func (s *llamaServerRunner) handoffActionBudget(ctx context.Context, action stri
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
+		if base != "" && res.StatusCode == http.StatusInternalServerError {
+			return 0, errCheckpointDeltaSave
+		}
 		return 0, fmt.Errorf("slot %s returned %d", action, res.StatusCode)
 	}
 	var out struct {
