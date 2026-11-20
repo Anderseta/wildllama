@@ -88,6 +88,7 @@ func (e *Engine) Status() RunnerStatus {
 				ConditioningCache bool `json:"conditioning_cache"`
 				RAMBudget         bool `json:"ram_budget"`
 				MOSSEdit          bool `json:"moss_edit"`
+				InpaintCrop       bool `json:"inpaint_crop"`
 			} `json:"features"`
 			Files []struct {
 				Name   string `json:"name"`
@@ -138,6 +139,7 @@ func (e *Engine) Status() RunnerStatus {
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 		status.RAMBudgetSupported = manifest.Features.RAMBudget
 		status.MOSSEditSupported = manifest.Features.MOSSEdit
+		status.InpaintCropSupported = manifest.Features.InpaintCrop
 	}
 	if !status.RAMBudgetSupported {
 		status.Error = "image runtime does not support bounded RAM offload; update the isolated image runtime"
@@ -469,6 +471,20 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if err != nil {
 		return Result{}, err
 	}
+	var original image.Point
+	if r.Inpaint != nil && r.Inpaint.Crop {
+		if !runnerStatus.InpaintCropSupported {
+			return Result{}, errors.New("the installed image runner does not support cropped inpainting")
+		}
+		cfg, err := referenceImageConfig(r.ReferenceImages[0])
+		if err != nil {
+			return Result{}, err
+		}
+		original = image.Pt(cfg.Width, cfg.Height)
+		var canvas image.Point
+		r.crop, canvas = planInpaintCrop(mask, original, image.Pt(p.Width, p.Height))
+		p.Width, p.Height = canvas.X, canvas.Y
+	}
 	output := filepath.Clean(r.OutputPath)
 	if !filepath.IsAbs(output) || !within(filepath.Clean(e.config.OutputDir), output) || strings.ToLower(filepath.Ext(output)) != ".png" || strings.Contains(filepath.Base(output), "%") {
 		return Result{}, errors.New("image output must be a PNG path inside the configured output directory")
@@ -539,7 +555,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	defer os.RemoveAll(jobDir)
 	finalPath := output
 	if r.Inpaint != nil {
-		if err := writeInpaintMask(mask, jobDir, p.Width, p.Height); err != nil {
+		if err := writeInpaintMask(mask, jobDir, p.Width, p.Height, r.crop, original); err != nil {
 			return Result{}, err
 		}
 		output = filepath.Join(jobDir, "generated.png")
@@ -565,6 +581,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	}
 	start := time.Now()
 	log := &progressLog{callback: progress, start: start, expectedSteps: p.Steps}
+	if !r.crop.Empty() {
+		log.emit(Progress{Phase: "preparing", Message: fmt.Sprintf("Editando recorte de %d × %d pixels em %d × %d. A saída mantém as dimensões da referência.", r.crop.Dx(), r.crop.Dy(), p.Width, p.Height)}, true)
+	}
 	mode := imageGPUResident
 	residentFailedAt := 0
 	if r.CPUOnly {
@@ -641,7 +660,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if runErr != nil {
 			return Result{}, runErr
 		}
-		size, err := composeInpaint(ctx, mask, r.ReferenceImages[0], decoded, finalPath)
+		size, err := composeInpaint(ctx, mask, r.ReferenceImages[0], decoded, finalPath, r.crop)
 		if err != nil {
 			return Result{}, err
 		}
@@ -766,6 +785,9 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 	}
 	if r.Inpaint != nil {
 		args = append(args, "--init-img", r.ReferenceImages[0], "--mask", filepath.Join(jobDir, "mask.png"), "--strength", "1")
+		if !r.crop.Empty() {
+			args = append(args, "--inpaint-crop", fmt.Sprintf("%d,%d,%d,%d", r.crop.Min.X, r.crop.Min.Y, r.crop.Dx(), r.crop.Dy()))
+		}
 	}
 	stage := "off"
 	if p.StageComponents {

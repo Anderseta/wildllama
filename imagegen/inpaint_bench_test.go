@@ -62,7 +62,7 @@ func BenchmarkFinalizeInpaint(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := composeInpaint(b.Context(), bitmap, source, decoded, out); err != nil {
+				if _, err := composeInpaint(b.Context(), bitmap, source, decoded, out, image.Rectangle{}); err != nil {
 					b.Fatal(err)
 				}
 			}

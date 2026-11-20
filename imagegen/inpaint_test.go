@@ -10,10 +10,122 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	xdraw "golang.org/x/image/draw"
 )
+
+func TestCroppedInpaintCoordinates(t *testing.T) {
+	original := image.Pt(1801, 1057)
+	canvas := image.Pt(1024, 768)
+	mask := image.NewGray(image.Rect(0, 0, 127, 99))
+	selected := image.Rect(119, 89, 127, 98)
+	draw.Draw(mask, selected, image.White, image.Point{}, draw.Src)
+	mask.SetGray(121, 92, color.Gray{}) // A hole inside the selected bounds.
+	crop, work := planInpaintCrop(mask, original, canvas)
+	if crop.Max != original || crop.Size() != image.Pt(512, 512) || work != crop.Size() {
+		t.Fatalf("unexpected crop %v and work canvas %v", crop, work)
+	}
+	dir := t.TempDir()
+	if err := writeInpaintMask(mask, dir, work.X, work.Y, crop, original); err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := readInpaintImage(filepath.Join(dir, "mask.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := image.Rectangle{Max: original}
+	dst := image.NewNRGBA64(b)
+	old := color.NRGBA64{R: 0x1234, G: 0x5678, B: 0x1357, A: 0x789a}
+	for y := 0; y < original.Y; y++ {
+		for x := 0; x < original.X; x++ {
+			dst.SetNRGBA64(x, y, old)
+		}
+	}
+	edit := image.NewNRGBA(image.Rectangle{Max: work})
+	for y := 0; y < work.Y; y++ {
+		for x := 0; x < work.X; x++ {
+			edit.SetNRGBA(x, y, color.NRGBA{R: uint8(x), G: uint8(y), A: 255})
+		}
+	}
+	if err := overlayInpaintRegion(t.Context(), dst, edit, mask, crop); err != nil {
+		t.Fatal(err)
+	}
+	for y := 0; y < original.Y; y++ {
+		for x := 0; x < original.X; x++ {
+			mx, my := (2*x+1)*mask.Rect.Dx()/(2*original.X), (2*y+1)*mask.Rect.Dy()/(2*original.Y)
+			inside := mask.GrayAt(mx, my).Y != 0
+			want := old
+			local := image.Pt(x, y).Sub(crop.Min)
+			if inside {
+				want = color.NRGBA64Model.Convert(edit.At(local.X, local.Y)).(color.NRGBA64)
+			}
+			if got := dst.NRGBA64At(x, y); got != want {
+				t.Fatalf("pixel %d,%d = %v, want %v", x, y, got, want)
+			}
+			if image.Pt(x, y).In(crop) {
+				v, _, _, _ := mapped.At(local.X, local.Y).RGBA()
+				if (v != 0) != inside {
+					t.Fatalf("work mask differs at %d,%d", x, y)
+				}
+			}
+		}
+	}
+	draw.Draw(mask, mask.Bounds(), image.White, image.Point{}, draw.Src)
+	if r, c := planInpaintCrop(mask, original, canvas); !r.Empty() || c != canvas {
+		t.Fatalf("full mask changed canvas: %v %v", r, c)
+	}
+}
+
+func TestInpaintReducedCropWithTwoReferences(t *testing.T) {
+	original, canvas := image.Pt(1399, 997), image.Pt(384, 288)
+	mask := image.NewGray(image.Rect(0, 0, 71, 63))
+	draw.Draw(mask, image.Rect(25, 7, 48, 29), image.White, image.Point{}, draw.Src)
+	mask.SetGray(4, 8, color.Gray{Y: 255})
+	crop, work := planInpaintCrop(mask, original, canvas)
+	if crop.Empty() || work.X >= crop.Dx() || work.X > canvas.X || work.Y > canvas.Y {
+		t.Fatalf("unexpected crop %v, work %v", crop, work)
+	}
+	refs := []string{"first.png", "second.png"}
+	request := Request{Inpaint: &InpaintMask{Crop: true}, ReferenceImages: refs, crop: crop}
+	args := buildArguments(Profile{Width: work.X, Height: work.Y}, request, "job", "result.png", 1)
+	value := func(name string) string {
+		i := slices.Index(args, name)
+		if i < 0 || i+1 >= len(args) {
+			t.Fatalf("missing %s", name)
+		}
+		return args[i+1]
+	}
+	if value("--init-img") != refs[0] || value("--inpaint-crop") == "" || !strings.Contains(strings.Join(args, " "), "-r first.png -r second.png") {
+		t.Fatal("runner lost crop or reference order", args)
+	}
+	edit := image.NewRGBA(image.Rectangle{Max: work})
+	for y := 0; y < work.Y; y++ {
+		for x := 0; x < work.X; x++ {
+			edit.SetRGBA(x, y, color.RGBA{R: uint8(x), G: uint8(y), A: 255})
+		}
+	}
+	dst := image.NewNRGBA(image.Rectangle{Max: original})
+	if err := overlayInpaintRegion(t.Context(), dst, edit, mask, crop); err != nil {
+		t.Fatal(err)
+	}
+	expected := image.NewNRGBA(crop)
+	xdraw.BiLinear.Scale(expected, crop, edit, edit.Bounds(), draw.Src, nil)
+	for y := 0; y < original.Y; y++ {
+		for x := 0; x < original.X; x++ {
+			mx, my := (2*x+1)*mask.Rect.Dx()/(2*original.X), (2*y+1)*mask.Rect.Dy()/(2*original.Y)
+			want := color.NRGBA{}
+			if mask.GrayAt(mx, my).Y != 0 {
+				want = expected.NRGBAAt(x, y)
+			}
+			if got := dst.NRGBAAt(x, y); got != want {
+				t.Fatalf("pixel %d,%d = %v, want %v", x, y, got, want)
+			}
+		}
+	}
+}
 
 func encodedInpaintPNG(t *testing.T, img image.Image) []byte {
 	t.Helper()
@@ -56,7 +168,7 @@ func TestInpaintProtectedPixels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := composeInpaint(context.Background(), bitmap, source, rendered, output); err != nil {
+	if _, err := composeInpaint(context.Background(), bitmap, source, rendered, output, image.Rectangle{}); err != nil {
 		t.Fatal(err)
 	}
 	actual, err := readInpaintImage(output)

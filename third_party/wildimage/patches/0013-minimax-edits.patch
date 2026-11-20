@@ -1,0 +1,283 @@
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -172,13 +172,13 @@
+         return packed;
+     }
+ 
+-    static sd::Tensor<float> resize_h3_image_reference(const sd::Tensor<float>& image, int64_t max_short_edge) {
++    static sd::Tensor<float> resized_h3_reference_if_needed(const sd::Tensor<float>& image, int64_t max_short_edge) {
+         const int64_t short_edge = std::min(image.shape()[0], image.shape()[1]);
+         const double scale       = static_cast<double>(std::clamp<int64_t>(short_edge, 1024, max_short_edge)) / short_edge;
+         const int64_t width      = std::max<int64_t>(32, static_cast<int64_t>(std::nearbyint(image.shape()[0] * scale / 32)) * 32);
+         const int64_t height     = std::max<int64_t>(32, static_cast<int64_t>(std::nearbyint(image.shape()[1] * scale / 32)) * 32);
+         if (width == image.shape()[0] && height == image.shape()[1]) {
+-            return image;
++            return {};
+         }
+         return sd::ops::interpolate(image, {width, height, image.shape()[2], image.shape()[3]}, sd::ops::InterpolateMode::Lanczos);
+     }
+@@ -338,10 +338,15 @@
+             }
+         }
+ 
+-        std::vector<sd::Tensor<float>> ref_images;
+-        for (int i = 0; i < sd_img_gen_params->ref_images_count; i++) {
+-            ref_images.push_back(ensure_image_tensor_channels(sd_image_to_tensor(sd_img_gen_params->ref_images[i]),
+-                                                              image_channels));
++        const bool h3_image = sd->version == VERSION_MINIMAX_H3_IMAGE;
++        std::vector<sd::Tensor<float>> ref_images(sd_img_gen_params->ref_images_count);
++        auto load_reference = [&](size_t i) {
++            return ensure_image_tensor_channels(sd_image_to_tensor(sd_img_gen_params->ref_images[i]), image_channels);
++        };
++        if (!h3_image) {
++            for (size_t i = 0; i < ref_images.size(); ++i) {
++                ref_images[i] = load_reference(i);
++            }
+         }
+ 
+         if (ref_images.empty() && sd_version_is_unet_edit(sd->version)) {
+@@ -361,12 +366,28 @@
+ 
+         std::vector<sd::Tensor<float>> ref_latents;
+         for (size_t i = 0; i < ref_images.size(); i++) {
++            // Materialize one full-resolution H3 reference at a time. Both
++            // encoder resizes must sample the original, in attachment order.
++            if (h3_image) {
++                ref_images[i] = load_reference(i);
++            }
++            auto prepare_h3_vision_input = [&] {
++                auto resized = resized_h3_reference_if_needed(ref_images[i], 1024);
++                if (!resized.empty()) {
++                    ref_images[i] = std::move(resized);
++                }
++            };
+             if (skip_vae_encoding) {
++                if (h3_image) prepare_h3_vision_input();
+                 continue;
+             }
+             sd::Tensor<float> ref_latent;
+-            if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
+-                ref_latent = sd->encode_first_stage(resize_h3_image_reference(ref_images[i], 2048));
++            if (h3_image) {
++                {
++                    auto resized = resized_h3_reference_if_needed(ref_images[i], 2048);
++                    ref_latent = sd->encode_first_stage(resized.empty() ? ref_images[i] : resized);
++                }
++                prepare_h3_vision_input();
+                 if (!ref_latent.empty()) {
+                     const int64_t width    = ref_latent.shape()[0];
+                     const int64_t height   = ref_latent.shape()[1];
+@@ -531,8 +552,10 @@
+             for (size_t i = 0; i < ref_latents.size(); ++i) {
+                 latents.minimax_reference_blocks.push_back({MiniMaxH3ReferenceKind::IMAGE, static_cast<int32_t>(i), -1});
+             }
+-            for (auto& image : ref_images) {
+-                image = sd->version == VERSION_P_H3_IMAGE ? resize_ph3_reference(image, 1000000) : resize_h3_image_reference(image, 1024);
++            if (sd->version == VERSION_P_H3_IMAGE) {
++                for (auto& image : ref_images) {
++                    image = resize_ph3_reference(image, 1000000);
++                }
+             }
+         }
+         latents.init_latent              = std::move(init_latent);
+@@ -997,6 +1020,11 @@
+             return false;
+         }
+         ImageGenerationEmbeds embeds = std::move(*embeds_opt);
++        if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
++            // The denoiser consumes the encoded latents. The VLM input rasters
++            // are no longer used, including on the subsequent high-res pass.
++            latents.ref_images.clear();
++        }
+         std::vector<sd::Tensor<float>> final_latents;
+         int64_t denoise_start = ggml_time_ms();
+         for (int b = 0; b < request.batch_count; b++) {
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -1088,7 +1088,8 @@
+                                              float video_t,
+                                              float audio_timestep,
+                                              float video_r,
+-                                             float audio_r) {
++                                             float audio_r,
++                                             bool emit_positions = true) {
+         PackedSequenceLayout layout;
+         float sqrt_area    = std::sqrt(static_cast<float>(latent_h * latent_w));
+         auto h_axis        = spatial_axis(latent_h, sqrt_area);
+@@ -1101,7 +1102,7 @@
+             layout.positions.push_back(h);
+             layout.positions.push_back(w);
+         };
+-        for (int64_t i = 0; i < text_len; ++i) {
++        for (int64_t i = 0; emit_positions && i < text_len; ++i) {
+             append_position(static_cast<float>(i), 0.f, 0.f);
+         }
+         layout.sequence_segments.push_back({0, text_len, SequenceKind::TEXT});
+@@ -1137,9 +1138,11 @@
+                                           float cursor) {
+             auto axes = condition_spatial_axes(condition);
+             for (int64_t t = 0; t < condition.shape()[2]; ++t) {
+-                for (float h : axes.first) {
+-                    for (float w : axes.second) {
+-                        append_position(cursor, h, w);
++                if (emit_positions) {
++                    for (float h : axes.first) {
++                        for (float w : axes.second) {
++                            append_position(cursor, h, w);
++                        }
+                     }
+                 }
+                 cursor += video_span(t);
+@@ -1150,6 +1153,7 @@
+                                           float cursor,
+                                           float w_low,
+                                           float w_high) {
++            if (!emit_positions) return;
+             for (int channel = 0; channel < 2; ++channel) {
+                 float w = channel == 0 ? w_low : w_high;
+                 for (int64_t t = 0; t < length; ++t) {
+@@ -1173,9 +1177,11 @@
+                 float keyframe_t      = is_first ? static_cast<float>(text_len)
+                                                  : static_cast<float>(text_len) + video_duration - FRAME_RESCALE;
+                 for (int64_t t = 0; t < condition.shape()[2]; ++t) {
+-                    for (float h : axes.first) {
+-                        for (float w : axes.second) {
+-                            append_position(keyframe_t, h, w);
++                    if (emit_positions) {
++                        for (float h : axes.first) {
++                            for (float w : axes.second) {
++                                append_position(keyframe_t, h, w);
++                            }
+                         }
+                     }
+                 }
+@@ -1258,9 +1264,11 @@
+ 
+         int64_t video_start = row;
+         for (int64_t t = 0; t < latent_t; ++t) {
+-            for (float h : h_axis) {
+-                for (float w : w_axis) {
+-                    append_position(cursor, h, w);
++            if (emit_positions) {
++                for (float h : h_axis) {
++                    for (float w : w_axis) {
++                        append_position(cursor, h, w);
++                    }
+                 }
+             }
+             cursor += video_span(t);
+@@ -1287,6 +1295,9 @@
+         Config config;
+         MiniMaxH3Transformer3DModel model;
+         sd::Tensor<float> position_input_cache;
++        // Coordinates depend on geometry, not pixel values, text tags or sigma.
++        // Cache only still image layouts. Dynamic modulation rows are rebuilt.
++        std::vector<int64_t> position_geometry;
+         sd::Tensor<float> timestep_feature_input_cache;
+         sd::Tensor<float> endpoint_feature_input_cache;
+         sd::Tensor<int32_t> curve_index_input_cache;
+@@ -1422,6 +1433,18 @@
+             // latent follows one sigma schedule. Restore x_a for the H3 network.
+             auto audio_ctx = get_context();
+             auto audio     = audio_carrier == nullptr ? nullptr : ggml_ext_scale(&audio_ctx, audio_carrier, sigma_a / sigma_v);
++            std::vector<int64_t> geometry;
++            if (config.audio_latent_channels == 0 && audio_length == 0 && condition_audios.empty() && keyframe_indices.empty()) {
++                geometry = {context_tensor.shape()[1], packed.shape()[0], packed.shape()[1], packed.shape()[2],
++                            static_cast<int64_t>(condition_videos.size())};
++                for (const auto& ref : condition_videos) {
++                    geometry.insert(geometry.end(), {ref.shape()[0], ref.shape()[1], ref.shape()[2]});
++                }
++                for (const auto& block : reference_blocks) {
++                    geometry.insert(geometry.end(), {static_cast<int64_t>(block.kind), block.video_index, block.audio_index});
++                }
++            }
++            const bool reuse_positions = !geometry.empty() && geometry == position_geometry;
+             auto layout    = build_layout(context_tensor.shape()[1],
+                                           packed.shape()[2],
+                                           packed.shape()[1],
+@@ -1435,11 +1458,13 @@
+                                           t_v,
+                                           t_a,
+                                           r_v,
+-                                          r_a);
+-
+-            position_input_cache = sd::Tensor<float>(
+-                {3, static_cast<int64_t>(layout.positions.size() / 3)},
+-                layout.positions);
++                                          r_a, !reuse_positions);
++
++            if (!reuse_positions) {
++                const auto count = static_cast<int64_t>(layout.positions.size() / 3);
++                position_input_cache = sd::Tensor<float>({3, count}, std::move(layout.positions));
++                position_geometry = std::move(geometry);
++            }
+             auto positions = make_input(position_input_cache);
+ 
+             ggml_tensor* timestep_features   = nullptr;
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -1,3 +1,4 @@
++#include "core/wildimage_edit_crop.h"
+ #include <stdio.h>
+ #include <string.h>
+ #include <time.h>
+@@ -856,11 +857,23 @@
+         return true;
+     };
+ 
++    if (!gen_params.inpaint_crop.empty() &&
++        (cli_params.mode != IMG_GEN || gen_params.init_image_path.empty() || gen_params.mask_image_path.empty() ||
++         gen_params.ref_image_paths.empty() || gen_params.ref_image_paths.front() != gen_params.init_image_path ||
++         gen_params.width <= 0 || gen_params.height <= 0)) {
++        LOG_ERROR("--inpaint-crop requires an explicit canvas, mask, and the init image as first reference");
++        return 1;
++    }
+     if (gen_params.init_image_path.size() > 0) {
+         const bool native_init = cli_params.mode == IMG_GEN || cli_params.mode == ADETAILER;
+         if (!load_image_and_update_size(gen_params.init_image_path, gen_params.init_image, native_init ? 0 : 3)) {
+             return 1;
+         }
++    }
++
++    if (!gen_params.inpaint_crop.empty() && !wildimage_crop_reference(gen_params.init_image.get(), gen_params.inpaint_crop)) {
++        LOG_ERROR("Invalid --inpaint-crop rectangle for the first reference");
++        return 1;
+     }
+ 
+     if (gen_params.end_image_path.size() > 0) {
+@@ -873,7 +886,10 @@
+         gen_params.ref_images.clear();
+         for (auto& path : gen_params.ref_image_paths) {
+             SDImageOwner ref_image({0, 0, 0, nullptr});
+-            if (!load_image_and_update_size(path, ref_image, 0)) {
++            if (!gen_params.inpaint_crop.empty() && gen_params.ref_images.empty()) {
++                ref_image = gen_params.init_image;
++                if (!ref_image.get().data) return 1;
++            } else if (!load_image_and_update_size(path, ref_image, 0)) {
+                 return 1;
+             }
+             gen_params.ref_images.push_back(std::move(ref_image));
+--- a/examples/common/common.cpp
++++ b/examples/common/common.cpp
+@@ -1146,6 +1146,11 @@
+          "path to the init image, or a single input image for vid_upscale",
+          0,
+          &init_image_path},
++        {"",
++         "--inpaint-crop",
++         "crop init image and first reference in original pixels (x,y,width,height); mask is in output canvas coordinates",
++         0,
++         &inpaint_crop},
+         {"",
+          "--end-img",
+          "path to the end image, required by flf2v",
+--- a/examples/common/common.h
++++ b/examples/common/common.h
+@@ -228,6 +228,7 @@
+     bool embed_image_metadata = true;
+ 
+     std::string init_image_path;
++    std::string inpaint_crop;
+     std::string end_image_path;
+     std::string mask_image_path;
+     std::string control_image_path;

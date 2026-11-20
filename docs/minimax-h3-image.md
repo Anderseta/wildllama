@@ -112,6 +112,21 @@ warmup can dominate a first run, so a faster second run alone is not evidence of
 a throughput improvement. Fixed-seed Qwen and MiniMax image comparisons retained
 identical pixels with the new waiting policy.
 
+MiniMax edits convert each reference in attachment order. The VAE and vision
+encoder each receive the appropriate resolution sampled from the original.
+An already aligned reference can be used directly. The runner releases the
+vision input rasters after conditioning. When image geometry matches across
+sampling steps it also reuses the host spatial coordinates, while rebuilding
+timestep-dependent modulation. Neither optimization adds a disk cache.
+
+For a local edit, paint and save a mask on the first reference in Wildgoose
+and enable the crop option for that edit. The runner includes surrounding
+context and fits the work canvas within the selected profile resolution.
+Additional references stay whole. WildLlama composites the result at the
+first reference's original dimensions and copies only masked pixels. Cropping
+changes the scene visible to the model and can change the result inside the
+mask. Leave it off when the edit needs the entire scene for lighting or layout.
+
 The Windows build invalidates old object files that were created with broken
 localized MSVC header detection once. It then checks that Ninja tracked the
 MiniMax and Qwen headers before packaging. Later builds remain incremental;

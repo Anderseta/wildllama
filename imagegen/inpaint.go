@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -19,6 +20,7 @@ import (
 type InpaintMask struct {
 	AssetID string `json:"asset_id"`
 	PNG     string `json:"png"`
+	Crop    bool   `json:"crop,omitempty"`
 }
 
 func (m *InpaintMask) bitmap() (*image.Gray, error) {
@@ -54,9 +56,75 @@ func (m *InpaintMask) bitmap() (*image.Gray, error) {
 	return mask, nil
 }
 func (m *InpaintMask) Validate() error { _, err := m.bitmap(); return err }
-func writeInpaintMask(mask *image.Gray, dir string, w, h int) error {
+func selectedMaskBounds(mask *image.Gray) image.Rectangle {
+	var selected image.Rectangle
+	for y := 0; y < mask.Rect.Dy(); y++ {
+		row := mask.Pix[y*mask.Stride : y*mask.Stride+mask.Rect.Dx()]
+		if x := bytes.IndexByte(row, 255); x >= 0 {
+			selected = selected.Union(image.Rect(x, y, bytes.LastIndexByte(row, 255)+1, y+1))
+		}
+	}
+	return selected
+}
+
+func maskRasterRect(cells image.Rectangle, mask, original image.Point) image.Rectangle {
+	return image.Rect(maskEdge(cells.Min.X, mask.X, original.X), maskEdge(cells.Min.Y, mask.Y, original.Y),
+		maskEdge(cells.Max.X, mask.X, original.X), maskEdge(cells.Max.Y, mask.Y, original.Y))
+}
+
+func planInpaintCrop(mask *image.Gray, original, canvas image.Point) (image.Rectangle, image.Point) {
+	selection := maskRasterRect(selectedMaskBounds(mask), mask.Rect.Size(), original)
+	if selection.Empty() {
+		return image.Rectangle{}, canvas
+	}
+	axis := func(lo, hi, size int) (int, int) {
+		span := hi - lo
+		length := min(size, max(512, span+2*max(64, span/4)))
+		start := max(0, min(size-length, lo-(length-span)/2))
+		return start, start + length
+	}
+	x0, x1 := axis(selection.Min.X, selection.Max.X, original.X)
+	y0, y1 := axis(selection.Min.Y, selection.Max.Y, original.Y)
+	crop := image.Rect(x0, y0, x1, y1)
+	if crop.Size() == original {
+		return image.Rectangle{}, canvas
+	}
+	scale := min(1.0, float64(canvas.X)/float64(crop.Dx()), float64(canvas.Y)/float64(crop.Dy()))
+	align := func(n, limit int) int { return min(limit, max(64, 32*int(math.Round(float64(n)*scale/32)))) }
+	return crop, image.Pt(align(crop.Dx(), canvas.X), align(crop.Dy(), canvas.Y))
+}
+
+func writeInpaintMask(mask *image.Gray, dir string, w, h int, crop image.Rectangle, original image.Point) error {
 	scaled := image.NewGray(image.Rect(0, 0, w, h))
-	xdraw.NearestNeighbor.Scale(scaled, scaled.Bounds(), mask, mask.Bounds(), draw.Src, nil)
+	if crop.Empty() {
+		xdraw.NearestNeighbor.Scale(scaled, scaled.Bounds(), mask, mask.Bounds(), draw.Src, nil)
+	} else {
+		// Cover even a one-pixel mark when reducing the work canvas. Final
+		// compositing still uses the original mask at original resolution.
+		for y := 0; y < mask.Rect.Dy(); y++ {
+			row := mask.Pix[y*mask.Stride : y*mask.Stride+mask.Rect.Dx()]
+			for x := 0; x < len(row); {
+				first := bytes.IndexByte(row[x:], 255)
+				if first < 0 {
+					break
+				}
+				x += first
+				end := len(row)
+				if gap := bytes.IndexByte(row[x:], 0); gap >= 0 {
+					end = x + gap
+				}
+				r := maskRasterRect(image.Rect(x, y, end, y+1), mask.Rect.Size(), original).Intersect(crop)
+				if !r.Empty() {
+					r = r.Sub(crop.Min)
+					xBasis, yBasis := int64(crop.Dx()), int64(crop.Dy())
+					rect := image.Rect(int(int64(r.Min.X)*int64(w)/xBasis), int(int64(r.Min.Y)*int64(h)/yBasis),
+						int((int64(r.Max.X)*int64(w)+xBasis-1)/xBasis), int((int64(r.Max.Y)*int64(h)+yBasis-1)/yBasis))
+					draw.Draw(scaled, rect, image.White, image.Point{}, draw.Src)
+				}
+				x = end
+			}
+		}
+	}
 	f, err := os.Create(filepath.Join(dir, "mask.png"))
 	if err != nil {
 		return err
@@ -79,7 +147,7 @@ func maskEdge(cell, cells, pixels int) int {
 	return int((2*int64(cell)*int64(pixels) + int64(cells) - 1) / (2 * int64(cells)))
 }
 
-func composeInpaint(ctx context.Context, mask *image.Gray, reference string, edited image.Image, output string) (image.Point, error) {
+func composeInpaint(ctx context.Context, mask *image.Gray, reference string, edited image.Image, output string, crop image.Rectangle) (image.Point, error) {
 	var zero image.Point
 	original, err := readInpaintImage(reference)
 	if err != nil {
@@ -105,7 +173,7 @@ func composeInpaint(ctx context.Context, mask *image.Gray, reference string, edi
 		}
 		draw.Draw(dst, b, original, b.Min, draw.Src)
 	}
-	if err := overlayInpaint(ctx, dst, edited, mask); err != nil {
+	if err := overlayInpaintRegion(ctx, dst, edited, mask, crop); err != nil {
 		return zero, err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(output), ".inpaint-*.png")
@@ -128,17 +196,15 @@ func composeInpaint(ctx context.Context, mask *image.Gray, reference string, edi
 // Keep the full bilinear coordinate transform. Restrict the destination
 // allocation and writes to the bounding rectangle of the selected mask cells.
 func overlayInpaint(ctx context.Context, dst draw.Image, edited image.Image, mask *image.Gray) error {
+	return overlayInpaintRegion(ctx, dst, edited, mask, image.Rectangle{})
+}
+
+func overlayInpaintRegion(ctx context.Context, dst draw.Image, edited image.Image, mask *image.Gray, crop image.Rectangle) error {
 	b := dst.Bounds()
 	mw, mh := mask.Bounds().Dx(), mask.Bounds().Dy()
 	region := image.Rectangle{}
-	if edited.Bounds() != b {
-		for y := 0; y < mh; y++ {
-			row := mask.Pix[y*mask.Stride : y*mask.Stride+mw]
-			x := bytes.IndexByte(row, 255)
-			if x >= 0 {
-				region = region.Union(image.Rect(x, y, bytes.LastIndexByte(row, 255)+1, y+1))
-			}
-		}
+	if !crop.Empty() || edited.Bounds() != b {
+		region = selectedMaskBounds(mask)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -146,8 +212,14 @@ func overlayInpaint(ctx context.Context, dst draw.Image, edited image.Image, mas
 		if rect.Empty() {
 			return nil
 		}
+		if crop.Empty() {
+			crop = b
+		}
+		if !rect.In(crop) || !crop.In(b) {
+			return errors.New("inpaint crop no longer matches the reference")
+		}
 		scaled := image.NewNRGBA(rect)
-		xdraw.BiLinear.Scale(scaled, b, edited, edited.Bounds(), draw.Src, nil)
+		xdraw.BiLinear.Scale(scaled, crop, edited, edited.Bounds(), draw.Src, nil)
 		edited = scaled
 	} else {
 		region = image.Rect(0, 0, mw, mh)

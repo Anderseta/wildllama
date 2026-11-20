@@ -5,6 +5,7 @@ package imagegen
 import (
 	"context"
 	"encoding/json"
+	"image"
 )
 
 const (
@@ -97,6 +98,7 @@ type LocalInspection struct {
 }
 
 type Request struct {
+	crop            image.Rectangle
 	Inpaint         *InpaintMask `json:"inpaint,omitempty"`
 	Prompt          string       `json:"prompt"`
 	NegativePrompt  string       `json:"negative_prompt,omitempty"`
@@ -142,6 +144,7 @@ type RunnerStatus struct {
 	ConditioningCacheSupported bool   `json:"conditioning_cache_supported"`
 	RAMBudgetSupported         bool   `json:"ram_budget_supported"`
 	MOSSEditSupported          bool   `json:"moss_edit_supported,omitempty"`
+	InpaintCropSupported       bool   `json:"inpaint_crop_supported,omitempty"`
 }
 
 type Component struct {

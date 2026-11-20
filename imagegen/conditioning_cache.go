@@ -189,6 +189,9 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 		}
 		components[fmt.Sprintf("lora-%d", i)] = identity
 	}
+	if !request.crop.Empty() {
+		components["reference-crop"] = request.crop.String()
+	}
 	for i, path := range request.ReferenceImages {
 		identity, err := conditioningFileIdentity(ctx, path, true, report)
 		if err != nil {
