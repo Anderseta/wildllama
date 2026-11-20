@@ -866,7 +866,7 @@ func TestSchedUseLoadedRunner(t *testing.T) {
 	req.model = &Model{}
 	r1.Options = &req.opts
 	r1.model.Store(req.model)
-	req.useLoadedRunner(r1, finished)
+	req.useLoadedRunner(r1, &Scheduler{finishedReqCh: finished})
 	require.Equal(t, uint(1), r1.refCount)
 	require.Equal(t, time.Duration(2), r1.sessionDuration)
 	select {

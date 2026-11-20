@@ -218,7 +218,7 @@ func TestRunnerReservationRevalidatesAfterHealthCheck(t *testing.T) {
 	runner.model.Store(nil)
 	runner.Options = nil
 	runner.refMu.Unlock()
-	if req.useLoadedRunner(runner, s.finishedReqCh) || runner.refCount != 0 {
+	if req.useLoadedRunner(runner, s) || runner.refCount != 0 {
 		t.Fatal("stale health check allowed reservation of an unloaded runner")
 	}
 }

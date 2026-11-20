@@ -60,7 +60,7 @@ func TestImageHandoffPreservesAutomaticMmapWithoutReloadingNextTurn(t *testing.T
 			scheduler.loaded[model.ModelPath] = runner
 			scheduler.publishLoadedSnapshotLocked()
 			scheduler.loadedMu.Unlock()
-			require.True(t, request.useLoadedRunner(runner, scheduler.finishedReqCh))
+			require.True(t, request.useLoadedRunner(runner, scheduler))
 			require.Empty(t, <-restored)
 			next := options
 			if test.automatic {

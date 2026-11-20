@@ -323,3 +323,24 @@ func TestSchedulerStaleEventsPreserveReplacementWithSamePID(t *testing.T) {
 	defer current.refMu.Unlock()
 	require.Equal(t, uint(1), current.refCount)
 }
+
+func TestSchedulerShutdownReleasesUndeliverableEvents(t *testing.T) {
+	ctx, stop := context.WithCancel(t.Context())
+	s := InitScheduler(ctx)
+	s.expiredCh = make(chan *runnerRef)
+	s.finishedReqCh = make(chan *LlmRequest)
+	disconnected, cancel := context.WithCancel(t.Context())
+	cancel()
+	done := make(chan struct{}, 3)
+	go func() { s.enqueueExpiration(&runnerRef{}); done <- struct{}{} }()
+	go func() { s.finishOnCancel(&LlmRequest{ctx: disconnected}); done <- struct{}{} }()
+	go func() { s.finishOnCancel(&LlmRequest{ctx: t.Context()}); done <- struct{}{} }()
+	stop()
+	for range 3 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("request lifecycle goroutine survived scheduler shutdown")
+		}
+	}
+}

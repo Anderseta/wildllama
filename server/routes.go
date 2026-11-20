@@ -301,6 +301,8 @@ func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []mo
 	case <-ctx.Done():
 		// Cancelled queued requests can be discarded without a runner or error.
 		return nil, nil, nil, ctx.Err()
+	case <-s.sched.stopping:
+		return nil, nil, nil, context.Canceled
 	}
 
 	return runner.llama, m, &opts, nil

@@ -66,6 +66,7 @@ type LlmRequest struct {
 }
 
 type Scheduler struct {
+	stopping       <-chan struct{}
 	pendingReqCh   chan *LlmRequest
 	finishedReqCh  chan *LlmRequest
 	expiredCh      chan *runnerRef
@@ -143,6 +144,7 @@ var ErrMaxQueue = errors.New("server busy, please try again.  maximum pending re
 func InitScheduler(ctx context.Context) *Scheduler {
 	maxQueue := envconfig.MaxQueue()
 	sched := &Scheduler{
+		stopping:        ctx.Done(),
 		pendingReqCh:    make(chan *LlmRequest, maxQueue),
 		finishedReqCh:   make(chan *LlmRequest, maxQueue),
 		expiredCh:       make(chan *runnerRef, maxQueue),
@@ -292,7 +294,7 @@ func (s *Scheduler) getRunnerWithMmapOrigin(c context.Context, m *Model, opts ap
 	if snapshot := s.loadedSnapshot.Load(); snapshot != nil {
 		runner = snapshot.byKey[key]
 	}
-	if c.Err() == nil && runner != nil && !runner.needsReload(c, req) && req.useLoadedRunner(runner, s.finishedReqCh) {
+	if c.Err() == nil && runner != nil && !runner.needsReload(c, req) && req.useLoadedRunner(runner, s) {
 		return req.successCh, req.errCh
 	}
 	// A simultaneous image job permits only the existing healthy reservation
@@ -388,7 +390,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				} else {
 					// Runner is usable, return it
 					logutil.Trace("using existing loaded runner", "model", pendingKey)
-					if pending.useLoadedRunner(runner, s.finishedReqCh) || pending.ctx.Err() != nil {
+					if pending.useLoadedRunner(runner, s) || pending.ctx.Err() != nil {
 						break
 					}
 					continue // the runner unloaded between its health check and reservation
@@ -641,7 +643,7 @@ func (s *Scheduler) expirationTimerFired(ctx context.Context, runner *runnerRef,
 // Complete the pending request and send the runner back to the requester
 // Wires up a finished event after the request context is completed
 // Updates session duration, and resets expiration timer
-func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) bool {
+func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, s *Scheduler) bool {
 	if !runner.refMu.lockContext(pending.ctx, pending.ctx) {
 		return false
 	}
@@ -662,12 +664,27 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 	}
 	runner.publishStatusLocked()
 	pending.successCh <- runner
-	go func() {
-		<-pending.ctx.Done()
-		slog.Debug("context for request finished", "runner", runner)
-		finished <- pending
-	}()
+	go s.finishOnCancel(pending)
 	return true
+}
+
+func (s *Scheduler) finishOnCancel(req *LlmRequest) {
+	select {
+	case <-s.stopping:
+		return
+	case <-req.ctx.Done():
+	}
+	select {
+	case <-s.stopping:
+	case s.finishedReqCh <- req:
+	}
+}
+
+func (s *Scheduler) enqueueExpiration(runner *runnerRef) {
+	select {
+	case <-s.stopping:
+	case s.expiredCh <- runner:
+	}
 }
 
 func (s *Scheduler) discardPendingLoading(req *LlmRequest) {
@@ -1116,7 +1133,7 @@ iGPUScan:
 			slog.Error("error loading llama server", "error", err)
 			req.errCh <- err
 			slog.Debug("triggering expiration for failed load", "runner", runner)
-			s.expiredCh <- runner
+			s.enqueueExpiration(runner)
 			return
 		}
 		slog.Debug("finished setting up", "runner", runner)
@@ -1130,11 +1147,7 @@ iGPUScan:
 		runner.lastUsed = time.Now()
 		runner.useCount++
 		runner.publishStatusLocked()
-		go func() {
-			<-req.ctx.Done()
-			slog.Debug("context for request finished")
-			s.finishedReqCh <- req
-		}()
+		go s.finishOnCancel(req)
 		req.successCh <- runner
 		runner.refMu.Unlock()
 	}()
@@ -2234,7 +2247,7 @@ func (s *Scheduler) requestExpiration(runner *runnerRef) {
 	idle := runner.refCount == 0
 	runner.refMu.Unlock()
 	if idle {
-		s.expiredCh <- runner
+		s.enqueueExpiration(runner)
 	}
 }
 
