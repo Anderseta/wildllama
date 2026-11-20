@@ -298,6 +298,9 @@ func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []mo
 	case runner = <-runnerCh:
 	case err = <-errCh:
 		return nil, nil, nil, err
+	case <-ctx.Done():
+		// Cancelled queued requests can be discarded without a runner or error.
+		return nil, nil, nil, ctx.Err()
 	}
 
 	return runner.llama, m, &opts, nil
@@ -2532,6 +2535,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/version", s.versionHandler)
 	r.GET("/api/activity", s.RuntimeActivityHandler)
+	r.GET("/api/memory/cuda", s.CUDAFreeMemoryHandler)
 	s.registerImageRoutes(r)
 	r.GET("/api/huggingface/search", s.HuggingFaceSearchHandler)
 	r.GET("/api/huggingface/files", s.HuggingFaceFilesHandler)
@@ -2880,6 +2884,18 @@ func streamResponse(c *gin.Context, ch chan any) {
 
 		return wroteFrame(encoder.Encode(val))
 	})
+}
+
+// Auxiliary clients must measure the server's GPU when connected remotely.
+func (s *Server) CUDAFreeMemoryHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	free, err := (&schedulerImageText{server: s}).FreeVRAM(ctx)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"free_bytes": free})
 }
 
 func (s *Server) StatusHandler(c *gin.Context) {

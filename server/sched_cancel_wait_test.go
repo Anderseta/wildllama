@@ -283,10 +283,10 @@ func TestSchedulerCompletedReferencesNotifyIdleOnceAndUnloadNormally(t *testing.
 	done := make(chan bool, 1)
 	go func() { enqueued, ok := s.expireIdleRunner(ctx, t.Context(), runner); done <- enqueued && ok }()
 	idleWaitStarted(t, runner)
-	s.finishedReqCh <- &LlmRequest{model: runner.model.Load()}
+	s.finishedReqCh <- &LlmRequest{model: runner.model.Load(), assigned: runner}
 	require.Eventually(t, func() bool { runner.refMu.Lock(); defer runner.refMu.Unlock(); return runner.refCount == 1 }, time.Second, time.Millisecond)
 	require.Empty(t, done)
-	s.finishedReqCh <- &LlmRequest{model: runner.model.Load()}
+	s.finishedReqCh <- &LlmRequest{model: runner.model.Load(), assigned: runner}
 	select {
 	case ok := <-done:
 		require.True(t, ok)

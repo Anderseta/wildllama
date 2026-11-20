@@ -58,7 +58,7 @@ func enqueueExpirationFixture(t *testing.T, s *Scheduler, runner *runnerRef) {
 
 func finishExpirationFixture(t *testing.T, s *Scheduler, runner *runnerRef) {
 	t.Helper()
-	s.finishedReqCh <- &LlmRequest{model: runner.model.Load()}
+	s.finishedReqCh <- &LlmRequest{model: runner.model.Load(), assigned: runner}
 	require.Eventually(t, func() bool {
 		return runner.status.Load() != nil
 	}, time.Second, time.Millisecond)
@@ -133,7 +133,7 @@ func TestSchedulerExplicitBusyExpirationStillUnloads(t *testing.T) {
 				s.expireRunner(runner.model.Load())
 			}
 			enqueueExpirationFixture(t, s, runner)
-			s.finishedReqCh <- &LlmRequest{model: runner.model.Load()}
+			s.finishedReqCh <- &LlmRequest{model: runner.model.Load(), assigned: runner}
 			select {
 			case <-s.unloadedCh:
 			case <-time.After(time.Second):
@@ -211,7 +211,7 @@ func TestSchedulerImmediateExpirationDoesNotBlockOnFullQueue(t *testing.T) {
 		}
 	})
 	runner.refMu.Lock()
-	s.finishedReqCh <- &LlmRequest{model: runner.model.Load()}
+	s.finishedReqCh <- &LlmRequest{model: runner.model.Load(), assigned: runner}
 	// The completion loop has received the request and is waiting for refMu.
 	// Fill its expiration queue before it can process the final reference.
 	s.expiredCh <- blocker
@@ -224,4 +224,102 @@ func TestSchedulerImmediateExpirationDoesNotBlockOnFullQueue(t *testing.T) {
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 	require.True(t, runner.unloaded)
+}
+
+func TestQueuedHTTPAdmissionReturnsOnDisconnect(t *testing.T) {
+	s, _ := idleFixture(t, 0)
+	server := &Server{sched: s}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, _, _, err := server.scheduleRunnerForModel(ctx, &Model{ModelPath: "queued"}, nil, nil, nil, nil)
+		result <- err
+	}()
+	select {
+	case queued := <-s.pendingReqCh:
+		defer func() { queued.errCh <- context.Canceled }()
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach admission")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("disconnected HTTP request still waits for a discarded queue entry")
+	}
+}
+
+func TestSchedulerExplicitExpirationReleasesLockBeforeQueueWait(t *testing.T) {
+	for _, oom := range []bool{false, true} {
+		s, runner := idleFixture(t, 0)
+		s.expiredCh = make(chan *runnerRef)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if oom {
+				s.expireRunnersForRuntimeOOM(runner.model.Load(), errors.New("out of memory"))
+			} else {
+				s.expireRunner(runner.model.Load())
+			}
+		}()
+		observed := assertUnlockedAfterExpiration(runner)
+		require.Same(t, runner, <-s.expiredCh)
+		<-done
+		require.True(t, observed, "expiration held refMu while waiting for the queue")
+	}
+}
+
+func assertUnlockedAfterExpiration(r *runnerRef) bool {
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if r.refMu.TryLock() {
+			expired := r.sessionDuration == 0
+			r.refMu.Unlock()
+			if expired {
+				return true
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+func TestSchedulerUnrelatedWakeupCannotCompleteEviction(t *testing.T) {
+	s, runner := idleFixture(t, 0)
+	s.unloadedCh = make(chan any, 1)
+	s.unloadedCh <- struct{}{} // a different model finished earlier
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	require.False(t, s.waitForUnload(ctx, ctx, runner))
+	// A full notification queue must still allow cleanup and further admissions.
+	s.unloadedCh <- struct{}{}
+	done := make(chan struct{})
+	go func() { defer close(done); s.unloadExpiredRunner(runner) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		<-s.unloadedCh
+		t.Fatal("full wakeup queue stopped the completed-request loop")
+	}
+	require.True(t, s.waitForUnload(t.Context(), t.Context(), runner))
+}
+
+func TestSchedulerStaleEventsPreserveReplacementWithSamePID(t *testing.T) {
+	s, old := startExpirationFixture(t, 0, 0)
+	current := &runnerRef{modelKey: old.modelKey, pid: old.pid, refCount: 2}
+	current.model.Store(old.model.Load())
+	s.loadedMu.Lock()
+	s.loaded[current.modelKey] = current
+	s.loadedMu.Unlock()
+	s.unloadExpiredRunner(old)
+	s.finishedReqCh <- &LlmRequest{model: current.model.Load(), assigned: old}
+	finishExpirationFixture(t, s, current)
+	s.loadedMu.Lock()
+	require.Same(t, current, s.loaded[current.modelKey])
+	s.loadedMu.Unlock()
+	current.refMu.Lock()
+	defer current.refMu.Unlock()
+	require.Equal(t, uint(1), current.refCount)
 }
