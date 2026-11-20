@@ -1,0 +1,967 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index b119bf6868c55799d7c17cd9b1eb86d87183a19c..e0ece24a23ab761e4e87c55c96c77b752d9f9ee3 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1472,7 +1472,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_IMAGE_HANDOFF_MIB","WILDLLAMA_EXACT_GPU_TOP_K","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE","WILDLLAMA_MTP_RESPONSE_LOOKUP","WILDLLAMA_MTP_AUTO_STRATEGY","WILDLLAMA_MTP_EARLY_STOP"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_IMAGE_HANDOFF_MIB","WILDLLAMA_EXACT_GPU_TOP_K","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE","WILDLLAMA_MTP_RESPONSE_LOOKUP","WILDLLAMA_MTP_AUTO_STRATEGY","WILDLLAMA_MTP_EARLY_STOP","WILDLLAMA_SINGLE_PREFILL_TUNE","WILDLLAMA_CHECKPOINT_DIRECT_READ"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 0c574ee4815852aefa22e5fac75b56d67db6b17f..4e042f32c542d3771a37ddaf7ea5983300225c83 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1575,7 +1575,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::unique_ptr<common_mtp_edit_lookup> edit_lookup;
+     uint64_t edit_rounds = 0;
+     std::unique_ptr<common_mtp_response_lookup> response_lookup;
+-    common_mtp_round_policy round_policy;
++    common_mtp_round_policy early_policy;
++    std::vector<common_mtp_round_policy> strategy_costs;
++    size_t strategy_index = 0;
+     bool auto_strategy = false, early_stop = false;
+     int64_t round_start = 0;
+     uint32_t proposed = 0, last_committed = 0;
+@@ -1821,7 +1823,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+         if (response_lookup) { response_lookup->begin(prompt.size()); }
+         if (auto_strategy || early_stop) {
+-            round_policy = {}; round_start = 0; last_committed = proposed = 0;
++            early_policy = {}; strategy_costs.clear(); round_start = 0; last_committed = proposed = 0;
+             if (auto_strategy) {
+                 if (draft_vocab_active) { llama_set_mtp_draft_vocab(params.ctx_dft, 0); draft_vocab_active = false; }
+                 tune_proposals = false; proposal_policy[0] = {}; proposal_feedback[0] = {};
+@@ -2083,7 +2085,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 dp.proposal_feedback = nullptr;
+                 const int64_t now = ggml_time_us();
+                 if (round_start && last_committed && dp.pos0 == round_pos + int64_t(last_committed)) {
+-                    round_policy.observe(now - round_start, last_committed);
++                    strategy_costs[strategy_index].observe(now - round_start, last_committed);
+                 }
+                 round_start = 0; last_committed = 0;
+             }
+@@ -2114,9 +2116,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+ 
+             if (auto_strategy) {
+-                const bool eligible = dp.edit_history && dp.result_q && dp.temp > 0;
++                const bool eligible = !dp.depth_trial && dp.edit_history && dp.result_q && dp.temp > 0;
++                if (eligible) {
++                    const int bucket = int(dp.pos0 >= 2048) + int(dp.pos0 >= 8192) + int(dp.pos0 >= 24576);
++                    if (strategy_costs.empty()) { strategy_costs.resize(4 * 5); }
++                    strategy_index = size_t(bucket * 5) + std::min<size_t>(maximum, 4);
++                }
+                 if (eligible) { round_start = ggml_time_us(); round_pos = dp.pos0; }
+-                const auto arm = eligible ? round_policy.selected() : common_mtp_round_policy::normal;
++                const auto arm = eligible ? strategy_costs[strategy_index].selected() : common_mtp_round_policy::normal;
+                 tune_proposals = arm == common_mtp_round_policy::temperature;
+                 const bool use_shortlist = arm == common_mtp_round_policy::shortlist;
+                 if (use_shortlist != draft_vocab_active) {
+@@ -2131,7 +2138,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                             }
+                             llama_mtp_draft_vocab_observe(ctx_dft, &dp.id_last, 1);
+                         }
+-                    } else { round_policy.disable_shortlist(); round_start = 0; }
++                    } else { for (auto & policy : strategy_costs) { policy.disable_shortlist(); } round_start = 0; }
+                 }
+             }
+             // result_q is only set when the caller wants rejection, so it also gates the retune
+@@ -2235,9 +2242,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+ 
+                 if (early_stop && dp.result_q) { proposed = uint32_t(result.size()); }
+-                const bool stop = early_stop && dp.result_q && result.size() == 2 &&
++                const bool stop = early_stop && !dp.depth_trial && dp.result_q && result.size() == 2 &&
+                     common_speculative_draft_limit(params.n_max, dp.n_max) > 2 &&
+-                    round_policy.stop_after_two(cur_p->data[0].p);
++                    early_policy.stop_after_two(cur_p->data[0].p);
+                 if (stop || result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
+                     llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+                     drafting[seq_id] = false;
+@@ -2294,7 +2301,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) { return; }
+         if (round_start) { last_committed = uint32_t(n_accepted) + 1; }
+-        if (early_stop) { round_policy.extension_result(proposed, n_accepted); proposed = 0; }
++        if (early_stop) { early_policy.extension_result(proposed, n_accepted); proposed = 0; }
+         if (tune_proposals && (!auto_strategy || round_start)) {
+             const auto previous = proposal_policy[seq_id].arm;
+             proposal_policy[seq_id].update(proposal_feedback[seq_id]);
+@@ -2315,7 +2322,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 (vocab_rounds == 32 && vocab_accepted < 8)) {
+                 llama_set_mtp_draft_vocab(params.ctx_dft, 0);
+                 draft_vocab_active = false;
+-                if (auto_strategy) { round_policy.disable_shortlist(); round_start = 0; }
++                if (auto_strategy) { for (auto & policy : strategy_costs) { policy.disable_shortlist(); } round_start = 0; }
+                 SPC_WRN("%s", "draft vocabulary coverage low; restoring the complete proposal head\n");
+             }
+         }
+@@ -3471,6 +3478,11 @@ bool common_speculative_is_single_mtp(const common_speculative * spec) {
+     return common_speculative_single_mtp(spec) != nullptr;
+ }
+ 
++bool common_speculative_auto_strategy(const common_speculative * spec) {
++    const auto * mtp = common_speculative_single_mtp(spec);
++    return mtp && mtp->auto_strategy;
++}
++
+ bool common_speculative_uses_edit_lookup(const common_speculative * spec) {
+     const auto * mtp = common_speculative_single_mtp(spec);
+     return mtp && (mtp->edit_lookup || mtp->response_lookup || mtp->auto_strategy) && spec->synth_probs.empty();
+diff --git a/common/speculative.h b/common/speculative.h
+index 59596e82e125ed88e11a63a841df5f9b8d8aa139..aa4d18cd8250b66753a3a3a019b7b05f1acc49a7 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -113,6 +113,7 @@ struct common_speculative_draft_params {
+     common_mtp_proposal_feedback * proposal_feedback = nullptr;
+     // Borrowed only for this draft call; media and other proposers never use it.
+     const llama_tokens * edit_history = nullptr;
++    bool depth_trial = false;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+@@ -125,6 +126,7 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
+ // fenced is the target just synchronized by the submitting server thread, or null.
+ bool common_speculative_process_after_forward(common_speculative * spec, const common_batch & batch, llama_context * fenced);
+ bool common_speculative_is_single_mtp(const common_speculative * spec);
++bool common_speculative_auto_strategy(const common_speculative * spec);
+ bool common_speculative_uses_edit_lookup(const common_speculative * spec);
+ 
+ // Single-head MTP may wait until verification selects the committed prefix.
+diff --git a/include/llama.h b/include/llama.h
+index 37557aa0170bc1ede2d6fa3518e9956ac1b75caa..1660a3fdd995768ceb60f721f28a3d8e0bfc4077 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -973,6 +973,11 @@ extern "C" {
+                     llama_seq_id   dest_seq_id);
+ 
+     typedef bool (*llama_state_sink)(void * user, const void * data, size_t size);
++    typedef bool (*llama_state_source)(void * user, void * data, size_t size);
++    LLAMA_API size_t llama_state_seq_write_raw(struct llama_context * ctx, llama_seq_id seq_id,
++            llama_state_sink sink, void * user);
++    LLAMA_API size_t llama_state_seq_read_raw(struct llama_context * ctx, llama_seq_id seq_id,
++            size_t limit, bool buffer_header, llama_state_source source, void * user);
+     LLAMA_API size_t llama_state_seq_write_stream(struct llama_context * ctx, llama_seq_id seq_id,
+             const llama_token * tokens, size_t count, llama_state_sink sink, void * user);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f7a2b4c69d1f147683a2d485268cf30d2f636ddf..c06561da2a89a99d45a31d9d6b66464e2f1198bc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4675,17 +4675,23 @@ private:
+ 
+ class llama_io_read_file : public llama_io_read_i {
+ public:
+-    llama_io_read_file(llama_file * f) : file(f) {}
++    llama_io_read_file(llama_file * f) : file(f), limit(f->size() - f->tell()) {}
++    llama_io_read_file(llama_state_source source, void * user, size_t limit)
++        : file(nullptr), source(source), user(user), limit(limit) {}
+ 
+     void read(void * dst, size_t size) override {
+-        file->read_raw(dst, size);
++        if (size > limit - size_read) { throw std::runtime_error("sequence state exceeds input"); }
++        if (source) {
++            if (!source(user, dst, size)) { throw std::runtime_error("sequence state read failed"); }
++        } else {
++            file->read_raw(dst, size);
++        }
+         size_read += size;
+     }
+ 
+     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+         const size_t page = llama_file_tensor_chunk_size(tensor, offset, size);
+-        const size_t position = file->tell(), length = file->size();
+-        if (position > length || size > length - position) {
++        if (size > limit - size_read) {
+             throw std::runtime_error("state tensor exceeds the remaining file data");
+         }
+         temp_buffer.resize(page);
+@@ -4703,6 +4709,9 @@ public:
+ 
+ private:
+     llama_file * file;
++    llama_state_source source = nullptr;
++    void * user = nullptr;
++    size_t limit;
+     size_t size_read = 0;
+     std::vector<uint8_t> temp_buffer;
+ };
+@@ -5297,23 +5306,9 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
+         const size_t state_size = file.size() - file.tell();
+         llama_io_read_file io(&file);
+         try {
+-            const size_t nread = state_seq_read_data(io, seq_id, 0);
+-            if (!nread || nread > state_size) { throw std::runtime_error("failed to restore complete sequence state"); }
+-            GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
++            state_seq_read_checked(io, seq_id, state_size);
+         } catch (...) {
+-            // A failed real restore may have published earlier tensor chunks.
+-            // Drop output/NextN metadata as well as the affected memory state.
+-            n_outputs = 0;
+-            std::fill(output_ids.begin(), output_ids.end(), -1);
+-            output_swaps.clear();
+-            embd_batch_idxs.clear();
+-            embd_seq.clear();
+-            nextn_device_host_stale = false;
+-            nextn_device_active = -1;
+-            nextn_device_row_ids.clear();
+-            nextn_device_inputs.clear();
+             *n_token_count_out = 0;
+-            if (memory) { memory->seq_rm(seq_id, -1, -1); }
+             throw;
+         }
+     }
+@@ -5321,6 +5316,65 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
+     return file.tell();
+ }
+ 
++size_t llama_context::state_seq_read_checked(llama_io_read_i & io, llama_seq_id seq_id, size_t limit) {
++    try {
++        const size_t n = state_seq_read_data(io, seq_id, 0);
++        if (!n || n > limit) { throw std::runtime_error("invalid sequence state length"); }
++        return n;
++    } catch (...) {
++        n_outputs = 0;
++        std::fill(output_ids.begin(), output_ids.end(), -1);
++        output_swaps.clear();
++        embd_batch_idxs.clear();
++        embd_seq.clear();
++        nextn_device_host_stale = false;
++        nextn_device_active = -1;
++        nextn_device_row_ids.clear();
++        nextn_device_inputs.clear();
++        if (memory) { memory->seq_rm(seq_id, -1, -1); }
++        throw;
++    }
++}
++
++size_t llama_context::state_seq_write_raw(llama_seq_id seq_id, llama_state_sink sink, void * user) {
++    llama_io_write_file io(sink, user);
++    // The draft appendix uses the in-memory sequence format, including the
++    // sequence header. Target slot files have a separate prompt header.
++    io.write(&io_magic, sizeof(io_magic));
++    io.write(&seq_id, sizeof(seq_id));
++    return state_seq_write_data(io, seq_id, 0);
++}
++
++size_t llama_state_seq_write_raw(llama_context * ctx, llama_seq_id seq_id, llama_state_sink sink, void * user) {
++    if (!sink) { return 0; }
++    try {
++        ctx->synchronize();
++        return ctx->state_seq_write_raw(seq_id, sink, user);
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
++        return 0;
++    }
++}
++
++size_t llama_state_seq_read_raw(llama_context * ctx, llama_seq_id seq_id, size_t limit, bool buffer_header, llama_state_source source, void * user) {
++    if (!source) { return 0; }
++    try {
++        ctx->synchronize();
++        llama_io_read_file io(source, user, limit);
++        if (buffer_header) {
++            uint32_t magic;
++            llama_seq_id saved_id;
++            io.read(&magic, sizeof(magic));
++            io.read(&saved_id, sizeof(saved_id));
++            if (magic != io_magic) { return 0; }
++        }
++        return ctx->state_seq_read_checked(io, seq_id, limit);
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
++        return 0;
++    }
++}
++
+ size_t llama_context::state_seq_write_stream(llama_seq_id seq_id, const llama_token * tokens,
+         size_t count, llama_state_sink sink, void * user) {
+     if (!sink || count > UINT32_MAX) { return 0; }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 8b1c1e7a0cf706f656713e86eb7cc3aa2ce4c851..ca9c7adf7d001ff7684bdd2b761c86127b416708 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -308,6 +308,8 @@ struct llama_context {
+                 size_t   n_token_capacity,
+                 size_t * n_token_count_out);
+ 
++    size_t state_seq_write_raw(llama_seq_id seq_id, llama_state_sink sink, void * user);
++    size_t state_seq_read_checked(llama_io_read_i & io, llama_seq_id seq_id, size_t limit);
+     size_t state_seq_write_stream(llama_seq_id seq_id, const llama_token * tokens, size_t count,
+                                   llama_state_sink sink, void * user);
+ 
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+index da8b03438ec32dd2028efbe764eebc364525a5ab..10ebd3c085a88a359d3dbeabad2b0cfe2df5d67a 100644
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -527,6 +527,34 @@ int main(int argc, char ** argv) {
+         reference.process(a.back(), 3); switching.process(a.back(), 3);
+         step("prefill A complete; save snapshot");
+         const auto saved = switching.save();
++        {
++            auto * ctx = switching.draft.get();
++            const size_t n = llama_state_seq_get_size(ctx, 0);
++            std::vector<uint8_t> buffered(n), streamed;
++            require(llama_state_seq_get_data(ctx, buffered.data(), n, 0) == n, "buffered draft save failed");
++            auto sink = [](void * p, const void * data, size_t count) {
++                auto & out = *static_cast<std::vector<uint8_t> *>(p);
++                const auto * bytes = static_cast<const uint8_t *>(data);
++                if (count) { out.insert(out.end(), bytes, bytes + count); }
++                return true;
++            };
++            require(llama_state_seq_write_raw(ctx, 0, sink, &streamed) == n && buffered == streamed,
++                    "streamed draft bytes differ from existing checkpoints");
++            struct cursor { const std::vector<uint8_t> & data; size_t offset; } reader{buffered, 0};
++            auto source = [](void * p, void * dst, size_t count) {
++                auto & in = *static_cast<cursor *>(p);
++                if (count > in.data.size() - in.offset) { return false; }
++                if (count) { std::memcpy(dst, in.data.data() + in.offset, count); }
++                in.offset += count;
++                return true;
++            };
++            require(!llama_state_seq_read_raw(ctx, 0, n - 1, true, source, &reader), "accepted truncated draft");
++            reader.offset = 0;
++            require(llama_state_seq_read_raw(ctx, 0, n, true, source, &reader) == n, "streamed draft restore failed");
++            streamed.clear();
++            require(llama_state_seq_write_raw(ctx, 0, sink, &streamed) == n && streamed == buffered,
++                    "draft changed on restore");
++        }
+         step("snapshot A saved");
+         common_mtp_state history;
+         require(history.load(saved.spec, 32, 64), "invalid saved format");
+diff --git a/tests/test-server-mtp-depth.cpp b/tests/test-server-mtp-depth.cpp
+index eb0adda76fd634b828e112aa7881293d60bfdeb3..d1f9a7869074bc3f69013a83915b7e9a520a87a9 100644
+--- a/tests/test-server-mtp-depth.cpp
++++ b/tests/test-server-mtp-depth.cpp
+@@ -1,6 +1,7 @@
+ #include "../common/mtp-edit-lookup.h"
+ #include "../common/mtp-round-policy.h"
+ #include "../tools/server/server-mtp-depth.h"
++#include "../tools/server/server-single-prefill.h"
+ 
+ #include <cstdio>
+ #include <cstdlib>
+@@ -38,6 +39,33 @@ int main() {
+     check(depth.choose(800, 1) <= 1, "lowered ceiling was ignored");
+     check(depth.choose(800, 5) == 0, "unsupported depth was admitted");
+ 
++    server_mtp_depth coordinated;
++    int strategy_trials = 0, depth_trials = 0;
++    for (int i = 0; i < 180; ++i) {
++        const int d = coordinated.choose(5000, 4, true);
++        if (coordinated.strategy_turn()) {
++            ++strategy_trials;
++            check(d == 4, "strategy probe changed the learned depth");
++            coordinated.observe(99999, 1); // must not contaminate the depth comparison
++        } else {
++            ++depth_trials;
++            coordinated.observe(d == 4 ? 12 : 20, 2);
++        }
++    }
++    check(strategy_trials && depth_trials && depth_trials < 150, "controllers did not alternate");
++
++    server_single_prefill prefill;
++    for (int id = 0; id < 24; ++id) {
++        const int n = prefill.plan(id, 0, 4096, 512, 128, 100);
++        check(n == (id < 6 ? (id % 2 ? 256 : 512) : ((id-6)%16 == 0 ? 512 : 256)),
++              "isolated prefill failed paired confirmation or recovery");
++        check(prefill.plan(id, 128, 2000, 512, 128, 120) == n, "prefill size changed during a prompt");
++        prefill.finish(id, n == 512 ? 2100 : 1600);
++    }
++    check(prefill.plan(50, 32000, 4096, 512, 128, 10) == 512, "mixed different contexts");
++    check(prefill.plan(51, 0, 64, 512, 128, 10) == 512, "short prompt became a trial");
++    check(prefill.plan(52, 0, 4096, 128, 128, 10) == 128, "ignored the batch ceiling");
++
+     server_mtp_depth third;
+     for (int round = 0; round < 24; ++round) {
+         const int proposal_limit = third.choose(32000, 3);
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index fabcc054a4110d58269aba9b1d219cc47d4eabb2..98eef29687f3e168e8b60aa4857aa07588013e95 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -408,6 +408,7 @@ json format_response_rerank(
+ struct server_speculation_control {
+     bool enabled = false;
+     bool short_mtp = false;
++    bool coordinate_strategy = false;
+     server_mtp_depth mtp_depth;
+     int cap = 0;
+     int ceiling = 8;
+@@ -429,7 +430,7 @@ struct server_speculation_control {
+     void begin(int64_t now, uint64_t context_tokens = 0) {
+         if (enabled && started == 0) {
+             if (short_mtp) {
+-                cap = mtp_depth.choose(context_tokens, ceiling);
++                cap = mtp_depth.choose(context_tokens, ceiling, coordinate_strategy);
+             }
+             started = now;
+             proposed = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f23de038e6387157b7f11f88caa9524a46f60a2f..94992bd278e6d917acaf7b384f950078ca1210c1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,5 @@
+ #include "server-slot-delta.h"
++#include "server-single-prefill.h"
+ #include "server-context.h"
+ #include "server-admission.h"
+ #include "server-decode-overlap.h"
+@@ -1232,6 +1233,8 @@ private:
+     server_admission admission;
+     server_prefill_budget prefill_budget;
+     bool prefill_budget_enabled = false;
++    bool single_prefill_enabled = false;
++    server_single_prefill single_prefill;
+     bool prefill_budget_failed = false;
+     bool prefill_round_eligible = false;
+     bool prefill_round_reuse_only = false;
+@@ -1771,6 +1774,8 @@ private:
+             const char * option = std::getenv("WILDLLAMA_DECODE_OVERLAP");
+             decode_overlap_enabled = option && std::strcmp(option, "1") == 0;
+             decode_overlap_failed = false;
++            single_prefill_enabled = server_prefill_budget::enabled(std::getenv("WILDLLAMA_SINGLE_PREFILL_TUNE"));
++            single_prefill = {};
+             prefill_budget_enabled = server_prefill_budget::enabled(std::getenv("WILDLLAMA_ADAPTIVE_PREFILL"));
+             prefill_budget.reset(server_prefill_budget::parse_target(std::getenv("WILDLLAMA_PREFILL_LATENCY_US")));
+             prefill_budget_failed = false;
+@@ -2233,6 +2238,7 @@ private:
+                 return ctx && (type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                         (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx) >= uint32_t(depth)));
+             };
++            slot.spec_control.coordinate_strategy = task.params.sampling.temp > 0 && common_speculative_auto_strategy(slot.spec);
+             slot.spec_control.short_mtp = slots.size() == 1 && depth <= 4 &&
+                 common_speculative_is_single_mtp(slot.spec) &&
+                 params_base.speculative.draft.n_min <= 1 && !decode_overlap_enabled &&
+@@ -3073,7 +3079,11 @@ private:
+     static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353; // "SCKP"
+     static constexpr uint32_t SLOT_CKPT_VERSION = 1;
+ 
+-    static bool ckpt_read(std::ifstream & ifs, void * dst, size_t size, size_t & n_read) {
++    static bool slot_read(void * p, void * dst, size_t n) {
++        return bool(static_cast<std::istream *>(p)->read(static_cast<char *>(dst), n));
++    }
++
++    static bool ckpt_read(std::istream & ifs, void * dst, size_t size, size_t & n_read) {
+         if (!ifs.read((char *) dst, size)) {
+             return false;
+         }
+@@ -3081,10 +3091,10 @@ private:
+         return true;
+     }
+ 
+-    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
++    static bool ckpt_read_buf(std::istream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
+         uint64_t n = 0;
+         // check the size against the bytes left in the file before allocating, the size field may be corrupted
+-        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
++        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || (n_read > n_avail || n > n_avail - n_read)) {
+             return false;
+         }
+         buf.resize(n);
+@@ -3142,10 +3152,9 @@ private:
+     }
+ 
+     // returns the number of bytes consumed, 0 if there is no usable appendix
+-    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
+-        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+-        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
+-        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
++    size_t load_slot_checkpoints(std::istream & ifs, size_t file_size, const std::string & filepath, size_t offset, server_slot & slot) const {
++        ifs.clear();
++        if (file_size <= offset || !ifs.seekg(offset)) {
+             return 0;
+         }
+         const size_t n_avail = file_size - offset; // bytes after the llama state payload
+@@ -3209,15 +3218,9 @@ private:
+     bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written,
+                          std::vector<uint8_t> data_spec = {}, bool have_spec = false, std::ostream * sink = nullptr) const {
+         n_written = 0;
+-        std::vector<uint8_t> data_dft;
+-        if (ctx_dft != nullptr) {
+-            data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+-            if (llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != data_dft.size()) {
+-                return false;
+-            }
+-        }
++        const uint64_t draft_bytes = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+         if (!have_spec) { common_speculative_get_state(spec.get(), slot.id, data_spec); }
+-        if (data_dft.empty() && data_spec.empty()) {
++        if (!draft_bytes && data_spec.empty()) {
+             return true;
+         }
+         std::ofstream file;
+@@ -3231,7 +3234,14 @@ private:
+         const uint32_t version = SLOT_DRAFT_VERSION;
+         ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
+         ckpt_write(ofs, &version, sizeof(version), n_written);
+-        ckpt_write_buf(ofs, data_dft,  n_written);
++        ckpt_write(ofs, &draft_bytes, sizeof(draft_bytes), n_written);
++        if (draft_bytes) {
++            auto put = [](void * p, const void * data, size_t n) {
++                return bool(static_cast<std::ostream *>(p)->write(static_cast<const char *>(data), n));
++            };
++            if (llama_state_seq_write_raw(ctx_dft, slot.id, put, &ofs) != draft_bytes) { return false; }
++            n_written += draft_bytes;
++        }
+         ckpt_write_buf(ofs, data_spec, n_written);
+         ofs.flush();
+         if (!ofs) {
+@@ -3244,14 +3254,13 @@ private:
+ 
+     // returns the number of bytes consumed, 0 if there is no usable draft state
+     // the draft starts empty unless the file holds a draft state that fits the draft context
+-    size_t load_slot_draft(const std::string & filepath, size_t offset, server_slot & slot) const {
++    size_t load_slot_draft(std::istream & ifs, size_t file_size, const std::string & filepath, size_t offset, server_slot & slot) const {
+         common_speculative_set_state(spec.get(), slot.id, {});
+         if (ctx_dft != nullptr) {
+             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+         }
+-        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+-        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
+-        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
++        ifs.clear();
++        if (file_size <= offset || !ifs.seekg(offset)) {
+             return 0;
+         }
+         const size_t n_avail = file_size - offset;
+@@ -3261,24 +3270,30 @@ private:
+         if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_DRAFT_MAGIC) {
+             return 0;
+         }
+-        std::vector<uint8_t> data_dft;
++        uint64_t draft_bytes;
+         std::vector<uint8_t> data_spec;
+         if (!ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_DRAFT_VERSION ||
+-            !ckpt_read_buf(ifs, data_dft,  n_avail, n_read) ||
+-            !ckpt_read_buf(ifs, data_spec, n_avail, n_read)) {
+-            SLT_WRN(slot, "invalid draft state in '%s' - ignored\n", filepath.c_str());
++            !ckpt_read(ifs, &draft_bytes, sizeof(draft_bytes), n_read) || n_read > n_avail || draft_bytes > n_avail - n_read) {
+             return 0;
+         }
+-        if (!data_dft.empty()) {
+-            if (ctx_dft == nullptr ||
+-                llama_state_seq_set_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != data_dft.size()) {
+-                if (ctx_dft != nullptr) {
+-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+-                }
+-                SLT_WRN(slot, "draft state in '%s' does not match the draft context - dropped\n", filepath.c_str());
+-                return n_read;
++        bool draft_ok = true;
++        if (draft_bytes) {
++            draft_ok = ctx_dft && llama_state_seq_read_raw(ctx_dft, slot.id, draft_bytes, true, slot_read, &ifs) == draft_bytes;
++            n_read += draft_bytes;
++            if (!draft_ok) {
++                if (ctx_dft) { llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1); }
++                ifs.clear();
++                if (!ifs.seekg(offset + n_read)) { return 0; }
+             }
+         }
++        if (!ckpt_read_buf(ifs, data_spec, n_avail, n_read)) {
++            if (ctx_dft) { llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1); }
++            return 0;
++        }
++        if (!draft_ok) {
++            SLT_WRN(slot, "incompatible draft state in '%s' - dropped\n", filepath.c_str());
++            return n_read;
++        }
+         if (!data_spec.empty() && !common_speculative_set_state(spec.get(), slot.id, data_spec)) {
+             if (ctx_dft) { llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1); }
+             common_speculative_set_state(spec.get(), slot.id, {});
+@@ -3616,14 +3631,42 @@ private:
+                     std::string filename = task.slot_action.filename;
+                     std::string filepath = task.slot_action.filepath;
+ 
+-                    size_t nread = 0;
++                    size_t nread = 0, logical = 0;
++                    std::ifstream file;
++                    std::unique_ptr<server_slot_delta_input> delta;
++                    std::istream input(nullptr);
+                     try {
+                         size_t n_packed = 0;
+                         llama_tokens packed;
+-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+-                        if (nread != 0) {
+-                            packed.resize(std::max<size_t>(1, n_packed));
+-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
++                        if (task.slot_action.checkpoint_base.empty()) {
++                            file.open(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
++                            if (!file) { throw std::runtime_error("Cannot open slot"); }
++                            logical = size_t(file.tellg());
++                            input.rdbuf(file.rdbuf());
++                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
++                            if (nread) {
++                                packed.resize(std::max<size_t>(1, n_packed));
++                                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
++                            }
++                        } else {
++                            delta = std::make_unique<server_slot_delta_input>(std::filesystem::u8path(filepath),
++                                task.slot_action.checkpoint_base, task.slot_action.image_budget);
++                            logical = delta->size();
++                            input.rdbuf(delta.get());
++                            uint32_t header[3];
++                            if (logical < sizeof(header) || !slot_read(&input, header, sizeof(header)) ||
++                                header[0] != LLAMA_STATE_SEQ_MAGIC || header[1] != LLAMA_STATE_SEQ_VERSION ||
++                                header[2] > (logical - sizeof(header)) / sizeof(llama_token) ||
++                                uint64_t(header[2]) > uint64_t(slot->n_ctx) + 4) {
++                                throw std::runtime_error("Invalid text checkpoint header");
++                            }
++                            n_packed = header[2];
++                            packed.resize(n_packed);
++                            const size_t bytes = n_packed * sizeof(llama_token);
++                            if (!slot_read(&input, packed.data(), bytes)) { throw std::runtime_error("Missing prompt tokens"); }
++                            const size_t offset = sizeof(header) + bytes;
++                            nread = llama_state_seq_read_raw(ctx_tgt, slot->id, logical - offset, false, slot_read, &input);
++                            if (nread) { nread += offset; }
+                         }
+                         if (nread == 0) {
+                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
+@@ -3649,8 +3692,14 @@ private:
+                     }
+ 
+                     // nread is the end offset of the llama state payload within the file
+-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
++                    const size_t nread_ckpt = load_slot_checkpoints(input, logical, filepath, nread, *slot);
++                    const size_t nread_dft  = load_slot_draft(input, logical, filepath, nread + nread_ckpt, *slot);
++
++                    if (delta && nread + nread_ckpt + nread_dft != logical) {
++                        slot->prompt_clear();
++                        send_error(task, "Incomplete incremental slot restore", ERROR_TYPE_INVALID_REQUEST);
++                        break;
++                    }
+ 
+                     const int64_t t_end = ggml_time_us();
+                     const double t_restore_ms = (t_end - t_start) / 1000.0;
+@@ -4389,6 +4438,8 @@ private:
+                             /* .proposal_feedback = */ nullptr,
+                             /* .edit_history = */ common_speculative_uses_edit_lookup(spec.get()) ?
+                                 slot.prompt.tokens.text_view() : nullptr,
++                            /* .depth_trial = */ slot.spec_control.short_mtp && slot.spec_control.coordinate_strategy &&
++                                !slot.spec_control.mtp_depth.strategy_turn(),
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -5177,6 +5228,19 @@ private:
+ 
+                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+ 
++                    if (single_prefill_enabled && !prefill_budget_failed && slots.size() == 1 && !batch.size() &&
++                        slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.task->is_parent() && !slot.task->is_child() &&
++                        !slot.need_embd() && slot.can_split() && !slot.task->tokens.has_media() && slot.lora.empty() &&
++                        !slot.audio_stream && llama_get_causal_attn(ctx_tgt)) {
++                        prompt_batch_limit = single_prefill.plan(slot.task->id, slot.prompt.n_tokens(),
++                            slot.task->n_tokens() - slot.prompt.n_tokens(), n_batch, n_ubatch, ggml_time_us());
++                        if (single_prefill.reduced()) {
++                            prefill_round_reuse_only = true;
++                            prefill_memory.mark_deferred();
++                            prefill_draft_memory.mark_deferred();
++                        }
++                    }
++
+                     // add prompt tokens for processing in the current batch
+                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < prompt_batch_limit) {
+                         // get next token to process
+@@ -5650,6 +5714,10 @@ private:
+             }
+ 
+             if (slot.state == SLOT_STATE_DONE_PROMPT) {
++                if (single_prefill_enabled && !prefill_budget_failed && single_prefill.measuring(slot.task->id)) {
++                    single_prefill.finish(slot.task->id, ggml_time_us());
++                    SLT_DBG(slot, "isolated prefill completed with batch limit %d\n", single_prefill.batch_size());
++                }
+                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
+                     // prompt evaluated for embedding
+                     send_embedding(slot, batch.view);
+@@ -7394,6 +7462,11 @@ void server_routes::init_routes() {
+             res->ok({{"token_count", count}, {"prepared", prepared}});
+             return res;
+         }
++        if (prepared_chat_request_header(req, "x-wildllama-checkpoint-tokens") == "1" &&
++                files.empty() && ctx_server.mctx == nullptr) {
++            res->ok({{"tokens", tokenize_mixed(ctx_server.vocab, data.at("prompt"), true, true)}});
++            return res;
++        }
+         json result = {{ "prompt", std::move(data.at("prompt")) }};
+         if (json_value(body, "count_tokens", false) && files.empty() && ctx_server.mctx == nullptr) {
+             // Match text generation's tokenize_input_prompts(..., true, true),
+@@ -7822,6 +7895,19 @@ void server_routes::init_routes() {
+     };
+ }
+ 
++static bool parse_checkpoint_options(const json & data, server_task & task) {
++    task.slot_action.image_budget = data.value("image_budget", uint64_t(0));
++    if (data.contains("checkpoint_base")) {
++        const auto digest = data.value("checkpoint_base", std::string());
++        if (!std::getenv("WILDLLAMA_IMAGE_HANDOFF_AUTH") || !task.slot_action.image_budget ||
++            digest.size() != 64 || digest.find_first_not_of("0123456789abcdef") != std::string::npos) {
++            return false;
++        }
++        task.slot_action.checkpoint_base = digest;
++    }
++    return true;
++}
++
+ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
+     auto res = create_response();
+     const json request_data = json::parse(req.body);
+@@ -7835,15 +7921,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
+     auto & rd = res->rd;
+     {
+         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
+-        task.slot_action.image_budget = request_data.value("image_budget", uint64_t(0));
+-        if (request_data.contains("checkpoint_base")) {
+-            const std::string digest = request_data.value("checkpoint_base", std::string());
+-            if (!std::getenv("WILDLLAMA_IMAGE_HANDOFF_AUTH") || !task.slot_action.image_budget ||
+-                    digest.size() != 64 || digest.find_first_not_of("0123456789abcdef") != std::string::npos) {
+-                res->error(format_error_response("Invalid incremental checkpoint", ERROR_TYPE_INVALID_REQUEST));
+-                return res;
+-            }
+-            task.slot_action.checkpoint_base = digest;
++        if (!parse_checkpoint_options(request_data, task)) {
++            res->error(format_error_response("Invalid incremental checkpoint", ERROR_TYPE_INVALID_REQUEST));
++            return res;
+         }
+         task.id = rd.get_new_id();
+         task.slot_action.id_slot  = id_slot;
+@@ -7881,6 +7961,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const
+     auto & rd = res->rd;
+     {
+         server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
++        if (!parse_checkpoint_options(request_data, task)) {
++            res->error(format_error_response("Invalid incremental checkpoint", ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
+         task.id = rd.get_new_id();
+         task.slot_action.id_slot  = id_slot;
+         task.slot_action.filename = filename;
+diff --git a/tools/server/server-mtp-depth.h b/tools/server/server-mtp-depth.h
+index 41ac059d1c7af54f9909ba76a0e91465ab8e4ed6..183df834f10fbb1e22d4178e02fc48c7e0c56126 100644
+--- a/tools/server/server-mtp-depth.h
++++ b/tools/server/server-mtp-depth.h
+@@ -28,6 +28,7 @@ class server_mtp_depth {
+     struct history {
+         std::array<cost, 5> depths{};
+         // Keep the two-vs-four experiment independent of the general controller.
++        unsigned coordinated_rounds = 0;
+         int pair_rounds = 0;
+         int pair_arm = 2;
+         int pair_best = 2;
+@@ -40,6 +41,8 @@ class server_mtp_depth {
+     std::array<history, 4> histories{};
+     int active_history = -1;
+     int active_depth = -1;
++    bool strategy_window = false;
++    bool coordinated = false;
+     bool warmup = true;
+     bool pair_mode = false;
+     std::array<uint64_t, 2> measured_pair_rounds{};
+@@ -47,7 +50,11 @@ class server_mtp_depth {
+ public:
+     const std::array<uint64_t, 2> & pair_rounds() const { return measured_pair_rounds; }
+ 
+-    int choose(uint64_t context_tokens, int ceiling) {
++    bool strategy_turn() const { return strategy_window; }
++
++    int choose(uint64_t context_tokens, int ceiling, bool coordinate = false) {
++        coordinated = coordinate;
++        strategy_window = false;
+         if (ceiling < 1 || ceiling > 4) {
+             active_depth = -1;
+             return 0;
+@@ -76,6 +83,12 @@ public:
+                 selected = h.until_refresh > 0 ? h.preferred : h.refresh_depth % (ceiling + 1);
+             }
+         }
++        // Depth comparisons use the normal proposal strategy exclusively. In
++        // the other window hold the winning depth and let strategy probes run.
++        const int best = ceiling == 4 ? h.pair_best : h.preferred;
++        strategy_window = coordinated && best > 0 && best <= ceiling &&
++                h.coordinated_rounds % 48 >= 16;
++        if (strategy_window) { selected = best; }
+         if (bucket != active_history || selected != active_depth || pair_mode != (ceiling == 4)) {
+             warmup = true; // discard the graph transition from the measurement
+         }
+@@ -89,11 +102,13 @@ public:
+         if (active_depth < 0 || us <= 0 || committed == 0) {
+             return;
+         }
++        auto & h = histories[active_history];
++        if (coordinated) { ++h.coordinated_rounds; }
++        if (strategy_window) { return; }
+         if (warmup && !pair_mode) {
+             warmup = false;
+             return;
+         }
+-        auto & h = histories[active_history];
+         h.depths[active_depth].add(us, committed);
+         if (pair_mode) {
+             ++measured_pair_rounds[active_depth == 4];
+diff --git a/tools/server/server-single-prefill.h b/tools/server/server-single-prefill.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..81b12350f7cd1e12ea1005f81deaa17929cfb886
+--- /dev/null
++++ b/tools/server/server-single-prefill.h
+@@ -0,0 +1,70 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstdint>
++
++// Runner-local, single text sequence. Each observation covers the entire
++// uncached prefill including draft catch-up and the ordinary output fence.
++class server_single_prefill {
++    struct history {
++        unsigned rounds = 0;
++        int candidate_wins = 0;
++        bool smaller = false;
++        int baseline_rows = 0, baseline_end = 0;
++        double baseline = 0;
++    };
++    std::array<history, 32> costs{};
++    int task = -1, key = 0, rows = 0, end = 0, chunk = 0;
++    bool candidate = false, trial = false;
++    int64_t start = 0;
++public:
++    int plan(int id, int prefix, int remaining, int ceiling, int micro, int64_t now) {
++        if (id == task) {
++            if (ceiling < chunk) { start = 0; candidate = false; chunk = ceiling; }
++            return chunk;
++        }
++        task = id;
++        chunk = ceiling;
++        start = 0;
++        candidate = false;
++        if (micro <= 0 || ceiling / micro < 2 || remaining < 2048 || remaining / ceiling < 4) {
++            return chunk;
++        }
++        int size_bin = 0;
++        for (int n = remaining / 2048; n > 1 && size_bin < 7; n /= 2) { ++size_bin; }
++        key = size_bin * 4 + int(prefix >= 2048) + int(prefix >= 8192) + int(prefix >= 24576);
++        auto & h = costs[key];
++        // Three independent control/probe pairs, then one pair in sixteen.
++        const unsigned phase = h.rounds < 6 ? h.rounds % 2 : (h.rounds - 6) % 16;
++        trial = phase <= 1;
++        candidate = phase == 1 || (!trial && h.smaller);
++        if (candidate) { chunk = std::max(1, ceiling / micro / 2) * micro; }
++        rows = remaining;
++        end = prefix + remaining;
++        start = now;
++        return chunk;
++    }
++    bool reduced() const { return candidate; }
++    bool measuring(int id) const { return id == task && start != 0; }
++    int batch_size() const { return chunk; }
++    void finish(int id, int64_t now) {
++        if (id != task || !start || now <= start) { return; }
++        auto & h = costs[key];
++        const double cost = double(now - start) / rows;
++        if (trial && !candidate) {
++            h.baseline = cost;
++            h.baseline_rows = rows;
++            h.baseline_end = end;
++        }
++        const auto comparable = [](int a, int b) {
++            return int64_t(std::max(a,b)) * 8 <= int64_t(std::min(a,b)) * 9;
++        };
++        if (trial && candidate && h.baseline > 0 && comparable(rows,h.baseline_rows) && comparable(end,h.baseline_end)) {
++            if (cost < h.baseline * .94) { h.candidate_wins = std::min(3, h.candidate_wins + 1); }
++            else if (cost > h.baseline * .98) { h.candidate_wins = 0; }
++            h.smaller = h.candidate_wins >= 3;
++        }
++        ++h.rounds;
++        start = 0;
++    }
++};
+diff --git a/tools/server/server-slot-delta.h b/tools/server/server-slot-delta.h
+index bbe78db4f285107c55d38574b1256f198dfac3f0..d8429548bc26e937c799367c9fa76296a40bd5bd 100644
+--- a/tools/server/server-slot-delta.h
++++ b/tools/server/server-slot-delta.h
+@@ -153,3 +153,84 @@ class server_slot_delta final : public std::streambuf {
+         return physical;
+     }
+ };
++
++// Read the format emitted above without creating a logical-size scratch file.
++// Only the last record can be short. The index costs one offset per 64 KiB.
++class server_slot_delta_input : public std::streambuf {
++    static constexpr size_t block = 65536;
++    std::ifstream delta, base;
++    struct span { bool copy; uint64_t offset; };
++    std::vector<span> spans;
++    std::vector<char> buffer = std::vector<char>(block);
++    size_t logical = 0, next = 0;
++
++    uint64_t integer(size_t width) {
++        uint64_t value = 0;
++        for (size_t i = 0; i < width; ++i) {
++            const auto c = delta.get();
++            if (c == EOF) { throw std::runtime_error("truncated delta record"); }
++            value |= uint64_t(uint8_t(c)) << (8 * i);
++        }
++        return value;
++    }
++    bool locate(size_t pos) {
++        if (pos > logical) { return false; }
++        if (eback() && pos >= next - size_t(egptr() - eback()) && pos <= next) {
++            setg(eback(), egptr() - (next - pos), egptr());
++            return true;
++        }
++        setg(nullptr, nullptr, nullptr);
++        next = pos;
++        return true;
++    }
++protected:
++    int_type underflow() override {
++        if (next == logical) { return traits_type::eof(); }
++        const size_t index = next / block, skip = next % block;
++        const auto & span = spans[index];
++        auto & in = span.copy ? base : delta;
++        const size_t size = std::min(block - skip, logical - next);
++        const auto pos = std::streamoff(span.offset + skip);
++        if (in.tellg() != pos) { in.seekg(pos); }
++        if (!in.read(buffer.data(), size)) { throw std::runtime_error("short checkpoint input"); }
++        setg(buffer.data(), buffer.data(), buffer.data() + size);
++        next += size;
++        return traits_type::to_int_type(*gptr());
++    }
++    pos_type seekoff(off_type off, std::ios::seekdir dir, std::ios::openmode) override {
++        const auto cur = off_type(next) - (gptr() ? egptr() - gptr() : 0);
++        const auto origin = dir == std::ios::beg ? off_type(0) : dir == std::ios::end ? off_type(logical) : cur;
++        if (off < -origin || off > off_type(logical) - origin) { return pos_type(-1); }
++        return locate(size_t(origin + off)) ? pos_type(origin + off) : pos_type(-1);
++    }
++    pos_type seekpos(pos_type pos, std::ios::openmode mode) override {
++        return seekoff(off_type(pos), std::ios::beg, mode);
++    }
++public:
++    size_t size() const { return logical; }
++    server_slot_delta_input(const std::filesystem::path & path, const std::string & digest, size_t limit)
++        : delta(path, std::ios::binary | std::ios::ate),
++          base(std::filesystem::path(path).concat(".base"), std::ios::binary | std::ios::ate) {
++        if (!delta || !base) { throw std::runtime_error("missing checkpoint inputs"); }
++        const uint64_t encoded = delta.tellg(), base_size = base.tellg();
++        if (encoded > limit || base_size > limit) { throw std::runtime_error("checkpoint exceeds budget"); }
++        delta.seekg(0);
++        std::string header(72, ' ');
++        if (!delta.read(header.data(), header.size()) || header != "WLDDEL01" + digest) {
++            throw std::runtime_error("invalid checkpoint header");
++        }
++        while (auto kind = integer(1)) {
++            const auto n = integer(4);
++            if ((kind != 1 && kind != 2) || !n || n > block || logical % block || n > limit - logical) {
++                throw std::runtime_error("invalid checkpoint record");
++            }
++            const uint64_t offset = kind == 2 ? integer(8) : uint64_t(delta.tellg());
++            const uint64_t end = kind == 2 ? base_size : encoded;
++            if (offset > end || n > end - offset) { throw std::runtime_error("checkpoint span exceeds input"); }
++            spans.push_back({kind == 2, offset});
++            if (kind == 1) { delta.seekg(std::streamoff(n), std::ios::cur); }
++            logical += size_t(n);
++        }
++        if (!logical || uint64_t(delta.tellg()) != encoded) { throw std::runtime_error("invalid checkpoint end"); }
++    }
++};

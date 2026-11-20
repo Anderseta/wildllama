@@ -2450,10 +2450,6 @@ func (s *llamaServerRunner) chat(ctx context.Context, req ChatRequest, fn func(C
 		return fmt.Errorf("unexpected server status: %s", status)
 	}
 
-	checkpoint, err := s.beginChatCheckpoint(ctx, req.CheckpointSession)
-	if err != nil {
-		return err
-	}
 	if wire == nil {
 		req.Options = s.boundedChatOptions(req.Options)
 		data, err := s.llamaServerChatRequest(req, true)
@@ -2470,6 +2466,12 @@ func (s *llamaServerRunner) chat(ctx context.Context, req ChatRequest, fn func(C
 		wire = buffer.Bytes()
 	}
 
+	checkpoint, err := s.beginChatCheckpoint(ctx, req.CheckpointSession, func() ([]int, error) {
+		return s.checkpointPromptTokens(ctx, wire)
+	})
+	if err != nil {
+		return err
+	}
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", s.port)
 	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(wire))
 	if err != nil {
@@ -2635,7 +2637,7 @@ func (s *llamaServerRunner) chat(ctx context.Context, req ChatRequest, fn func(C
 		s.status.observeSpeculativeGeneration(speculativeGeneration, finalResp.SpeculativeDraftTokens, finalResp.SpeculativeAcceptedTokens)
 		fn(finalResp)
 		if checkpoint != nil {
-			s.finishChatCheckpoint(ctx, checkpoint, finalResp.PromptEvalCount+finalResp.EvalCount)
+			s.finishChatCheckpoint(ctx, checkpoint, finalResp.PromptEvalCount+finalResp.EvalCount, finalResp.PromptEvalCachedCount)
 		}
 
 		return nil

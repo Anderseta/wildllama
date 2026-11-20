@@ -42,52 +42,74 @@ func checkpointBase(path string) (string, error) {
 
 // Decoding never follows another delta. Cap both the materialized file and
 // individual records and reject trailing bytes before submitting to the runner.
-func expandCheckpoint(reader io.Reader, base io.ReaderAt, baseSize int64, dst io.Writer, limit int64) (int64, error) {
-	r := bufio.NewReaderSize(reader, 64<<10)
-	buf := make([]byte, 64<<10)
-	var total int64
-	for {
-		kind, err := r.ReadByte()
+type checkpointReader struct {
+	input                  *bufio.Reader
+	base                   io.ReaderAt
+	baseSize, limit, total int64
+	remaining              io.LimitedReader
+	done                   bool
+}
+
+func readCheckpointRecords(src io.Reader, base io.ReaderAt, baseSize, limit int64) *checkpointReader {
+	return &checkpointReader{input: bufio.NewReaderSize(src, 4096), base: base, baseSize: baseSize, limit: limit}
+}
+
+func (r *checkpointReader) Read(dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	if r.done {
+		return 0, io.EOF
+	}
+	if r.remaining.N == 0 {
+		kind, err := r.input.ReadByte()
 		if err != nil {
-			return 0, err
+			return 0, io.ErrUnexpectedEOF
 		}
 		if kind == 0 {
-			if _, err = r.ReadByte(); err != io.EOF || total == 0 {
+			if _, err = r.input.ReadByte(); err != io.EOF || r.total == 0 {
 				return 0, fmt.Errorf("invalid checkpoint terminator")
 			}
-			return total, nil
+			r.done = true
+			return 0, io.EOF
 		}
 		if kind != 1 && kind != 2 {
 			return 0, fmt.Errorf("invalid checkpoint record")
 		}
 		var length uint32
-		if err = binary.Read(r, binary.LittleEndian, &length); err != nil {
-			return 0, err
+		if err = binary.Read(r.input, binary.LittleEndian, &length); err != nil {
+			return 0, io.ErrUnexpectedEOF
 		}
 		n := int64(length)
-		if n <= 0 || n > int64(len(buf)) || n > limit-total {
+		if n == 0 || n > 65536 || n > r.limit-r.total {
 			return 0, fmt.Errorf("invalid checkpoint length")
 		}
-		chunk := buf[:n]
-		if kind == 2 {
+		if kind == 1 {
+			r.remaining = io.LimitedReader{R: r.input, N: n}
+		} else {
 			var off uint64
-			if err = binary.Read(r, binary.LittleEndian, &off); err != nil {
-				return 0, err
+			if err = binary.Read(r.input, binary.LittleEndian, &off); err != nil {
+				return 0, io.ErrUnexpectedEOF
 			}
-			if n > baseSize || off > uint64(baseSize-n) {
+			if n > r.baseSize || off > uint64(r.baseSize-n) {
 				return 0, fmt.Errorf("invalid checkpoint span")
 			}
-			if _, err = base.ReadAt(chunk, int64(off)); err != nil {
-				return 0, err
-			}
-		} else if _, err = io.ReadFull(r, chunk); err != nil {
-			return 0, err
+			r.remaining = io.LimitedReader{R: io.NewSectionReader(r.base, int64(off), n), N: n}
 		}
-		if _, err = dst.Write(chunk); err != nil {
-			return 0, err
-		}
-		total += n
+		r.total += n
 	}
+	n, err := r.remaining.Read(dst)
+	if err == io.EOF {
+		if r.remaining.N != 0 {
+			return n, io.ErrUnexpectedEOF
+		}
+		err = nil
+	}
+	return n, err
+}
+
+func expandCheckpoint(reader io.Reader, base io.ReaderAt, baseSize int64, dst io.Writer, limit int64) (int64, error) {
+	return io.Copy(dst, readCheckpointRecords(reader, base, baseSize, limit))
 }
 
 func (c *chatCheckpoint) materialize(source, scratch string, size, scratchBudget int64) (int64, error) {
@@ -98,17 +120,9 @@ func (c *chatCheckpoint) materialize(source, scratch string, size, scratchBudget
 	if digest == "" {
 		return size, os.Link(source, scratch)
 	}
-	basePath := filepath.Join(c.directory, c.prefix()+digest+".slot")
-	info, err := os.Lstat(basePath)
+	basePath, baseSize, err := c.verifiedBase(digest)
 	if err != nil {
 		return 0, err
-	}
-	if !info.Mode().IsRegular() || info.Size() > c.maxFile {
-		return 0, fmt.Errorf("invalid checkpoint base")
-	}
-	sum, err := handoffChecksum(basePath, info.Size())
-	if err != nil || hex.EncodeToString(sum[:]) != digest {
-		return 0, fmt.Errorf("damaged checkpoint base")
 	}
 	base, err := os.Open(basePath)
 	if err != nil {
@@ -127,8 +141,36 @@ func (c *chatCheckpoint) materialize(source, scratch string, size, scratchBudget
 	if err != nil {
 		return 0, err
 	}
-	n, writeErr := expandCheckpoint(delta, base, info.Size(), dst, min(c.maxFile, scratchBudget))
+	n, writeErr := expandCheckpoint(delta, base, baseSize, dst, min(c.maxFile, scratchBudget))
 	return n, errors.Join(writeErr, dst.Close())
+}
+
+func (c *chatCheckpoint) verifiedBase(digest string) (string, int64, error) {
+	basePath := filepath.Join(c.directory, c.prefix()+digest+".slot")
+	info, err := os.Lstat(basePath)
+	if err != nil {
+		return "", 0, err
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > c.maxFile {
+		return "", 0, fmt.Errorf("invalid checkpoint base")
+	}
+	sum, err := handoffChecksum(basePath, info.Size())
+	if err != nil || hex.EncodeToString(sum[:]) != digest {
+		return "", 0, fmt.Errorf("damaged checkpoint base")
+	}
+	return basePath, info.Size(), nil
+}
+
+// Both hard links pin immutable inputs until the native restore finishes.
+func (c *chatCheckpoint) linkRestore(source, scratch, digest string) error {
+	base, _, err := c.verifiedBase(digest)
+	if err != nil {
+		return err
+	}
+	if err := os.Link(base, scratch+".base"); err != nil {
+		return err
+	}
+	return os.Link(source, scratch)
 }
 
 // Rotate the keyframe when its last delta grows large. Hard links pin the

@@ -9,6 +9,7 @@ import struct
 import subprocess
 import tempfile
 import time
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
@@ -96,7 +97,23 @@ def check(server, model, directory):
                 assert slot("restore")["n_read"] == len(full)
                 return complete(tokens + [7, 8])["content"]
 
-            assert resume(full) == resume(restored)
+            reference = resume(full)
+            assert reference == resume(restored)
+            path.write_bytes(delta)
+            slot("erase")
+            options = dict(image_budget=128 << 20, checkpoint_base=hashlib.sha256(base).hexdigest())
+            assert slot("restore", **options)["n_read"] == len(full)
+            assert complete(tokens + [7, 8])["content"] == reference
+            assert path.read_bytes() == delta
+            for damaged in (delta[:-1], delta + b"extra"):
+                path.write_bytes(damaged)
+                try:
+                    slot("restore", **options)
+                except HTTPError as error:
+                    assert error.code == 400
+                else:
+                    raise AssertionError("accepted invalid incremental state")
+            assert resume(full) == reference
             print(json.dumps({"base_bytes": len(base), "full_bytes": len(full), "delta_bytes": len(delta)}))
         finally:
             proc.terminate()

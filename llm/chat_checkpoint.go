@@ -22,6 +22,7 @@ const checkpointBudgetEnv = "WILDLLAMA_CHAT_CHECKPOINT_MIB"
 type chatCheckpoint struct {
 	directory, owner, runtime string
 	budget, maxFile           int64
+	restored                  bool
 }
 
 func ValidCheckpointSession(id string) bool {
@@ -186,7 +187,7 @@ func (s *llamaServerRunner) checkpointIO(ctx context.Context, action string, max
 var errCheckpointWriterActive = errors.New("checkpoint operation is still finishing")
 var errCheckpointDeltaSave = errors.New("native incremental save did not complete")
 
-func (s *llamaServerRunner) beginChatCheckpoint(ctx context.Context, id string) (*chatCheckpoint, error) {
+func (s *llamaServerRunner) beginChatCheckpoint(ctx context.Context, id string, prompt func() ([]int, error)) (*chatCheckpoint, error) {
 	if s.launch.handoff == nil {
 		return nil, nil
 	}
@@ -221,9 +222,10 @@ func (s *llamaServerRunner) beginChatCheckpoint(ctx context.Context, id string) 
 	if err != nil {
 		return c, nil
 	}
+	files = c.restoreCandidates(files, prompt)
 	for _, f := range files {
-		if !strings.HasPrefix(f.name, c.prefix()) || f.size <= 0 || f.size > c.maxFile {
-			continue
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		source := filepath.Join(c.directory, f.name)
 		sum, err := handoffChecksum(source, f.size)
@@ -235,39 +237,60 @@ func (s *llamaServerRunner) beginChatCheckpoint(ctx context.Context, id string) 
 			return nil, nil
 		}
 		os.Remove(scratch)
-		logical, err := c.materialize(source, scratch, f.size, c.budget-used)
+		os.Remove(scratch + ".base")
+		digest, err := checkpointBase(source)
+		if err != nil {
+			continue
+		}
+		direct := cfg.directRestore && digest != ""
+		var logical int64
+		if direct {
+			err = c.linkRestore(source, scratch, digest)
+		} else {
+			digest = ""
+			logical, err = c.materialize(source, scratch, f.size, c.budget-used)
+		}
 		if err != nil {
 			continue
 		}
 		if c.revoked() {
 			return nil, nil
 		}
-		n, err := s.checkpointIO(ctx, "restore", c.maxFile, lock, scratch, "")
+		n, err := s.checkpointIO(ctx, "restore", c.maxFile, lock, scratch, digest)
 		if errors.Is(err, errCheckpointWriterActive) {
 			release = false
 			return nil, err
 		}
-		if err != nil || n != logical {
+		if err != nil || n <= 0 || n > c.maxFile || (!direct && n != logical) {
 			os.Remove(source)
 			if _, clearErr := s.handoffAction(ctx, "erase"); clearErr != nil {
 				return nil, fmt.Errorf("reset failed chat restore: %w", clearErr)
 			}
-			return c, nil
+			continue
 		}
 		now := time.Now()
 		os.Chtimes(source, now, now)
-		slog.Debug("restored chat prefix", "bytes", n)
+		c.restored = true
+		slog.Debug("restored chat prefix", "bytes", n, "incremental_read", direct)
 		break
 	}
 	return c, nil
 }
 
-func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatCheckpoint, tokens int) {
+func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatCheckpoint, tokens int, cached *int) {
 	s.checkpointResident = c.prefix()
 	if tokens < 1024 || c.maxFile <= 0 || c.revoked() {
 		return
 	}
-	if !s.checkpointTime.IsZero() && time.Since(s.checkpointTime) < 5*time.Minute && tokens < s.checkpointTokens+2048 {
+	// A short continuation after a successful reload already has a durable
+	// prefix. Save the SSD round trip for a later turn with more new work.
+	if c.restored && cached != nil && *cached >= 1024 && *cached <= tokens && tokens-*cached < 256 {
+		s.checkpointTime = time.Now()
+		s.checkpointTokens = *cached
+		return
+	}
+	changedBranch := cached != nil && *cached >= 0 && tokens-*cached >= 1024 && *cached < tokens/2
+	if !changedBranch && !s.checkpointTime.IsZero() && time.Since(s.checkpointTime) < 5*time.Minute && tokens < s.checkpointTokens+2048 {
 		return
 	}
 	cfg := s.launch.handoff
@@ -338,6 +361,18 @@ func (s *llamaServerRunner) finishChatCheckpoint(ctx context.Context, c *chatChe
 	if c.revoked() {
 		os.Remove(dest)
 		return
+	}
+	// Retain one independent previous turn for edited branches, within the
+	// existing family quota. A delta already keeps its own full keyframe.
+	if baseName == "" {
+		for _, f := range files {
+			if f.name != name && strings.HasPrefix(f.name, c.prefix()) && f.size <= c.maxFile {
+				if d, err := checkpointBase(filepath.Join(c.directory, f.name)); err == nil && d == "" {
+					baseName = f.name
+					break
+				}
+			}
+		}
 	}
 	for _, f := range files {
 		if f.name != name && f.name != baseName && strings.HasPrefix(f.name, c.prefix()) {

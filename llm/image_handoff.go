@@ -28,6 +28,7 @@ const handoffFile = "resume.bin"
 type imageHandoffConfig struct {
 	directory, auth string
 	budget          int64
+	directRestore   bool
 }
 
 func newImageHandoff(launch llamaServerLaunchConfig, split bool) *imageHandoffConfig {
@@ -58,7 +59,8 @@ func newImageHandoff(launch llamaServerLaunchConfig, split bool) *imageHandoffCo
 			slog.Debug("chat checkpoint directory unavailable", "error", err)
 		}
 	}
-	cfg := &imageHandoffConfig{directory: dir, auth: rand.Text(), budget: mib << 20}
+	cfg := &imageHandoffConfig{directory: dir, auth: rand.Text(), budget: mib << 20,
+		directRestore: os.Getenv("WILDLLAMA_CHECKPOINT_DIRECT_READ") != "0" && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, "WILDLLAMA_CHECKPOINT_DIRECT_READ")}
 	// A service that crashed cannot restore its in-memory receipt. Only the
 	// lock owner can remove a stale checkpoint, including across processes.
 	if lock, err := cfg.lock(); err == nil {
@@ -159,7 +161,7 @@ func (s *llamaServerRunner) handoffActionWithBase(ctx context.Context, action st
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		if base != "" && res.StatusCode == http.StatusInternalServerError {
+		if action == "save" && base != "" && res.StatusCode == http.StatusInternalServerError {
 			return 0, errCheckpointDeltaSave
 		}
 		return 0, fmt.Errorf("slot %s returned %d", action, res.StatusCode)

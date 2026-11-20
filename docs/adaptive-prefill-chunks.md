@@ -41,3 +41,17 @@ same ordinary batch, checking secondary memory admission. These are correctness
 and resource contracts, not trained-model throughput or SGLang parity results.
 CUDA behavior and end-to-end throughput require separate measurements before
 changing defaults.
+
+## Isolated text prompts
+
+`WILDLLAMA_SINGLE_PREFILL_TUNE=1` enables a separate runner-local experiment
+for one causal text slot, including compatible MTP runners. The controller
+times the uncached prompt through the first sampled position, including draft
+catch-up. It tries the configured batch and a smaller multiple of the existing
+microbatch on long prompts of comparable length and starting context. Three
+paired wins of more than 6% admit the smaller batch; periodic control requests
+can reverse the choice. All trials stay within the configured batch limits.
+Graph variants are reuse-only on reduced batches. Learning resets on model
+reload. Short prompts, media, adapters, child requests and embeddings retain
+normal batching. Set the profile's runner environment value to `0` for fixed
+batching.

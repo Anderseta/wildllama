@@ -99,8 +99,14 @@ func TestChatCheckpointIncrementalPublishing(t *testing.T) {
 		}
 		if r.URL.Query().Get("action") == "restore" {
 			b, _ := os.ReadFile(scratch)
-			restored = bytes.Equal(next, b)
-			fmt.Fprintf(w, "{\"n_read\":%d}", len(b))
+			if body["checkpoint_base"] != nil {
+				pinned, err := os.ReadFile(scratch + ".base")
+				restored = err == nil && bytes.Equal(pinned, base) && body["checkpoint_base"] == digest &&
+					bytes.HasPrefix(b, []byte(deltaMagic+digest))
+			} else {
+				restored = bytes.Equal(next, b)
+			}
+			fmt.Fprintf(w, "{\"n_read\":%d}", len(next))
 			return
 		}
 		data := base
@@ -127,20 +133,25 @@ func TestChatCheckpointIncrementalPublishing(t *testing.T) {
 	}
 	r := runner()
 	ctx := context.Background()
-	c, err := r.beginChatCheckpoint(ctx, "incremental")
+	c, err := r.beginChatCheckpoint(ctx, "incremental", nil)
 	if err != nil || c == nil {
 		t.Fatal(err)
 	}
-	r.finishChatCheckpoint(ctx, c, 2000)
-	r.finishChatCheckpoint(ctx, c, 5000)
+	r.finishChatCheckpoint(ctx, c, 2000, nil)
+	r.finishChatCheckpoint(ctx, c, 5000, nil)
 	files, _, err := c.files()
 	if err != nil || len(files) != 2 || saves != 2 {
 		t.Fatal(files, saves, err)
 	}
 	// A profile may opt out again between saving and restarting.
 	t.Setenv(checkpointDeltaEnv, "0")
-	if _, err = runner().beginChatCheckpoint(ctx, "incremental"); err != nil || !restored {
+	if _, err = runner().beginChatCheckpoint(ctx, "incremental", nil); err != nil || !restored {
 		t.Fatal(err, restored)
+	}
+	cfg.directRestore = true
+	restored = false
+	if _, err = runner().beginChatCheckpoint(ctx, "incremental", nil); err != nil || !restored {
+		t.Fatal("native restore did not receive both immutable inputs", err)
 	}
 	if _, err = os.Stat(scratch + ".base"); !os.IsNotExist(err) {
 		t.Fatal("baseline link leaked", err)

@@ -101,7 +101,15 @@ Compatible single-slot runners save long, expensive prefixes under
 `OLLAMA_MODELS/.chat-checkpoints`. The native format includes supported draft
 and recurrent state. The runner checks runtime identity, settings and file
 integrity before asking the model to reuse a matching prefix. A changed
-conversation still undergoes native token-prefix validation.
+conversation still undergoes native token-prefix validation. When a conversation
+has left the runner, it compares the incoming text token IDs with the small
+token headers of compatible snapshots before reading model state. The longest
+match of at least 256 tokens wins, with a complete matching snapshot preferred
+on ties. A full save can retain the previous full turn within the shared quota.
+Incremental saves keep their immutable base. Compatible native runners read
+copy and literal records directly from these two files. Checksums are verified
+before restore. Draft state uses the existing wire format and streams through
+the backend's tensor transfer buffers.
 
 The disk pool defaults to 2 GiB. Set `WILDLLAMA_CHAT_CHECKPOINT_MIB=0` to
 disable it or give a positive size in MiB. Snapshots share the native slot-save

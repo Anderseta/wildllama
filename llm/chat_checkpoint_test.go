@@ -55,21 +55,21 @@ func TestChatCheckpointRestartIsolationAndDeletion(t *testing.T) {
 	}
 	ctx := context.Background()
 	r := runner("a")
-	c, err := r.beginChatCheckpoint(ctx, "project")
+	c, err := r.beginChatCheckpoint(ctx, "project", nil)
 	if err != nil || c == nil {
 		t.Fatal(err)
 	}
-	r.finishChatCheckpoint(ctx, c, 100)
+	r.finishChatCheckpoint(ctx, c, 100, nil)
 	if saves != 0 {
 		t.Fatal("short chat persisted")
 	}
-	r.finishChatCheckpoint(ctx, c, 6000)
-	r.finishChatCheckpoint(ctx, c, 6005)
+	r.finishChatCheckpoint(ctx, c, 6000, nil)
+	r.finishChatCheckpoint(ctx, c, 6005, nil)
 	if saves != 1 {
 		t.Fatal("repeated checkpoint")
 	}
 	begin := func(r *llamaServerRunner, id string) *chatCheckpoint {
-		cc, e := r.beginChatCheckpoint(ctx, id)
+		cc, e := r.beginChatCheckpoint(ctx, id, nil)
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -94,7 +94,12 @@ func TestChatCheckpointRestartIsolationAndDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	r = runner("a")
-	begin(r, "project")
+	resumed := begin(r, "project")
+	cached := 5980
+	r.finishChatCheckpoint(ctx, resumed, 6004, &cached)
+	if saves != 1 {
+		t.Fatal("small resumed turn rewrote its snapshot")
+	}
 	if restores != 1 {
 		t.Fatal("missing restart restore")
 	}
@@ -115,7 +120,7 @@ func TestChatCheckpointRestartIsolationAndDeletion(t *testing.T) {
 	if begin(r, "project") != nil {
 		t.Fatal("revoked session admitted")
 	}
-	r.finishChatCheckpoint(ctx, c, 12000)
+	r.finishChatCheckpoint(ctx, c, 12000, nil)
 	if saves != 1 {
 		t.Fatal("deleted checkpoint republished")
 	}

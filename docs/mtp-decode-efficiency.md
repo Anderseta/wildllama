@@ -158,3 +158,9 @@ distribution. Changing a proposal may change a seeded output.
 
 The last two switches need independent and combined measurements on the intended
 model. The response lookup does not require a GPU index or new weights.
+
+When automatic proposal selection and short adaptive MTP depth are both in
+use, depth trials use ordinary proposals. Strategy trials hold a learned depth
+and have separate cost histories by depth and context range. Experimental
+strategy timing does not enter depth estimates. Both use elapsed time per
+committed token and the model's existing verification and sampling paths.
