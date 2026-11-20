@@ -1,0 +1,127 @@
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -6,6 +6,8 @@
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstddef>
++#include <cstdlib>
++#include <cstring>
+ #include <functional>
+ #include <set>
+ #include <string>
+@@ -411,9 +413,13 @@
+ 
+         ggml_tensor* attend(GGMLRunnerContext* ctx,
+                             const std::vector<ggml_tensor*>& qkv,
+-                            ggml_tensor* pe = nullptr) {
++                            ggml_tensor* pe = nullptr,
++                            ggml_tensor* query_pe = nullptr) {
++            if (query_pe == nullptr) {
++                query_pe = pe;
++            }
+             // Budget one F32 Q/K tensor per group, not the full attention working set.
+-            const double head_bytes  = double(ggml_row_size(GGML_TYPE_F32, head_dim)) * qkv[0]->ne[2] * qkv[0]->ne[3];
++            const double head_bytes  = double(ggml_row_size(GGML_TYPE_F32, head_dim)) * qkv[1]->ne[2] * qkv[1]->ne[3];
+             const int64_t head_chunk = head_chunk_budget_gib > 0
+                                            ? static_cast<int64_t>(std::clamp(double(head_chunk_budget_gib) * (1024ULL * 1024 * 1024) / head_bytes,
+                                                                              1.0, double(heads)))
+@@ -425,18 +431,19 @@
+                     for (auto tensor : qkv) {
+                         part.push_back(ggml_ext_slice(ctx, tensor, 1, start, std::min(start + head_chunk, heads), false));
+                     }
+-                    outputs.push_back(attend_heads(ctx, part, pe));
++                    outputs.push_back(attend_heads(ctx, part, query_pe, pe));
+                     // Keep each head group's temporaries out of the concatenation tree's live set.
+                     ctx->expand_graph(outputs.back());
+                 }
+                 return ggml_ext_vec_concat(ctx, outputs, 0);
+             }
+-            return attend_heads(ctx, qkv, pe);
++            return attend_heads(ctx, qkv, query_pe, pe);
+         }
+ 
+         ggml_tensor* attend_heads(GGMLRunnerContext* ctx,
+                                   const std::vector<ggml_tensor*>& qkv,
+-                                  ggml_tensor* pe) {
++                                  ggml_tensor* query_pe,
++                                  ggml_tensor* key_pe) {
+             auto q_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
+             auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+             auto q      = qkv[0];
+@@ -444,9 +451,9 @@
+             auto v      = qkv[2];
+             q           = q_norm->forward(ctx, q);
+             k           = k_norm->forward(ctx, k);
+-            if (pe != nullptr) {
+-                q = apply_partial_rope(ctx, q, pe);
+-                k = apply_partial_rope(ctx, k, pe);
++            if (key_pe != nullptr) {
++                q = apply_partial_rope(ctx, q, query_pe);
++                k = apply_partial_rope(ctx, k, key_pe);
+             } else {
+                 q = attention_layout(ctx->ggml_ctx, q);
+                 k = attention_layout(ctx->ggml_ctx, k);
+@@ -618,7 +625,8 @@
+                              ggml_tensor* t_emb,
+                              const std::vector<TokenModulationSpan>& segments,
+                              ggml_tensor* pe,
+-                             size_t first_output) {
++                             size_t first_output,
++                             bool target_queries) {
+             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
+             auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
+             auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
+@@ -639,11 +647,21 @@
+             auto qkv      = attn->project_qkv(ctx, inputs, [&](ggml_tensor* input, size_t i) {
+                 return modulate(norm1->forward(ctx, input), rows[i], 0, 1);
+             });
+-            auto attended = attn->attend(ctx, qkv, pe);
++            // The image head reads only the final target. Preserve all keys, values
++            // and original RoPE positions, including when attention heads are grouped.
++            const int64_t query_start = target_queries ? segments[first_output].start : 0;
++            auto query_pe = pe;
++            if (query_start > 0) {
++                qkv[0] = ggml_ext_slice(ctx, qkv[0], 2, query_start, qkv[0]->ne[2], false);
++                if (pe != nullptr) {
++                    query_pe = ggml_ext_slice(ctx, pe, 3, query_start, pe->ne[3], false);
++                }
++            }
++            auto attended = attn->attend(ctx, qkv, pe, query_pe);
+             std::vector<ggml_tensor*> projections;
+             for (size_t i = first_output; i < segments.size(); ++i) {
+                 const auto& segment = segments[i];
+-                auto part = ggml_ext_slice(ctx, attended, 1, segment.start, segment.end, false);
++                auto part = ggml_ext_slice(ctx, attended, 1, segment.start - query_start, segment.end - query_start, false);
+                 projections.push_back(attn->project_output(ctx, part));
+             }
+             ggml_tensor* output = nullptr;
+@@ -744,6 +762,7 @@
+ 
+     struct MiniMaxH3Transformer3DModel : public GGMLBlock {
+         Config config;
++        bool target_only_queries = false;
+ 
+         explicit MiniMaxH3Transformer3DModel(const Config& config)
+             : config(config) {
+@@ -982,7 +1001,8 @@
+                     final_video.end -= final_video.start;
+                     final_video.start = 0;
+                 }
+-                h = block->forward(ctx, h, t_emb, segments, pe, first_output);
++                h = block->forward(ctx, h, t_emb, segments, pe, first_output,
++                                   first_output > 0 && target_only_queries && !ctx->sage_attn_enabled);
+                 sd::ggml_graph_cut::mark_graph_cut(h,
+                                                    "minimax_h3.blocks." + std::to_string(i),
+                                                    "hidden_states");
+@@ -1273,6 +1293,11 @@
+             : DiffusionModelRunner(backend, prefix, weight_manager),
+               config(Config::detect_from_weights(tensors, prefix)),
+               model(config) {
++            const char* target_queries = std::getenv("WILDIMAGE_MINIMAX_TARGET_QUERIES");
++            model.target_only_queries = target_queries && std::strcmp(target_queries, "1") == 0;
++            if (model.target_only_queries) {
++                LOG_INFO("MiniMax-H3 image target-only final queries enabled (standard attention)");
++            }
+             float head_chunk_budget_gib = DEFAULT_ATTN_CHUNK_BUDGET_GIB;
+             for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
+                 if (key == "minimax_h3_attn_chunk_budget") {

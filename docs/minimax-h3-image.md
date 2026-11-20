@@ -51,6 +51,22 @@ output projection and feed-forward network. The PDD head also skips unit
 multiplications. These changes use the existing weights and six-step schedule
 and release components at the same stage boundaries.
 
+Set `WILDIMAGE_MINIMAX_TARGET_QUERIES=1` in the WildLlama server environment
+to try target-only attention queries in the last image block. The runner keeps
+the existing QKV projection, all keys and values, the target's original rotary
+positions and the configured head-group budget. The image target must be the
+final segment. Sage Attention and audio models use the full-query path.
+The default is off. CUDA can change the reduction order for a shorter query
+sequence, so a fixed seed does not guarantee identical pixels across modes.
+
+On an RTX 5060 Ti, a small Q5_K final-block test with two synthetic references,
+Flash Attention and grouped heads took 0.601 ms with full queries and 0.504 ms
+with target-only queries. Both allocated 11.9 MiB of graph workspace. The
+maximum absolute difference in that case was 0.000181. These figures cover
+one synthetic layer. To compare complete edits, use
+`scripts/benchmark-wildimage.py --compare-minimax-target-queries --require-pixel-parity`
+with the same runner, profile, seed and reference files for both modes.
+
 For independent named tensors in ordinary weight files, the native loader
 dispatches reads in file-offset order and reuses each worker's scratch space
 until the load ends. The reported `mean_step_seconds_after_first` in the native

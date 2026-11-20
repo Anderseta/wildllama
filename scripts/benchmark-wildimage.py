@@ -285,12 +285,15 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
         env.pop(name, None)
     env["CUDA_VISIBLE_DEVICES"] = initial["uuid"]
     env["WILDIMAGE_CUDA_WAIT"] = (options.candidate_cuda_wait or options.cuda_wait) if variant == "candidate" else options.cuda_wait
+    if options.compare_minimax_target_queries:
+        env["WILDIMAGE_MINIMAX_TARGET_QUERIES"] = "1" if variant == "candidate" else "0"
     env["CUDA_CACHE_PATH"] = str(options.cuda_cache_dir or directory.parent / "cuda-cache")
     env["TMP"] = env["TEMP"] = str(directory)
     Path(env["CUDA_CACHE_PATH"]).mkdir(exist_ok=True)
     samples, memory_samples, errors, phases, native = [], [], [], [(0.0, "loading")], {}
     phase_cursor = 0
     first_step_at = last_step_at = None
+    target_queries_requested = False
     cpu_seconds = None
     stop, timed_out = threading.Event(), threading.Event()
     start = time.perf_counter()
@@ -323,6 +326,8 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
             for line in child.stdout:
                 elapsed = time.perf_counter() - start
                 log.write(f"{elapsed:9.3f} {line}")
+                if "MiniMax-H3 image target-only final queries enabled" in line:
+                    target_queries_requested = True
                 for index in range(phase_cursor, len(PHASE_STARTS)):
                     phase, pattern = PHASE_STARTS[index]
                     if pattern.search(line):
@@ -361,6 +366,7 @@ def run_trial(runner, profile, options, directory, nvidia_smi, variant, prompt, 
         phase_times[name] = round(end - begin, 4)
     return {
         "command": command, "seconds": round(elapsed, 4), "exit_code": code,
+        "minimax_target_queries_requested": target_queries_requested,
         "timed_out": timed_out.is_set(), "log": str(directory / "runner.log"),
         "wall_phase_seconds": phase_times, "native_phase_seconds": native,
         # The first step may include loading the entire denoiser from disk.
@@ -402,6 +408,8 @@ def arguments():
     parser.add_argument("--candidate-profile", type=absolute_path,
                         help="saved image configuration or one profile JSON object for the candidate")
     parser.add_argument("--candidate-runner", type=absolute_path)
+    parser.add_argument("--compare-minimax-target-queries", action="store_true",
+                        help="compare full final attention against target-only queries using the MiniMax image runner")
     parser.add_argument("--cuda-wait", choices=["auto", "blocking", "spin", "yield"], default="auto")
     parser.add_argument("--candidate-cuda-wait", choices=["auto", "blocking", "spin", "yield"])
     parser.add_argument("--cuda-cache-dir", type=absolute_path,
@@ -441,7 +449,7 @@ def main():
     candidate = load_profile(options.candidate_profile) if options.candidate_profile else baseline
     candidate_runner = options.candidate_runner or options.runner
     cases = [("baseline", options.runner, baseline)]
-    if options.candidate_profile or options.candidate_runner or options.candidate_cuda_wait:
+    if options.candidate_profile or options.candidate_runner or options.candidate_cuda_wait or options.compare_minimax_target_queries:
         cases.append(("candidate", candidate_runner, candidate))
     if options.sage:
         cases.append(("sage", candidate_runner, candidate))
@@ -453,6 +461,7 @@ def main():
         print(json.dumps({
             "mode": "dry-run", "repetitions": options.repetitions, "prompt_file": str(options.prompt),
             "cuda_wait": options.cuda_wait, "candidate_cuda_wait": options.candidate_cuda_wait,
+            "compare_minimax_target_queries": options.compare_minimax_target_queries,
             "cases": {name: runner_command(runner, profile, options, options.work_dir / "<run>" / name, name)
                       for name, runner, profile in cases},
         }, ensure_ascii=False, indent=2))
@@ -491,6 +500,9 @@ def main():
             trial = run_trial(runner, profile, options, directory, nvidia_smi, name, prompt, negative)
             trial.update(repetition=repeat, case=name)
             report["trials"].append(trial)
+            if options.compare_minimax_target_queries and trial["minimax_target_queries_requested"] != (name == "candidate"):
+                trial["configuration_error"] = "MiniMax runner did not confirm the requested final-query mode"
+                failed = True
             try:
                 with Image.open(directory / "image.png", formats=("PNG",)) as image:
                     if image.size != (profile["width"], profile["height"]):
