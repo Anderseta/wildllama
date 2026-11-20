@@ -1,6 +1,7 @@
 // Link against the patched native image runner and its GGML backend.
 #include "model/diffusion/minimax_h3.hpp"
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #include "ggml-cuda.h"
 #include <chrono>
 #include <cstdio>
@@ -134,6 +135,16 @@ int main(int argc, char** argv) {
     }
     auto backend = ggml_backend_cuda_init(0);
     GGML_ASSERT(backend);
+    GGML_ASSERT(MiniMaxH3::target_queries_enabled(backend, nullptr));
+    GGML_ASSERT(MiniMaxH3::target_queries_enabled(backend, ""));
+    GGML_ASSERT(MiniMaxH3::target_queries_enabled(backend, "1"));
+    GGML_ASSERT(!MiniMaxH3::target_queries_enabled(backend, "0"));
+    GGML_ASSERT(!MiniMaxH3::target_queries_enabled(backend, "invalid"));
+    GGML_ASSERT(!MiniMaxH3::target_queries_enabled(nullptr, nullptr));
+    auto cpu = ggml_backend_cpu_init();
+    GGML_ASSERT(cpu && !MiniMaxH3::target_queries_enabled(cpu, nullptr));
+    GGML_ASSERT(MiniMaxH3::target_queries_enabled(cpu, "1"));
+    ggml_backend_free(cpu);
     if (mode == "--baseline" || mode == "--target") {
         // Separate processes let an external device-memory sampler compare peaks.
         for (int i = 0; i < 12; ++i) {

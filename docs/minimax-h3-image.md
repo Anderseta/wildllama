@@ -45,18 +45,19 @@ Tensor loading wakes its progress reporter on completion instead of paying a
 fixed polling delay for each small block.
 
 Inside the denoiser, modulation vectors are views into the current layer's
-projection. The image model's last transformer block keeps full attention over
-the prompt, references and target. After attention, only the target needs the
-output projection and feed-forward network. The PDD head also skips unit
-multiplications. These changes use the existing weights and six-step schedule
+projection. The image model's last transformer block uses keys and values from
+the entire prompt, all references and the target. After attention, only the
+target needs the output projection and feed-forward network. The PDD head also
+skips unit multiplications. These changes use the existing weights and six-step schedule
 and release components at the same stage boundaries.
 
-Set `WILDIMAGE_MINIMAX_TARGET_QUERIES=1` in the WildLlama server environment
-to try target-only attention queries in the last image block. The runner keeps
-the existing QKV projection, all keys and values, the target's original rotary
+On CUDA the last image block computes attention queries for the target by
+default. Set `WILDIMAGE_MINIMAX_TARGET_QUERIES=0` in the WildLlama server
+environment to restore full queries. Other backends can opt in with `1`.
+The runner keeps the existing QKV projection, all keys and values, the target's original rotary
 positions and the configured head-group budget. The image target must be the
 final segment. Sage Attention and audio models use the full-query path.
-The default is off. CUDA can change the reduction order for a shorter query
+CUDA can change the reduction order for a shorter query
 sequence, so a fixed seed does not guarantee identical pixels across modes.
 
 On an RTX 5060 Ti, a small Q5_K final-block test with two synthetic references,

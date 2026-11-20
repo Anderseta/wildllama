@@ -1,0 +1,33 @@
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -16,6 +16,7 @@
+ #include <vector>
+ #include "core/ggml_tensor_utils.h"
+ 
++#include "core/ggml_extend_backend.h"
+ #include "core/ggml_graph_cut.h"
+ #include "model/common/block.hpp"
+ #include "model/diffusion/dit.hpp"
+@@ -1275,6 +1276,13 @@
+         return layout;
+     }
+ 
++    static bool target_queries_enabled(ggml_backend_t backend, const char* setting) {
++        if (setting && setting[0]) {
++            return std::strcmp(setting, "1") == 0;
++        }
++        return sd_backend_is(backend, "CUDA");
++    }
++
+     struct MiniMaxH3Runner : public DiffusionModelRunner {
+         Config config;
+         MiniMaxH3Transformer3DModel model;
+@@ -1294,7 +1302,7 @@
+               config(Config::detect_from_weights(tensors, prefix)),
+               model(config) {
+             const char* target_queries = std::getenv("WILDIMAGE_MINIMAX_TARGET_QUERIES");
+-            model.target_only_queries = target_queries && std::strcmp(target_queries, "1") == 0;
++            model.target_only_queries = config.audio_latent_channels == 0 && target_queries_enabled(backend, target_queries);
+             if (model.target_only_queries) {
+                 LOG_INFO("MiniMax-H3 image target-only final queries enabled (standard attention)");
+             }

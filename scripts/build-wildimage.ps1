@@ -20,7 +20,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 . (Join-Path $PSScriptRoot 'cuda-toolkit.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
-$runtimeRevision = 'b9d7176-wildllama-h3-6'
+$runtimeRevision = 'b9d7176-wildllama-h3-7'
 $originalOutputEncoding = [Console]::OutputEncoding
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
@@ -313,7 +313,7 @@ int main() {
         Copy-ReplacingFile $header (Join-Path $SourceDirectory $target)
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
-    $patches = @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch','0008-moss-edit.patch','0009-minimax-views-and-weight-io.patch','0010-lazy-graph-cut-planning.patch','0011-minimax-target-queries.patch') | ForEach-Object { Join-Path $repository "third_party/wildimage/patches/$_" }
+    $patches = @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch','0008-moss-edit.patch','0009-minimax-views-and-weight-io.patch','0010-lazy-graph-cut-planning.patch','0011-minimax-target-queries.patch','0012-minimax-default-target-queries.patch') | ForEach-Object { Join-Path $repository "third_party/wildimage/patches/$_" }
     for ($i = 0; $i -lt $patches.Count; $i++) {
         $patch = $patches[$i]
         $patchName = [IO.Path]::GetFileName($patch)
