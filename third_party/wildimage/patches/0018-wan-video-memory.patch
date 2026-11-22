@@ -1,0 +1,585 @@
+diff --git a/src/core/backend_fit.cpp b/src/core/backend_fit.cpp
+index 120cbe4..618600b 100644
+--- a/src/core/backend_fit.cpp
++++ b/src/core/backend_fit.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "core/ggml_extend_backend.h"
+ #include "core/util.h"
++#include "core/wildimage_ram_budget.h"
+ #include "ggml-backend.h"
+ 
+ namespace sd::backend_fit {
+@@ -430,7 +431,8 @@ namespace sd::backend_fit {
+                               ggml_type override_wtype,
+                               sd::ggml_graph_cut::MaxVramAssignment& budgets,
+                               std::string& runtime_spec,
+-                              std::string& params_spec) {
++                              std::string& params_spec,
++                              bool& enable_mmap) {
+         std::string error;
+         if (!budgets.canonicalize_backend_keys(&error)) {
+             LOG_ERROR("%s", error.c_str());
+@@ -447,7 +449,33 @@ namespace sd::backend_fit {
+             return false;
+         }
+         const int64_t free_ram   = available_ram_bytes();
+-        const int64_t ram_budget = std::max<int64_t>(free_ram - std::max<int64_t>(2048 * MiB, free_ram / 10), 0);
++        int64_t ram_budget = std::max<int64_t>(free_ram - std::max<int64_t>(2048 * MiB, free_ram / 10), 0);
++        const auto version = loader.get_sd_version();
++        if (wildimage_ram::budget().stage_components && (version == VERSION_WAN2 || version == VERSION_WAN2_2_I2V)) {
++            ram_budget = std::min<int64_t>(ram_budget, wildimage_ram::budget().remaining());
++#ifdef _WIN32
++            const size_t gpu = select_main_device(devices);
++            if (gpu != SIZE_MAX && devices[gpu].type == GGML_BACKEND_DEVICE_TYPE_GPU &&
++                (runtimes.empty() || !runtimes.front().devices.empty())) {
++                MEMORYSTATUSEX memory{};
++                memory.dwLength = sizeof(memory);
++                if (GlobalMemoryStatusEx(&memory)) {
++                    ram_budget = std::min(ram_budget, std::max<int64_t>(0, int64_t(memory.ullAvailPageFile) - 2048 * MiB));
++                }
++                // WDDM also needs commit for GPU allocations. Full file views can occupy
++                // the host working set alongside their device copies throughout denoising.
++                int64_t weights = 0;
++                for (const auto& component : components) {
++                    weights += component.params_bytes;
++                }
++                if (weights > ram_budget - devices[gpu].budget_bytes) {
++                    ram_budget = 0;
++                    enable_mmap = false;
++                    LOG_INFO("Wan: streaming nonresident weights with buffered reads to preserve host memory");
++                }
++            }
++#endif
++        }
+         const auto plan          = compute_plan(components, devices, ram_budget, runtimes);
+         params_spec.clear();
+         if (!plan.valid) {
+diff --git a/src/core/backend_fit.h b/src/core/backend_fit.h
+index ad1b60c..64cea08 100644
+--- a/src/core/backend_fit.h
++++ b/src/core/backend_fit.h
+@@ -13,7 +13,8 @@ namespace sd::backend_fit {
+                               ggml_type override_wtype,
+                               sd::ggml_graph_cut::MaxVramAssignment& budgets,
+                               std::string& runtime_spec,
+-                              std::string& params_spec);
++                              std::string& params_spec,
++                              bool& enable_mmap);
+ 
+     bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params,
+                                          bool prefer_temporal_tiling,
+diff --git a/src/model/vae/vae.hpp b/src/model/vae/vae.hpp
+index 3c66965..fd4ff4b 100644
+--- a/src/model/vae/vae.hpp
++++ b/src/model/vae/vae.hpp
+@@ -254,14 +254,13 @@ public:
+     }
+ 
+     sd::Tensor<float> encode(int n_threads,
+-                             const sd::Tensor<float>& x,
++                             sd::Tensor<float> input,
+                              sd_tiling_params_t tiling_params,
+                              bool circular_x,
+                              bool circular_y,
+                              bool auto_end) {
+         int64_t t0              = ggml_time_ms();
+         tiling_params           = resolve_tiling_params(tiling_params);
+-        sd::Tensor<float> input = x;
+         sd::Tensor<float> output;
+         if (scale_input) {
+             scale_tensor_to_minus1_1(&input);
+@@ -331,7 +330,7 @@ public:
+                              bool auto_end) {
+         int64_t t0              = ggml_time_ms();
+         tiling_params           = resolve_tiling_params(tiling_params);
+-        sd::Tensor<float> input = x;
++        const auto& input = x;
+         sd::Tensor<float> output;
+ 
+         if (tiling_params.enabled) {
+diff --git a/src/model/vae/vae_tiling.hpp b/src/model/vae/vae_tiling.hpp
+index c88ff9f..2e75b49 100644
+--- a/src/model/vae/vae_tiling.hpp
++++ b/src/model/vae/vae_tiling.hpp
+@@ -102,16 +102,54 @@ inline VAETemporalTilePlan make_vae_temporal_tile_plan(int64_t total_frames,
+ template <typename Fn>
+ inline sd::Tensor<float> process_vae_temporal_tiles(const sd::Tensor<float>& input,
+                                                     const VAETemporalTilePlan& plan,
+-                                                    Fn&& on_processing) {
++                                                    Fn&& on_processing,
++                                                    int64_t expected_frames = 0) {
++    if (plan.tiles.size() == 1 && plan.tiles.front().start == 0 && plan.tiles.front().end == input.shape()[2]) {
++        auto output = on_processing(input, plan.tiles.front());
++        if (expected_frames > 0 && (output.dim() < 3 || output.shape()[2] != expected_frames)) {
++            return {};
++        }
++        return output;
++    }
++
+     sd::Tensor<float> output;
++    int64_t written = 0;
+     for (const auto& tile : plan.tiles) {
+         auto input_tile  = sd::ops::slice(input, 2, tile.start, tile.end);
+         auto output_tile = on_processing(input_tile, tile);
+         if (output_tile.empty()) {
+             return {};
+         }
+-        output = output.empty() ? std::move(output_tile)
+-                                : sd::ops::concat(output, output_tile, 2);
++        if (expected_frames <= 0) {
++            output = output.empty() ? std::move(output_tile) : sd::ops::concat(output, output_tile, 2);
++            continue;
++        }
++        if (output_tile.dim() < 3 || output_tile.shape()[2] > expected_frames - written) {
++            LOG_ERROR("unexpected temporal decode length");
++            return {};
++        }
++        auto shape = output_tile.shape();
++        const int64_t frames = shape[2];
++        shape[2] = expected_frames;
++        if (output.empty()) {
++            output = sd::Tensor<float>(shape);
++        } else if (output.shape() != shape) {
++            LOG_ERROR("inconsistent temporal decode shape");
++            return {};
++        }
++        // Frame planes are contiguous within each channel/batch. Preserve their original strides.
++        const int64_t plane = shape[0] * shape[1];
++        const int64_t slab = frames * plane;
++        const int64_t groups = output_tile.numel() / slab;
++        for (int64_t g = 0; g < groups; ++g) {
++            std::copy_n(output_tile.data() + g * slab, slab,
++                        output.data() + (g * expected_frames + written) * plane);
++        }
++        written += frames;
++    }
++    if (expected_frames > 0 && written != expected_frames) {
++        LOG_ERROR("incomplete temporal decode");
++        return {};
+     }
+     return output;
+ }
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+index d44fe92..9c259e6 100644
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -1514,7 +1514,7 @@ namespace WAN {
+                 return restore_trailing_singleton_dims(
+                     GGMLRunner::compute(get_graph, n_threads, false),
+                     static_cast<size_t>(input.dim()));
+-            });
++            }, sd_version_is_wan(version) ? 1 + 4 * (input.shape()[2] - 1) : 0);
+ 
+             free_cache_ctx_and_buffer();
+             ae.clear_cache();
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+index 22314d4..7a0a562 100644
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -904,6 +904,40 @@ void ModelLoader::set_wtype_override(ggml_type wtype, std::string tensor_type_ru
+     ++revision_;
+ }
+ 
++static void open_model_mapping(ModelFileData& fdata, bool writable_mmap) {
++    LOG_VERBOSE("using mmap for I/O");
++    std::unique_ptr<MmapWrapper> mmapped = MmapWrapper::create(fdata.path, writable_mmap);
++    if (mmapped) {
++        uint8_t* mmap_data             = static_cast<uint8_t*>(mmapped->writable_data());
++        ggml_backend_buffer_t buf_mmap = ggml_backend_cpu_buffer_from_ptr(mmap_data, mmapped->size());
++        if (buf_mmap) {
++            LOG_INFO("using mmap for '%s'", fdata.path.c_str());
++            fdata.mmbuffer = std::shared_ptr<struct ggml_backend_buffer>(buf_mmap, ggml_backend_buffer_free);
++        } else {
++            LOG_WARN("mmap: failed to create backend buffer for file %s", fdata.path.c_str());
++        }
++        fdata.mapping_writable = writable_mmap;
++        fdata.mmapped = std::shared_ptr<MmapWrapper>(std::move(mmapped));
++    } else {
++        LOG_WARN("failed to memory-map '%s' (falling back to read())", fdata.path.c_str());
++    }
++}
++
++void ModelLoader::release_unused_readonly_maps() {
++    for (auto& file : file_data) {
++        // Each live tensor store owns both its mapping and its backend wrapper.
++        if (file.mapping_writable || file.mmapped.use_count() != 1 || file.mmbuffer.use_count() > 1 ||
++            std::any_of(file.device_mmbuffers.begin(), file.device_mmbuffers.end(),
++                        [](const auto& entry) { return entry.second.use_count() > 1; })) {
++            continue;
++        }
++        file.device_mmbuffers.clear();
++        file.mmbuffer.reset();
++        file.mmapped.reset();
++        file.reopen_readonly_map = true;
++    }
++}
++
+ void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
+     if (model_files_processed) {
+         return;
+@@ -941,21 +975,7 @@ void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
+         fdata.tensors       = std::move(file_tensors);
+ 
+         if (enable_mmap && !is_zip) {
+-            LOG_VERBOSE("using mmap for I/O");
+-            std::unique_ptr<MmapWrapper> mmapped = MmapWrapper::create(file_path, writable_mmap);
+-            if (mmapped) {
+-                uint8_t* mmap_data             = static_cast<uint8_t*>(mmapped->writable_data());
+-                ggml_backend_buffer_t buf_mmap = ggml_backend_cpu_buffer_from_ptr(mmap_data, mmapped->size());
+-                if (buf_mmap) {
+-                    LOG_INFO("using mmap for '%s'", file_path.c_str());
+-                    fdata.mmbuffer = std::shared_ptr<struct ggml_backend_buffer>(buf_mmap, ggml_backend_buffer_free);
+-                } else {
+-                    LOG_WARN("mmap: failed to create backend buffer for file %s", fdata.path.c_str());
+-                }
+-                fdata.mmapped = std::shared_ptr<MmapWrapper>(std::move(mmapped));
+-            } else {
+-                LOG_WARN("failed to memory-map '%s' (falling back to read())", file_path.c_str());
+-            }
++            open_model_mapping(fdata, writable_mmap);
+         }
+ 
+         file_data.push_back(std::move(fdata));
+@@ -986,6 +1006,11 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
+     int64_t t_start = ggml_time_ms();
+ 
+     for (auto& fdata : file_data) {
++        if (fdata.reopen_readonly_map && std::any_of(fdata.tensors.begin(), fdata.tensors.end(),
++                [&](const TensorStorage& ts) { return tensors.count(ts.name) != 0; })) {
++            open_model_mapping(fdata, false);
++            fdata.reopen_readonly_map = false;
++        }
+         if (!fdata.mmbuffer)
+             continue;
+ 
+@@ -1176,6 +1201,10 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
+         if (tensors_to_process.empty()) {
+             continue;
+         }
++        if (enable_mmap && fdata.reopen_readonly_map) {
++            open_model_mapping(fdata, false);
++            fdata.reopen_readonly_map = false;
++        }
+         // Named inference destinations are independent. Dispatch reads in file
+         // order so workers do not seek back and forth between transformer layers.
+         if (target_tensor_names && !fdata.is_zip && !fdata.mmapped) {
+diff --git a/src/model_loader.h b/src/model_loader.h
+index aae3590..927eb92 100644
+--- a/src/model_loader.h
++++ b/src/model_loader.h
+@@ -31,6 +31,8 @@ struct ModelFileData {
+     // mmapped wrapped by devices that can use host memory in place (buffer_from_host_ptr)
+     std::map<ggml_backend_dev_t, std::shared_ptr<struct ggml_backend_buffer>> device_mmbuffers;
+     bool is_zip;
++    bool mapping_writable = false;
++    bool reopen_readonly_map = false;
+ };
+ 
+ struct MmapTensorStore {
+@@ -129,6 +131,7 @@ public:
+     const std::map<std::string, std::string>& get_metadata() const { return metadata_; }
+     void set_n_threads(int n_threads);
+     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
++    void release_unused_readonly_maps();
+     void process_model_files(bool enable_mmap = false, bool writable_mmap = true);
+     std::vector<MmapTensorStore> mmap_tensors(std::map<std::string, ggml_tensor*>& tensors,
+                                               std::set<std::string> ignore_tensors = {},
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+index 9ee4d87..1572e54 100644
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1337,7 +1337,7 @@ void ModelManager::release_params_storage_blocks(bool force,
+     }
+ }
+ 
+-void ModelManager::evict_inactive_components(const std::set<ModelComponent>& components) {
++void ModelManager::evict_inactive_components(const std::set<ModelComponent>& components, bool release_file_maps) {
+     // Called at a completed pipeline phase, after every runner has released its use.
+     clear_all_prefetched_params();
+     std::unordered_set<TensorState*> targets;
+@@ -1363,6 +1363,9 @@ void ModelManager::evict_inactive_components(const std::set<ModelComponent>& com
+         free_params_storage_block(block);
+         it = params_storage_blocks_.erase(it);
+     }
++    if (release_file_maps && enable_mmap_ && !writable_mmap_) {
++        model_loader_.release_unused_readonly_maps();
++    }
+     if (gpu_bytes || host_bytes)
+         LOG_INFO("staged final decode: released inactive weights (%.2f MiB VRAM, %.2f MiB RAM)",
+                  gpu_bytes / (1024.0 * 1024.0), host_bytes / (1024.0 * 1024.0));
+diff --git a/src/model_manager.h b/src/model_manager.h
+index 6020ad1..1929ba5 100644
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -280,7 +280,7 @@ public:
+     bool prefetch_enabled() const override { return !prefetch_disabled_; }
+     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+     void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+-    void evict_inactive_components(const std::set<ModelComponent>& components);
++    void evict_inactive_components(const std::set<ModelComponent>& components, bool release_file_maps = false);
+     WeightResidencyInfo inspect_compute_backend_params(
+         const std::vector<ggml_tensor*>& tensors) const override;
+     void update_runtime_residency(uintptr_t owner_id,
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+index 1583245..794807e 100644
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -961,7 +961,6 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
+ 
+     model_manager = std::make_shared<ModelManager>();
+     model_manager->set_n_threads(n_threads);
+-    model_manager->set_enable_mmap(enable_mmap);
+     model_manager->set_segmented_compute_disabled(disable_segmented_compute);
+     model_manager->set_prefetch_disabled(disable_prefetch);
+     ModelLoader model_loader;
+@@ -983,11 +982,13 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
+                                                    sd_type_to_ggml_type(sd_ctx_params->wtype),
+                                                    max_vram_assignment,
+                                                    backend_spec,
+-                                                   params_backend_spec)) {
++                                                   params_backend_spec,
++                                                   enable_mmap)) {
+             return false;
+         }
+     }
+ 
++    model_manager->set_enable_mmap(enable_mmap);
+     if (!init_backend()) {
+         return false;
+     }
+diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
+index f450916..8ffc0a9 100644
+--- a/src/pipeline/video.cpp
++++ b/src/pipeline/video.cpp
+@@ -22,6 +22,10 @@
+ 
+ namespace sd::pipeline {
+ 
++    static bool stage_wan_weights(SDVersion version) {
++        return wildimage_ram::budget().stage_components && (version == VERSION_WAN2 || version == VERSION_WAN2_2_I2V);
++    }
++
+     static sd_audio_t* waveform_to_sd_audio(const StableDiffusionGGML* sd,
+                                             const sd::Tensor<float>& waveform) {
+         if (sd == nullptr || waveform.empty()) {
+@@ -966,9 +970,9 @@ namespace sd::pipeline {
+                 }
+ 
+                 int64_t t1 = ggml_time_ms();
+-                if (wildimage_ram::budget().stage_components && sd->version == VERSION_WAN2) {
++                if (stage_wan_weights(sd->version)) {
+                     sd->end_runners();
+-                    sd->model_manager->evict_inactive_components({ModelComponent::CLIPVision});
++                    sd->model_manager->evict_inactive_components({ModelComponent::CLIPVision}, true);
+                 }
+                 LOG_INFO("get_clip_vision_output completed, taking %" PRId64 " ms", t1 - prepare_start_ms);
+             }
+@@ -982,7 +986,18 @@ namespace sd::pipeline {
+                 sd::ops::slice_assign(&image, 2, request->frames - 1, request->frames, end_image.unsqueeze(2));
+             }
+ 
+-            auto concat_latent = sd->encode_first_stage(image);  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
++            sd::Tensor<float> concat_latent;
++            if (sd->first_stage_model->get_desc() == "wan_vae") {
++                // Wan's encoder already returns latents. Normalize the owned input clip in place.
++                sd->generation_progress.report("vae_encode");
++                auto encoded = sd->first_stage_model->encode(sd->n_threads, std::move(image), sd->vae_tiling_params,
++                                                              sd->circular_x, sd->circular_y, true);
++                if (!encoded.empty()) {
++                    concat_latent = sd->first_stage_model->vae_to_diffusion_latents(encoded);
++                }
++            } else {
++                concat_latent = sd->encode_first_stage(image);
++            }
+             if (concat_latent.empty()) {
+                 LOG_ERROR("failed to encode video conditioning frames");
+                 return std::nullopt;
+@@ -1200,7 +1215,7 @@ namespace sd::pipeline {
+     static std::optional<ImageGenerationEmbeds> prepare_video_generation_embeds(StableDiffusionGGML* sd,
+                                                                                 const sd_vid_gen_params_t* sd_vid_gen_params,
+                                                                                 const GenerationRequest& request,
+-                                                                                const ImageGenerationLatents& latents,
++                                                                                ImageGenerationLatents& latents,
+                                                                                 const RefImageParams& ref_image_params) {
+         ConditionerRunnerEndOnExit conditioner_runner_end{sd->cond_stage_model.get()};
+ 
+@@ -1220,8 +1235,6 @@ namespace sd::pipeline {
+             LOG_ERROR("failed to encode video prompt");
+             return std::nullopt;
+         }
+-        embeds.cond.c_concat = latents.concat_latent;
+-        embeds.cond.c_vector = latents.clip_vision_output;
+         if (sd_version_is_minimax_h3(sd->version)) {
+             embeds.cond.c_ref_images       = latents.ref_latents;
+             embeds.cond.c_ref_audios       = latents.reference_audio_latents;
+@@ -1262,6 +1275,9 @@ namespace sd::pipeline {
+             }
+         }
+ 
++        embeds.cond.c_concat = std::move(latents.concat_latent);
++        embeds.cond.c_vector = std::move(latents.clip_vision_output);
++
+         int64_t t1 = ggml_time_ms();
+         LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
+ 
+@@ -1270,9 +1286,9 @@ namespace sd::pipeline {
+ 
+     static sd_image_t* decode_video_outputs(StableDiffusionGGML* sd,
+                                             const GenerationRequest& request,
+-                                            const sd::Tensor<float>& final_latent,
++                                            sd::Tensor<float> video_latent,
+                                             int* num_frames_out) {
+-        if (final_latent.empty()) {
++        if (video_latent.empty()) {
+             LOG_ERROR("no latent video to decode");
+             return nullptr;
+         }
+@@ -1280,7 +1296,6 @@ namespace sd::pipeline {
+             LOG_ERROR("cancelling video decode");
+             return nullptr;
+         }
+-        sd::Tensor<float> video_latent = final_latent;
+         if ((sd_version_is_ltxav(sd->version) || sd_version_is_minimax_h3(sd->version)) &&
+             video_latent.shape()[3] > sd->get_latent_channel()) {
+             video_latent = sd::ops::slice(video_latent, 3, 0, sd->get_latent_channel());
+@@ -1304,24 +1319,25 @@ namespace sd::pipeline {
+                     (int)vid.shape()[1],
+                     (int)vid.shape()[2],
+                     (int)vid.shape()[3]);
+-        if (request.frames > 0 &&
+-            vid.shape()[2] > request.frames) {
+-            vid = sd::ops::slice(vid, 2, 0, request.frames);
+-        }
+-
+-        sd_image_t* result_images = (sd_image_t*)calloc(vid.shape()[2], sizeof(sd_image_t));
++        const int64_t frame_count = request.frames > 0 ? std::min<int64_t>(request.frames, vid.shape()[2]) : vid.shape()[2];
++        sd_image_t* result_images = (sd_image_t*)calloc(frame_count, sizeof(sd_image_t));
+         if (result_images == nullptr) {
+             return nullptr;
+         }
+-        if (num_frames_out != nullptr) {
+-            *num_frames_out = static_cast<int>(vid.shape()[2]);
+-        }
+-
+-        for (int64_t i = 0; i < vid.shape()[2]; i++) {
++        const auto release = [frame_count](sd_image_t* images) {
++            free_sd_images(images, static_cast<int>(frame_count));
++        };
++        std::unique_ptr<sd_image_t, decltype(release)> frames(result_images, release);
++        for (int64_t i = 0; i < frame_count; ++i) {
++            if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
++                return nullptr;
++            }
+             result_images[i] = tensor_to_sd_image(vid, static_cast<int>(i));
+         }
+-
+-        return result_images;
++        if (num_frames_out != nullptr) {
++            *num_frames_out = static_cast<int>(frame_count);
++        }
++        return frames.release();
+     }
+ 
+     static bool hires_upscaler_is_latent_interpolation(enum sd_hires_upscaler_t upscaler) {
+@@ -1916,10 +1932,10 @@ namespace sd::pipeline {
+ 
+         // All subsequent Wan stages consume computed host tensors. Release reloadable
+         // weights only at completed boundaries, never between denoising steps.
+-        const bool stage_wan = wildimage_ram::budget().stage_components && sd->version == VERSION_WAN2;
++        const bool stage_wan = stage_wan_weights(sd->version);
+         if (stage_wan) {
+             sd->end_runners();
+-            sd->model_manager->evict_inactive_components({ModelComponent::VAE, ModelComponent::CLIPVision});
++            sd->model_manager->evict_inactive_components({ModelComponent::VAE, ModelComponent::CLIPVision}, true);
+         }
+         auto embeds_opt = prepare_video_generation_embeds(sd,
+                                                           sd_vid_gen_params,
+@@ -1932,7 +1948,7 @@ namespace sd::pipeline {
+         ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+         if (stage_wan) {
+             sd->end_runners();
+-            sd->model_manager->evict_inactive_components({ModelComponent::Conditioner});
++            sd->model_manager->evict_inactive_components({ModelComponent::Conditioner}, true);
+         }
+         if (latent_upscale_enabled) {
+             LOG_INFO("generate_video %dx%dx%d -> video latent spatial upscale",
+@@ -1951,7 +1967,7 @@ namespace sd::pipeline {
+         int H                = request.height / request.vae_scale_factor;
+         int T                = static_cast<int>(latents.init_latent.shape()[2]);
+ 
+-        sd::Tensor<float> x_t   = latents.init_latent;
++        sd::Tensor<float> x_t   = std::move(latents.init_latent);
+         sd::Tensor<float> noise = sd::Tensor<float>::randn_like(x_t, sd->rng);
+ 
+         if (plan.high_noise_sample_steps > 0) {
+@@ -1999,6 +2015,10 @@ namespace sd::pipeline {
+ 
+             x_t   = std::move(x_t_sampled);
+             noise = {};
++            if (stage_wan && sd->high_noise_diffusion_model != sd->diffusion_model) {
++                sd->end_runners();
++                sd->model_manager->evict_inactive_components({ModelComponent::HighNoiseDiffusion}, true);
++            }
+             LOG_INFO("sampling(high noise) completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+         }
+ 
+@@ -2290,9 +2310,12 @@ namespace sd::pipeline {
+         }
+         if (stage_wan) {
+             sd->end_runners();
+-            sd->model_manager->evict_inactive_components({ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::LoRA});
++            sd->model_manager->evict_inactive_components({ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::LoRA}, true);
++            embeds = {};
++            x_t = {};
++            latents = {};
+         }
+-        auto result = decode_video_outputs(sd, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
++        auto result = decode_video_outputs(sd, latent_upscale_enabled ? hires_request : request, std::move(final_latent), num_frames_out);
+         LOG_DEBUG("decode_video_outputs returned %s", result == nullptr ? "nullptr (failed)" : "frames");
+         if (result == nullptr) {
+             free_sd_audio(generated_audio);
+diff --git a/src/runtime/tiling.cpp b/src/runtime/tiling.cpp
+index 95bcc22..9c099ae 100644
+--- a/src/runtime/tiling.cpp
++++ b/src/runtime/tiling.cpp
+@@ -71,12 +71,15 @@ static sd::Tensor<float> sd_tensor_split_2d(const sd::Tensor<float>& input, int
+     int64_t input_plane  = sd_tensor_plane_size(input);
+     int64_t output_plane = sd_tensor_plane_size(output);
+     int64_t plane_count  = input.numel() / input_plane;
+-    for (int iy = 0; iy < height; iy++) {
+-        for (int ix = 0; ix < width; ix++) {
+-            int64_t src_xy = (ix + x) % input_width + input_width * ((iy + y) % input_height);
+-            int64_t dst_xy = ix + width * iy;
+-            for (int64_t plane = 0; plane < plane_count; ++plane) {
+-                output[plane * output_plane + dst_xy] = input[plane * input_plane + src_xy];
++    const int64_t start_x = x % input_width;
++    const int64_t first = std::min<int64_t>(width, input_width - start_x);
++    for (int64_t plane = 0; plane < plane_count; ++plane) {
++        for (int iy = 0; iy < height; ++iy) {
++            const float* row = input.data() + plane * input_plane + ((y + iy) % input_height) * input_width;
++            float* dst = output.data() + plane * output_plane + iy * int64_t(width);
++            std::copy_n(row + start_x, first, dst);
++            if (first < width) {
++                std::copy_n(row, width - first, dst + first);
+             }
+         }
+     }
+@@ -179,6 +182,17 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
+         LOG_VERBOSE("processing %i tiles", num_tiles);
+         pretty_progress(0, num_tiles, 0.0f);
+     }
++    if (num_tiles == 1 && input_tile_width == input_width && input_tile_height == input_height) {
++        const int64_t t1 = ggml_time_ms();
++        auto result = on_processing(input);
++        if (!result.empty()) {
++            GGML_ASSERT(result.shape()[0] == output_width && result.shape()[1] == output_height);
++            if (!silent) {
++                pretty_progress(1, 1, (ggml_time_ms() - t1) / 1000.0f);
++            }
++        }
++        return result;
++    }
+     for (const auto& y : tiles_y) {
+         for (const auto& x : tiles_x) {
+             int64_t t1       = ggml_time_ms();
