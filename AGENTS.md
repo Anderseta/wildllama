@@ -10,7 +10,7 @@
 
 - Read `docs/development.md` for supported build workflows. Quick Go-only iteration against an existing native payload: `go build .`. Native changes require the corresponding CMake/backend checks.
 - Reuse installed SDKs and dependencies. In this workspace, keep outputs, downloads and `TEMP`/`TMP`/`TMPDIR` on G: or F:, never C:.
-- Format changed code and run focused unit/race tests. Use small fixtures first; real GPU/large-model tests require user authorization and available hardware. Coordinate loads with Wildgoose and other tests.
+- Format changed code and run the unit, race or integration tests that cover the affected paths. Reserve broader suites for changes that affect those additional paths, an explicit request, or a release that requires them. Documentation-only edits need a diff review. Use small fixtures first. Real GPU or large-model tests require user authorization and available hardware. Coordinate loads with Wildgoose and other tests.
 - Verify numerical correctness, cancellation, memory-budget behavior and compatibility where affected. Separate component measurements from real model throughput; do not claim a speedup without evidence.
 - Never overwrite an executable or library in use. Verify the build's source revision and hashes before installation; preserve user configuration, model stores and unaffected native libraries. Keep experimental runtimes isolated when requested.
 
