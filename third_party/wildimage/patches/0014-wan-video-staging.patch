@@ -1,0 +1,49 @@
+--- a/src/pipeline/video.cpp
++++ b/src/pipeline/video.cpp
+@@ -966,6 +966,10 @@
+                 }
+ 
+                 int64_t t1 = ggml_time_ms();
++                if (wildimage_ram::budget().stage_components && sd->version == VERSION_WAN2) {
++                    sd->end_runners();
++                    sd->model_manager->evict_inactive_components({ModelComponent::CLIPVision});
++                }
+                 LOG_INFO("get_clip_vision_output completed, taking %" PRId64 " ms", t1 - prepare_start_ms);
+             }
+ 
+@@ -1910,6 +1914,13 @@
+         }
+         ImageGenerationLatents latents = std::move(*latent_inputs_opt);
+ 
++        // All subsequent Wan stages consume computed host tensors. Release reloadable
++        // weights only at completed boundaries, never between denoising steps.
++        const bool stage_wan = wildimage_ram::budget().stage_components && sd->version == VERSION_WAN2;
++        if (stage_wan) {
++            sd->end_runners();
++            sd->model_manager->evict_inactive_components({ModelComponent::VAE, ModelComponent::CLIPVision});
++        }
+         auto embeds_opt = prepare_video_generation_embeds(sd,
+                                                           sd_vid_gen_params,
+                                                           request,
+@@ -1919,6 +1930,10 @@
+             return false;
+         }
+         ImageGenerationEmbeds embeds = std::move(*embeds_opt);
++        if (stage_wan) {
++            sd->end_runners();
++            sd->model_manager->evict_inactive_components({ModelComponent::Conditioner});
++        }
+         if (latent_upscale_enabled) {
+             LOG_INFO("generate_video %dx%dx%d -> video latent spatial upscale",
+                      request.width,
+@@ -2273,6 +2288,10 @@
+             free_sd_audio(generated_audio);
+             return false;
+         }
++        if (stage_wan) {
++            sd->end_runners();
++            sd->model_manager->evict_inactive_components({ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::LoRA});
++        }
+         auto result = decode_video_outputs(sd, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
+         LOG_DEBUG("decode_video_outputs returned %s", result == nullptr ? "nullptr (failed)" : "frames");
+         if (result == nullptr) {

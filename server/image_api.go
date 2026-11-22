@@ -116,6 +116,8 @@ type imageAsset struct {
 }
 
 type imageJob struct {
+	Video               *imagegen.VideoOptions  `json:"video,omitempty"`
+	VideoFile           *videoRecord            `json:"video_file,omitempty"`
 	ID                  string                  `json:"id"`
 	Kind                string                  `json:"kind"`
 	RequestID           string                  `json:"request_id,omitempty"`
@@ -468,6 +470,7 @@ func (v *imageService) runtime() imagegen.RunnerStatus {
 }
 
 func (s *Server) registerImageRoutes(r *gin.Engine) {
+	s.registerVideoRoutes(r)
 	r.GET("/api/images/config", s.imageConfigHandler)
 	r.PATCH("/api/images/config", s.imageConfigHandler)
 	r.GET("/api/images/models", s.imageModelsHandler)

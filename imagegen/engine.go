@@ -89,6 +89,7 @@ func (e *Engine) Status() RunnerStatus {
 				ConditioningCache bool `json:"conditioning_cache"`
 				RAMBudget         bool `json:"ram_budget"`
 				MOSSEdit          bool `json:"moss_edit"`
+				WanVideoStaging   bool `json:"wan_video_staging"`
 				InpaintCrop       bool `json:"inpaint_crop"`
 			} `json:"features"`
 			Files []struct {
@@ -140,6 +141,7 @@ func (e *Engine) Status() RunnerStatus {
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 		status.RAMBudgetSupported = manifest.Features.RAMBudget
 		status.MOSSEditSupported = manifest.Features.MOSSEdit
+		status.WanVideoStagingSupported = manifest.Features.WanVideoStaging
 		status.InpaintCropSupported = manifest.Features.InpaintCrop
 	}
 	if !status.RAMBudgetSupported {
@@ -174,10 +176,10 @@ func ValidateProfile(p Profile) error {
 	if math.IsNaN(p.CFGScale) || math.IsInf(p.CFGScale, 0) || p.CFGScale < 0 || p.CFGScale > 30 {
 		return errors.New("image CFG must be finite and between 0 and 30")
 	}
-	if p.Sampler != "euler" {
+	if p.Sampler != "euler" && !(p.IsWanRapid() && p.Sampler == "euler_a") {
 		return errors.New("this image pipeline currently supports the verified Euler sampler")
 	}
-	if p.Scheduler != "" && p.Scheduler != "simple" && p.Scheduler != "discrete" && p.Scheduler != "karras" {
+	if p.Scheduler != "" && p.Scheduler != "simple" && p.Scheduler != "discrete" && p.Scheduler != "karras" && !(p.IsWanRapid() && p.Scheduler == "beta") {
 		return errors.New("unsupported image scheduler")
 	}
 	if p.Tokenizer != "" && !isTokenizerPath(p.Tokenizer) {
@@ -254,6 +256,9 @@ func ValidateRequest(p Profile, r Request) error {
 }
 
 func prepareImageRequest(p Profile, r Request) (Profile, *image.Gray, error) {
+	if err := validateVideoMode(p, r); err != nil {
+		return p, nil, err
+	}
 	var mask *image.Gray
 	var err error
 	if r.Inpaint != nil {
@@ -278,6 +283,9 @@ func prepareImageRequest(p Profile, r Request) (Profile, *image.Gray, error) {
 func validateImageInputs(p Profile, r Request) error {
 	if err := ValidateProfile(p); err != nil {
 		return err
+	}
+	if r.Video != nil && p.MaxRAMMiB > 0 && int64(p.Width)*int64(p.Height)*3*int64(r.Video.Frames) > int64(p.MaxRAMMiB)<<20 {
+		return errors.New("decoded video frames alone exceed the configured RAM budget; reduce frames or resolution")
 	}
 	if strings.TrimSpace(r.Prompt) == "" || len(r.Prompt) > 32768 || len(r.NegativePrompt) > 32768 {
 		return errors.New("image prompt must contain 1–32768 bytes; negative prompt is limited to 32768 bytes")
@@ -471,6 +479,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if !runnerStatus.Ready {
 		return Result{}, errors.New(runnerStatus.Error)
 	}
+	if r.Video != nil && !runnerStatus.WanVideoStagingSupported {
+		return Result{}, errors.New("update the Wildllama media runtime to enable staged Wan video generation")
+	}
 	if p.UsesMOSSEdit() && len(r.ReferenceImages) > 0 && !runnerStatus.MOSSEditSupported {
 		return Result{}, errors.New("the image runner does not support MOSS edits")
 	}
@@ -493,8 +504,12 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		p.Width, p.Height = canvas.X, canvas.Y
 	}
 	output := filepath.Clean(r.OutputPath)
-	if !filepath.IsAbs(output) || !within(filepath.Clean(e.config.OutputDir), output) || strings.ToLower(filepath.Ext(output)) != ".png" || strings.Contains(filepath.Base(output), "%") {
-		return Result{}, errors.New("image output must be a PNG path inside the configured output directory")
+	extension := ".png"
+	if r.Video != nil {
+		extension = ".webm"
+	}
+	if !filepath.IsAbs(output) || !within(filepath.Clean(e.config.OutputDir), output) || strings.ToLower(filepath.Ext(output)) != extension || strings.Contains(filepath.Base(output), "%") {
+		return Result{}, fmt.Errorf("output must be a %s file inside the configured output directory", extension)
 	}
 	if err := validateWritePath(output); err != nil {
 		return Result{}, err
@@ -515,7 +530,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Result{}, err
 	}
-	if err := CheckDiskSpace(ctx, output, int64(p.Width)*int64(p.Height)*4+(16<<20)); err != nil {
+	if err := CheckDiskSpace(ctx, output, OutputSpaceBudget(p.Width, p.Height, r.Video)); err != nil {
 		return Result{}, err
 	}
 	if err := CheckDiskSpace(ctx, e.config.WorkDir, 16<<20); err != nil {
@@ -561,6 +576,10 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	}
 	defer os.RemoveAll(jobDir)
 	finalPath := output
+	if r.Video != nil {
+		output = filepath.Join(filepath.Dir(output), "rendering-"+filepath.Base(output))
+		defer os.Remove(output)
+	}
 	if r.Inpaint != nil {
 		if err := writeInpaintMask(mask, jobDir, p.Width, p.Height, r.crop, original); err != nil {
 			return Result{}, err
@@ -571,7 +590,10 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if err != nil {
 		return Result{}, err
 	}
-	prompt, negativePrompt := runnerReferencePrompts(p.DiffusionModel, r)
+	prompt, negativePrompt := r.Prompt, r.NegativePrompt
+	if r.Video == nil {
+		prompt, negativePrompt = runnerReferencePrompts(p.DiffusionModel, r)
+	}
 	if err := os.WriteFile(filepath.Join(jobDir, "prompt.txt"), []byte(prompt+loraTags), 0600); err != nil {
 		return Result{}, err
 	}
@@ -620,7 +642,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if !retryCUDA && !retryMemory {
 			break
 		}
-		decoded, _ = decodeOutputPNG(output, p.Width, p.Height)
+		if r.Video == nil {
+			decoded, _ = decodeOutputPNG(output, p.Width, p.Height)
+		}
 		if decoded != nil {
 			break
 		}
@@ -650,6 +674,15 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		runErr = ctx.Err()
 	} else if err != nil {
 		runErr = err
+	}
+	if r.Video != nil {
+		if runErr != nil {
+			return Result{}, runErr
+		}
+		if err := publishWebM(output, finalPath, r.Video.Frames); err != nil {
+			return Result{}, err
+		}
+		return Result{Path: finalPath, MIMEType: "video/webm", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}, nil
 	}
 	if decoded == nil {
 		log.emit(Progress{Phase: "validating_output", Message: "Verificando o PNG salvo"}, true)
@@ -701,7 +734,7 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	if eagerCUDA && mode != imageRAMCPU {
 		cmd.Env = append(cmd.Env, cudaload.ModuleLoadingEnv+"=EAGER")
 	}
-	if status.ConditioningCacheSupported && e.config.ConditioningCacheMiB > 0 {
+	if r.Video == nil && status.ConditioningCacheSupported && e.config.ConditioningCacheMiB > 0 {
 		cacheEnv, cacheErr := conditioningCacheEnvironment(ctx, e.config, p, r, status.Revision, log.callback)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -783,7 +816,11 @@ func buildArguments(p Profile, r Request, jobDir, output string, seed int64) []s
 }
 
 func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode) []string {
-	args := []string{"--diffusion-model", p.DiffusionModel, "--llm", p.TextEncoder, "--vae", p.VAE,
+	encoderFlag := "--llm"
+	if r.Video != nil {
+		encoderFlag = "--t5xxl"
+	}
+	args := []string{"--diffusion-model", p.DiffusionModel, encoderFlag, p.TextEncoder, "--vae", p.VAE,
 		"--prompt-file", filepath.Join(jobDir, "prompt.txt"), "--negative-prompt-file", filepath.Join(jobDir, "negative.txt"),
 		"--width", strconv.Itoa(p.Width), "--height", strconv.Itoa(p.Height), "--steps", strconv.Itoa(p.Steps),
 		"--cfg-scale", strconv.FormatFloat(p.CFGScale, 'g', -1, 64), "--sampling-method", p.Sampler, "--seed", strconv.FormatInt(seed, 10), "--output", output}
@@ -814,6 +851,10 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 	}
 	if mode != imageGPUResident {
 		args = append(args, "--params-backend", "cpu", "--offload-to-cpu", "--auto-fit", "off")
+	} else if r.Video != nil {
+		// Wan activation memory scales with the clip. Let the native planner fit the
+		// graph and weights to the measured job budget on the first attempt.
+		args = append(args, "--auto-fit", "on")
 	} else if p.OffloadToCPU {
 		placement := backend
 		if p.StageComponents {
@@ -866,7 +907,12 @@ func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int
 	if p.VAETiling {
 		args = append(args, "--vae-tiling")
 	}
-	if len(r.ReferenceImages) > 0 {
+	if r.Video != nil {
+		args = append(args, "-M", "vid_gen", "--video-frames", strconv.Itoa(r.Video.Frames), "--fps", strconv.Itoa(r.Video.FPS), "--mmap", "--temporal-tiling")
+		if len(r.ReferenceImages) == 1 {
+			args = append(args, "--init-img", r.ReferenceImages[0], "--clip_vision", p.VisionEncoder)
+		}
+	} else if len(r.ReferenceImages) > 0 {
 		if p.UsesMOSSEdit() {
 			args = append(args, "--ref-image-args", "preset=moss_edit,vae_input_max_edge=384")
 		} else if !sameComponentPath(p.VisionEncoder, p.TextEncoder) {

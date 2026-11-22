@@ -1,0 +1,315 @@
+--- a/examples/common/media_io.cpp
++++ b/examples/common/media_io.cpp
+@@ -146,8 +146,8 @@
+     void ElementStartNotify(mkvmuxer::uint64, mkvmuxer::int64) override {
+     }
+ 
+-    const std::vector<uint8_t>& data() const {
+-        return data_;
++    std::vector<uint8_t> take_data() {
++        return std::move(data_);
+     }
+ 
+ private:
+@@ -1184,156 +1184,162 @@
+ #endif
+ 
+ #ifdef SD_USE_WEBM
+-std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
++static int write_webm_frames(mkvmuxer::IMkvWriter& writer, sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
+     if (num_images == 0) {
+         fprintf(stderr, "Error: Image array is empty.\n");
+-        return {};
++        return -1;
+     }
+     if (fps <= 0) {
+         fprintf(stderr, "Error: FPS must be positive.\n");
+-        return {};
++        return -1;
+     }
+ 
+     const int width  = static_cast<int>(images[0].width);
+     const int height = static_cast<int>(images[0].height);
+     if (width <= 0 || height <= 0) {
+         fprintf(stderr, "Error: Invalid frame dimensions.\n");
+-        return {};
+-    }
+-
+-    MemoryMkvWriter writer;
+-
+-    const int ret = [&]() -> int {
+-        mkvmuxer::Segment segment;
+-        if (!segment.Init(&writer)) {
+-            fprintf(stderr, "Error: Failed to initialize WebM muxer.\n");
++        return -1;
++    }
++
++    mkvmuxer::Segment segment;
++    if (!segment.Init(&writer)) {
++        fprintf(stderr, "Error: Failed to initialize WebM muxer.\n");
++        return -1;
++    }
++
++    segment.set_mode(mkvmuxer::Segment::kFile);
++    segment.OutputCues(true);
++    segment.set_estimate_file_duration(true);
++    if (audio == nullptr) {
++        segment.set_duration(static_cast<double>(num_images) * 1e9 / fps / segment.segment_info()->timecode_scale());
++    }
++
++    const uint64_t track_number = segment.AddVideoTrack(width, height, 0);
++    if (track_number == 0) {
++        fprintf(stderr, "Error: Failed to add VP8 video track.\n");
++        return -1;
++    }
++    if (!segment.CuesTrack(track_number)) {
++        fprintf(stderr, "Error: Failed to set WebM cues track.\n");
++        return -1;
++    }
++
++    mkvmuxer::VideoTrack* video_track = static_cast<mkvmuxer::VideoTrack*>(segment.GetTrackByNumber(track_number));
++    if (video_track != nullptr) {
++        video_track->set_display_width(static_cast<uint64_t>(width));
++        video_track->set_display_height(static_cast<uint64_t>(height));
++        video_track->set_default_duration(1000000000ULL / fps);
++        video_track->set_frame_rate(static_cast<double>(fps));
++    }
++
++    uint64_t audio_track_number    = 0;
++    std::vector<uint8_t> audio_pcm = audio_to_pcm16_bytes(audio);
++    if (audio != nullptr && !audio_pcm.empty()) {
++        audio_track_number = segment.AddAudioTrack(static_cast<int32_t>(audio->sample_rate), static_cast<int32_t>(audio->channels), 0);
++        if (audio_track_number == 0) {
++            fprintf(stderr, "Error: Failed to add audio track.\n");
+             return -1;
+         }
+-
+-        segment.set_mode(mkvmuxer::Segment::kFile);
+-        segment.OutputCues(true);
+-
+-        const uint64_t track_number = segment.AddVideoTrack(width, height, 0);
+-        if (track_number == 0) {
+-            fprintf(stderr, "Error: Failed to add VP8 video track.\n");
++        auto* audio_track = static_cast<mkvmuxer::AudioTrack*>(segment.GetTrackByNumber(audio_track_number));
++        if (audio_track == nullptr) {
++            fprintf(stderr, "Error: Failed to get audio track.\n");
+             return -1;
+         }
+-        if (!segment.CuesTrack(track_number)) {
+-            fprintf(stderr, "Error: Failed to set WebM cues track.\n");
+-            return -1;
+-        }
+-
+-        mkvmuxer::VideoTrack* video_track = static_cast<mkvmuxer::VideoTrack*>(segment.GetTrackByNumber(track_number));
+-        if (video_track != nullptr) {
+-            video_track->set_display_width(static_cast<uint64_t>(width));
+-            video_track->set_display_height(static_cast<uint64_t>(height));
+-            video_track->set_frame_rate(static_cast<double>(fps));
+-        }
+-
+-        uint64_t audio_track_number    = 0;
+-        std::vector<uint8_t> audio_pcm = audio_to_pcm16_bytes(audio);
+-        if (audio != nullptr && !audio_pcm.empty()) {
+-            audio_track_number = segment.AddAudioTrack(static_cast<int32_t>(audio->sample_rate), static_cast<int32_t>(audio->channels), 0);
+-            if (audio_track_number == 0) {
+-                fprintf(stderr, "Error: Failed to add audio track.\n");
+-                return -1;
+-            }
+-            auto* audio_track = static_cast<mkvmuxer::AudioTrack*>(segment.GetTrackByNumber(audio_track_number));
+-            if (audio_track == nullptr) {
+-                fprintf(stderr, "Error: Failed to get audio track.\n");
+-                return -1;
+-            }
+-            audio_track->set_codec_id("A_PCM/INT/LIT");
+-            audio_track->set_bit_depth(16);
+-            audio_track->set_sample_rate(static_cast<double>(audio->sample_rate));
+-            audio_track->set_channels(audio->channels);
+-        }
+-        segment.GetSegmentInfo()->set_writing_app("stable-diffusion.cpp");
+-        segment.GetSegmentInfo()->set_muxing_app("stable-diffusion.cpp");
+-
+-        LOG_DEBUG("Embedding parameters to metadata: %s", parameters.c_str());
+-        if (!parameters.empty()) {
+-            mkvmuxer::Tag* tag = segment.AddTag();
+-
+-            if (tag) {
+-                if (!tag->add_simple_tag("COMMENT", parameters.c_str())) {
+-                    LOG_WARN("Failed to add COMMENT simple tag.");
+-                }
+-            } else {
+-                LOG_WARN("Failed to add tag to segment.");
++        audio_track->set_codec_id("A_PCM/INT/LIT");
++        audio_track->set_bit_depth(16);
++        audio_track->set_sample_rate(static_cast<double>(audio->sample_rate));
++        audio_track->set_channels(audio->channels);
++    }
++    segment.GetSegmentInfo()->set_writing_app("stable-diffusion.cpp");
++    segment.GetSegmentInfo()->set_muxing_app("stable-diffusion.cpp");
++
++    LOG_DEBUG("Embedding parameters to metadata: %s", parameters.c_str());
++    if (!parameters.empty()) {
++        mkvmuxer::Tag* tag = segment.AddTag();
++
++        if (tag) {
++            if (!tag->add_simple_tag("COMMENT", parameters.c_str())) {
++                LOG_WARN("Failed to add COMMENT simple tag.");
+             }
+         } else {
+-            LOG_INFO("Paramaters is empty, COMMENT tag not embedded.\n");
+-        }
+-
+-        const uint64_t frame_duration_ns = std::max<uint64_t>(
+-            1, static_cast<uint64_t>(std::llround(1000000000.0 / static_cast<double>(fps))));
+-        uint64_t timestamp_ns = 0;
+-
+-        for (int i = 0; i < num_images; ++i) {
+-            const sd_image_t& image = images[i];
+-            if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
+-                fprintf(stderr, "Error: Frame dimensions do not match.\n");
+-                return -1;
+-            }
+-
+-            std::vector<uint8_t> vp8_frame;
+-            if (!encode_sd_image_to_vp8_frame(image, quality, vp8_frame)) {
+-                fprintf(stderr, "Error: Failed to encode frame %d as VP8.\n", i);
+-                return -1;
+-            }
+-
+-            if (!segment.AddFrame(vp8_frame.data(),
+-                                  static_cast<uint64_t>(vp8_frame.size()),
+-                                  track_number,
+-                                  timestamp_ns,
+-                                  true)) {
+-                fprintf(stderr, "Error: Failed to mux frame %d into WebM.\n", i);
+-                return -1;
+-            }
+-
+-            if (audio_track_number != 0) {
+-                auto [audio_begin, audio_end] = audio_sample_range_for_video_frame(audio, i, num_images, fps);
+-                const uint64_t frame_samples  = audio_end - audio_begin;
+-                if (frame_samples > 0) {
+-                    const uint64_t frame_bytes = frame_samples * audio->channels * sizeof(int16_t);
+-                    const uint8_t* frame_ptr   = audio_pcm.data() + audio_begin * audio->channels * sizeof(int16_t);
+-                    if (!segment.AddFrame(frame_ptr,
+-                                          frame_bytes,
+-                                          audio_track_number,
+-                                          timestamp_ns,
+-                                          true)) {
+-                        fprintf(stderr, "Error: Failed to mux audio chunk %d into WebM.\n", i);
+-                        return -1;
+-                    }
++            LOG_WARN("Failed to add tag to segment.");
++        }
++    } else {
++        LOG_INFO("Paramaters is empty, COMMENT tag not embedded.\n");
++    }
++
++    const uint64_t frame_duration_ns = std::max<uint64_t>(
++        1, static_cast<uint64_t>(std::llround(1000000000.0 / static_cast<double>(fps))));
++    uint64_t timestamp_ns = 0;
++
++    for (int i = 0; i < num_images; ++i) {
++        const sd_image_t& image = images[i];
++        if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
++            fprintf(stderr, "Error: Frame dimensions do not match.\n");
++            return -1;
++        }
++
++        std::vector<uint8_t> vp8_frame;
++        if (!encode_sd_image_to_vp8_frame(image, quality, vp8_frame)) {
++            fprintf(stderr, "Error: Failed to encode frame %d as VP8.\n", i);
++            return -1;
++        }
++
++        if (!segment.AddFrame(vp8_frame.data(),
++                              static_cast<uint64_t>(vp8_frame.size()),
++                              track_number,
++                              timestamp_ns,
++                              true)) {
++            fprintf(stderr, "Error: Failed to mux frame %d into WebM.\n", i);
++            return -1;
++        }
++
++        if (audio_track_number != 0) {
++            auto [audio_begin, audio_end] = audio_sample_range_for_video_frame(audio, i, num_images, fps);
++            const uint64_t frame_samples  = audio_end - audio_begin;
++            if (frame_samples > 0) {
++                const uint64_t frame_bytes = frame_samples * audio->channels * sizeof(int16_t);
++                const uint8_t* frame_ptr   = audio_pcm.data() + audio_begin * audio->channels * sizeof(int16_t);
++                if (!segment.AddFrame(frame_ptr,
++                                      frame_bytes,
++                                      audio_track_number,
++                                      timestamp_ns,
++                                      true)) {
++                    fprintf(stderr, "Error: Failed to mux audio chunk %d into WebM.\n", i);
++                    return -1;
+                 }
+             }
+-
+-            timestamp_ns += frame_duration_ns;
+-        }
+-
+-        if (!segment.Finalize()) {
+-            fprintf(stderr, "Error: Failed to finalize WebM output.\n");
+-            return -1;
+-        }
+-        return 0;
+-    }();
+-    if (ret != 0) {
++        }
++
++        timestamp_ns += frame_duration_ns;
++    }
++
++    if (!segment.Finalize()) {
++        fprintf(stderr, "Error: Failed to finalize WebM output.\n");
++        return -1;
++    }
++    return 0;
++}
++
++std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
++    MemoryMkvWriter writer;
++    if (write_webm_frames(writer, images, num_images, fps, quality, audio, parameters) != 0) {
+         return {};
+     }
+-    return writer.data();
++    return writer.take_data();
+ }
+ 
+ int create_webm_from_sd_images(const char* filename, sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
+-    std::vector<uint8_t> webm_data = create_webm_from_sd_images_to_vector(images, num_images, fps, quality, audio, parameters);
+-    if (webm_data.empty()) {
+-        return -1;
+-    }
+-    if (!write_binary_file_bytes(filename, webm_data)) {
+-        perror("Error opening file for writing");
+-        return -1;
+-    }
+-    return 0;
++#ifdef _WIN32
++    FILE* raw = _wfopen(fs::u8path(filename).c_str(), L"wb");
++#else
++    FILE* raw = std::fopen(filename, "wb");
++#endif
++    if (!raw) return -1;
++    std::unique_ptr<FILE, decltype(&std::fclose)> file(raw, &std::fclose);
++    mkvmuxer::MkvWriter writer(file.get());
++    if (write_webm_frames(writer, images, num_images, fps, quality, audio, parameters) != 0) return -1;
++    return std::fclose(file.release()) == 0 ? 0 : -1;
+ }
+ #endif
+ 
+@@ -1373,6 +1379,12 @@
+     std::string path                = filename ? filename : "";
+     auto pos                        = path.find_last_of('.');
+     std::string ext                 = pos == std::string::npos ? "" : path.substr(pos);
++#ifdef SD_USE_WEBM
++    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
++    if (ext == ".webm") {
++        return create_webm_from_sd_images(filename, images, num_images, fps, quality, audio, parameters);
++    }
++#endif
+     std::vector<uint8_t> video_data = create_video_from_sd_images_to_vector(ext, images, num_images, fps, quality, audio, parameters);
+     if (video_data.empty()) {
+         return -1;

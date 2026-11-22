@@ -115,7 +115,7 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 	if err := v.checkImageSessionLocked(job.SessionID, job.RequestID); err != nil {
 		return nil, err
 	}
-	if job.Kind == "generate" {
+	if job.Kind == "generate" || job.Kind == "video" {
 		for _, id := range imageJobReferences(job) {
 			if _, exists := v.assets[id]; !exists {
 				return nil, errors.New("reference image is no longer available")
@@ -285,7 +285,7 @@ func (v *imageService) workQueue(transfer bool) {
 		job.StartedAt = &started
 		job.Status = "running"
 		job.executing = true
-		if job.Kind == "generate" {
+		if job.Kind == "generate" || job.Kind == "video" {
 			job.startImageTiming(started)
 		}
 		if err := v.persistJobsLocked(); err != nil {
@@ -424,7 +424,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	}
 	profile := generation.Profile.Profile
 	budgetCtx := imagegen.WithDiskReserve(job.ctx, job.Config.MinFreeDiskMiB)
-	if err := imagegen.CheckDiskSpace(budgetCtx, job.Config.OutputDir, int64(profile.Width)*int64(profile.Height)*4+(16<<20)); err != nil {
+	if err := imagegen.CheckDiskSpace(budgetCtx, job.Config.OutputDir, imagegen.OutputSpaceBudget(profile.Width, profile.Height, job.Video)); err != nil {
 		return err
 	}
 	if err := imagegen.CheckDiskSpace(budgetCtx, job.Config.WorkDir, 16<<20); err != nil {
@@ -434,7 +434,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	if err != nil {
 		return err
 	}
-	input := imagegen.Request{Inpaint: request.Inpaint, Prompt: generation.Prompt, NegativePrompt: generation.NegativePrompt, Width: profile.Width, Height: profile.Height, Seed: seed, OutputPath: filepath.Join(job.Config.OutputDir, job.ID, "image.png")}
+	input := imagegen.Request{Video: job.Video, Inpaint: request.Inpaint, Prompt: generation.Prompt, NegativePrompt: generation.NegativePrompt, Width: profile.Width, Height: profile.Height, Seed: seed, OutputPath: filepath.Join(job.Config.OutputDir, job.ID, "image.png")}
 	refs := generation.ReferenceAssetIDs
 	parent := request.ParentAssetID
 	if parent == "" && len(refs) > 0 {
@@ -554,7 +554,11 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			v.mu.Unlock()
 		}
 	}()
-	if status := engine.Status(); !status.Ready {
+	status := engine.Status()
+	if job.Video != nil && status.Ready && !status.WanVideoStagingSupported {
+		return errors.New("atualize o motor de mídia do Wildllama para habilitar a geração Wan por etapas")
+	}
+	if !status.Ready {
 		return fmt.Errorf("image runtime is not ready: %s", status.Error)
 	}
 	v.mu.Lock()
@@ -596,6 +600,9 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			return err
 		}
 		filename := imageBatchFilename(index)
+		if job.Video != nil {
+			filename = "video.webm"
+		}
 		input.OutputPath = filepath.Join(job.Config.OutputDir, job.ID, filename)
 		input.Seed = seed
 		if seed >= 0 {
@@ -622,7 +629,13 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			v.updateImageProgress(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total), progress.PeakRSSBytes)
 		})
 		if result.Path != "" {
-			if err := v.registerImageResult(job, result, filename, index, generation.Count); err != nil {
+			var saveErr error
+			if job.Video != nil {
+				saveErr = v.registerVideoResult(job, result)
+			} else {
+				saveErr = v.registerImageResult(job, result, filename, index, generation.Count)
+			}
+			if err := saveErr; err != nil {
 				return errors.Join(generationErr, err)
 			}
 		} else if generationErr == nil {
@@ -764,7 +777,7 @@ func (s *Server) imageJobHistoryClearHandler(c *gin.Context) {
 	jobs := append([]*imageJob(nil), previous...)
 	cleared := []string{}
 	for i, job := range jobs {
-		if job.HistoryCleared || job.executing || !imageTerminal(job.Status) {
+		if job.Kind == "video" || job.HistoryCleared || job.executing || !imageTerminal(job.Status) {
 			continue
 		}
 		// Retain request identity and the published asset links for chat and
@@ -818,7 +831,7 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		sessionID := c.Query("session_id")
 		queueSummary := summary && requestID == "" && sessionID == ""
 		for i := len(v.jobs) - 1; i >= 0; i-- {
-			if queueSummary && v.jobs[i].HistoryCleared {
+			if v.jobs[i].Kind == "video" || queueSummary && v.jobs[i].HistoryCleared {
 				continue
 			}
 			if (requestID == "" || v.jobs[i].RequestID == requestID) && (sessionID == "" || v.jobs[i].SessionID == sessionID) {
