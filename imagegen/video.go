@@ -83,7 +83,7 @@ func webmVint(r io.ByteReader, id bool) (int64, bool, error) {
 	return n, !id && n == (1<<(7*width))-1, nil
 }
 
-func checkWebM(path string, frames int) error {
+func checkWebM(path string, frames, width, height int) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -93,7 +93,8 @@ func checkWebM(path string, frames int) error {
 	if err != nil {
 		return err
 	}
-	var tracks, header bool
+	var header bool
+	var pixelWidth, pixelHeight int
 	count := 0
 	r := bufio.NewReader(file)
 	var walk func(int64, int64, int64) error
@@ -128,12 +129,29 @@ func checkWebM(path string, frames int) error {
 			switch {
 			case parent == 0 && start == 0 && id == 0x1a45dfa3:
 				header = true
-			case parent == 0 && id == 0x18538067 && header, parent == 0x18538067 && id == 0x1f43b675:
+			case parent == 0 && id == 0x18538067 && header,
+				parent == 0x18538067 && (id == 0x1f43b675 || id == 0x1654ae6b),
+				parent == 0x1654ae6b && id == 0xae, parent == 0xae && id == 0xe0:
 				if err := walk(pos, pos+size, id); err != nil {
 					return err
 				}
-			case parent == 0x18538067 && id == 0x1654ae6b:
-				tracks = size > 0
+			case parent == 0xe0 && (id == 0xb0 || id == 0xba):
+				if size < 1 || size > 4 {
+					return errors.New("invalid video track dimensions")
+				}
+				n := 0
+				for range size {
+					b, err := r.ReadByte()
+					if err != nil {
+						return err
+					}
+					n = n<<8 | int(b)
+				}
+				if id == 0xb0 {
+					pixelWidth = n
+				} else {
+					pixelHeight = n
+				}
 			case parent == 0x1f43b675 && id == 0xa3 && size > 4:
 				count++
 			case parent == 0x1f43b675 && id == 0xa0 && size > 4:
@@ -146,14 +164,17 @@ func checkWebM(path string, frames int) error {
 	if err = walk(0, info.Size(), 0); err != nil {
 		return err
 	}
-	if !tracks || count != frames {
+	if pixelWidth != width || pixelHeight != height {
+		return fmt.Errorf("invalid WebM: expected %dx%d, found %dx%d", width, height, pixelWidth, pixelHeight)
+	}
+	if count != frames {
 		return fmt.Errorf("invalid WebM: expected %d video frames, found %d", frames, count)
 	}
 	return nil
 }
 
-func publishWebM(partial, target string, frames int) error {
-	if err := checkWebM(partial, frames); err != nil {
+func publishWebM(partial, target string, frames, width, height int) error {
+	if err := checkWebM(partial, frames, width, height); err != nil {
 		return fmt.Errorf("incomplete generated video: %w", err)
 	}
 	return os.Rename(partial, target)

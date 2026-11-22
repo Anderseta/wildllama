@@ -169,8 +169,12 @@ func (e *Engine) Close() error {
 }
 
 func ValidateProfile(p Profile) error {
-	if p.Width < 64 || p.Width > 4096 || p.Width%32 != 0 || p.Height < 64 || p.Height > 4096 || p.Height%32 != 0 {
-		return errors.New("image dimensions must be multiples of 32 between 64 and 4096")
+	alignment := 32
+	if p.IsWanRapid() {
+		alignment = 16 // Wan 14B uses an 8x spatial VAE and 2x2 diffusion patches.
+	}
+	if p.Width < 64 || p.Width > 4096 || p.Width%alignment != 0 || p.Height < 64 || p.Height > 4096 || p.Height%alignment != 0 {
+		return fmt.Errorf("dimensions must be multiples of %d between 64 and 4096", alignment)
 	}
 	if p.Steps < 1 || p.Steps > 100 {
 		return errors.New("image steps must be between 1 and 100")
@@ -688,7 +692,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if runErr != nil {
 			return Result{}, runErr
 		}
-		if err := publishWebM(output, finalPath, r.Video.Frames); err != nil {
+		if err := publishWebM(output, finalPath, r.Video.Frames, p.Width, p.Height); err != nil {
 			return Result{}, err
 		}
 		return Result{Path: finalPath, MIMEType: "video/webm", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}, nil

@@ -166,11 +166,12 @@ func (s *Server) videoStartHandler(c *gin.Context) {
 		return
 	}
 	var req struct {
-		RequestID string `json:"request_id"`
-		Prompt    string `json:"prompt"`
-		Negative  string `json:"negative_prompt"`
-		Asset     string `json:"input_asset_id"`
-		Seed      *int64 `json:"seed"`
+		RequestID     string `json:"request_id"`
+		Prompt        string `json:"prompt"`
+		Negative      string `json:"negative_prompt"`
+		Asset         string `json:"input_asset_id"`
+		PreparedFrame bool   `json:"prepared_frame,omitempty"`
+		Seed          *int64 `json:"seed"`
 	}
 	if !imageBind(c, &req) {
 		return
@@ -207,6 +208,10 @@ func (s *Server) videoStartHandler(c *gin.Context) {
 		return
 	}
 	profile := p.runtimeProfile(mode)
+	if req.PreparedFrame && (mode != "i2v" || !exists || asset.Width != p.Width || asset.Height != p.Height) {
+		c.JSON(409, gin.H{"error": "O primeiro quadro diverge da resolução do perfil atual. Recarregue o perfil e confira o recorte."})
+		return
+	}
 	request := imageJobRequest{RequestID: req.RequestID, Prompt: req.Prompt, NegativePrompt: req.Negative, Seed: req.Seed, InputAssetID: req.Asset}
 	probe := imagegen.Request{Video: &p.VideoOptions, Prompt: req.Prompt, NegativePrompt: req.Negative}
 	if req.Asset != "" {

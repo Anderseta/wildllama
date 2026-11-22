@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"image"
+	"image/png"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -91,6 +93,11 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(profile.Vision, weights, 0600))
 	profile.Width, profile.Height, profile.Frames = 64, 64, 5
+	hd := profile
+	hd.Width, hd.Height = 1280, 720
+	require.NoError(t, hd.validate("i2v"))
+	hd.Height = 721
+	require.Error(t, hd.validate("i2v"))
 	call := func(method, path string, body any) *httptest.ResponseRecorder {
 		encoded, err := json.Marshal(body)
 		require.NoError(t, err)
@@ -104,6 +111,14 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	upload := imageTestHTTP(router, "POST", imageUploadURI("first-frame", ""), imageUploadFixture(t, 150), "image/png")
 	require.Equal(t, 201, upload.Code, upload.Body.String())
 	reference, _ := imageUploadedResponse(t, upload)
+	input["input_asset_id"] = reference.AssetID
+	input["prepared_frame"] = true
+	require.Equal(t, 409, call("POST", "/api/videos/jobs", input).Code)
+	var fitted bytes.Buffer
+	require.NoError(t, png.Encode(&fitted, image.NewRGBA(image.Rect(0, 0, 64, 64))))
+	upload = imageTestHTTP(router, "POST", imageUploadURI("fitted-frame", ""), fitted.Bytes(), "image/png")
+	require.Equal(t, 201, upload.Code)
+	reference, _ = imageUploadedResponse(t, upload)
 	input["input_asset_id"] = reference.AssetID
 	response := call("POST", "/api/videos/jobs", input)
 	require.Equal(t, 202, response.Code, response.Body.String())
