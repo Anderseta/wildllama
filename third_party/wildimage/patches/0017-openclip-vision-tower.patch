@@ -1,0 +1,38 @@
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -303,9 +303,20 @@
+     }
+ 
+     size_t file_index = add_file_path(file_path);
++    // Full OpenCLIP checkpoints may carry a second, unused text transformer.
++    // Register only the visual tower, preserving its original offsets and dtype.
++    const auto& names = parsed_tensor_names_[file_path];
++    const bool open_clip_vision = prefix == "clip_vision." &&
++                                  (names.count("visual.conv1.weight") || names.count("model.visual.conv1.weight"));
+ 
+     for (auto& tensor_storage : tensor_storages) {
+-        if (!starts_with(tensor_storage.name, prefix)) {
++        if (open_clip_vision) {
++            if (starts_with(tensor_storage.name, "visual.")) {
++                tensor_storage.name = "model." + tensor_storage.name;
++            }
++            if (!starts_with(tensor_storage.name, "model.visual.")) continue;
++            tensor_storage.name = "cond_stage_model." + tensor_storage.name;
++        } else if (!starts_with(tensor_storage.name, prefix)) {
+             tensor_storage.name = prefix + tensor_storage.name;
+         }
+         tensor_storage.file_index = file_index;
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -609,7 +609,10 @@
+                 break;
+             }
+         }
+-        vision_model = CLIPVisionModelProjection(OPEN_CLIP_VIT_H_14, false, proj_in);
++        const auto projection = tensor_storage_map.find(weight_prefix + ".visual_projection.weight");
++        const bool transpose = projection != tensor_storage_map.end() &&
++                               projection->second.ne[0] == 1024 && projection->second.ne[1] == 1280;
++        vision_model = CLIPVisionModelProjection(OPEN_CLIP_VIT_H_14, transpose, proj_in);
+         vision_model.init(params_ctx, tensor_storage_map, weight_prefix);
+     }
+ 

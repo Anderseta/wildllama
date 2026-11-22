@@ -49,6 +49,10 @@ func TestWanPackageResumesAndReusesExactLocalComponents(t *testing.T) {
 	published := wanComponents()
 	require.Len(t, published, 5)
 	for _, c := range published {
+		if c.Role == "vision_encoder" {
+			require.Equal(t, "olivv-cs/wan_nsfw_clip_vision_h", c.Repo)
+			require.Equal(t, int64(3944517804), c.Size)
+		}
 		if c.Role == "text_encoder" {
 			require.Contains(t, c.Filename, "fp8_e4m3fn_scaled")
 		}

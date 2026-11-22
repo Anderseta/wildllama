@@ -22,7 +22,7 @@ func wanComponents() []Component {
 		{Role: "diffusion", Repo: "desirel/WAN2.2-14B-Rapid-AllInOne-GGUF-NSFW-v10", Revision: "4502c7f3de51fd728d851b37eda262f2be2a5628", Filename: "wan2.2-i2v-rapid-aio-v10-nsfw-Q6_K.gguf", Size: 13741647616, SHA256: "0b0180e2fb46e8ded9af200c7670fedc5eacf5ad679d9b63e177bc56fab8d880"},
 		{Role: "text_encoder", Repo: encoder, Revision: encoderRev, Filename: "encoders/nsfw_wan_umt5_xxl_v2_fp8_e4m3fn_scaled.safetensors", Size: 6741537445, SHA256: "8da6e259cfeb986dcff327364146089711c989c546d81cedd70c3e87e9cfee26"},
 		{Role: "wan_vocabulary", Repo: encoder, Revision: encoderRev, Filename: "new_tokens_v4.json", Size: 10752, SHA256: "992dd94a5a0a89b724c0c745f43958e6bc9fcf351c631149649242ade96b647d"},
-		{Role: "vision_encoder", Repo: comfy, Revision: comfyRev, Filename: "split_files/clip_vision/clip_vision_h.safetensors", Size: 1264219396, SHA256: "64a7ef761bfccbadbaa3da77366aac4185a6c58fa5de5f589b42a65bcc21f161"},
+		{Role: "vision_encoder", Repo: "olivv-cs/wan_nsfw_clip_vision_h", Revision: "4003d23664991a62f59351224a63e527fc356190", Filename: "wan21NSFWClipVisionH_v10.safetensors", Size: 3944517804, SHA256: "be3da981f2e6a94700aeefb49fb9d84cba724ace7ea0ced110ccda95a5b2fc56"},
 		{Role: "vae", Repo: comfy, Revision: comfyRev, Filename: "split_files/vae/wan_2.1_vae.safetensors", Size: 253815318, SHA256: "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"},
 	}
 }
