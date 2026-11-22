@@ -33,6 +33,50 @@ func (r *videoTestRunner) Run(ctx context.Context, p imagegen.Profile, input ima
 	err := os.WriteFile(input.OutputPath, r.payload, 0600)
 	return imagegen.Result{Path: input.OutputPath, MIMEType: "video/webm", Seed: input.Seed}, err
 }
+func TestWanPackageActivatesOnlyAfterSuccessAndPreservesEdits(t *testing.T) {
+	_, s, _, _, _ := newImageTestService(t)
+	p := defaultVideoProfile()
+	job := &imageJob{ctx: context.Background(), Profile: p.runtimeProfile("i2v")}
+	p.Steps = 12
+	path := filepath.Join(s.root, "video-i2v.json")
+	require.NoError(t, writeImageJSON(path, p))
+	files := map[string]string{"diffusion": "wan.gguf", "text_encoder": "fp8.safetensors", "vae": "vae.safetensors", "vision_encoder": "clip.safetensors", "wan_vocabulary": "tokens.json"}
+	require.NoError(t, s.applyWanVideoPackage(job, files))
+	actual, err := s.loadVideoProfile("i2v")
+	require.NoError(t, err)
+	require.Equal(t, p.Steps, actual.Steps)
+	require.Equal(t, files["wan_vocabulary"], actual.Vocabulary)
+	actual.Encoder = "manual.gguf"
+	require.NoError(t, writeImageJSON(path, actual))
+	require.ErrorContains(t, s.applyWanVideoPackage(job, files), "editados")
+	after, err := s.loadVideoProfile("i2v")
+	require.NoError(t, err)
+	require.Equal(t, actual, after)
+	other, err := s.loadVideoProfile("t2v")
+	require.NoError(t, err)
+	require.Empty(t, other.Encoder)
+}
+
+func TestWanPackageInstallQueueIsSeparateAndIdempotent(t *testing.T) {
+	_, s, router, _, _ := newImageTestService(t)
+	s.transferStarted = true
+	post := func(id string) *httptest.ResponseRecorder {
+		return imageTestHTTP(router, "POST", "/api/videos/install", []byte(`{"request_id":"`+id+`"}`), "application/json")
+	}
+	require.Equal(t, 400, post("!").Code)
+	require.Equal(t, 202, post("wan-test").Code)
+	require.Equal(t, 202, post("wan-test").Code)
+	require.Equal(t, 202, post("wan-another").Code)
+	require.Len(t, s.jobs, 1)
+	job := s.jobs[0]
+	require.True(t, imageTransferJob(job))
+	require.Contains(t, imageTestHTTP(router, "GET", "/api/videos/jobs", nil, "").Body.String(), job.ID)
+	require.NotContains(t, imageTestHTTP(router, "GET", "/api/images/jobs", nil, "").Body.String(), job.ID)
+	response := imageTestHTTP(router, "POST", "/api/videos/jobs/"+job.ID+"/cancel", nil, "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	require.Equal(t, "cancelled", job.Status)
+}
+
 func TestWanVideoReferenceToStream(t *testing.T) {
 	_, service, router, events, base := newImageTestService(t)
 	data, err := os.ReadFile(filepath.Join("..", "imagegen", "testdata", "wan-five-frames.webm"))

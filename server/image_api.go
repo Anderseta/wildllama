@@ -161,6 +161,7 @@ type imageJob struct {
 }
 
 type imageService struct {
+	videoProfileMu    sync.Mutex
 	mu                sync.Mutex
 	libraryMu         sync.Mutex
 	server            *Server

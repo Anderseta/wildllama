@@ -138,6 +138,13 @@ func (v *imageService) enqueue(job *imageJob) (*imageJob, error) {
 			}
 		}
 	}
+	if job.Kind == "video_install" {
+		for _, existing := range v.jobs {
+			if existing.Kind == job.Kind && existing.Config.ModelsDir == job.Config.ModelsDir && !imageTerminal(existing.Status) {
+				return existing, nil
+			}
+		}
+	}
 	if job.Config.Version != 0 && job.Config.Revision != v.config.Revision {
 		return nil, errors.New("image configuration changed while preparing the request; refresh and retry")
 	}
@@ -195,7 +202,7 @@ func (v *imageService) notifyImageQueueLocked() {
 }
 
 func imageTransferJob(job *imageJob) bool {
-	return job.Kind == "install" || job.Kind == "import" || job.Kind == "install_lora"
+	return job.Kind == "video_install" || job.Kind == "install" || job.Kind == "import" || job.Kind == "install_lora"
 }
 
 func (v *imageService) notifyImageQueueForLocked(transfer bool) {
@@ -302,7 +309,9 @@ func (v *imageService) workQueue(transfer bool) {
 		}
 		v.mu.Unlock()
 		var err error
-		if job.Kind == "install_lora" {
+		if job.Kind == "video_install" {
+			err = v.installWanVideo(job)
+		} else if job.Kind == "install_lora" {
 			err = v.installLoRA(job)
 		} else if job.Kind == "import" {
 			err = v.copyLocal(job)
@@ -555,6 +564,9 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		}
 	}()
 	status := engine.Status()
+	if job.Video != nil && status.Ready && job.Profile.Tokenizer != "" && !status.WanExtendedUMT5Supported {
+		return errors.New("atualize o motor de mídia do Wildllama para usar o vocabulário estendido do UMT5")
+	}
 	if job.Video != nil && status.Ready && !status.WanVideoStagingSupported {
 		return errors.New("atualize o motor de mídia do Wildllama para habilitar a geração Wan por etapas")
 	}
@@ -777,7 +789,7 @@ func (s *Server) imageJobHistoryClearHandler(c *gin.Context) {
 	jobs := append([]*imageJob(nil), previous...)
 	cleared := []string{}
 	for i, job := range jobs {
-		if job.Kind == "video" || job.HistoryCleared || job.executing || !imageTerminal(job.Status) {
+		if isVideoJob(job) || job.HistoryCleared || job.executing || !imageTerminal(job.Status) {
 			continue
 		}
 		// Retain request identity and the published asset links for chat and
@@ -831,7 +843,7 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		sessionID := c.Query("session_id")
 		queueSummary := summary && requestID == "" && sessionID == ""
 		for i := len(v.jobs) - 1; i >= 0; i-- {
-			if v.jobs[i].Kind == "video" || queueSummary && v.jobs[i].HistoryCleared {
+			if isVideoJob(v.jobs[i]) || queueSummary && v.jobs[i].HistoryCleared {
 				continue
 			}
 			if (requestID == "" || v.jobs[i].RequestID == requestID) && (sessionID == "" || v.jobs[i].SessionID == sessionID) {

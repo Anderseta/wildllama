@@ -1,0 +1,153 @@
+--- a/src/tokenizers/tokenizer_config.h
++++ b/src/tokenizers/tokenizer_config.h
+@@ -22,6 +22,10 @@
+     explicit TokenizerConfig(const char* config);
+     bool has(Slot slot) const;
+     std::shared_ptr<Tokenizer> create(Slot slot, int64_t embedding_rows, int padding_id, bool pad_left = false, bool clip = false) const;
++    std::string take_main_path() const {
++        used_[MAIN] = has(MAIN);
++        return paths_[MAIN];
++    }
+     void validate_usage() const;
+ };
+ 
+--- a/src/model/integrations/wan.cpp
++++ b/src/model/integrations/wan.cpp
+@@ -14,7 +14,7 @@
+                                                                       true,
+                                                                       0,
+                                                                       true,
+-                                                                      weight_manager);
++                                                                      weight_manager, nullptr, tokenizers.take_main_path());
+     result.diffusion               = std::make_shared<WAN::WanRunner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
+                                                                       tensor_storage_map,
+                                                                       "model.diffusion_model",
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -1400,8 +1400,10 @@
+                    int mask_pad                                        = 0,
+                    bool is_umt5                                        = false,
+                    std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+-                   const char* model_args                              = nullptr)
+-        : use_mask(use_mask), mask_pad(mask_pad), t5_tokenizer(is_umt5) {
++                   const char* model_args                              = nullptr,
++                   const std::string& extra_tokens                     = {})
++        : use_mask(use_mask), mask_pad(mask_pad),
++          t5_tokenizer(is_umt5, extra_tokens, is_umt5 ? T5Config::detect_from_weights(tensor_storage_map, "text_encoders.t5xxl.transformer", true).vocab_size : 0) {
+         for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
+             if (key == "chroma_use_t5_mask") {
+                 bool parsed = false;
+--- a/src/tokenizers/t5_unigram_tokenizer.h
++++ b/src/tokenizers/t5_unigram_tokenizer.h
+@@ -42,6 +42,8 @@
+     std::unique_ptr<Darts::DoubleArray> trie_;
+     int trie_results_size_ = 0;
+     Status status_         = OK;
++    int first_extra_id_ = -1;
++    EncodeResult encode_ordinary(const std::string& normalized) const;
+     float kUnkPenalty      = 10.0f;
+     std::string replacement;
+     bool add_prefix_space = true;
+@@ -61,7 +63,7 @@
+     std::string normalize(const std::string& input) const override;
+ 
+ public:
+-    explicit T5UniGramTokenizer(bool is_umt5 = false);
++    explicit T5UniGramTokenizer(bool is_umt5 = false, const std::string& extra_tokens = {}, int64_t rows = 0);
+     ~T5UniGramTokenizer();
+ 
+     bool encode(const std::string& input, std::vector<int>& tokens, on_new_token_cb_t on_new_token_cb = nullptr, std::string* error = nullptr) override;
+--- a/src/tokenizers/t5_unigram_tokenizer.cpp
++++ b/src/tokenizers/t5_unigram_tokenizer.cpp
+@@ -3,6 +3,8 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <filesystem>
++#include <fstream>
+ #include <regex>
+ #include <sstream>
+ 
+@@ -143,6 +145,37 @@
+ }
+ 
+ EncodeResult T5UniGramTokenizer::EncodeOptimized(const std::string& normalized) const {
++    if (first_extra_id_ < 0 || status() != OK) return encode_ordinary(normalized);
++    // SentencePiece USER_DEFINED symbols are atomic, including inside a larger word.
++    // Split after metaspace preprocessing so ordinary spans receive no extra prefix.
++    EncodeResult out;
++    size_t span = 0;
++    auto flush = [&](size_t end) {
++        if (end == span) return;
++        auto part = encode_ordinary(normalized.substr(span, end - span));
++        out.insert(out.end(), part.begin(), part.end());
++    };
++    for (size_t pos = 0; pos < normalized.size();) {
++        size_t node = 0, key = pos, end = pos;
++        int match = -1;
++        while (key < normalized.size()) {
++            int id = trie_->traverse(normalized.data(), node, key, key + 1);
++            if (id == -2) break;
++            if (id >= first_extra_id_) { match = id; end = key; }
++        }
++        if (match >= 0) {
++            flush(pos);
++            out.emplace_back(piece_score_pairs[match].first, match);
++            span = pos = end;
++        } else {
++            pos += std::min(OneCharLen(normalized.data() + pos), normalized.size() - pos);
++        }
++    }
++    flush(normalized.size());
++    return out;
++}
++
++EncodeResult T5UniGramTokenizer::encode_ordinary(const std::string& normalized) const {
+     if (status() != OK || normalized.empty()) {
+         return {};
+     }
+@@ -210,7 +243,7 @@
+     return results;
+ }
+ 
+-T5UniGramTokenizer::T5UniGramTokenizer(bool is_umt5) {
++T5UniGramTokenizer::T5UniGramTokenizer(bool is_umt5, const std::string& extra_tokens, int64_t rows) {
+     add_bos_token = false;
+     add_eos_token = true;
+ 
+@@ -250,6 +283,26 @@
+         InitializePieces(load_t5_tokenizer_json());
+     }
+ 
++    if (!extra_tokens.empty()) {
++        std::ifstream f(std::filesystem::u8path(extra_tokens), std::ios::binary | std::ios::ate);
++        if (!is_umt5 || !f || f.tellg() <= 0 || f.tellg() > (1 << 20))
++            throw std::runtime_error("invalid UMT5 extension vocabulary file");
++        f.seekg(0);
++        const auto tokens = nlohmann::json::parse(f);
++        if (!tokens.is_array() || tokens.empty() || rows <= 0 ||
++            tokens.size() + piece_score_pairs.size() != static_cast<size_t>(rows))
++            throw std::runtime_error("UMT5 extension vocabulary does not match the encoder embedding rows");
++        first_extra_id_ = static_cast<int>(piece_score_pairs.size());
++        for (const auto& token : tokens) {
++            if (!token.is_string()) throw std::runtime_error("invalid UMT5 token");
++            const auto& value = token.get_ref<const std::string&>();
++            if (value.empty() || value.size() > 512 || value.find(char(0)) != std::string::npos)
++                throw std::runtime_error("invalid UMT5 token text");
++            piece_score_pairs.emplace_back(value, 0.f);
++        }
++    } else if (is_umt5 && rows > 256384) {
++        throw std::runtime_error("extended UMT5 encoder requires its matching token list (--tokenizer)");
++    }
+     min_score_ = FLT_MAX;
+     max_score_ = FLT_MIN;
+ 
+@@ -264,6 +317,8 @@
+     }
+ 
+     BuildTrie(&pieces);
++    if (first_extra_id_ >= 0 && status() != OK)
++        throw std::runtime_error("invalid extended UMT5 vocabulary trie");
+ }
+ 
+ T5UniGramTokenizer::~T5UniGramTokenizer() = default;

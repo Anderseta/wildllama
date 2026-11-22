@@ -218,6 +218,9 @@ func refreshBundle(b *Bundle) {
 }
 
 func validateBundleComponent(c InstalledComponent) error {
+	if c.Role == "wan_vocabulary" {
+		return validateWanVocabulary(c.Path)
+	}
 	if c.Role == "tokenizer" {
 		return validateTokenizerFile(c.Path)
 	}

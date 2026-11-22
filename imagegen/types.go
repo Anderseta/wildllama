@@ -145,6 +145,7 @@ type RunnerStatus struct {
 	Error                      string `json:"error,omitempty"`
 	ConditioningCacheSupported bool   `json:"conditioning_cache_supported"`
 	RAMBudgetSupported         bool   `json:"ram_budget_supported"`
+	WanExtendedUMT5Supported   bool   `json:"wan_extended_umt5_supported,omitempty"`
 	WanVideoStagingSupported   bool   `json:"wan_video_staging_supported,omitempty"`
 	MOSSEditSupported          bool   `json:"moss_edit_supported,omitempty"`
 	InpaintCropSupported       bool   `json:"inpaint_crop_supported,omitempty"`

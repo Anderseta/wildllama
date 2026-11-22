@@ -89,6 +89,7 @@ func (e *Engine) Status() RunnerStatus {
 				ConditioningCache bool `json:"conditioning_cache"`
 				RAMBudget         bool `json:"ram_budget"`
 				MOSSEdit          bool `json:"moss_edit"`
+				WanExtendedUMT5   bool `json:"wan_extended_umt5"`
 				WanVideoStaging   bool `json:"wan_video_staging"`
 				InpaintCrop       bool `json:"inpaint_crop"`
 			} `json:"features"`
@@ -141,6 +142,7 @@ func (e *Engine) Status() RunnerStatus {
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 		status.RAMBudgetSupported = manifest.Features.RAMBudget
 		status.MOSSEditSupported = manifest.Features.MOSSEdit
+		status.WanExtendedUMT5Supported = manifest.Features.WanExtendedUMT5
 		status.WanVideoStagingSupported = manifest.Features.WanVideoStaging
 		status.InpaintCropSupported = manifest.Features.InpaintCrop
 	}
@@ -302,7 +304,11 @@ func validateImageInputs(p Profile, r Request) error {
 		}
 	}
 	if p.Tokenizer != "" || p.ModelID == MOSSRecipeID {
-		if err := validateTokenizerFile(p.Tokenizer); err != nil {
+		validate := validateTokenizerFile
+		if p.IsWanRapid() {
+			validate = validateWanVocabulary
+		}
+		if err := validate(p.Tokenizer); err != nil {
 			return fmt.Errorf("tokenizer: %w", err)
 		}
 	}
@@ -478,6 +484,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	runnerStatus := e.Status()
 	if !runnerStatus.Ready {
 		return Result{}, errors.New(runnerStatus.Error)
+	}
+	if r.Video != nil && p.Tokenizer != "" && !runnerStatus.WanExtendedUMT5Supported {
+		return Result{}, errors.New("update the Wildllama media runtime to use an extended Wan UMT5 vocabulary")
 	}
 	if r.Video != nil && !runnerStatus.WanVideoStagingSupported {
 		return Result{}, errors.New("update the Wildllama media runtime to enable staged Wan video generation")

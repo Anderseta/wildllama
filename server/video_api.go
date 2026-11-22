@@ -16,14 +16,15 @@ import (
 
 // Video settings are independent of the active image and chat profiles.
 type videoProfile struct {
-	Diffusion string  `json:"diffusion_model"`
-	Encoder   string  `json:"text_encoder"`
-	VAE       string  `json:"vae"`
-	Vision    string  `json:"vision_encoder"`
-	Width     int     `json:"width"`
-	Height    int     `json:"height"`
-	Steps     int     `json:"steps"`
-	CFG       float64 `json:"cfg_scale"`
+	Diffusion  string  `json:"diffusion_model"`
+	Encoder    string  `json:"text_encoder"`
+	VAE        string  `json:"vae"`
+	Vision     string  `json:"vision_encoder"`
+	Vocabulary string  `json:"tokenizer,omitempty"`
+	Width      int     `json:"width"`
+	Height     int     `json:"height"`
+	Steps      int     `json:"steps"`
+	CFG        float64 `json:"cfg_scale"`
 	imagegen.VideoOptions
 	Reserve int `json:"vram_reserve_mib"`
 	RAM     int `json:"max_ram_mib"`
@@ -39,7 +40,7 @@ func (p videoProfile) runtimeProfile(mode string) imageProfile {
 		model = imagegen.WanRapidT2V
 	}
 	return imageProfile{Name: "Wan Rapid v10", ExecutionMode: "exclusive", Profile: imagegen.Profile{ID: model, ModelID: model,
-		DiffusionModel: p.Diffusion, TextEncoder: p.Encoder, VAE: p.VAE, VisionEncoder: p.Vision,
+		DiffusionModel: p.Diffusion, TextEncoder: p.Encoder, VAE: p.VAE, VisionEncoder: p.Vision, Tokenizer: p.Vocabulary,
 		Width: p.Width, Height: p.Height, Steps: p.Steps, CFGScale: p.CFG, Sampler: "euler_a", Scheduler: "beta",
 		OffloadToCPU: true, StageComponents: true, FlashAttention: true, VAETiling: true, MaxRAMMiB: p.RAM, VRAMReserveMiB: p.Reserve}}
 }
@@ -106,6 +107,7 @@ func videoMode(c *gin.Context) (string, bool) {
 func (s *Server) registerVideoRoutes(r *gin.Engine) {
 	r.GET("/api/videos/config", s.videoConfigHandler)
 	r.PUT("/api/videos/config", s.videoConfigHandler)
+	r.POST("/api/videos/install", s.videoInstallHandler)
 	r.GET("/api/videos/jobs", s.videoJobsHandler)
 	r.POST("/api/videos/jobs", s.videoStartHandler)
 	r.POST("/api/videos/jobs/:id/cancel", s.videoCancelHandler)
@@ -118,6 +120,8 @@ func (s *Server) videoConfigHandler(c *gin.Context) {
 		return
 	}
 	v := s.imageService()
+	v.videoProfileMu.Lock()
+	defer v.videoProfileMu.Unlock()
 	if c.Request.Method == http.MethodPut {
 		var p videoProfile
 		if !imageBind(c, &p) {
@@ -147,7 +151,7 @@ func (s *Server) videoJobsHandler(c *gin.Context) {
 	jobs := make([]*imageJob, 0)
 	v.mu.Lock()
 	for i := len(v.jobs) - 1; i >= 0; i-- {
-		if job := v.jobs[i]; job.Kind == "video" {
+		if job := v.jobs[i]; isVideoJob(job) {
 			copy := cloneImageJobLocked(job)
 			copy.Generation = nil
 			jobs = append(jobs, copy)
@@ -241,7 +245,7 @@ func (s *Server) videoCancelHandler(c *gin.Context) {
 	v.mu.Lock()
 	found := false
 	for _, job := range v.jobs {
-		if job.ID == c.Param("id") && job.Kind == "video" {
+		if job.ID == c.Param("id") && isVideoJob(job) {
 			found = true
 			break
 		}
