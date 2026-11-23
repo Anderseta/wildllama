@@ -145,6 +145,7 @@ func scanWanWebM(file *os.File, frames, width, height int, middle func(int64, in
 	var header bool
 	var pixelWidth, pixelHeight int
 	count := 0
+	found := errors.New("requested WebM data found")
 	section := io.NewSectionReader(file, 0, info.Size())
 	r := bufio.NewReader(section)
 	// Keep the read-ahead for adjacent EBML headers; seek over large blocks.
@@ -242,6 +243,7 @@ func scanWanWebM(file *os.File, frames, width, height int, middle func(int64, in
 					if err := middle(offset, pos+size-offset); err != nil {
 						return err
 					}
+					return found
 				}
 				count++
 			}
@@ -249,10 +251,14 @@ func scanWanWebM(file *os.File, frames, width, height int, middle func(int64, in
 		}
 		if comment != nil && tagName == "COMMENT" && len(tagText) > 0 {
 			*comment = tagText
+			return found
 		}
 		return nil
 	}
 	if err = walk(0, info.Size(), 0); err != nil {
+		if err == found {
+			return nil
+		}
 		return err
 	}
 	if width > 0 && (pixelWidth != width || pixelHeight != height) {
