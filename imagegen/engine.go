@@ -615,6 +615,12 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		return Result{}, err
 	}
 	seed := r.Seed
+	if r.VideoCheckpoint.Step() > 0 {
+		if r.CPUOnly {
+			return Result{}, errors.New("Libere VRAM para retomar o passo que foi calculado na GPU.")
+		}
+		seed = r.VideoCheckpoint.seed
+	}
 	if seed < 0 {
 		var data [8]byte
 		if _, err := rand.Read(data[:]); err != nil {
@@ -641,7 +647,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	}
 	var reference, checkpoint wanReference
 	if r.Video != nil && !r.CPUOnly && p.OffloadToCPU && p.ModelID == WanRapidI2V {
-		latentBytes := int64(p.Width/8) * int64(p.Height/8) * int64(1+(r.Video.Frames-1)/4) * 16 * 4
+		latentBytes := WanLatentBytes(p.Width, p.Height, r.Video.Frames)
 		budget := int64(256 << 20)
 		if p.MaxRAMMiB > 0 {
 			budget = min(budget, (int64(p.MaxRAMMiB)<<20)/16)
@@ -656,11 +662,31 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		// Two alternating slots preserve the last complete Euler A step even
 		// if a child exits during the next copy. The parent owns their lifetime.
 		if size := 16 + 2*latentBytes; p.Steps > 1 && p.Sampler == "euler_a" && size <= budget {
-			checkpoint = newWanReference(size)
+			if r.VideoCheckpoint.Step() > 0 {
+				if r.VideoCheckpoint.size != size {
+					return Result{}, errors.New("A resolução diverge do passo salvo.")
+				}
+				checkpoint = r.VideoCheckpoint.memory
+				log.wan.savedStep = r.VideoCheckpoint.Step()
+			} else {
+				checkpoint = newWanReference(size)
+			}
 			if checkpoint.close != nil {
-				defer checkpoint.close()
+				defer func() {
+					if step := checkpoint.publishedStep(p.Steps); r.VideoCheckpoint != nil && step > 0 {
+						*r.VideoCheckpoint = VideoCheckpoint{memory: checkpoint, step: step, size: size, seed: seed}
+					} else {
+						checkpoint.close()
+						if r.VideoCheckpoint != nil {
+							*r.VideoCheckpoint = VideoCheckpoint{}
+						}
+					}
+				}()
 			}
 		}
+	}
+	if r.VideoCheckpoint.Step() > 0 && checkpoint.view == nil {
+		return Result{}, errors.New("Memória disponível insuficiente para retomar o vídeo na GPU.")
 	}
 	var runErr error
 	var decoded image.Image
@@ -669,6 +695,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
 		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log, reference, checkpoint)
+		if err != nil && checkpoint.view != nil {
+			log.wan.savedStep = checkpoint.publishedStep(p.Steps)
+		}
 		select {
 		case diskErr := <-diskGuard:
 			runErr = diskErr

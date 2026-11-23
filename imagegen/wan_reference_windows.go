@@ -3,6 +3,7 @@ package imagegen
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -21,5 +22,12 @@ func newWanReference(size int64) wanReference {
 		}
 		return wanReference{}
 	}
-	return wanReference{name: name, close: func() { windows.CloseHandle(h) }}
+	return wanReference{name: name, close: func() { windows.CloseHandle(h) }, view: func(length int, use func([]byte) error) error {
+		addr, err := windows.MapViewOfFile(h, windows.FILE_MAP_READ|windows.FILE_MAP_WRITE, 0, 0, uintptr(length))
+		if err != nil {
+			return err
+		}
+		defer windows.UnmapViewOfFile(addr)
+		return use(unsafe.Slice((*byte)(unsafe.Pointer(addr)), length))
+	}}
 }

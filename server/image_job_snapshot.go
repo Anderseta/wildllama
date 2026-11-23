@@ -6,6 +6,7 @@ import "time"
 // can then run without holding the service mutex or racing live progress.
 func cloneImageJobLocked(job *imageJob) *imageJob {
 	copy := *job
+	copy.ResumeStep = job.resumableStep()
 	copy.Results = append([]imageAsset(nil), job.Results...)
 	copy.RestoreErrors = append([]string(nil), job.RestoreErrors...)
 	copy.Timings = job.imageTimingSnapshot(time.Now())

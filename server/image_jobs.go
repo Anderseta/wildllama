@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -38,7 +39,7 @@ func (v *imageService) persistJobsLocked() error {
 		remove := len(v.jobs) - 200
 		kept := make([]*imageJob, 0, len(v.jobs))
 		for _, job := range v.jobs {
-			if remove > 0 && imageTerminal(job.Status) && !job.executing {
+			if remove > 0 && imageTerminal(job.Status) && !job.executing && job.resumableStep() == 0 {
 				remove--
 				continue
 			}
@@ -357,6 +358,12 @@ func (v *imageService) workQueue(transfer bool) {
 		if err != nil {
 			job.Error = err.Error()
 		}
+		if job.VideoFile != nil {
+			if dropErr := job.dropVideoCheckpoint(); dropErr != nil {
+				job.PersistenceError = dropErr.Error()
+				slog.Warn("remove video checkpoint", "error", dropErr)
+			}
+		}
 		job.cancel()
 		v.persistImageJobStateLocked(job)
 		v.mu.Unlock()
@@ -486,6 +493,12 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		return err
 	}
 	v.mu.Lock()
+	if job.Video != nil && profile.ModelID == imagegen.WanRapidI2V {
+		if job.checkpoint == nil {
+			job.checkpoint = &imagegen.VideoCheckpoint{}
+		}
+		input.VideoCheckpoint = job.checkpoint
+	}
 	job.Generation = generation
 	job.ParentAssetID = parent
 	job.Progress.BatchCount = generation.Count
@@ -1088,11 +1101,19 @@ func (s *Server) imageAssetHandler(c *gin.Context) {
 }
 
 func (s *Server) stopImageJobs() {
+	if err := s.shutdownMedia(); err != nil {
+		slog.Error("save video checkpoint on shutdown", "error", err)
+	}
+}
+
+func (s *Server) shutdownMedia() error {
 	v := s.imageService()
+	v.shutdownMu.Lock()
+	defer v.shutdownMu.Unlock()
 	v.mu.Lock()
 	if v.closed {
 		v.mu.Unlock()
-		return
+		return v.saveVideoCheckpoints()
 	}
 	v.closed = true
 	v.shutdownCancel()
@@ -1116,4 +1137,5 @@ func (s *Server) stopImageJobs() {
 	}
 	v.mu.Unlock()
 	v.workers.Wait()
+	return v.saveVideoCheckpoints()
 }

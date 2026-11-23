@@ -11,6 +11,7 @@ type wanReference struct {
 	name  string
 	file  *os.File
 	close func()
+	view  func(int, func([]byte) error) error
 }
 
 func (m wanReference) pass(cmd *exec.Cmd, key string) {

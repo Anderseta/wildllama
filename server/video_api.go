@@ -77,7 +77,7 @@ type videoRecord struct {
 }
 
 func (v *imageService) registerVideoResult(job *imageJob, result imagegen.Result) error {
-	r := videoRecord{GenerationSeconds: result.DurationSeconds, ID: job.ID, Path: result.Path, Seed: result.Seed, Created: time.Now().UTC(), Frames: job.Video.Frames, FPS: job.Video.FPS}
+	r := videoRecord{GenerationSeconds: job.PriorVideoSeconds + result.DurationSeconds, ID: job.ID, Path: result.Path, Seed: result.Seed, Created: time.Now().UTC(), Frames: job.Video.Frames, FPS: job.Video.FPS}
 	if err := writeImageJSON(filepath.Join(v.root, "video-records", job.ID+".json"), r); err != nil {
 		return err
 	}
@@ -115,6 +115,8 @@ func (s *Server) registerVideoRoutes(r *gin.Engine) {
 	r.GET("/api/videos/jobs", s.videoJobsHandler)
 	r.POST("/api/videos/jobs", s.videoStartHandler)
 	r.POST("/api/videos/jobs/:id/cancel", s.videoCancelHandler)
+	r.POST("/api/videos/jobs/:id/resume", s.videoResumeHandler)
+	r.POST("/api/videos/prepare-shutdown", s.videoShutdownHandler)
 	r.DELETE("/api/videos/jobs/:id/history", s.videoClearHandler)
 	r.GET("/api/videos/files/:id", s.videoFileHandler)
 	r.HEAD("/api/videos/files/:id", s.videoFileHandler)
@@ -254,6 +256,18 @@ func (s *Server) videoClearHandler(c *gin.Context) {
 				return
 			}
 		}
+		// The durable clear must succeed before discarding the only live step.
+		current := job
+		for _, candidate := range v.jobs {
+			if candidate.ID == job.ID {
+				current = candidate
+				break
+			}
+		}
+		if err := current.dropVideoCheckpoint(); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(200, gin.H{"cleared": true})
 		return
 	}
@@ -337,7 +351,7 @@ func (s *Server) videoStartHandler(c *gin.Context) {
 		return
 	}
 	config.OutputDir = filepath.Join(config.OutputDir, "videos")
-	job, err := v.enqueue(&imageJob{Kind: "video", RequestID: req.RequestID, ProfileID: profile.ID, ModelID: profile.ModelID,
+	job, err := v.enqueue(&imageJob{Kind: "video", VideoWorkDir: config.WorkDir, RequestID: req.RequestID, ProfileID: profile.ID, ModelID: profile.ModelID,
 		Request: request, Config: config, Profile: profile, Fingerprint: fingerprint, Generation: generation, Video: &p.VideoOptions, ParentAssetID: req.Asset})
 	if err != nil {
 		c.JSON(409, gin.H{"error": err.Error()})

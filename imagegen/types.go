@@ -99,7 +99,8 @@ type LocalInspection struct {
 }
 
 type Request struct {
-	Video           *VideoOptions `json:"-"`
+	Video           *VideoOptions    `json:"-"`
+	VideoCheckpoint *VideoCheckpoint `json:"-"`
 	crop            image.Rectangle
 	Inpaint         *InpaintMask `json:"inpaint,omitempty"`
 	Prompt          string       `json:"prompt"`

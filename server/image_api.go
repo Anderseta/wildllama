@@ -119,6 +119,13 @@ type imageAsset struct {
 }
 
 type imageJob struct {
+	ResumeStep          int     `json:"resume_step,omitempty"`
+	VideoWorkDir        string  `json:"video_work_dir,omitempty"`
+	PriorVideoSeconds   float64 `json:"prior_video_seconds,omitempty"`
+	checkpoint          *imagegen.VideoCheckpoint
+	diskStep            int
+	isResume            bool
+	queuedAgain         *time.Time
 	Video               *imagegen.VideoOptions  `json:"video,omitempty"`
 	VideoFile           *videoRecord            `json:"video_file,omitempty"`
 	ID                  string                  `json:"id"`
@@ -165,6 +172,7 @@ type imageJob struct {
 }
 
 type imageService struct {
+	shutdownMu        sync.Mutex
 	videoProfileMu    sync.Mutex
 	mu                sync.Mutex
 	libraryMu         sync.Mutex
@@ -291,6 +299,9 @@ func (s *Server) imageService() *imageService {
 			service.configError = "Cannot load image asset catalog: " + err.Error()
 		}
 		service.recoverImageJobStates()
+		for _, job := range service.jobs {
+			job.discoverSavedStep()
+		}
 		service.loadDeletedImageSessions()
 		service.loadImageAssetDeletions()
 		if err := service.backfillImageMetadata(); err != nil {

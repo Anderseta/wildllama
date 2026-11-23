@@ -61,8 +61,12 @@ func (job *imageJob) imageTimingSnapshot(now time.Time) *imageJobTimings {
 }
 
 func (job *imageJob) startImageTiming(now time.Time) {
+	queued := job.CreatedAt
+	if job.queuedAgain != nil {
+		queued = *job.queuedAgain
+	}
 	job.Timings = &imageJobTimings{
-		QueueSeconds: max(0, now.Sub(job.CreatedAt).Seconds()),
+		QueueSeconds: max(0, now.Sub(queued).Seconds()),
 		PhaseSeconds: make(map[string]float64),
 	}
 	job.timingPhase, job.timingPhaseStarted = "preparing", now
