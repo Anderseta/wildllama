@@ -1,0 +1,200 @@
+diff --git a/src/device_residency_manager.h b/src/device_residency_manager.h
+--- a/src/device_residency_manager.h
++++ b/src/device_residency_manager.h
+@@ -80,6 +80,7 @@
+     virtual bool prefetch_enabled() const                   = 0;
+     virtual void register_runtime_owner(uintptr_t owner_id) = 0;
+     virtual void remove_runtime_owner(uintptr_t owner_id)   = 0;
++    virtual void reserve_host_for_compute(const DeviceMemoryRequest&) {}
+     // Capacity requests select their backend's weights; protection spans all backends.
+     virtual bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
+                                                const std::vector<ggml_tensor*>& required_params) const = 0;
+diff --git a/src/core/execution_engine.cpp b/src/core/execution_engine.cpp
+--- a/src/core/execution_engine.cpp
++++ b/src/core/execution_engine.cpp
+@@ -647,6 +647,9 @@
+             auto ensure_capacity   = [&]() {
+                 sync_runtime_residency();
+                 auto requests = memory_requests(measurement.buffers, new_cache_bytes);
++                if (manager) {
++                    for (const auto& request : requests) manager->reserve_host_for_compute(request);
++                }
+                 if (fits(requests, weights.params(index))) {
+                     return true;
+                 }
+diff --git a/src/model_manager.h b/src/model_manager.h
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -38,6 +38,8 @@
+     struct HostWeight {
+         wildimage_ram::Reservation ram;
+         std::unique_ptr<uint8_t[]> bytes;
++        std::shared_ptr<MmapWrapper> source;
++        uint64_t offset = 0;
+     };
+ 
+     struct TensorState {
+@@ -149,7 +151,9 @@
+     bool load_tensors_to_params_backend(const std::vector<TensorState*>& states);
+     bool wan_weight_tiering_ = std::getenv("WILDLLAMA_WAN_WEIGHT_CACHE") != nullptr;
+     void retain_wan_weights(const ParamsStorageBlock& block);
+-    void trim_wan_weights(size_t pending);
++    void trim_wan_weights(size_t pending, bool device_commit = false);
++    bool bind_clean_wan_weight(const TensorState& state, HostWeight& host);
++    std::map<size_t, std::weak_ptr<MmapWrapper>> wan_sources_;
+     bool reclaim_ram(size_t pending, const std::vector<TensorState*>& protected_states);
+     bool apply_loras_to_params(const std::vector<TensorState*>& states);
+     bool mmap_params(const std::vector<TensorState*>& states,
+@@ -295,6 +299,7 @@
+     void update_runtime_residency(uintptr_t owner_id,
+                                   ggml_backend_t compute_backend,
+                                   size_t resident_bytes) override;
++    void reserve_host_for_compute(const DeviceMemoryRequest& request) override;
+     bool ensure_compute_backend_capacity(
+         const DeviceMemoryRequest& request,
+         const std::vector<ggml_tensor*>& required_params,
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1059,7 +1059,7 @@
+     using ReadGroup = std::pair<ModelLoader::FileId, SDVersion>;
+     using ReadBatch = std::map<std::string, std::vector<ggml_tensor*>>;
+     std::map<ReadGroup, std::vector<ReadBatch>> groups;
+-    size_t restored = 0;
++    size_t restored = 0, mapped_restored = 0;
+     size_t part_count = 0;
+     for (const auto* state : states) {
+         if (state != nullptr && state->sources.size() > 1 && ggml_backend_buffer_is_host(state->tensor->buffer)) {
+@@ -1091,7 +1091,10 @@
+         if (state->host_weight) {
+             const size_t bytes = ggml_nbytes(state->tensor);
+             if (state->host_weight->ram.bytes() == bytes && loras_.empty()) {
+-                ggml_backend_tensor_set(state->tensor, state->host_weight->bytes.get(), 0, bytes);
++                const auto& backing = *state->host_weight;
++                const void* data = backing.source ? backing.source->data() + backing.offset : backing.bytes.get();
++                if (backing.source) mapped_restored += bytes;
++                ggml_backend_tensor_set(state->tensor, data, 0, bytes);
+                 state->host_weight.reset();
+                 state->loaded_to_params_backend = true;
+                 restored += bytes;
+@@ -1124,7 +1127,7 @@
+         }
+         add_destination(*state, state->name, state->tensor);
+     }
+-    if (restored) LOG_INFO("Wan restored %.2f MiB of weights from RAM", restored / 1048576.);
++    if (restored) LOG_INFO("Wan restored %.2f MiB of weights from RAM (%.2f MiB via read-only model pages)", restored / 1048576., mapped_restored / 1048576.);
+     for (auto& group : groups) {
+         for (auto& batch : group.second) {
+             std::set<std::string> names;
+@@ -2067,9 +2070,60 @@
+     return available > reserve ? available - reserve : 0;
+ }
+ 
++// Quantized GGUF weights were already read once. Keep a read-only view of
++// the same cached file pages instead of allocating a private copy and
++// copying it back over PCIe. The OS may reclaim clean pages under pressure.
++bool ModelManager::bind_clean_wan_weight(const TensorState& state, HostWeight& host) {
++#ifdef _WIN32
++    if (state.source_file || state.sources.size() != 1) return false;
++    const auto& raw = state.sources.front();
++    if (!ggml_is_quantized(raw.type) || raw.type != state.tensor->type ||
++        raw.index_in_zip >= 0 || raw.file_index >= model_loader_.file_data.size() ||
++        raw.is_f64 || raw.is_i64 || raw.is_f8_e4m3 || raw.is_f8_e5m2 ||
++        raw.is_int8_tensorwise || raw.w4_convrot_kind || raw.int8_convrot ||
++        !std::equal(state.tensor->ne, state.tensor->ne + GGML_MAX_DIMS, raw.ne) ||
++        raw.nbytes_to_read() != static_cast<int64_t>(host.ram.bytes())) return false;
++    const auto& file = model_loader_.file_data[raw.file_index];
++    if (file.is_zip || file.mapping_writable) return false;
++    auto& entry = wan_sources_[raw.file_index];
++    auto mapping = entry.lock();
++    if (!mapping) {
++        mapping = MmapWrapper::create(file.path, false);
++        if (!mapping) return false;
++        entry = mapping;
++    }
++    if (raw.offset > mapping->size() || host.ram.bytes() > mapping->size() - raw.offset) return false;
++    host.offset = raw.offset;
++    host.source = std::move(mapping);
++    return true;
++#else
++    return false;
++#endif
++}
++
++void ModelManager::reserve_host_for_compute(const DeviceMemoryRequest& request) {
++#ifdef _WIN32
++    if (wan_weight_tiering_ && request.pending_allocation_bytes && !sd_backend_is_cpu(request.compute_backend)) {
++        trim_wan_weights(request.pending_allocation_bytes, true);
++    }
++#endif
++}
++
+ void ModelManager::retain_wan_weights(const ParamsStorageBlock& block) {
+     if (!wan_weight_tiering_ || !loras_.empty() || block.states.empty()) return;
+-    uint64_t space = std::min(wan_host_space(), wildimage_ram::budget().remaining());
++    const auto memory = wildimage_ram::system_memory();
++    const uint64_t reserve = std::max<uint64_t>(wildimage_ram::GiB, memory.total / 20);
++    uint64_t space = std::min(wildimage_ram::budget().remaining(),
++                              memory.available > reserve ? memory.available - reserve : 0);
++    uint64_t private_space = wan_host_space();
++#ifdef _WIN32
++    size_t device_free = 0, device_total = 0;
++    if (const auto backend = block.states.front()->compute_backend) {
++        ggml_backend_dev_memory(ggml_backend_get_device(backend), &device_free, &device_total);
++    }
++    // WDDM charges commit when the next graph grows into currently free VRAM.
++    private_space = private_space > device_free ? private_space - device_free : 0;
++#endif
+     for (auto* state : block.states) {
+         if (!state || (state->component != ModelComponent::Diffusion && state->component != ModelComponent::HighNoiseDiffusion) ||
+             !state->tensor || state->sources.empty() || state->applied_lora_epoch != UINT64_MAX ||
+@@ -2079,20 +2133,24 @@
+         if (!bytes || bytes > space) continue;
+         auto host = std::unique_ptr<HostWeight>(new (std::nothrow) HostWeight);
+         if (!host || !host->ram.try_reset(bytes)) continue;
+-        host->bytes.reset(new (std::nothrow) uint8_t[bytes]);
+-        if (!host->bytes) continue;
+-        ggml_backend_tensor_get(state->tensor, host->bytes.get(), 0, bytes);
++        if (!bind_clean_wan_weight(*state, *host)) {
++            if (bytes > private_space) continue;
++            host->bytes.reset(new (std::nothrow) uint8_t[bytes]);
++            if (!host->bytes) continue;
++            ggml_backend_tensor_get(state->tensor, host->bytes.get(), 0, bytes);
++            private_space -= bytes;
++        }
+         state->host_weight = std::move(host);
+         space -= bytes;
+     }
+ }
+ 
+-void ModelManager::trim_wan_weights(size_t pending) {
++void ModelManager::trim_wan_weights(size_t pending, bool device_commit) {
+     if (!wan_weight_tiering_) return;
+-    auto space = std::min(wan_host_space(), wildimage_ram::budget().remaining());
++    auto space = device_commit ? wan_host_space() : wildimage_ram::budget().remaining();
+     if (space >= pending) return;
+     for (const auto& state : tensor_states_) {
+-        if (!state->host_weight) continue;
++        if (!state->host_weight || (device_commit && state->host_weight->source)) continue;
+         const auto bytes = state->host_weight->ram.bytes();
+         state->host_weight.reset();
+         space += bytes;
+@@ -2171,7 +2229,6 @@
+         wildimage_ram::budget().fail();
+         return false;
+     }
+-    if (wan_weight_tiering_) trim_wan_weights(std::min<size_t>(request.pending_allocation_bytes, size_t{512} << 20));
+     const bool ready = execution_engine()->ensure_capacity(*this, request, required_params, preferred_eviction_order, protected_params);
+     if (!ready) wildimage_ram::gpu_failure();
+     return ready;
+diff --git a/src/model_manager_files.cpp b/src/model_manager_files.cpp
+--- a/src/model_manager_files.cpp
++++ b/src/model_manager_files.cpp
+@@ -36,6 +36,7 @@
+ }
+ 
+ void ModelManager::invalidate_sources(const std::unordered_set<TensorState*>& states) {
++    wan_sources_.clear();
+     auto affected = states;
+     for (const auto& block : params_storage_blocks_) {
+         if (std::any_of(block->states.begin(), block->states.end(), [&](TensorState* state) { return states.count(state) != 0; })) {
