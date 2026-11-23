@@ -1,0 +1,168 @@
+diff --git a/examples/common/media_io.cpp b/examples/common/media_io.cpp
+--- a/examples/common/media_io.cpp
++++ b/examples/common/media_io.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <future>
+ #include <string>
+ #include <vector>
+ 
+@@ -384,35 +385,14 @@
+ }
+ 
+ #ifdef SD_USE_WEBM
+-bool extract_vp8_frame_from_webp(const std::vector<uint8_t>& webp_data, std::vector<uint8_t>& vp8_frame) {
+-    if (!is_webp_signature(webp_data.data(), webp_data.size())) {
+-        return false;
+-    }
+-
+-    size_t offset = 12;
+-    while (offset + 8 <= webp_data.size()) {
+-        const uint8_t* chunk     = webp_data.data() + offset;
+-        const uint32_t chunk_len = read_u32_le_bytes(chunk + 4);
+-        const size_t chunk_start = offset + 8;
+-        const size_t padded_len  = static_cast<size_t>(chunk_len) + (chunk_len & 1u);
+-
+-        if (chunk_start + chunk_len > webp_data.size()) {
+-            return false;
+-        }
+-
+-        if (memcmp(chunk, "VP8 ", 4) == 0) {
+-            vp8_frame.assign(webp_data.data() + chunk_start,
+-                             webp_data.data() + chunk_start + chunk_len);
+-            return !vp8_frame.empty();
+-        }
+-
+-        offset = chunk_start + padded_len;
+-    }
+-
+-    return false;
+-}
+-
+-bool encode_sd_image_to_vp8_frame(const sd_image_t& image, int quality, std::vector<uint8_t>& vp8_frame) {
++// Keep the encoder allocation alive until libwebm consumes the native VP8 packet.
++struct VideoPacket {
++    WebPBufferPtr bytes;
++    const uint8_t* payload = nullptr;
++    size_t size = 0;
++};
++
++static bool encode_sd_image_to_vp8_frame(const sd_image_t& image, int quality, VideoPacket& packet) {
+     if (image.data == nullptr || image.width == 0 || image.height == 0) {
+         return false;
+     }
+@@ -444,12 +424,23 @@
+         rgb_data = rgb_buffer.data();
+     }
+ 
+-    std::vector<uint8_t> encoded_webp;
+-    if (!encode_webp_image_to_vector(rgb_data, width, height, 3, "", quality, encoded_webp)) {
+-        return false;
+-    }
+-
+-    return extract_vp8_frame_from_webp(encoded_webp, vp8_frame);
++    uint8_t* encoded = nullptr;
++    const size_t size = WebPEncodeRGB(rgb_data, width, height, width * 3, static_cast<float>(quality), &encoded);
++    packet.bytes.reset(encoded);
++    if (!encoded || !is_webp_signature(encoded, size)) return false;
++    for (size_t i = 12; size - i >= 8;) {
++        const size_t length = read_u32_le_bytes(encoded + i + 4);
++        const size_t start = i + 8;
++        if (length > size - start) return false;
++        if (std::memcmp(encoded + i, "VP8 ", 4) == 0 && length) {
++            packet.payload = encoded + start;
++            packet.size = length;
++            return true;
++        }
++        if ((length & 1) && length == size - start) return false;
++        i = start + length + (length & 1);
++    }
++    return false;
+ }
+ #endif
+ #endif
+@@ -1272,21 +1263,44 @@
+         1, static_cast<uint64_t>(std::llround(1000000000.0 / static_cast<double>(fps))));
+     uint64_t timestamp_ns = 0;
+ 
++    // At most one frame is encoded ahead. The muxer remains single-threaded,
++    // preserving order, timestamps, audio interleaving and the middle keyframe.
++    struct Workspace {
++        size_t bytes = 0;
++        ~Workspace() { if (bytes) sd_host_release(bytes); }
++    } workspace;
++    const uint64_t pixels = uint64_t(width) * height;
++    if (std::getenv("WILDLLAMA_VIDEO_PROGRESS") && num_images >= 5 && pixels <= 2U * 1024 * 1024 &&
++        sd_get_num_physical_cores() >= 2) {
++        const size_t extra = static_cast<size_t>(pixels) * 48 + (4U << 20);
++        if (sd_try_host_workspace(extra)) workspace.bytes = extra;
++    }
++    std::future<VideoPacket> next;
++    const auto encode = [&](int index) {
++        VideoPacket packet;
++        const auto& image = images[index];
++        if (image.width == images[0].width && image.height == images[0].height)
++            encode_sd_image_to_vp8_frame(image, quality, packet);
++        return packet;
++    };
++    bool overlap = workspace.bytes != 0;
+     for (int i = 0; i < num_images; ++i) {
+-        const sd_image_t& image = images[i];
+-        if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
+-            fprintf(stderr, "Error: Frame dimensions do not match.\n");
+-            return -1;
+-        }
+-
+-        std::vector<uint8_t> vp8_frame;
+-        if (!encode_sd_image_to_vp8_frame(image, quality, vp8_frame)) {
++        VideoPacket frame;
++        if (next.valid()) {
++            try { frame = next.get(); } catch (const std::exception&) { overlap = false; }
++        } else if (overlap && i + 1 < num_images) {
++            try { next = std::async(std::launch::async, encode, i + 1); }
++            catch (const std::system_error&) { overlap = false; }
++            catch (const std::bad_alloc&) { overlap = false; }
++        }
++        if (!frame.payload) frame = encode(i);
++        if (!frame.payload) {
+             fprintf(stderr, "Error: Failed to encode frame %d as VP8.\n", i);
+             return -1;
+         }
+ 
+-        if (!segment.AddFrame(vp8_frame.data(),
+-                              static_cast<uint64_t>(vp8_frame.size()),
++        if (!segment.AddFrame(frame.payload,
++                              static_cast<uint64_t>(frame.size),
+                               track_number,
+                               timestamp_ns,
+                               true)) {
+diff --git a/include/stable-diffusion.h b/include/stable-diffusion.h
+--- a/include/stable-diffusion.h
++++ b/include/stable-diffusion.h
+@@ -32,6 +32,8 @@
+ SD_API bool sd_set_memory_budget(const char* max_ram_gib, bool stage_components,const char* vram_reserve_gib);
+ SD_API int sd_get_memory_failure_code(void); // 75 GPU allocation/budget, 76 RAM budget
+ SD_API bool sd_host_reserve(size_t bytes);
++// Optional work may fall back without reporting a job memory failure.
++SD_API bool sd_try_host_workspace(size_t bytes);
+ SD_API void sd_host_release(size_t bytes);
+ SD_API void* sd_host_malloc(size_t bytes);
+ SD_API void* sd_host_realloc(void* ptr, size_t bytes);
+diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -25,6 +25,12 @@
+ }
+ SD_API int sd_get_memory_failure_code(void) { return wildimage_ram::budget().failure_code(); }
+ SD_API bool sd_host_reserve(size_t bytes) { if(wildimage_ram::budget().try_acquire(bytes)) return true; wildimage_ram::budget().fail(); return false; }
++SD_API bool sd_try_host_workspace(size_t bytes) {
++    const auto memory = wildimage_ram::system_memory();
++    // Leave OS headroom as well as room for the primary codec worker.
++    return bytes <= wildimage_ram::effective_limit(0, memory) / 2 &&
++           bytes <= wildimage_ram::budget().remaining() / 2 && wildimage_ram::budget().try_acquire(bytes);
++}
+ SD_API void sd_host_release(size_t bytes) { wildimage_ram::budget().release(bytes); }
+ SD_API void* sd_host_malloc(size_t bytes) { return wildimage_ram::raw_malloc(bytes); }
+ SD_API void* sd_host_realloc(void* ptr,size_t bytes) { return wildimage_ram::raw_realloc(ptr,bytes); }

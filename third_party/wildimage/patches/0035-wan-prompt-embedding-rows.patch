@@ -1,0 +1,209 @@
+diff --git a/src/model_loader.h b/src/model_loader.h
+--- a/src/model_loader.h
++++ b/src/model_loader.h
+@@ -131,6 +131,10 @@
+     const std::map<std::string, std::string>& get_metadata() const { return metadata_; }
+     void set_n_threads(int n_threads);
+     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
++    // TensorStorage.file_index addresses the original shard list, including skipped empty shards.
++    std::string plain_weight_path(const TensorStorage& raw) const {
++        return raw.index_in_zip < 0 && raw.file_index < file_paths_.size() ? file_paths_[raw.file_index] : std::string{};
++    }
+     std::string readonly_weight_path(size_t index) const {
+         if (index >= file_data.size() || file_data[index].is_zip || file_data[index].mapping_writable) return {};
+         return file_data[index].path;
+diff --git a/src/model/common/ggml_block.hpp b/src/model/common/ggml_block.hpp
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -372,6 +372,8 @@
+     }
+ 
+ public:
++    ggml_tensor* weight() const { return params.at("weight"); }
++
+     Embedding(int64_t num_embeddings, int64_t embedding_dim)
+         : embedding_dim(embedding_dim),
+           num_embeddings(num_embeddings) {
+diff --git a/src/model_manager.h b/src/model_manager.h
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -191,6 +191,10 @@
+     ~ModelManager() override;
+ 
+     const ModelLoader& loader() const { return model_loader_; }
++
++    // Copy the requested rows from an unmodified, on-disk F16 embedding table.
++    using PromptRowBytes = std::vector<uint8_t, wildimage_ram::Allocator<uint8_t>>;
++    bool read_prompt_rows(const ggml_tensor* weight, const std::vector<int32_t>& rows, PromptRowBytes& data) const;
+ 
+     bool set_loader(ModelLoader loader);
+     bool add_file(const std::string& path, const std::string& prefix = "", ModelLoader::FileId* id = nullptr, bool force = false);
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -3,6 +3,8 @@
+ #include <algorithm>
+ #include <cstdint>
+ #include <iterator>
++#include <fstream>
++#include <filesystem>
+ #include <mutex>
+ #include <tuple>
+ #include <unordered_set>
+@@ -2073,6 +2075,43 @@
+ // Quantized GGUF weights were already read once. Keep a read-only view of
+ // the same cached file pages instead of allocating a private copy and
+ // copying it back over PCIe. The OS may reclaim clean pages under pressure.
++bool ModelManager::read_prompt_rows(const ggml_tensor* weight, const std::vector<int32_t>& rows, PromptRowBytes& data) const {
++    if (!weight || weight->type != GGML_TYPE_F16 || !ggml_is_contiguous(weight) ||
++        !loras_.empty() || rows.empty()) return false;
++    const auto it = tensor_states_by_tensor_.find(weight);
++    if (it == tensor_states_by_tensor_.end()) return false;
++    const auto& state = *it->second;
++    if (state.source_file || state.sources.size() != 1 || state.loaded_to_params_backend ||
++        (state.usage_op != GGML_OP_NONE && state.usage_op != GGML_OP_GET_ROWS)) return false;
++    const auto& raw = state.sources.front();
++    if (raw.type != weight->type || raw.index_in_zip >= 0 || raw.n_dims != 2 ||
++        raw.is_f64 || raw.is_i64 || raw.is_f8_e4m3 || raw.is_f8_e5m2 || raw.is_int8_tensorwise ||
++        !std::equal(weight->ne, weight->ne + GGML_MAX_DIMS, raw.ne) ||
++        raw.nbytes_to_read() != static_cast<int64_t>(ggml_nbytes(weight))) return false;
++    const auto path = model_loader_.plain_weight_path(raw);
++    const std::set<std::string> names{raw.name};
++    if (path.empty() || !model_loader_.validate_sources(&names)) return false;
++    std::ifstream file(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
++    const std::streamoff end = file.tellg();
++    if (end < 0 || raw.offset > static_cast<uint64_t>(end) ||
++        ggml_nbytes(weight) > static_cast<uint64_t>(end) - raw.offset) return false;
++    const size_t stride = weight->nb[1];
++    // Limit optional scratch independently of the total vocabulary size.
++    if (!stride || rows.size() > (8U << 20) / stride ||
++        std::any_of(rows.begin(), rows.end(), [&](int32_t id) { return id < 0 || id >= weight->ne[1]; })) return false;
++    if (rows.size() * stride > wildimage_ram::budget().remaining()) return false;
++    PromptRowBytes result(rows.size() * stride);
++    for (size_t i = 0; i < rows.size();) {
++        size_t next = i + 1;
++        while (next < rows.size() && int64_t(rows[next]) == int64_t(rows[next - 1]) + 1) ++next;
++        file.seekg(static_cast<std::streamoff>(raw.offset + size_t(rows[i]) * stride));
++        if (!file.read(reinterpret_cast<char*>(result.data() + i * stride), (next - i) * stride)) return false;
++        i = next;
++    }
++    data.swap(result);
++    return true;
++}
++
+ bool ModelManager::bind_clean_wan_weight(const TensorState& state, HostWeight& host) {
+ #ifdef _WIN32
+     if (state.source_file || state.sources.size() != 1) return false;
+diff --git a/src/model/te/t5.hpp b/src/model/te/t5.hpp
+--- a/src/model/te/t5.hpp
++++ b/src/model/te/t5.hpp
+@@ -365,6 +365,10 @@
+     T5Config config;
+ 
+ public:
++    ggml_tensor* embedding_weight() const {
++        return std::static_pointer_cast<Embedding>(blocks.at("shared"))->weight();
++    }
++
+     T5() {}
+     T5(T5Config config)
+         : config(config) {
+@@ -382,13 +386,14 @@
+                          ggml_tensor* input_ids,
+                          ggml_tensor* past_bias                = nullptr,
+                          ggml_tensor* attention_mask           = nullptr,
+-                         ggml_tensor* relative_position_bucket = nullptr) {
++                         ggml_tensor* relative_position_bucket = nullptr,
++                         ggml_tensor* prompt_table             = nullptr) {
+         // input_ids: [N, n_token]
+ 
+         auto shared  = std::dynamic_pointer_cast<Embedding>(blocks["shared"]);
+         auto encoder = std::dynamic_pointer_cast<T5Stack>(blocks["encoder"]);
+ 
+-        auto x = shared->forward(ctx, input_ids);
++        auto x = prompt_table ? ggml_ext_embedding(ctx, prompt_table, input_ids) : shared->forward(ctx, input_ids);
+         sd::ggml_graph_cut::mark_graph_cut(x, "t5.prelude", "x");
+         x = encoder->forward(ctx, x, past_bias, attention_mask, relative_position_bucket, "t5");
+         return x;
+@@ -399,6 +404,7 @@
+     T5Config config;
+     T5 model;
+     std::vector<int> relative_position_bucket_vec;
++    bool compact_video_prompt;
+ 
+     T5Runner(ggml_backend_t backend,
+              const String2TensorStorage& tensor_storage_map,
+@@ -406,7 +412,8 @@
+              bool is_umt5                                        = false,
+              std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+         : GGMLRunner(backend, weight_manager),
+-          config(T5Config::detect_from_weights(tensor_storage_map, prefix, is_umt5)) {
++          config(T5Config::detect_from_weights(tensor_storage_map, prefix, is_umt5)),
++          compact_video_prompt(is_umt5 && std::getenv("WILDLLAMA_VIDEO_PROGRESS")) {
+         model = T5(config);
+         model.init(params_ctx, tensor_storage_map, prefix);
+     }
+@@ -422,16 +429,14 @@
+     ggml_tensor* forward(GGMLRunnerContext* ctx,
+                          ggml_tensor* input_ids,
+                          ggml_tensor* relative_position_bucket,
+-                         ggml_tensor* attention_mask = nullptr) {
+-        size_t N       = input_ids->ne[1];
+-        size_t n_token = input_ids->ne[0];
+-
+-        auto hidden_states = model.forward(ctx, input_ids, nullptr, attention_mask, relative_position_bucket);  // [N, n_token, model_dim]
+-        return hidden_states;
++                         ggml_tensor* attention_mask = nullptr,
++                         ggml_tensor* prompt_table = nullptr) {
++        return model.forward(ctx, input_ids, nullptr, attention_mask, relative_position_bucket, prompt_table);
+     }
+ 
+     ggml_cgraph* build_graph(const sd::Tensor<int32_t>& input_ids_tensor,
+-                             const sd::Tensor<float>& attention_mask_tensor = {}) {
++                             const sd::Tensor<float>& attention_mask_tensor = {},
++                             const ModelManager::PromptRowBytes& rows = {}) {
+         ggml_cgraph* gf             = ggml_new_graph(compute_ctx);
+         ggml_tensor* input_ids      = make_input(input_ids_tensor);
+         ggml_tensor* attention_mask = attention_mask_tensor.empty() ? nullptr : make_input(attention_mask_tensor);
+@@ -448,7 +453,13 @@
+         set_backend_tensor_data(relative_position_bucket, relative_position_bucket_vec.data());
+ 
+         auto runner_ctx            = get_context();
+-        ggml_tensor* hidden_states = forward(&runner_ctx, input_ids, relative_position_bucket, attention_mask);
++        ggml_tensor* table = nullptr;
++        if (!rows.empty()) {
++            const auto* weight = model.embedding_weight();
++            table = ggml_new_tensor_2d(compute_ctx, weight->type, weight->ne[0], rows.size() / weight->nb[1]);
++            set_backend_tensor_data(table, rows.data());
++        }
++        ggml_tensor* hidden_states = forward(&runner_ctx, input_ids, relative_position_bucket, attention_mask, table);
+ 
+         ggml_build_forward_expand(gf, hidden_states);
+ 
+@@ -459,8 +470,25 @@
+                               const sd::Tensor<int32_t>& input_ids,
+                               const sd::Tensor<float>& attention_mask,
+                               bool auto_runner_end = true) {
++        // The input buffers live across graph planning, execution and any internal retry.
++        ModelManager::PromptRowBytes rows;
++        sd::Tensor<int32_t> remapped;
++        if (compact_video_prompt && !weight_adapter && input_ids.numel() > 0 && input_ids.numel() <= 2048 &&
++            ggml_nbytes(model.embedding_weight()) >= (64U << 20)) {
++            auto manager = std::dynamic_pointer_cast<ModelManager>(residency_manager.lock());
++            std::vector<int32_t> ids(input_ids.data(), input_ids.data() + input_ids.numel());
++            std::sort(ids.begin(), ids.end());
++            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
++            if (manager && manager->read_prompt_rows(model.embedding_weight(), ids, rows)) {
++                remapped = sd::Tensor<int32_t>(input_ids.shape());
++                for (int64_t i = 0; i < input_ids.numel(); ++i) {
++                    remapped.data()[i] = static_cast<int32_t>(std::lower_bound(ids.begin(), ids.end(), input_ids.data()[i]) - ids.begin());
++                }
++                LOG_VERBOSE("compact UMT5 prompt: %zu rows, %zu bytes instead of %zu", ids.size(), rows.size(), ggml_nbytes(model.embedding_weight()));
++            }
++        }
+         auto get_graph = [&]() -> ggml_cgraph* {
+-            return build_graph(input_ids, attention_mask);
++            return build_graph(rows.empty() ? input_ids : remapped, attention_mask, rows);
+         };
+         return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, auto_runner_end), 3);
+     }
