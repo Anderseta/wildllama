@@ -1,0 +1,282 @@
+--- a/src/model/vae/vae_tiling.hpp
++++ b/src/model/vae/vae_tiling.hpp
+@@ -99,13 +99,28 @@
+     return plan;
+ }
+ 
++// Wan I2V represents an initial image followed by neutral frames. Only the
++// first window contains pixels. In VAE space every other value is exactly +0.
++inline sd::Tensor<float> wan_reference_window(const sd::Tensor<float>& first,
++                                              int64_t start, int64_t end) {
++    GGML_ASSERT(first.dim() == 5 && first.shape()[2] == 1 && start >= 0 && end > start);
++    auto shape = first.shape();
++    shape[2] = end - start;
++    sd::Tensor<float> window(shape);
++    if (start == 0) {
++        const int64_t plane = shape[0] * shape[1];
++        for (int64_t c = 0; c < first.numel() / plane; ++c) {
++            std::copy_n(first.data() + c * plane, plane, window.data() + c * shape[2] * plane);
++        }
++    }
++    return window;
++}
++
+ template <typename Fn>
+-inline sd::Tensor<float> process_vae_temporal_tiles(const sd::Tensor<float>& input,
+-                                                    const VAETemporalTilePlan& plan,
+-                                                    Fn&& on_processing,
+-                                                    int64_t expected_frames = 0) {
+-    if (plan.tiles.size() == 1 && plan.tiles.front().start == 0 && plan.tiles.front().end == input.shape()[2]) {
+-        auto output = on_processing(input, plan.tiles.front());
++inline sd::Tensor<float> assemble_vae_temporal_tiles(const VAETemporalTilePlan& plan,
++                                                     Fn&& run_tile, int64_t expected_frames) {
++    if (plan.tiles.size() == 1) {
++        auto output = run_tile(plan.tiles.front());
+         if (expected_frames > 0 && (output.dim() < 3 || output.shape()[2] != expected_frames)) {
+             return {};
+         }
+@@ -115,8 +130,7 @@
+     sd::Tensor<float> output;
+     int64_t written = 0;
+     for (const auto& tile : plan.tiles) {
+-        auto input_tile  = sd::ops::slice(input, 2, tile.start, tile.end);
+-        auto output_tile = on_processing(input_tile, tile);
++        auto output_tile = run_tile(tile);
+         if (output_tile.empty()) {
+             return {};
+         }
+@@ -152,6 +166,19 @@
+         return {};
+     }
+     return output;
++}
++
++template <typename Fn>
++inline sd::Tensor<float> process_vae_temporal_tiles(const sd::Tensor<float>& input,
++                                                    const VAETemporalTilePlan& plan,
++                                                    Fn&& on_processing,
++                                                    int64_t expected_frames = 0) {
++    return assemble_vae_temporal_tiles(plan, [&](const VAETemporalTile& tile) {
++        if (tile.start == 0 && tile.end == input.shape()[2]) {
++            return on_processing(input, tile);
++        }
++        return on_processing(sd::ops::slice(input, 2, tile.start, tile.end), tile);
++    }, expected_frames);
+ }
+ 
+ template <typename FrameCount, typename FrameOffset, typename Fn>
+--- a/src/model/vae/vae.hpp
++++ b/src/model/vae/vae.hpp
+@@ -100,6 +100,12 @@
+         return _compute_temporal_tiled(n_threads, input, direction, config);
+     }
+ 
++    virtual sd::Tensor<float> encode_reference_tile(int n_threads, const sd::Tensor<float>& first,
++                                                    int frames, const sd_tiling_params_t& params) {
++        return compute_with_temporal_tiling(n_threads, wan_reference_window(first, 0, frames),
++                                            VAETemporalDirection::ENCODE, params);
++    }
++
+     static inline void scale_tensor_to_minus1_1(sd::Tensor<float>* tensor) {
+         GGML_ASSERT(tensor != nullptr);
+         for (int64_t i = 0; i < tensor->numel(); ++i) {
+@@ -128,13 +134,14 @@
+                                     bool decode_graph,
+                                     const sd_tiling_params_t& tiling_params,
+                                     const char* error_message,
+-                                    bool silent = false) {
++                                    bool silent = false,
++                                    int reference_frames = 0) {
+         auto on_processing = [&](const sd::Tensor<float>& input_tile) {
+-            auto output_tile = compute_with_temporal_tiling(
+-                n_threads,
+-                input_tile,
+-                decode_graph ? VAETemporalDirection::DECODE : VAETemporalDirection::ENCODE,
+-                tiling_params);
++            auto output_tile = reference_frames > 0
++                ? encode_reference_tile(n_threads, input_tile, reference_frames, tiling_params)
++                : compute_with_temporal_tiling(n_threads, input_tile,
++                                               decode_graph ? VAETemporalDirection::DECODE : VAETemporalDirection::ENCODE,
++                                               tiling_params);
+             if (output_tile.empty()) {
+                 LOG_ERROR("%s", error_message);
+                 return sd::Tensor<float>();
+@@ -261,7 +268,8 @@
+                              bool circular_x,
+                              bool circular_y,
+                              bool auto_end,
+-                             bool input_already_scaled = false) {
++                             bool input_already_scaled = false,
++                             int reference_frames = 0) {
+         int64_t t0              = ggml_time_ms();
+         tiling_params           = resolve_tiling_params(tiling_params);
+         sd::Tensor<float> output;
+@@ -292,7 +300,11 @@
+                                    circular_y,
+                                    false,
+                                    tiling_params,
+-                                   "vae encode compute failed while processing a tile");
++                                   "vae encode compute failed while processing a tile",
++                                   false,
++                                   reference_frames);
++        } else if (reference_frames > 0) {
++            output = encode_reference_tile(n_threads, input, reference_frames, tiling_params);
+         } else {
+             output = compute_with_temporal_tiling(n_threads,
+                                                   input,
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -663,6 +663,7 @@
+         ggml_tensor* output = nullptr;
+         int next_feature = 0;
+         int next_block = 0;
++        int next_stage = 2;
+     };
+ 
+     class Encoder3d : public GGMLBlock {
+@@ -754,7 +755,7 @@
+                              int64_t b,
+                              std::vector<ggml_tensor*>& feat_cache,
+                              int& feat_idx,
+-                             int chunk_idx, NeutralEncoderPrefix* neutral_prefix = nullptr) {
++                             int chunk_idx, NeutralEncoderPrefix* neutral_prefix, NeutralEncoderPrefix& deeper) {
+             // x: [b*c, t, h, w]
+             GGML_ASSERT(b == 1);
+             auto conv1    = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv1"]);
+@@ -771,10 +772,17 @@
+             const bool eligible = neutral_prefix && chunk_idx >= 7 && !wan2_2 && !is_2D &&
+                                   num_res_blocks == 2 && temperal_downsample.size() >= 2 &&
+                                   !temperal_downsample[0] && temperal_downsample[1];
+-            const bool reuse = eligible && neutral_prefix->output;
++            // On the four-stage 2.1 encoder each additional pair of residual blocks
++            // adds four causal 3-tap convolutions. Including the stride-2 time
++            // convolution, stage 2 sees at most 41 source frames and stage 3
++            // sees at most 73. Groups 16 and 24 start at frames 61 and 93.
++            const bool deep_eligible = eligible && dim_mult.size() == 4 &&
++                                       temperal_downsample.size() == 3 && temperal_downsample[2];
++            auto* cached = deep_eligible && deeper.output ? &deeper : neutral_prefix;
++            const bool reuse = eligible && cached->output;
+             if (reuse) {
+-                x = neutral_prefix->output;
+-                feat_idx = neutral_prefix->next_feature;
++                x = cached->output;
++                feat_idx = cached->next_feature;
+             } else if (is_2D) {
+                 auto conv1 = std::dynamic_pointer_cast<Conv2dBut3d>(blocks["conv1"]);
+                 x          = conv1->forward(ctx, x);
+@@ -802,8 +810,8 @@
+             for (int u : dim_mult) {
+                 dims.push_back(dim * u);
+             }
+-            int index = reuse ? neutral_prefix->next_block : 0;
+-            for (int i = reuse ? 2 : 0; i < dims.size() - 1; i++) {
++            int index = reuse ? cached->next_block : 0;
++            for (int i = reuse ? cached->next_stage : 0; i < dims.size() - 1; i++) {
+                 if (wan2_2) {
+                     auto layer = std::dynamic_pointer_cast<Down_ResidualBlock>(blocks["downsamples." + std::to_string(index++)]);
+ 
+@@ -823,6 +831,9 @@
+                 }
+                 if (eligible && i == 1) {
+                     *neutral_prefix = {x, feat_idx, index};
++                } else if (deep_eligible && ((i == 2 && chunk_idx >= 16) || (i == 3 && chunk_idx >= 24))) {
++                    // Graph-local only. Do not pin another activation between graphs or tiles.
++                    deeper = {x, feat_idx, index, i + 1};
+                 }
+                 // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.encoder.down." + std::to_string(i), "x");
+             }
+@@ -1231,6 +1242,7 @@
+             const int64_t groups = first_group == 0 ? 1 + (x->ne[2] - 1) / 4 : x->ne[2] / 4;
+             ggml_tensor* out = nullptr;
+             NeutralEncoderPrefix local_prefix;
++            NeutralEncoderPrefix deeper;
+             auto* prefix = neutral_tail ? (carried_prefix ? carried_prefix : &local_prefix) : nullptr;
+             int64_t offset = 0;
+             for (int i = 0; i < groups; ++i) {
+@@ -1238,7 +1250,7 @@
+                 const int count = group == 0 ? 1 : 4;
+                 _enc_conv_idx = 0;
+                 auto in = ggml_ext_slice(ctx, x, 2, offset, offset + (is_2D ? 1 : count));
+-                auto encoded = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, group, prefix);
++                auto encoded = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, group, prefix, deeper);
+                 out = out ? ggml_concat(ctx->ggml_ctx, out, encoded, 2) : encoded;
+                 offset += count;
+             }
+@@ -1556,15 +1568,23 @@
+         // even when all model weights fit. Bound its lifetime per spatial tile.
+         static constexpr int encode_groups_per_graph = 8;
+ 
+-        sd::Tensor<float> encode_blocks(int n_threads, const sd::Tensor<float>& input) {
+-            const int64_t groups = 1 + (input.shape()[2] - 1) / 4;
++        sd::Tensor<float> encode_reference_tile(int n_threads, const sd::Tensor<float>& first,
++                                                int frames, const sd_tiling_params_t& params) override {
++            if (supports_wan_encode_blocks() && (frames - 1) / 4 >= encode_groups_per_graph) {
++                return encode_blocks(n_threads, first, frames);
++            }
++            return VAE::encode_reference_tile(n_threads, first, frames, params);
++        }
++
++        sd::Tensor<float> encode_blocks(int n_threads, const sd::Tensor<float>& input, int reference_frames = 0) {
++            const int64_t groups = 1 + ((reference_frames ? reference_frames : input.shape()[2]) - 1) / 4;
+             // Check the actual tiled VAE input. End frames, video edits, signed zero
+             // or any other non-neutral sample use the ordinary causal encoder.
+             bool neutral_tail = version == VERSION_WAN2 && !ae.wan2_2 && !ae.is_2D &&
+                                 input.dim() == 5 && input.shape()[3] == 3 && input.shape()[4] == 1 &&
+                                 groups > encode_groups_per_graph && std::getenv("WILDLLAMA_VIDEO_PROGRESS") &&
+                                 sd_backend_is(runtime_backend, "CUDA");
+-            if (neutral_tail) {
++            if (neutral_tail && !reference_frames) {
+                 const size_t plane = size_t(input.shape()[0]) * input.shape()[1];
+                 const size_t channel = plane * input.shape()[2];
+                 const size_t bytes = (channel - plane) * sizeof(float);
+@@ -1591,7 +1611,7 @@
+             int prefix_feature = 0;
+             int prefix_block = 0;
+             const bool carry_prefix = neutral_tail && !std::getenv("WILDLLAMA_WAN_DISABLE_PREFIX_CACHE");
+-            auto output = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& frames, const VAETemporalTile& tile) {
++            auto encode_window = [&](const sd::Tensor<float>& frames, const VAETemporalTile& tile) {
+                 if (std::getenv("WILDLLAMA_VIDEO_PROGRESS")) LOG_INFO("wildvideo chunk %d/%zu", tile.index, plan.tiles.size());
+                 auto get_graph = [&]() {
+                     ae.clear_cache();
+@@ -1632,7 +1652,12 @@
+                     return graph;
+                 };
+                 return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), input.dim());
+-            }, groups);
++            };
++            auto output = reference_frames
++                ? assemble_vae_temporal_tiles(plan, [&](const VAETemporalTile& tile) {
++                      return encode_window(wan_reference_window(input, tile.start, tile.end), tile);
++                  }, groups)
++                : process_vae_temporal_tiles(input, plan, encode_window, groups);
+             free_cache_ctx_and_buffer();
+             ae.clear_cache();
+             return output;
+--- a/src/pipeline/video.cpp
++++ b/src/pipeline/video.cpp
+@@ -1042,11 +1042,14 @@
+                     sd->first_stage_model->scales_input_pixels() && start_image.numel() == plane * 3;
+                 // Neutral 0.5 is exactly zero in VAE space. Leave the blank frames
+                 // zero-initialized and transform only the actual RGB reference.
+-                const std::vector<int64_t> shape{request->width, request->height, frames, 3, 1};
++                const bool sparse = normalized && sd->version == VERSION_WAN2 &&
++                    sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B";
++                const int stored_frames = sparse ? 1 : frames;
++                const std::vector<int64_t> shape{request->width, request->height, stored_frames, 3, 1};
+                 auto image = normalized ? sd::zeros<float>(shape) : sd::full<float>(shape, 0.5f);
+                 if (normalized) {
+                     for (size_t ch = 0; ch < 3; ++ch) {
+-                        auto dest = image.data() + ch * frames * plane;
++                        auto dest = image.data() + ch * stored_frames * plane;
+                         const auto pixels = start_image.data() + ch * plane;
+                         for (size_t i = 0; i < plane; ++i) dest[i] = pixels[i] * 2.0f - 1.0f;
+                     }
+@@ -1061,7 +1064,7 @@
+                     // Wan's encoder already returns latents. Normalize the owned input clip in place.
+                     sd->generation_progress.report("vae_encode");
+                     auto encoded = sd->first_stage_model->encode(sd->n_threads, std::move(image), sd->vae_tiling_params,
+-                                                                  sd->circular_x, sd->circular_y, true, normalized);
++                                                                  sd->circular_x, sd->circular_y, true, normalized, sparse ? frames : 0);
+                     if (!encoded.empty()) {
+                         return sd->first_stage_model->vae_to_diffusion_latents(encoded);
+                     }

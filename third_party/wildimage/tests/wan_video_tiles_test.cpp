@@ -79,9 +79,36 @@ static void check_wan_decode_plan() {
     assert(!sd_plan_wan_decode_tiles(params, 96, 128, 8, 12 * gib, 4 * gib));
 }
 
+static void check_sparse_reference(int frames) {
+    using Tensor = sd::Tensor<float>;
+    Tensor first({11, 9, 1, 3, 1});
+    for (int64_t i = 0; i < first.numel(); ++i) first[i] = float(i - 97) / 128.f;
+    first[0] = -0.0f;
+    Tensor dense({11, 9, frames, 3, 1});
+    sd::ops::slice_assign(&dense, 2, 0, 1, first);
+    const auto plan = make_vae_temporal_tile_plan(frames, {32, 0, 1});
+    auto compare = [&](const Tensor& source, bool sparse) {
+        return process_tiles_2d(source, 11, 9, 1, 7, 6, .25f, true, true, [&](const Tensor& tile) {
+            if (sparse) {
+                return assemble_vae_temporal_tiles(plan, [&](const VAETemporalTile& span) {
+                    return wan_reference_window(tile, span.start, span.end);
+                }, frames);
+            }
+            return tile;
+        }, true);
+    };
+    const auto actual = compare(first, true);
+    const auto expected = compare(dense, false);
+    assert(actual.shape() == expected.shape());
+    assert(std::memcmp(actual.data(), expected.data(), actual.numel() * sizeof(float)) == 0);
+}
+
 int main() {
     check_wan_decode_plan();
     ggml_time_init();
+    check_sparse_reference(5);
+    check_sparse_reference(33);
+    check_sparse_reference(109);
     const auto previous_peak = assembly_peak(false);
     const auto direct_peak = assembly_peak(true);
     assert(direct_peak < previous_peak);
