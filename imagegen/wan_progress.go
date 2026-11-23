@@ -11,6 +11,7 @@ import (
 // The percentage estimates overall work. It advances on native events, never on a timer.
 // The step counter comes from the sampler; segment counters subdivide an evaluation.
 type wanProgress struct {
+	savedStep, resumedStep                            int
 	stage                                             string
 	attempt, high, evaluations, evaluation, stepsDone int
 	tile, tiles, chunk, chunks, segment, segments     int
@@ -19,7 +20,7 @@ type wanProgress struct {
 }
 
 func (w *wanProgress) restart(cfg float64) {
-	*w = wanProgress{attempt: w.attempt + 1, high: w.high, evaluations: 1, tiles: 1}
+	*w = wanProgress{attempt: w.attempt + 1, high: w.high, savedStep: w.savedStep, evaluations: 1, tiles: 1}
 	if cfg > 1 {
 		w.evaluations = 2
 	}
@@ -42,6 +43,13 @@ func (w *wanProgress) observe(line string, steps int) (Progress, bool) {
 		}
 	}
 	switch {
+	case total == steps && n > 0 && strings.Contains(line, "wildvideo saved step "):
+		w.savedStep = max(w.savedStep, n)
+		return Progress{}, false
+	case total == steps && n > 0 && strings.Contains(line, "wildvideo resumed step "):
+		w.stepsDone, w.resumedStep, w.stage, w.samplingSince = n, n, "sample", time.Now()
+		w.high = max(w.high, 30+56*n/steps)
+		return Progress{Phase: "sampling", Message: fmt.Sprintf("Retomado da RAM · %d/%d passos já concluídos", n, steps), Current: n, Total: steps, VideoPercent: w.high, VideoAttempt: w.attempt}, true
 	case strings.Contains(line, "auto-fit: --backend") && strings.Contains(line, "--params-backend") && strings.Contains(line, "=cpu"):
 		w.hostWeights = true
 		return Progress{Phase: "preparing", Message: "GPU selecionada para o cálculo, com pesos na RAM", VideoPercent: w.high, VideoAttempt: w.attempt, VideoHostWeights: true}, true
@@ -118,8 +126,9 @@ func (w *wanProgress) observe(line string, steps int) (Progress, bool) {
 			p.Message += fmt.Sprintf(" · segmentos concluídos %d/%d", w.segment, w.segments)
 		}
 		local = 30 + 56*f
-		if elapsed := time.Since(w.samplingSince).Seconds(); f >= 0.05 && elapsed >= 4 {
-			p.VideoETASeconds = int(math.Ceil(elapsed / f * ((1 - f) + 12./56)))
+		newWork := f - float64(w.resumedStep)/float64(steps)
+		if elapsed := time.Since(w.samplingSince).Seconds(); newWork >= 0.05 && elapsed >= 4 {
+			p.VideoETASeconds = int(math.Ceil(elapsed / newWork * ((1 - f) + 12./56)))
 		}
 	case "save":
 		p.Phase, p.Message, local = "saving", "Finalizando e gravando o arquivo WebM", 99

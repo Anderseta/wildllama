@@ -639,23 +639,36 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		residentFailedAt = r.GPUResidentFailedAtMiB
 		log.emit(Progress{Phase: "ram_offload", Message: "Reutilizando a execução em GPU com apoio da RAM, validada neste lote."}, true)
 	}
-	var reference wanReference
-	if r.Video != nil && !r.CPUOnly && p.OffloadToCPU && p.ModelID == WanRapidI2V && r.Video.Frames >= 65 {
-		size := int64(p.Width/8)*int64(p.Height/8)*int64(1+(r.Video.Frames-1)/4)*16*4 + 1
-		maxBytes := int64(p.MaxRAMMiB) << 20
-		if size <= 256<<20 && (maxBytes == 0 || size <= maxBytes/16) {
-			reference = newWanReference(size)
+	var reference, checkpoint wanReference
+	if r.Video != nil && !r.CPUOnly && p.OffloadToCPU && p.ModelID == WanRapidI2V {
+		latentBytes := int64(p.Width/8) * int64(p.Height/8) * int64(1+(r.Video.Frames-1)/4) * 16 * 4
+		budget := int64(256 << 20)
+		if p.MaxRAMMiB > 0 {
+			budget = min(budget, (int64(p.MaxRAMMiB)<<20)/16)
+		}
+		if r.Video.Frames >= 65 && latentBytes+1 <= budget {
+			reference = newWanReference(latentBytes + 1)
 			if reference.close != nil {
 				defer reference.close()
+				budget -= latentBytes + 1
+			}
+		}
+		// Two alternating slots preserve the last complete Euler A step even
+		// if a child exits during the next copy. The parent owns their lifetime.
+		if size := 16 + 2*latentBytes; p.Steps > 1 && p.Sampler == "euler_a" && size <= budget {
+			checkpoint = newWanReference(size)
+			if checkpoint.close != nil {
+				defer checkpoint.close()
 			}
 		}
 	}
 	var runErr error
 	var decoded image.Image
 	eagerCUDA := false
+	retriedStep := false
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
-		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log, reference)
+		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log, reference, checkpoint)
 		select {
 		case diskErr := <-diskGuard:
 			runErr = diskErr
@@ -667,7 +680,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		}
 		retryCUDA := allowCUDARetry && !eagerCUDA && cudaload.IsSharedObjectInitFailure(log.tail())
 		retryMemory := p.OffloadToCPU && exit.ExitCode() == GPUOutOfMemoryExitCode
-		if !retryCUDA && !retryMemory {
+		// Retry a terminated native process once with the last published step.
+		// Host-budget exits, validation errors and user cancellations stay final.
+		nativeCrash := exit.ExitCode() < 0 || runtime.GOOS == "windows" && uint64(exit.ExitCode()) >= 0x80000000
+		resume := !retriedStep && checkpoint.name != "" && log.wan.savedStep > 0 && (nativeCrash || retryMemory && mode == imageRAMGPU)
+		if !retryCUDA && !retryMemory && !resume {
 			break
 		}
 		if r.Video != nil {
@@ -689,6 +706,12 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if retryCUDA {
 			eagerCUDA = true
 			log.emit(Progress{Phase: "cuda_module_retry", Message: "O CUDA falhou ao inicializar um kernel. Tentando novamente na GPU com carregamento antecipado e a mesma seed."}, true)
+			continue
+		}
+		if resume {
+			retriedStep = true
+			mode = imageRAMGPU
+			log.emit(Progress{Phase: "ram_offload", Message: fmt.Sprintf("Reabrindo o gerador na GPU com o passo %d salvo na RAM.", log.wan.savedStep)}, true)
 			continue
 		}
 		if mode == imageGPUResident {
@@ -759,7 +782,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	return result, nil
 }
 
-func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode, eagerCUDA bool, status RunnerStatus, log *progressLog, reference wanReference) error {
+func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode, eagerCUDA bool, status RunnerStatus, log *progressLog, reference, checkpoint wanReference) error {
 	args := buildArgumentsForMode(p, r, jobDir, output, seed, mode)
 	if mode == imageRAMCPU {
 		// CPU conditioning gets a separate exact cache namespace. The saved
@@ -774,11 +797,9 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 		if mode != imageRAMCPU && (p.Steps > 1 || p.CFGScale > 1) {
 			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_WEIGHT_CACHE=1")
 		}
-		if mode != imageRAMCPU && reference.name != "" {
-			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_REFERENCE="+reference.name)
-			if reference.file != nil {
-				cmd.ExtraFiles = []*os.File{reference.file}
-			}
+		if mode != imageRAMCPU {
+			reference.pass(cmd, "WILDLLAMA_WAN_REFERENCE")
+			checkpoint.pass(cmd, "WILDLLAMA_WAN_STEP")
 		}
 	}
 	if eagerCUDA && mode != imageRAMCPU {
@@ -1085,7 +1106,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	if runtime.GOOS == "windows" && strings.TrimSpace(os.Getenv("WILDIMAGE_CUDA_WAIT")) == "" {
 		set("WILDIMAGE_CUDA_WAIT", "blocking")
 	}
-	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_WEIGHT_CACHE"} {
+	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_STEP", "WILDLLAMA_WAN_WEIGHT_CACHE"} {
 		set(key, "")
 	}
 	set("PATH", filepath.Dir(config.RunnerPath)+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -1,0 +1,272 @@
+diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
+--- a/src/pipeline/video.cpp
++++ b/src/pipeline/video.cpp
+@@ -17,6 +17,7 @@
+ #include "conditioning/wan_audio.h"
+ #include "core/rng.hpp"
+ #include "core/rng_philox.hpp"
++#include "core/wan_shared_memory.h"
+ #include "diffusion_engine.h"
+ #include "model/diffusion/minimax_h3.hpp"
+ #include "model/upscaler/h3_latent_upscaler.hpp"
+@@ -55,40 +56,7 @@
+         return true;
+     }
+ 
+-    // The parent owns a fresh, anonymous shared-memory object per job.
+-    // Publish the rank last so a killed writer cannot publish a partial payload.
+-    struct WanReferenceMemory {
+-        unsigned char* data = nullptr;
+-        size_t bytes;
+-        explicit WanReferenceMemory(const char* name, size_t size) : bytes(size) {
+-            if (!name || size == 0) return;
+-#if defined(_WIN32)
+-            if (std::strncmp(name, "Local\\wildllama-wan-", sizeof("Local\\wildllama-wan-") - 1) != 0) return;
+-            HANDLE mapping = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
+-            if (mapping) {
+-                data = static_cast<unsigned char*>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size));
+-                CloseHandle(mapping);
+-            }
+-#elif defined(__linux__)
+-            struct stat info{};
+-            if (std::strcmp(name, "fd:3") != 0 || fstat(3, &info) || info.st_size != static_cast<off_t>(size)) return;
+-            void* view = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, 3, 0);
+-            if (view != MAP_FAILED) data = static_cast<unsigned char*>(view);
+-#endif
+-        }
+-        ~WanReferenceMemory() {
+-            if (!data) return;
+-#if defined(_WIN32)
+-            UnmapViewOfFile(data);
+-#elif defined(__linux__)
+-            munmap(data, bytes);
+-#endif
+-        }
+-        WanReferenceMemory(const WanReferenceMemory&) = delete;
+-        WanReferenceMemory& operator=(const WanReferenceMemory&) = delete;
+-    };
+-
+-    static sd::Tensor<float> restore_wan_reference(const WanReferenceMemory& mem, std::vector<int64_t> shape) {
++    static sd::Tensor<float> restore_wan_reference(const WanSharedMemory& mem, std::vector<int64_t> shape) {
+         if (!mem.data) return {};
+         const int rank = mem.data[0];
+         if (rank != 4 && rank != 5) return {};
+@@ -99,7 +67,7 @@
+         return result;
+     }
+ 
+-    static void save_wan_reference(WanReferenceMemory& mem, const sd::Tensor<float>& value,
++    static void save_wan_reference(WanSharedMemory& mem, const sd::Tensor<float>& value,
+                                    const std::vector<int64_t>& expected) {
+         if (!mem.data || (value.dim() != 4 && value.dim() != 5) ||
+             !std::equal(value.shape().begin(), value.shape().end(), expected.begin()) ||
+@@ -1096,7 +1064,7 @@
+                 retry_name = std::getenv("WILDLLAMA_WAN_REFERENCE");
+             }
+             const std::vector<int64_t> shape{request->width / 8, request->height / 8, (request->frames - 1) / 4 + 1, 16, 1};
+-            WanReferenceMemory retry(retry_name, 1 + size_t(shape[0]) * shape[1] * shape[2] * shape[3] * sizeof(float));
++            WanSharedMemory retry(retry_name, 1 + size_t(shape[0]) * shape[1] * shape[2] * shape[3] * sizeof(float));
+             auto concat_latent = restore_wan_reference(retry, shape);
+             if (concat_latent.empty()) {
+                 concat_latent = encode_clip(constant_tail ? 125 : request->frames);
+diff --git a/src/core/wan_shared_memory.h b/src/core/wan_shared_memory.h
+new file mode 100644
+--- /dev/null
++++ b/src/core/wan_shared_memory.h
+@@ -0,0 +1,43 @@
++#pragma once
++#include <cstddef>
++#include <cstring>
++#if defined(_WIN32)
++#include "core/wildimage_ram_budget.h"
++#elif defined(__linux__)
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++// The parent owns a fresh, anonymous shared-memory object per job.
++struct WanSharedMemory {
++    unsigned char* data = nullptr;
++    size_t bytes;
++    explicit WanSharedMemory(const char* name, size_t size) : bytes(size) {
++        if (!name || size == 0) return;
++#if defined(_WIN32)
++        if (std::strncmp(name, "Local\\wildllama-wan-", sizeof("Local\\wildllama-wan-") - 1) != 0) return;
++        HANDLE mapping = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
++        if (mapping) {
++            data = static_cast<unsigned char*>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size));
++            CloseHandle(mapping);
++        }
++#elif defined(__linux__)
++        struct stat info{};
++        int fd = std::strcmp(name, "fd:3") == 0 ? 3 : std::strcmp(name, "fd:4") == 0 ? 4 : -1;
++        if (fd < 0 || fstat(fd, &info) || info.st_size != static_cast<off_t>(size)) return;
++        void* view = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        if (view != MAP_FAILED) data = static_cast<unsigned char*>(view);
++#endif
++    }
++    ~WanSharedMemory() {
++        if (!data) return;
++#if defined(_WIN32)
++        UnmapViewOfFile(data);
++#elif defined(__linux__)
++        munmap(data, bytes);
++#endif
++    }
++    WanSharedMemory(const WanSharedMemory&) = delete;
++    WanSharedMemory& operator=(const WanSharedMemory&) = delete;
++};
+diff --git a/src/runtime/wan_step_checkpoint.hpp b/src/runtime/wan_step_checkpoint.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/runtime/wan_step_checkpoint.hpp
+@@ -0,0 +1,62 @@
++#pragma once
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include "core/tensor.hpp"
++#include "core/wan_shared_memory.h"
++
++// The parent creates this mapping for one immutable job and waits for each
++// runner to exit before starting its successor. The aligned step is published
++// only after the other slot has received the complete, native float tensor.
++class WanStepCheckpoint {
++    size_t bytes_;
++    WanSharedMemory memory_;
++    uint32_t signature_ = 2166136261u;
++
++    uint32_t step() const {
++        uint32_t n = 0;
++        std::memcpy(&n, memory_.data, sizeof(n));
++        return n;
++    }
++    void publish(uint32_t n) {
++#if defined(_WIN32)
++        InterlockedExchange(reinterpret_cast<volatile LONG*>(memory_.data), static_cast<LONG>(n));
++#elif defined(__linux__)
++        __atomic_store_n(reinterpret_cast<uint32_t*>(memory_.data), n, __ATOMIC_RELEASE);
++#endif
++    }
++    void sign(const void* input, size_t count) {
++        auto data = static_cast<const unsigned char*>(input);
++        for (size_t i = 0; i < count; ++i) signature_ = (signature_ ^ data[i]) * 16777619u;
++    }
++
++public:
++    WanStepCheckpoint(const char* name, const sd::Tensor<float>& x, const std::vector<float>& sigmas, float eta)
++        : bytes_(x.numel() * sizeof(float)), memory_(name, bytes_ <= (size_t{128} << 20) ? 16 + 2 * bytes_ : 0) {
++        if (!memory_.data) return;
++        const auto& shape = x.shape();
++        sign(shape.data(), shape.size() * sizeof(shape[0]));
++        sign(sigmas.data(), sigmas.size() * sizeof(float));
++        sign(&eta, sizeof(eta));
++        uint32_t stored = 0;
++        std::memcpy(&stored, memory_.data + 4, sizeof(stored));
++        if (stored != signature_) {
++            publish(0);
++            std::memcpy(memory_.data + 4, &signature_, sizeof(signature_));
++        }
++    }
++    int restore(sd::Tensor<float>& x, int steps) const {
++        if (!memory_.data) return 0;
++        const uint32_t n = step();
++        if (n == 0 || n > static_cast<uint32_t>(steps)) return 0;
++        std::memcpy(x.data(), memory_.data + 16 + (n % 2) * bytes_, bytes_);
++        LOG_INFO("wildvideo resumed step %u/%d", n, steps);
++        return static_cast<int>(n);
++    }
++    void save(const sd::Tensor<float>& x, int n, int total) {
++        if (!memory_.data || x.numel() * sizeof(float) != bytes_) return;
++        std::memcpy(memory_.data + 16 + (n % 2) * bytes_, x.data(), bytes_);
++        publish(static_cast<uint32_t>(n));
++        LOG_INFO("wildvideo saved step %d/%d in RAM", n, total);
++    }
++};
+diff --git a/src/runtime/denoiser.hpp b/src/runtime/denoiser.hpp
+--- a/src/runtime/denoiser.hpp
++++ b/src/runtime/denoiser.hpp
+@@ -20,6 +20,7 @@
+ #include "model.h"
+ #include "runtime/gits_noise.h"
+ #include "runtime/guidance.h"
++#include "runtime/wan_step_checkpoint.hpp"
+ 
+ /*================================================= CompVisDenoiser ==================================================*/
+ 
+@@ -1806,9 +1807,20 @@
+                                                 const std::vector<float>& sigmas,
+                                                 NoiseSampler& noise_sampler,
+                                                 bool is_flow_denoiser = false,
+-                                                float eta             = 0.f) {
++                                                float eta             = 0.f,
++                                                WanStepCheckpoint* checkpoint = nullptr) {
+     int steps = static_cast<int>(sigmas.size()) - 1;
++    const int completed = checkpoint ? checkpoint->restore(x, steps) : 0;
+     for (int i = 0; i < steps; i++) {
++        if (i < completed) {
++            // Replay only the original IID draws to restore the sampler RNG.
++            // No denoiser, attention or other model work is repeated.
++            if (eta != 0.f && sigmas[i + 1] != 0.f &&
++                std::get<1>(get_ancestral_step(sigmas[i], sigmas[i + 1], eta, is_flow_denoiser)) > 0.f) {
++                noise_sampler(sigmas[i], sigmas[i + 1]);
++            }
++            continue;
++        }
+         float sigma       = sigmas[i];
+         float sigma_to    = sigmas[i + 1];
+         auto denoised_opt = model(x, sigma, i + 1);
+@@ -1832,6 +1844,7 @@
+                 x += noise_sampler(sigma, sigma_to) * sigma_up;
+             }
+         }
++        if (checkpoint) checkpoint->save(x, i + 1, steps);
+     }
+     return x;
+ }
+@@ -3108,7 +3121,8 @@
+                                             float eta,
+                                             bool is_flow_denoiser,
+                                             const char* extra_sample_args,
+-                                            std::shared_ptr<Denoiser> denoiser_for_dispatch = nullptr) {
++                                            std::shared_ptr<Denoiser> denoiser_for_dispatch = nullptr,
++                                            bool allow_wan_step_resume = false) {
+     if (denoiser_for_dispatch) {
+         if (auto sefi = std::dynamic_pointer_cast<SefiFlowDenoiser>(denoiser_for_dispatch)) {
+             return sample_sefi_euler(sefi.get(), model, std::move(x));
+@@ -3119,8 +3133,14 @@
+     std::unique_ptr<NoiseSampler> noise_sampler = make_noise_sampler(x, rng, method, sigmas, extra_args);
+ 
+     switch (method) {
+-        case EULER_A_SAMPLE_METHOD:
++        case EULER_A_SAMPLE_METHOD: {
++            const char* name = allow_wan_step_resume && extra_args.empty() ? std::getenv("WILDLLAMA_WAN_STEP") : nullptr;
++            if (name) {
++                WanStepCheckpoint checkpoint(name, x, sigmas, eta);
++                return sample_euler_ancestral(model, std::move(x), sigmas, *noise_sampler, is_flow_denoiser, eta, &checkpoint);
++            }
+             return sample_euler_ancestral(model, std::move(x), sigmas, *noise_sampler, is_flow_denoiser, eta);
++        }
+         case EULER_SAMPLE_METHOD:
+             return sample_euler(model, std::move(x), sigmas);
+         case HEUN_SAMPLE_METHOD:
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -2913,7 +2913,14 @@
+         LOG_DEBUG("sigmas: %s", oss.str().c_str());
+     }
+ 
+-    auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args, denoiser);
++    // Other samplers, stateful guidance/caches and multi-stage models can
++    // depend on more than the latent and RNG. Only resume the plain Wan flow.
++    const bool wan_resume = (version == VERSION_WAN2 || version == VERSION_WAN2_2_I2V) &&
++                            !high_noise_diffusion_model && work_diffusion_model == diffusion_model &&
++                            (!cache_params || cache_params->mode == SD_CACHE_DISABLED) && !use_apg_guidance &&
++                            !has_skiplayer && std::none_of(generation_extensions.begin(), generation_extensions.end(),
++                                                          [](const auto& extension) { return extension->is_enabled(); });
++    auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args, denoiser, wan_resume);
+     if (x0_opt.empty()) {
+         LOG_ERROR("Diffusion model sampling failed");
+         if (control_net) {

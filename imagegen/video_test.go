@@ -145,6 +145,25 @@ func TestWanVideoModesAndArguments(t *testing.T) {
 	r.Video.Frames = 32
 	require.Error(t, validateVideoMode(p, r))
 }
+
+func TestWanRestoresOnlyPublishedSamplerSteps(t *testing.T) {
+	var w wanProgress
+	w.restart(1)
+	_, emitted := w.observe("wildvideo saved step 1/4 in ram", 4)
+	require.False(t, emitted)
+	require.Equal(t, 1, w.savedStep)
+	w.restart(1)
+	p, ok := w.observe("wildvideo resumed step 1/4", 4)
+	require.True(t, ok)
+	require.Equal(t, 1, p.Current)
+	require.Equal(t, 44, p.VideoPercent)
+	p, ok = w.observe("wildvideo segment 61/122", 4)
+	require.True(t, ok)
+	require.Equal(t, 51, p.VideoPercent)
+	require.Contains(t, p.Message, "passo 2/4")
+	_, _ = w.observe("wildvideo saved step 3/12 in ram", 4)
+	require.Equal(t, 1, w.savedStep)
+}
 func TestWanVideoOnlyPublishesCompleteOutput(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("testdata", "wan-five-frames.webm"))
 	require.NoError(t, err)
