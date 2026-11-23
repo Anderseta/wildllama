@@ -1,0 +1,177 @@
+diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
+--- a/src/pipeline/video.cpp
++++ b/src/pipeline/video.cpp
+@@ -21,6 +21,32 @@
+ #include "runtime/image_preprocess.h"
+ 
+ namespace sd::pipeline {
++
++    // Wan 2.1's causal encoder sees at most 113 source frames: two
++    // temporal stride-2 convolutions, four residual stages and the middle
++    // blocks. At source frames 120 and 124 the first image is outside
++    // this window. Verify the stationary latent bitwise before extending it.
++    static bool extend_constant_wan_tail(sd::Tensor<float>& latent, int64_t frames) {
++        auto shape = latent.shape();
++        if (shape.size() < 4 || shape[2] != 32) return false;
++        const size_t plane = shape[0] * shape[1], times = shape[2];
++        const size_t channels = latent.numel() / (plane * times);
++        for (size_t c = 0; c < channels; ++c) {
++            auto last = latent.data() + ((c + 1) * times - 1) * plane;
++            if (std::memcmp(last, last - plane, plane * sizeof(float)) != 0) return false;
++        }
++        shape[2] = 1 + (frames - 1) / 4;
++        sd::Tensor<float> full(shape);
++        for (size_t c = 0; c < channels; ++c) {
++            auto dst = full.data() + c * shape[2] * plane;
++            auto in = latent.data() + c * times * plane;
++            std::copy_n(in, times * plane, dst);
++            for (int64_t i = times; i < shape[2]; ++i)
++                std::copy_n(in + (times - 1) * plane, plane, dst + i * plane);
++        }
++        latent = std::move(full);
++        return true;
++    }
+ 
+     static bool stage_wan_weights(SDVersion version) {
+         return wildimage_ram::budget().stage_components && (version == VERSION_WAN2 || version == VERSION_WAN2_2_I2V);
+@@ -978,25 +1004,37 @@
+             }
+ 
+             int64_t t1              = ggml_time_ms();
+-            sd::Tensor<float> image = sd::full<float>({request->width, request->height, request->frames, 3, 1}, 0.5f);
+-            if (!start_image.empty()) {
+-                sd::ops::slice_assign(&image, 2, 0, 1, start_image.unsqueeze(2));
+-            }
+-            if (!end_image.empty()) {
+-                sd::ops::slice_assign(&image, 2, request->frames - 1, request->frames, end_image.unsqueeze(2));
+-            }
+-
+-            sd::Tensor<float> concat_latent;
+-            if (sd->first_stage_model->get_desc() == "wan_vae") {
+-                // Wan's encoder already returns latents. Normalize the owned input clip in place.
+-                sd->generation_progress.report("vae_encode");
+-                auto encoded = sd->first_stage_model->encode(sd->n_threads, std::move(image), sd->vae_tiling_params,
+-                                                              sd->circular_x, sd->circular_y, true);
+-                if (!encoded.empty()) {
+-                    concat_latent = sd->first_stage_model->vae_to_diffusion_latents(encoded);
+-                }
+-            } else {
+-                concat_latent = sd->encode_first_stage(image);
++            const bool constant_tail = sd->version == VERSION_WAN2 && end_image.empty() &&
++                sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B" &&
++                sd->first_stage_model->get_desc() == "wan_vae" && request->frames > 129;
++            auto encode_clip = [&](int frames) -> sd::Tensor<float> {
++                sd::Tensor<float> image = sd::full<float>({request->width, request->height, frames, 3, 1}, 0.5f);
++                if (!start_image.empty()) {
++                    sd::ops::slice_assign(&image, 2, 0, 1, start_image.unsqueeze(2));
++                }
++                if (!end_image.empty()) {
++                    sd::ops::slice_assign(&image, 2, frames - 1, frames, end_image.unsqueeze(2));
++                }
++
++                if (sd->first_stage_model->get_desc() == "wan_vae") {
++                    // Wan's encoder already returns latents. Normalize the owned input clip in place.
++                    sd->generation_progress.report("vae_encode");
++                    auto encoded = sd->first_stage_model->encode(sd->n_threads, std::move(image), sd->vae_tiling_params,
++                                                                  sd->circular_x, sd->circular_y, true);
++                    if (!encoded.empty()) {
++                        return sd->first_stage_model->vae_to_diffusion_latents(encoded);
++                    }
++                } else {
++                    return sd->encode_first_stage(image);
++                }
++                return {};
++            };
++            auto concat_latent = encode_clip(constant_tail ? 125 : request->frames);
++            if (constant_tail && !concat_latent.empty() && !extend_constant_wan_tail(concat_latent, request->frames)) {
++                concat_latent = {};
++                concat_latent = encode_clip(request->frames);
++            } else if (constant_tail && !concat_latent.empty()) {
++                LOG_INFO("Wan reference encoded 125 source frames; stationary tail verified for %d", request->frames);
+             }
+             if (concat_latent.empty()) {
+                 LOG_ERROR("failed to encode video conditioning frames");
+@@ -1229,6 +1267,7 @@
+         condition_params.ref_image_params      = ref_image_params;
+ 
+         int64_t prepare_start_ms = ggml_time_ms();
++        LOG_INFO("wildvideo stage text");
+         sd->generation_progress.report("conditioning", "positive_prompt");
+         embeds.cond = sd->get_learned_condition(condition_params);
+         if (embeds.cond.empty()) {
+@@ -1253,6 +1292,7 @@
+         }
+         if (request.use_uncond) {
+             condition_params.text = request.negative_prompt;
++            LOG_INFO("wildvideo stage negative");
+             sd->generation_progress.report("conditioning", "negative_prompt");
+             embeds.uncond = sd->get_learned_condition(condition_params);
+             if (embeds.uncond.empty()) {
+diff --git a/src/core/execution_engine.cpp b/src/core/execution_engine.cpp
+--- a/src/core/execution_engine.cpp
++++ b/src/core/execution_engine.cpp
+@@ -589,6 +589,11 @@
+                 peak       = std::max(peak, session_.workspace_.bytes(backend));
+             }
+         };
++        const bool video_progress = std::getenv("WILDLLAMA_VIDEO_PROGRESS") != nullptr &&
++                                    task_.description.compare(0, 3, "Wan") == 0 &&
++                                    !plan.segments.empty() && plan.segments.front().group_name.rfind("wan.", 0) == 0;
++        int64_t last_video_report = 0;
++        if (video_progress) LOG_INFO("wildvideo segment 0/%zu", plan.segments.size());
+         for (size_t index = 0; index < plan.segments.size(); ++index) {
+             const auto& segment = plan.segments[index];
+             const bool last     = index + 1 == plan.segments.size();
+@@ -722,6 +727,13 @@
+             }
+             // Final outputs and their callbacks may still be views of consumed cuts.
+             session_.cut_cache_.prune(segment.future_cut_names);
++            if (video_progress) {
++                const int64_t now = ggml_time_ms();
++                if (last || now - last_video_report >= 350) {
++                    LOG_INFO("wildvideo segment %zu/%zu", index + 1, plan.segments.size());
++                    last_video_report = now;
++                }
++            }
+         }
+         if (segments_changed || peak_compute_bytes != session_.logged_compute_bytes_) {
+             for (const auto& entry : peak_compute_bytes) {
+diff --git a/src/runtime/tiling.cpp b/src/runtime/tiling.cpp
+--- a/src/runtime/tiling.cpp
++++ b/src/runtime/tiling.cpp
+@@ -177,6 +177,8 @@
+ 
+     const int num_tiles = static_cast<int>(tiles_x.size() * tiles_y.size());
+     int tile_count      = 0;
++    const bool video = input.dim() == 5 && std::getenv("WILDLLAMA_VIDEO_PROGRESS") != nullptr;
++    if (video) LOG_INFO("wildvideo tile 0/%d", num_tiles);
+     if (!silent) {
+         LOG_VERBOSE("num tiles : %d, %d ", static_cast<int>(tiles_x.size()), static_cast<int>(tiles_y.size()));
+         LOG_VERBOSE("processing %i tiles", num_tiles);
+@@ -197,6 +199,7 @@
+         for (const auto& x : tiles_x) {
+             int64_t t1       = ggml_time_ms();
+             auto input_tile  = sd_tensor_split_2d(input, input_tile_width, input_tile_height, x.offset * scale_in, y.offset * scale_in);
++            if (video && tile_count > 0) LOG_INFO("wildvideo tile %d/%d", tile_count, num_tiles);
+             auto output_tile = on_processing(input_tile);
+             if (output_tile.empty()) {
+                 return {};
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -1496,6 +1496,7 @@
+             }
+             free_cache_ctx_and_buffer();
+             auto output = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& frames, const VAETemporalTile& tile) {
++                if (std::getenv("WILDLLAMA_VIDEO_PROGRESS")) LOG_INFO("wildvideo chunk %d/%zu", tile.index, plan.tiles.size());
+                 auto get_graph = [&]() {
+                     ae.clear_cache();
+                     auto graph = new_graph_custom(10240 * encode_groups_per_graph);
+@@ -1550,6 +1551,7 @@
+             ae.clear_cache();
+ 
+             auto output = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& input_tile, const VAETemporalTile& tile) {
++                if (std::getenv("WILDLLAMA_VIDEO_PROGRESS")) LOG_INFO("wildvideo chunk %d/%zu", tile.index, plan.tiles.size());
+                 LOG_VERBOSE("Wan VAE temporal tile %d/%d: latent frames [%lld, %lld)",
+                             tile.index + 1,
+                             (int)plan.tiles.size(),

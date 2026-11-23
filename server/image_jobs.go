@@ -54,10 +54,15 @@ func (v *imageService) persistJobsLocked() error {
 }
 
 func (v *imageService) update(job *imageJob, phase, message string, current, total int64) {
-	v.updateImageProgress(job, phase, message, current, total, 0)
+	v.recordProgress(job, imagegen.Progress{Phase: phase, Message: message}, current, total)
 }
 
-func (v *imageService) updateImageProgress(job *imageJob, phase, message string, current, total int64, peakRSSBytes uint64) {
+func (v *imageService) updateImageProgress(job *imageJob, report imagegen.Progress) {
+	v.recordProgress(job, report, int64(report.Current), int64(report.Total))
+}
+
+func (v *imageService) recordProgress(job *imageJob, report imagegen.Progress, current, total int64) {
+	phase, message, peakRSSBytes := report.Phase, report.Message, report.PeakRSSBytes
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if peakRSSBytes > 0 {
@@ -69,8 +74,14 @@ func (v *imageService) updateImageProgress(job *imageJob, phase, message string,
 	job.trackImagePhase(phase, time.Now())
 	job.Phase = phase
 	previous := job.Progress
+	if job.Kind == "video" && (phase == "ram_offload" || phase == "cpu_fallback" || phase == "gpu_memory_limit") {
+		job.VideoMemoryIssue = message
+		if previous.VideoAttempt > 0 && previous.Message != "" {
+			job.VideoMemoryIssue += " Última etapa observada: " + previous.Message + "."
+		}
+	}
 	job.Progress = imageProgress{Current: current, Total: total, Message: message, BatchIndex: previous.BatchIndex, BatchCount: previous.BatchCount,
-		SamplingCurrent: previous.SamplingCurrent, SamplingTotal: previous.SamplingTotal}
+		SamplingCurrent: previous.SamplingCurrent, SamplingTotal: previous.SamplingTotal, VideoPercent: max(previous.VideoPercent, report.VideoPercent), VideoETASeconds: report.VideoETASeconds, VideoAttempt: max(previous.VideoAttempt, report.VideoAttempt)}
 	if phase == "starting" {
 		job.Progress.SamplingCurrent, job.Progress.SamplingTotal = 0, 0
 	} else if phase == "sampling" && total > 0 && current >= 0 && current <= total {
@@ -630,6 +641,9 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			}
 			beforeImageFree = free
 		}
+		if cpuOnly && job.Video != nil && !job.Video.AllowCPUFallback {
+			return errors.New("VRAM disponível insuficiente para iniciar o vídeo. Libere VRAM ou habilite a tentativa na CPU no perfil de vídeo.")
+		}
 		input.CPUOnly = cpuOnly
 		v.setImageComputeBackend(job, cpuOnly)
 		if cpuOnly {
@@ -638,7 +652,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
 		imageStarted = true
 		result, generationErr := engine.Run(job.ctx, runtimeProfile, input, func(progress imagegen.Progress) {
-			v.updateImageProgress(job, progress.Phase, progress.Message, int64(progress.Current), int64(progress.Total), progress.PeakRSSBytes)
+			v.updateImageProgress(job, progress)
 		})
 		if result.Path != "" {
 			var saveErr error

@@ -1,0 +1,85 @@
+diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
+--- a/src/pipeline/video.cpp
++++ b/src/pipeline/video.cpp
+@@ -4,6 +4,8 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdlib>
++#include <filesystem>
++#include <fstream>
+ #include <optional>
+ #include <utility>
+ 
+@@ -46,6 +48,41 @@
+         }
+         latent = std::move(full);
+         return true;
++    }
++
++    // The parent gives GPU attempts of one request the same private directory.
++    // Shape, components and reference stay fixed for its entire lifetime.
++    static sd::Tensor<float> restore_wan_reference(const std::filesystem::path& path, std::vector<int64_t> shape) {
++        if (path.empty()) return {};
++        std::ifstream in(path, std::ios::binary | std::ios::ate);
++        int64_t n = 1;
++        for (auto axis : shape) n *= axis;
++        if (!in || in.tellg() != static_cast<std::streamoff>(1 + n * sizeof(float))) return {};
++        in.seekg(0);
++        int rank = in.get();
++        if (rank != 4 && rank != 5) return {};
++        shape.resize(rank);
++        sd::Tensor<float> result(shape);
++        if (!in.read(reinterpret_cast<char*>(result.data()), n * sizeof(float))) return {};
++        return result;
++    }
++
++    static void save_wan_reference(const std::filesystem::path& path, const sd::Tensor<float>& value,
++                                   const std::vector<int64_t>& expected) {
++        if (path.empty() || (value.dim() != 4 && value.dim() != 5) ||
++            !std::equal(value.shape().begin(), value.shape().end(), expected.begin())) return;
++        std::error_code ec;
++        const auto bytes = static_cast<uintmax_t>(value.numel()) * sizeof(float);
++        auto disk = std::filesystem::space(path.parent_path(), ec);
++        if (ec || disk.available < bytes + (uintmax_t{256} << 20)) return;
++        auto part = path;
++        part += ".part";
++        std::ofstream out(part, std::ios::binary | std::ios::trunc);
++        out.put(static_cast<char>(value.dim()));
++        out.write(reinterpret_cast<const char*>(value.data()), bytes);
++        out.close();
++        if (out) std::filesystem::rename(part, path, ec);
++        std::filesystem::remove(part, ec);
+     }
+ 
+     static bool stage_wan_weights(SDVersion version) {
+@@ -1029,12 +1066,24 @@
+                 }
+                 return {};
+             };
+-            auto concat_latent = encode_clip(constant_tail ? 125 : request->frames);
+-            if (constant_tail && !concat_latent.empty() && !extend_constant_wan_tail(concat_latent, request->frames)) {
+-                concat_latent = {};
+-                concat_latent = encode_clip(request->frames);
+-            } else if (constant_tail && !concat_latent.empty()) {
+-                LOG_INFO("Wan reference encoded 125 source frames; stationary tail verified for %d", request->frames);
++            std::filesystem::path retry_file;
++            if (sd->version == VERSION_WAN2 && sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B" &&
++                sd->first_stage_model->get_desc() == "wan_vae") {
++                if (const char* path = std::getenv("WILDLLAMA_WAN_REFERENCE")) retry_file = std::filesystem::u8path(path);
++            }
++            const std::vector<int64_t> shape{request->width / 8, request->height / 8, (request->frames - 1) / 4 + 1, 16, 1};
++            auto concat_latent = restore_wan_reference(retry_file, shape);
++            if (concat_latent.empty()) {
++                concat_latent = encode_clip(constant_tail ? 125 : request->frames);
++                if (constant_tail && !concat_latent.empty() && !extend_constant_wan_tail(concat_latent, request->frames)) {
++                    concat_latent = {};
++                    concat_latent = encode_clip(request->frames);
++                } else if (constant_tail && !concat_latent.empty()) {
++                    LOG_INFO("Wan reference encoded 125 source frames; stationary tail verified for %d", request->frames);
++                }
++                if (!concat_latent.empty()) save_wan_reference(retry_file, concat_latent, shape);
++            } else {
++                LOG_INFO("wildvideo reference reused");
+             }
+             if (concat_latent.empty()) {
+                 LOG_ERROR("failed to encode video conditioning frames");

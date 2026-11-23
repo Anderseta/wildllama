@@ -84,6 +84,9 @@ type imageJobRequest struct {
 }
 
 type imageProgress struct {
+	VideoPercent    int    `json:"video_percent,omitempty"`
+	VideoETASeconds int    `json:"video_eta_seconds,omitempty"`
+	VideoAttempt    int    `json:"video_attempt,omitempty"`
 	Current         int64  `json:"current"`
 	Total           int64  `json:"total"`
 	Message         string `json:"message"`
@@ -137,6 +140,7 @@ type imageJob struct {
 	FinishedAt          *time.Time              `json:"finished_at,omitempty"`
 	Error               string                  `json:"error,omitempty"`
 	HistoryCleared      bool                    `json:"history_cleared,omitempty"`
+	VideoMemoryIssue    string                  `json:"video_memory_issue,omitempty"`
 	PersistenceError    string                  `json:"persistence_error,omitempty"`
 	Result              *imageAsset             `json:"result,omitempty"`
 	Results             []imageAsset            `json:"results,omitempty"`

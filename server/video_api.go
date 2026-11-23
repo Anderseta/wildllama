@@ -67,16 +67,17 @@ func (p videoProfile) validate(mode string) error {
 }
 
 type videoRecord struct {
-	ID      string    `json:"id"`
-	Path    string    `json:"path"`
-	Seed    int64     `json:"seed,string"`
-	Created time.Time `json:"created_at"`
-	Frames  int       `json:"frames"`
-	FPS     int       `json:"fps"`
+	GenerationSeconds float64   `json:"generation_seconds,omitempty"`
+	ID                string    `json:"id"`
+	Path              string    `json:"path"`
+	Seed              int64     `json:"seed,string"`
+	Created           time.Time `json:"created_at"`
+	Frames            int       `json:"frames"`
+	FPS               int       `json:"fps"`
 }
 
 func (v *imageService) registerVideoResult(job *imageJob, result imagegen.Result) error {
-	r := videoRecord{ID: job.ID, Path: result.Path, Seed: result.Seed, Created: time.Now().UTC(), Frames: job.Video.Frames, FPS: job.Video.FPS}
+	r := videoRecord{GenerationSeconds: result.DurationSeconds, ID: job.ID, Path: result.Path, Seed: result.Seed, Created: time.Now().UTC(), Frames: job.Video.Frames, FPS: job.Video.FPS}
 	if err := writeImageJSON(filepath.Join(v.root, "video-records", job.ID+".json"), r); err != nil {
 		return err
 	}
@@ -114,6 +115,7 @@ func (s *Server) registerVideoRoutes(r *gin.Engine) {
 	r.GET("/api/videos/jobs", s.videoJobsHandler)
 	r.POST("/api/videos/jobs", s.videoStartHandler)
 	r.POST("/api/videos/jobs/:id/cancel", s.videoCancelHandler)
+	r.DELETE("/api/videos/jobs/:id/history", s.videoClearHandler)
 	r.GET("/api/videos/files/:id", s.videoFileHandler)
 	r.HEAD("/api/videos/files/:id", s.videoFileHandler)
 }
@@ -215,7 +217,7 @@ func (s *Server) videoJobsHandler(c *gin.Context) {
 	jobs := make([]*imageJob, 0)
 	v.mu.Lock()
 	for i := len(v.jobs) - 1; i >= 0; i-- {
-		if job := v.jobs[i]; isVideoJob(job) {
+		if job := v.jobs[i]; isVideoJob(job) && (!job.HistoryCleared || job.VideoFile != nil) {
 			copy := cloneImageJobLocked(job)
 			copy.Generation = nil
 			jobs = append(jobs, copy)
@@ -224,6 +226,40 @@ func (s *Server) videoJobsHandler(c *gin.Context) {
 	v.mu.Unlock()
 	c.JSON(200, gin.H{"jobs": jobs})
 }
+
+// Retain the request identity for retries and any already published video.
+func (s *Server) videoClearHandler(c *gin.Context) {
+	v := s.imageService()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for i, job := range v.jobs {
+		if !isVideoJob(job) || job.ID != c.Param("id") {
+			continue
+		}
+		if job.executing || !imageTerminal(job.Status) || job.Status == "completed" {
+			c.JSON(409, gin.H{"error": "Somente tentativas encerradas com erro ou canceladas podem ser limpas."})
+			return
+		}
+		if !job.HistoryCleared {
+			previous := v.jobs
+			jobs := append([]*imageJob(nil), previous...)
+			copy := *job
+			copy.HistoryCleared = true
+			copy.Error, copy.PersistenceError, copy.RestoreErrors = "", "", nil
+			jobs[i] = &copy
+			v.jobs = jobs
+			if err := v.persistJobsLocked(); err != nil {
+				v.jobs = previous
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+		}
+		c.JSON(200, gin.H{"cleared": true})
+		return
+	}
+	c.JSON(404, gin.H{"error": "Tentativa de vídeo não encontrada."})
+}
+
 func (s *Server) videoStartHandler(c *gin.Context) {
 	mode, ok := videoMode(c)
 	if !ok {

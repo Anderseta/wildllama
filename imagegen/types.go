@@ -116,13 +116,16 @@ type Request struct {
 }
 
 type Progress struct {
-	Phase          string  `json:"phase"`
-	Message        string  `json:"message"`
-	Current        int     `json:"current,omitempty"`
-	Total          int     `json:"total,omitempty"`
-	PID            int     `json:"pid,omitempty"`
-	PeakRSSBytes   uint64  `json:"peak_rss_bytes,omitempty"`
-	ElapsedSeconds float64 `json:"elapsed_seconds"`
+	VideoPercent    int     `json:"video_percent,omitempty"`
+	VideoETASeconds int     `json:"video_eta_seconds,omitempty"`
+	VideoAttempt    int     `json:"video_attempt,omitempty"`
+	Phase           string  `json:"phase"`
+	Message         string  `json:"message"`
+	Current         int     `json:"current,omitempty"`
+	Total           int     `json:"total,omitempty"`
+	PID             int     `json:"pid,omitempty"`
+	PeakRSSBytes    uint64  `json:"peak_rss_bytes,omitempty"`
+	ElapsedSeconds  float64 `json:"elapsed_seconds"`
 }
 
 type Result struct {

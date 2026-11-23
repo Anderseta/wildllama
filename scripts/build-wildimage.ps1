@@ -20,7 +20,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 . (Join-Path $PSScriptRoot 'cuda-toolkit.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
 $sourceRevision = 'b9d7176bf88fe465576e0aafbe47ba253ffcfc2c'
-$runtimeRevision = 'b9d7176-wildllama-h3-13'
+$runtimeRevision = 'b9d7176-wildllama-h3-14'
 $originalOutputEncoding = [Console]::OutputEncoding
 $originalEnvironment = @{}
 Get-ChildItem Env: | ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
@@ -313,7 +313,7 @@ int main() {
         Copy-ReplacingFile $header (Join-Path $SourceDirectory $target)
         $sourceInputs += File-Record $header "third_party/wildimage/native/$name"
     }
-    $patches = @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch','0008-moss-edit.patch','0009-minimax-views-and-weight-io.patch','0010-lazy-graph-cut-planning.patch','0011-minimax-target-queries.patch','0012-minimax-default-target-queries.patch','0013-minimax-edits.patch','0014-wan-video-staging.patch','0015-stream-webm-output.patch','0016-wan-extended-umt5.patch','0017-openclip-vision-tower.patch','0018-wan-video-memory.patch','0019-wan-encode-blocks.patch','0020-wan-long-video-ffn.patch') | ForEach-Object { Join-Path $repository "third_party/wildimage/patches/$_" }
+    $patches = @('0001-conditioning-disk-cache.patch','0002-bounded-ram-offload.patch','0003-fp8-shared-packing.patch','0005-int8-workspaces.patch','0006-final-decode-staging.patch','0007-gguf-original-shapes.patch','0008-moss-edit.patch','0009-minimax-views-and-weight-io.patch','0010-lazy-graph-cut-planning.patch','0011-minimax-target-queries.patch','0012-minimax-default-target-queries.patch','0013-minimax-edits.patch','0014-wan-video-staging.patch','0015-stream-webm-output.patch','0016-wan-extended-umt5.patch','0017-openclip-vision-tower.patch','0018-wan-video-memory.patch','0019-wan-encode-blocks.patch','0020-wan-long-video-ffn.patch','0021-wan-video-work.patch','0022-wan-retry-reference.patch') | ForEach-Object { Join-Path $repository "third_party/wildimage/patches/$_" }
     for ($i = 0; $i -lt $patches.Count; $i++) {
         $patch = $patches[$i]
         $patchName = [IO.Path]::GetFileName($patch)
@@ -428,7 +428,7 @@ int main() {
     foreach ($relative in $licenses.Keys) { Copy-ReplacingFile (Join-Path $SourceDirectory $relative) (Join-Path $Destination $licenses[$relative]) }
     Invoke-Checked (Join-Path $Destination 'sd-cli.exe') @('--help') (Join-Path $BuildDirectory 'help.log') | Out-Null
     $files = @(Get-ChildItem -LiteralPath $Destination -File | Where-Object { $_.Name -ne 'wildimage-runtime.json' } | ForEach-Object { File-Record $_.FullName $_.Name })
-    $manifest = @{ provider = 'stable-diffusion.cpp'; source = 'https://github.com/leejet/stable-diffusion.cpp'; revision = $runtimeRevision; upstream_revision = $sourceRevision; base_release = $baseManifest.release; base_archive_sha256 = $baseManifest.archive_sha256; features = @{ wan_video_staging = $true; wan_video_memory = $true; wan_encode_blocks = $true; wan_extended_umt5 = $true; wan_openclip_vision = $true; inpaint_crop = $true; conditioning_cache = $true; ram_budget = $true; moss_edit = $true; gpu_memory_retry_exit = 75; ram_budget_exit = 76 }; build = $preparation; files = $files }
+    $manifest = @{ provider = 'stable-diffusion.cpp'; source = 'https://github.com/leejet/stable-diffusion.cpp'; revision = $runtimeRevision; upstream_revision = $sourceRevision; base_release = $baseManifest.release; base_archive_sha256 = $baseManifest.archive_sha256; features = @{ wan_video_staging = $true; wan_video_memory = $true; wan_encode_blocks = $true; wan_video_progress = $true; wan_extended_umt5 = $true; wan_openclip_vision = $true; inpaint_crop = $true; conditioning_cache = $true; ram_budget = $true; moss_edit = $true; gpu_memory_retry_exit = 75; ram_budget_exit = 76 }; build = $preparation; files = $files }
     $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Destination 'wildimage-runtime.json') -Encoding utf8
     Write-Output "WildImage custom runtime prepared: $Destination"
 } finally {

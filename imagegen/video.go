@@ -12,8 +12,9 @@ const WanRapidI2V = "wan-rapid-v10-i2v"
 const WanRapidT2V = "wan-rapid-v10-t2v"
 
 type VideoOptions struct {
-	Frames int `json:"frames"`
-	FPS    int `json:"fps"`
+	Frames           int  `json:"frames"`
+	FPS              int  `json:"fps"`
+	AllowCPUFallback bool `json:"allow_cpu_fallback,omitempty"`
 }
 
 func (p Profile) IsWanRapid() bool { return p.ModelID == WanRapidI2V || p.ModelID == WanRapidT2V }

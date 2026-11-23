@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/ollama/ollama/imagegen"
 	"testing"
 	"time"
 
@@ -41,10 +42,10 @@ func TestImageJobTimingsAccumulateAcrossImagesAndFreezeAtCompletion(t *testing.T
 func TestImageJobSnapshotsDetachPeakMemory(t *testing.T) {
 	service := &imageService{}
 	job := &imageJob{}
-	service.updateImageProgress(job, "loading", "", 0, 0, 2048)
+	service.updateImageProgress(job, imagegen.Progress{Phase: "loading", PeakRSSBytes: 2048})
 	snapshot := cloneImageJobLocked(job)
-	service.updateImageProgress(job, "sampling", "", 0, 0, 4096)
-	service.updateImageProgress(job, "decoding", "", 0, 0, 1024)
+	service.updateImageProgress(job, imagegen.Progress{Phase: "sampling", PeakRSSBytes: 4096})
+	service.updateImageProgress(job, imagegen.Progress{Phase: "decoding", PeakRSSBytes: 1024})
 	require.Equal(t, uint64(2048), snapshot.Memory.PeakRSSBytes)
 	require.Equal(t, uint64(4096), job.Memory.PeakRSSBytes)
 }

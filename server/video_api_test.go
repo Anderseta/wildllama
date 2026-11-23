@@ -77,6 +77,11 @@ func TestWanPackageInstallQueueIsSeparateAndIdempotent(t *testing.T) {
 	response := imageTestHTTP(router, "POST", "/api/videos/jobs/"+job.ID+"/cancel", nil, "")
 	require.Equal(t, 200, response.Code, response.Body.String())
 	require.Equal(t, "cancelled", job.Status)
+	clearURL := "/api/videos/jobs/" + job.ID + "/history"
+	require.Equal(t, 200, imageTestHTTP(router, "DELETE", clearURL, nil, "").Code)
+	require.Equal(t, 200, imageTestHTTP(router, "DELETE", clearURL, nil, "").Code)
+	require.NotContains(t, imageTestHTTP(router, "GET", "/api/videos/jobs", nil, "").Body.String(), job.ID)
+	require.Contains(t, imageTestHTTP(router, "POST", "/api/videos/install", []byte(`{"request_id":"wan-test"}`), "application/json").Body.String(), job.ID)
 }
 
 func TestWanVideoReferenceToStream(t *testing.T) {

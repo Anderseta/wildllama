@@ -630,6 +630,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	mode := imageGPUResident
 	residentFailedAt := 0
 	if r.CPUOnly {
+		if r.Video != nil && !r.Video.AllowCPUFallback {
+			return Result{}, errors.New("VRAM disponível insuficiente para iniciar o vídeo. Libere VRAM ou habilite a tentativa na CPU no perfil de vídeo.")
+		}
 		mode = imageRAMCPU
 	} else if p.OffloadToCPU && p.MaxVRAMMiB > 0 && p.MaxVRAMMiB <= r.GPUResidentFailedAtMiB {
 		mode = imageRAMGPU
@@ -682,6 +685,12 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			mode = imageRAMGPU
 			log.emit(Progress{Phase: "ram_offload", Message: "Os pesos e buffers não couberam na GPU; usando RAM dentro do orçamento e mantendo o cálculo na GPU."}, true)
 		} else {
+			if r.Video != nil && !r.Video.AllowCPUFallback {
+				const explanation = "O cálculo excedeu a VRAM disponível ou o orçamento da GPU mesmo com os pesos na RAM. Reduza os quadros ou a resolução, ou habilite a tentativa na CPU."
+				log.emit(Progress{Phase: "gpu_memory_limit", Message: explanation}, true)
+				err = fmt.Errorf("%s %w", explanation, err)
+				break
+			}
 			mode = imageRAMCPU
 			log.emit(Progress{Phase: "cpu_fallback", Message: "A GPU não comportou o cálculo com offload; tentando na CPU dentro do orçamento de RAM."}, true)
 		}
@@ -749,6 +758,12 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	cmd := exec.CommandContext(ctx, e.config.RunnerPath, args...)
 	cmd.Dir = jobDir
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
+	if r.Video != nil {
+		cmd.Env = append(cmd.Env, "WILDLLAMA_VIDEO_PROGRESS=1")
+		if mode != imageRAMCPU && p.OffloadToCPU && r.Video.Frames >= 65 {
+			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_REFERENCE="+filepath.Join(jobDir, "wan-reference.bin"))
+		}
+	}
 	if eagerCUDA && mode != imageRAMCPU {
 		cmd.Env = append(cmd.Env, cudaload.ModuleLoadingEnv+"=EAGER")
 	}
@@ -788,6 +803,9 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	}
 	log.mu.Lock()
 	log.counterPhase, log.loadPhase = "", ""
+	if r.Video != nil {
+		log.wan.restart(p.CFGScale)
+	}
 	log.lines = log.lines[:0]
 	log.emit(Progress{Phase: "starting", Message: message}, true)
 	log.mu.Unlock()
@@ -1050,7 +1068,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	if runtime.GOOS == "windows" && strings.TrimSpace(os.Getenv("WILDIMAGE_CUDA_WAIT")) == "" {
 		set("WILDIMAGE_CUDA_WAIT", "blocking")
 	}
-	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES"} {
+	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE"} {
 		set(key, "")
 	}
 	set("PATH", filepath.Dir(config.RunnerPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1061,6 +1079,7 @@ var stepPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,9})/([0-9]{1,9})(?:[^
 var byteRatePattern = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:[kmgt]i?)?b/s\b`)
 
 type progressLog struct {
+	wan            wanProgress
 	mu             sync.Mutex
 	pending        string
 	lines          []string
@@ -1118,18 +1137,16 @@ func (p *progressLog) line(line string) {
 		p.lines = p.lines[len(p.lines)-16:]
 	}
 	lower := strings.ToLower(line)
+	if p.video {
+		if update, ok := p.wan.observe(lower, p.expectedSteps); ok {
+			p.emit(update, false)
+		}
+		return
+	}
 	imageBatchHeader := strings.Contains(lower, "generating image:")
 	samplerSelected := strings.Contains(lower, "sampling using ") || strings.Contains(lower, "sampling(high noise) using ")
 	update := Progress{}
 	switch {
-	case p.video && (strings.Contains(lower, "img2vid") || strings.Contains(lower, "get_clip_vision_output completed")):
-		update.Phase = "encoding"
-	case p.video && strings.Contains(lower, "generate_video ") && !strings.Contains(lower, "completed"):
-		update.Phase, update.Total = "sampling", p.expectedSteps
-	case p.video && strings.Contains(lower, "generating latent video completed"):
-		update.Phase = "decoding"
-	case p.video && (strings.Contains(lower, "decode_first_stage completed") || strings.Contains(lower, "save result video to")):
-		update.Phase = "saving"
 	case strings.Contains(lower, "conditioning disk cache hit"):
 		update.Phase = "conditioning_cache_hit"
 		update.Message = "Reusing cached prompt encoding"
@@ -1215,22 +1232,6 @@ func (p *progressLog) line(line string) {
 		}
 	}
 	if update.Phase != "" {
-		if p.video {
-			switch update.Phase {
-			case "preparing":
-				update.Message = "Preparando a geração do vídeo"
-			case "encoding":
-				update.Message = "Codificando as referências e o prompt do vídeo"
-			case "sampling":
-				update.Message = "Executando os passos de geração do vídeo"
-			case "decoding":
-				update.Message = "Decodificando os quadros do vídeo"
-			case "saving":
-				update.Message = "Salvando o vídeo"
-			case "loading", "loading_diffusion", "loading_vae", "loading_text_encoder":
-				update.Message = "Carregando os componentes do vídeo"
-			}
-		}
 		p.emit(update, false)
 	}
 }
@@ -1238,7 +1239,7 @@ func (p *progressLog) emit(v Progress, force bool) {
 	if p.callback == nil {
 		return
 	}
-	if !force && v.Phase == p.lastPhase && v.Current == p.lastCurrent && v.Total == p.lastTotal && time.Since(p.lastEmit) < 500*time.Millisecond {
+	if !force && v.VideoAttempt == 0 && v.Phase == p.lastPhase && v.Current == p.lastCurrent && v.Total == p.lastTotal && time.Since(p.lastEmit) < 500*time.Millisecond {
 		return
 	}
 	p.lastPhase = v.Phase

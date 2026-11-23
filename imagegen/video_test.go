@@ -54,6 +54,66 @@ func TestWanVideoNativeProgress(t *testing.T) {
 	}
 }
 
+func TestWanVideoCPUFallbackRequiresOptIn(t *testing.T) {
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	config := Config{RunnerPath: exe, WorkDir: filepath.Join(dir, "work"), ModelsDir: filepath.Join(dir, "models"), OutputDir: filepath.Join(dir, "outputs")}
+	engine, err := NewEngine(config)
+	require.NoError(t, err)
+	defer engine.Close()
+	p := testProfile(t, dir)
+	p.ModelID, p.Sampler, p.Scheduler, p.Sigmas = WanRapidT2V, "euler_a", "beta", ""
+	t.Setenv("WILDIMAGE_FAKE_CHILD", "gpu-oom-then-cpu")
+	for _, tc := range []struct {
+		name     string
+		allow    bool
+		backends []string
+	}{
+		{"default", false, []string{"cuda0", "cuda0"}},
+		{"opt-in", true, []string{"cuda0", "cuda0", "cpu"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := filepath.Join(dir, tc.name+".jsonl")
+			t.Setenv("WILDIMAGE_FAKE_ATTEMPTS", log)
+			r := Request{Prompt: "literal --prompt ; &", OutputPath: filepath.Join(config.OutputDir, tc.name+".webm"), Video: &VideoOptions{Frames: 5, FPS: 16, AllowCPUFallback: tc.allow}}
+			_, err := engine.Run(t.Context(), p, r, nil)
+			if !tc.allow {
+				require.ErrorContains(t, err, "VRAM")
+			}
+			attempts := imageAttempts(t, log)
+			require.Len(t, attempts, len(tc.backends))
+			for i, args := range attempts {
+				require.Equal(t, tc.backends[i], imageArgument(t, args, "--backend"))
+			}
+		})
+	}
+}
+
+func TestWanVideoProgressAcrossSegmentsAndRetry(t *testing.T) {
+	var w wanProgress
+	w.restart(1)
+	events := []string{"img2vid", "get_clip_vision_output completed", "wildvideo tile 1/4",
+		"wildvideo chunk 2/4", "wildvideo stage text", "generate_video 480x832x221",
+		"wildvideo segment 0/42", "wildvideo segment 21/42", "|### | 1/4 - 6.5s/it",
+		"wildvideo segment 0/42", "wildvideo segment 20/42"}
+	last := 0
+	for _, event := range events {
+		p, ok := w.observe(event, 4)
+		require.True(t, ok, event)
+		require.GreaterOrEqual(t, p.VideoPercent, last, event)
+		last = p.VideoPercent
+	}
+	_, ok := w.observe("|##### | 256/256 - 12.0mb/s", 4)
+	require.False(t, ok)
+	require.Greater(t, last, 45)
+	w.restart(1)
+	p, ok := w.observe("img2vid", 4)
+	require.True(t, ok)
+	require.Equal(t, 2, p.VideoAttempt)
+	require.GreaterOrEqual(t, p.VideoPercent, last)
+}
+
 func TestWanVideoModesAndArguments(t *testing.T) {
 	p := Profile{ModelID: WanRapidI2V, Sampler: "euler_a", Scheduler: "beta", DiffusionModel: "wan.gguf", TextEncoder: "umt5.gguf", VisionEncoder: "clip.safetensors", VAE: "vae.safetensors", StageComponents: true, OffloadToCPU: true, VAETiling: true}
 	r := Request{Video: &VideoOptions{Frames: 33, FPS: 16}, ReferenceImages: []string{"first.png"}}
