@@ -5,9 +5,54 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestWanVideoLateFailurePreservesCompletedFile(t *testing.T) {
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	config := Config{RunnerPath: exe, WorkDir: filepath.Join(dir, "work"), ModelsDir: filepath.Join(dir, "models"), OutputDir: filepath.Join(dir, "outputs")}
+	engine, err := NewEngine(config)
+	require.NoError(t, err)
+	defer engine.Close()
+	fixture, err := filepath.Abs(filepath.Join("testdata", "wan-five-frames.webm"))
+	require.NoError(t, err)
+	log := filepath.Join(dir, "attempts.jsonl")
+	t.Setenv("WILDIMAGE_FAKE_CHILD", "saved-video-oom")
+	t.Setenv("WILDIMAGE_FAKE_WEBM", fixture)
+	t.Setenv("WILDIMAGE_FAKE_ATTEMPTS", log)
+	p := testProfile(t, dir)
+	p.ModelID, p.Sampler, p.Scheduler, p.Sigmas = WanRapidT2V, "euler_a", "beta", ""
+	r := Request{Prompt: "literal --prompt ; &", Seed: 42, OutputPath: filepath.Join(config.OutputDir, "clip.webm"), Video: &VideoOptions{Frames: 5, FPS: 16}}
+	result, err := engine.Run(t.Context(), p, r, nil)
+	require.Error(t, err)
+	require.Equal(t, r.OutputPath, result.Path, "%v", err)
+	require.NoError(t, checkWebM(result.Path, 5, 64, 64))
+	require.Len(t, imageAttempts(t, log), 1)
+	p.Width, p.Height, p.MaxRAMMiB, r.Video.Frames = 480, 832, 512, 221
+	require.ErrorContains(t, validateImageInputs(p, r), "tensor RGB")
+}
+
+func TestWanVideoNativeProgress(t *testing.T) {
+	var last Progress
+	log := progressLog{video: true, start: time.Now(), expectedSteps: 7, callback: func(v Progress) { last = v }}
+	for _, stage := range []struct{ native, phase string }{
+		{"sampling using Euler A method", "preparing"},
+		{"IMG2VID", "encoding"},
+		{"|### | 2/7 - 3.5s/it", "encoding"},
+		{"generate_video 480x832x221", "sampling"},
+		{"|#### | 3/7 - 1.5s/it", "sampling"},
+		{"generating latent video completed, taking 4.2s", "decoding"},
+		{"|### | 2/5 - 1.0s/it", "decoding"},
+		{"decode_first_stage completed, taking 0.31s", "saving"},
+	} {
+		log.line(stage.native)
+		require.Equal(t, stage.phase, last.Phase, stage.native)
+	}
+}
 
 func TestWanVideoModesAndArguments(t *testing.T) {
 	p := Profile{ModelID: WanRapidI2V, Sampler: "euler_a", Scheduler: "beta", DiffusionModel: "wan.gguf", TextEncoder: "umt5.gguf", VisionEncoder: "clip.safetensors", VAE: "vae.safetensors", StageComponents: true, OffloadToCPU: true, VAETiling: true}

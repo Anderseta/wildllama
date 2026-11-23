@@ -290,8 +290,9 @@ func validateImageInputs(p Profile, r Request) error {
 	if err := ValidateProfile(p); err != nil {
 		return err
 	}
-	if r.Video != nil && p.MaxRAMMiB > 0 && int64(p.Width)*int64(p.Height)*3*int64(r.Video.Frames) > int64(p.MaxRAMMiB)<<20 {
-		return errors.New("decoded video frames alone exceed the configured RAM budget; reduce frames or resolution")
+	if r.Video != nil && p.MaxRAMMiB > 0 && r.Video.RGBFloatBytes(p.Width, p.Height) > int64(p.MaxRAMMiB)<<20 {
+		return fmt.Errorf("o tensor RGB do vídeo exige pelo menos %d MiB de RAM para %d quadros em %d × %d; o perfil permite %d MiB",
+			(r.Video.RGBFloatBytes(p.Width, p.Height)+(1<<20)-1)>>20, r.Video.Frames, p.Width, p.Height, p.MaxRAMMiB)
 	}
 	if strings.TrimSpace(r.Prompt) == "" || len(r.Prompt) > 32768 || len(r.NegativePrompt) > 32768 {
 		return errors.New("image prompt must contain 1–32768 bytes; negative prompt is limited to 32768 bytes")
@@ -590,7 +591,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	defer os.RemoveAll(jobDir)
 	finalPath := output
 	if r.Video != nil {
-		output = filepath.Join(filepath.Dir(output), "rendering-"+filepath.Base(output))
+		output = filepath.Join(filepath.Dir(output), filepath.Base(jobDir)+"-"+filepath.Base(output))
 		defer os.Remove(output)
 	}
 	if r.Inpaint != nil {
@@ -622,7 +623,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		seed = int64(binary.LittleEndian.Uint64(data[:]) & math.MaxInt64)
 	}
 	start := time.Now()
-	log := &progressLog{callback: progress, start: start, expectedSteps: p.Steps}
+	log := &progressLog{callback: progress, start: start, expectedSteps: p.Steps, video: r.Video != nil}
 	if !r.crop.Empty() {
 		log.emit(Progress{Phase: "preparing", Message: fmt.Sprintf("Editando recorte de %d × %d pixels em %d × %d. A saída mantém as dimensões da referência.", r.crop.Dx(), r.crop.Dy(), p.Width, p.Height)}, true)
 	}
@@ -655,7 +656,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if !retryCUDA && !retryMemory {
 			break
 		}
-		if r.Video == nil {
+		if r.Video != nil {
+			if checkWebM(output, r.Video.Frames, p.Width, p.Height) == nil {
+				break
+			}
+		} else {
 			decoded, _ = decodeOutputPNG(output, p.Width, p.Height)
 		}
 		if decoded != nil {
@@ -689,13 +694,13 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		runErr = err
 	}
 	if r.Video != nil {
-		if runErr != nil {
-			return Result{}, runErr
-		}
 		if err := publishWebM(output, finalPath, r.Video.Frames, p.Width, p.Height); err != nil {
+			if runErr != nil {
+				return Result{}, runErr
+			}
 			return Result{}, err
 		}
-		return Result{Path: finalPath, MIMEType: "video/webm", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}, nil
+		return Result{Path: finalPath, MIMEType: "video/webm", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}, runErr
 	}
 	if decoded == nil {
 		log.emit(Progress{Phase: "validating_output", Message: "Verificando o PNG salvo"}, true)
@@ -773,8 +778,11 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	}
 	cmd.WaitDelay = 5 * time.Second
 	message := "Starting the isolated CUDA image runner"
+	if r.Video != nil {
+		message = "Iniciando o gerador de vídeo na GPU"
+	}
 	if mode == imageRAMCPU {
-		message = "Iniciando a tentativa na CPU com os mesmos parâmetros de imagem e orçamento de RAM."
+		message = "Iniciando a tentativa na CPU com os mesmos parâmetros e orçamento de RAM."
 	} else if eagerCUDA {
 		message = "Reiniciando o gerador com carregamento antecipado dos kernels CUDA."
 	}
@@ -1068,6 +1076,7 @@ type progressLog struct {
 	counterPhase   string
 	loadPhase      string
 	expectedSteps  int
+	video          bool
 }
 
 func (p *progressLog) Write(data []byte) (int, error) {
@@ -1113,6 +1122,14 @@ func (p *progressLog) line(line string) {
 	samplerSelected := strings.Contains(lower, "sampling using ") || strings.Contains(lower, "sampling(high noise) using ")
 	update := Progress{}
 	switch {
+	case p.video && (strings.Contains(lower, "img2vid") || strings.Contains(lower, "get_clip_vision_output completed")):
+		update.Phase = "encoding"
+	case p.video && strings.Contains(lower, "generate_video ") && !strings.Contains(lower, "completed"):
+		update.Phase, update.Total = "sampling", p.expectedSteps
+	case p.video && strings.Contains(lower, "generating latent video completed"):
+		update.Phase = "decoding"
+	case p.video && (strings.Contains(lower, "decode_first_stage completed") || strings.Contains(lower, "save result video to")):
+		update.Phase = "saving"
 	case strings.Contains(lower, "conditioning disk cache hit"):
 		update.Phase = "conditioning_cache_hit"
 		update.Message = "Reusing cached prompt encoding"
@@ -1198,6 +1215,22 @@ func (p *progressLog) line(line string) {
 		}
 	}
 	if update.Phase != "" {
+		if p.video {
+			switch update.Phase {
+			case "preparing":
+				update.Message = "Preparando a geração do vídeo"
+			case "encoding":
+				update.Message = "Codificando as referências e o prompt do vídeo"
+			case "sampling":
+				update.Message = "Executando os passos de geração do vídeo"
+			case "decoding":
+				update.Message = "Decodificando os quadros do vídeo"
+			case "saving":
+				update.Message = "Salvando o vídeo"
+			case "loading", "loading_diffusion", "loading_vae", "loading_text_encoder":
+				update.Message = "Carregando os componentes do vídeo"
+			}
+		}
 		p.emit(update, false)
 	}
 }

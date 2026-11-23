@@ -18,6 +18,12 @@ type VideoOptions struct {
 
 func (p Profile) IsWanRapid() bool { return p.ModelID == WanRapidI2V || p.ModelID == WanRapidT2V }
 
+// The Wan pipeline holds an RGB float32 clip on the host for VAE conditioning
+// or decode. Weights, spatial tiles, latents and device buffers are additional.
+func (v VideoOptions) RGBFloatBytes(width, height int) int64 {
+	return int64(width) * int64(height) * int64(v.Frames) * 3 * 4
+}
+
 func (v VideoOptions) Validate() error {
 	if v.Frames < 5 || v.Frames > 241 || (v.Frames-1)%4 != 0 {
 		return errors.New("Wan requires 4n+1 frames between 5 and 241")

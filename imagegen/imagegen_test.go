@@ -50,7 +50,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	manifest, err := json.Marshal(map[string]any{
-		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true},
+		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true, "wan_video_staging": true},
 		"files": []map[string]any{{"name": filepath.Base(exe), "size": len(data), "sha256": digest(data)}},
 	})
 	if err != nil {
@@ -142,6 +142,13 @@ func fakeChild(mode string) {
 	if mode == "ram-budget" {
 		fmt.Fprintln(os.Stderr, "managed RAM budget exhausted")
 		os.Exit(RAMBudgetExitCode)
+	}
+	if mode == "saved-video-oom" {
+		video, err := os.ReadFile(os.Getenv("WILDIMAGE_FAKE_WEBM"))
+		if err != nil || os.WriteFile(values["--output"], video, 0600) != nil {
+			os.Exit(4)
+		}
+		os.Exit(GPUOutOfMemoryExitCode)
 	}
 	if mode == "invalid-model" {
 		fmt.Fprintln(os.Stderr, "invalid model metadata")

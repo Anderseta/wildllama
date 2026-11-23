@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -107,12 +108,63 @@ func videoMode(c *gin.Context) (string, bool) {
 func (s *Server) registerVideoRoutes(r *gin.Engine) {
 	r.GET("/api/videos/config", s.videoConfigHandler)
 	r.PUT("/api/videos/config", s.videoConfigHandler)
+	r.POST("/api/videos/memory", s.videoMemoryHandler)
 	r.POST("/api/videos/install", s.videoInstallHandler)
 	r.GET("/api/videos/jobs", s.videoJobsHandler)
 	r.POST("/api/videos/jobs", s.videoStartHandler)
 	r.POST("/api/videos/jobs/:id/cancel", s.videoCancelHandler)
 	r.GET("/api/videos/files/:id", s.videoFileHandler)
 	r.HEAD("/api/videos/files/:id", s.videoFileHandler)
+}
+
+// Inspect the unsaved profile without reading model weights or acquiring the generation gate.
+func (s *Server) videoMemoryHandler(c *gin.Context) {
+	mode, ok := videoMode(c)
+	if !ok {
+		return
+	}
+	var p videoProfile
+	if !imageBind(c, &p) {
+		return
+	}
+	if err := p.validate(mode); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	v := s.imageService()
+	profile := p.runtimeProfile(mode)
+	result := gin.H{"rgb_float_bytes": p.RGBFloatBytes(p.Width, p.Height), "latent_frames": 1 + (p.Frames-1)/4}
+	v.mu.Lock()
+	nearest := 242
+	for i := len(v.jobs) - 1; i >= 0; i-- {
+		job := v.jobs[i]
+		if job.Status != "completed" || job.Video == nil || job.Generation == nil || job.Memory == nil || job.Memory.PeakRSSBytes == 0 {
+			continue
+		}
+		previous := job.Generation.Profile
+		if previous.ModelID != profile.ModelID || previous.Width != p.Width || previous.Height != p.Height ||
+			previous.DiffusionModel != p.Diffusion || previous.TextEncoder != p.Encoder || previous.VAE != p.VAE ||
+			previous.VisionEncoder != p.Vision || previous.Tokenizer != p.Vocabulary || previous.MaxRAMMiB != p.RAM ||
+			previous.VRAMReserveMiB != p.Reserve || previous.CFGScale != p.CFG {
+			continue
+		}
+		distance := max(job.Video.Frames-p.Frames, p.Frames-job.Video.Frames)
+		if distance < nearest {
+			nearest = distance
+			result["previous_run"] = gin.H{"frames": job.Video.Frames, "peak_rss_bytes": job.Memory.PeakRSSBytes, "backend": job.ComputeBackend}
+			if distance == 0 {
+				break
+			}
+		}
+	}
+	v.mu.Unlock()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if free, err := v.text.FreeVRAM(ctx); err == nil {
+		result["free_vram_bytes"] = free
+		result["usable_vram_bytes"] = free - min(free, uint64(p.Reserve)<<20)
+	}
+	c.JSON(http.StatusOK, result)
 }
 func (s *Server) videoConfigHandler(c *gin.Context) {
 	mode, ok := videoMode(c)

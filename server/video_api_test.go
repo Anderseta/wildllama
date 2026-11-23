@@ -105,6 +105,18 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	}
 	saved := call("PUT", "/api/videos/config?mode=i2v", profile)
 	require.Equal(t, 200, saved.Code, saved.Body.String())
+	estimate := profile
+	estimate.Width, estimate.Height, estimate.Frames, estimate.FPS = 480, 832, 221, 22
+	memory := call("POST", "/api/videos/memory?mode=i2v", estimate)
+	require.Equal(t, 200, memory.Code, memory.Body.String())
+	require.Contains(t, memory.Body.String(), `"rgb_float_bytes":1059102720`)
+	require.Contains(t, memory.Body.String(), `"latent_frames":56`)
+	require.NotContains(t, memory.Body.String(), "previous_run")
+	estimate.FPS = 30
+	require.JSONEq(t, memory.Body.String(), call("POST", "/api/videos/memory?mode=i2v", estimate).Body.String())
+	stored, err := service.loadVideoProfile("i2v")
+	require.NoError(t, err)
+	require.Equal(t, profile, stored)
 	require.NotContains(t, call("GET", "/api/videos/config?mode=t2v", nil).Body.String(), "vision.gguf")
 	input := map[string]any{"request_id": "test-wan", "prompt": "tilt up", "seed": int64(5232021495785965240)}
 	require.Equal(t, 400, call("POST", "/api/videos/jobs", input).Code)

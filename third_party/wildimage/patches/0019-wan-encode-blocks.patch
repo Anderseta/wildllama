@@ -1,0 +1,145 @@
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -1177,7 +1177,9 @@
+ 
+         ggml_tensor* encode(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+-                            int64_t b = 1) {
++                            int64_t b = 1,
++                            int first_group = 0,
++                            bool streaming = false) {
+             // x: [b*c, t, h, w]
+             GGML_ASSERT(b == 1);
+             GGML_ASSERT(decode_only == false);
+@@ -1186,7 +1188,9 @@
+                 LOG_WARN("Using 2D VAE to encode video, expect poor results");
+             }
+ 
+-            clear_cache();
++            if (!streaming) {
++                clear_cache();
++            }
+ 
+             x = patchify(ctx, x, patch_size, b);
+             // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.encode.prelude", "x");
+@@ -1194,20 +1198,19 @@
+             auto encoder = std::dynamic_pointer_cast<Encoder3d>(blocks["encoder"]);
+             auto conv1   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv1"]);
+ 
+-            int64_t t     = x->ne[2];
+-            int64_t iter_ = 1 + (t - 1) / 4;
+-            ggml_tensor* out;
+-            for (int i = 0; i < iter_; i++) {
++            // Encode the first frame alone, then four frames per causal step.
++            // Later graphs start on a four-frame boundary and reuse the previous graph's features.
++            const int64_t groups = first_group == 0 ? 1 + (x->ne[2] - 1) / 4 : x->ne[2] / 4;
++            ggml_tensor* out = nullptr;
++            int64_t offset = 0;
++            for (int i = 0; i < groups; ++i) {
++                const int group = first_group + i;
++                const int count = group == 0 ? 1 : 4;
+                 _enc_conv_idx = 0;
+-                if (i == 0) {
+-                    auto in = ggml_ext_slice(ctx, x, 2, 0, 1);  // [b*c, 1, h, w]
+-                    out     = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, i);
+-                } else {
+-                    // if is_2D, drop 3 out of 4 frames
+-                    auto in   = ggml_ext_slice(ctx, x, 2, 1 + 4 * (i - 1), (is_2D ? 1 - 3 : 1) + 4 * i);  // [b*c, 4, h, w]
+-                    auto out_ = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, i);
+-                    out       = ggml_concat(ctx->ggml_ctx, out, out_, 2);
+-                }
++                auto in = ggml_ext_slice(ctx, x, 2, offset, offset + (is_2D ? 1 : count));
++                auto encoded = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, group);
++                out = out ? ggml_concat(ctx->ggml_ctx, out, encoded, 2) : encoded;
++                offset += count;
+             }
+             if (is_2D) {
+                 auto conv1 = std::dynamic_pointer_cast<Conv2dBut3d>(blocks["conv1"]);
+@@ -1217,7 +1220,9 @@
+             }
+             auto mu = ggml_ext_chunk(ctx, out, 2, 3)[0];
+             // sd::ggml_graph_cut::mark_graph_cut(mu, "wan_vae.encode.final", "mu");
+-            clear_cache();
++            if (!streaming) {
++                clear_cache();
++            }
+             return mu;
+         }
+ 
+@@ -1334,8 +1339,12 @@
+             return "wan_vae";
+         }
+ 
++        bool supports_wan_encode_blocks() const {
++            return !ae.is_2D && (version == VERSION_WAN2 || version == VERSION_WAN2_2_I2V);
++        }
++
+         bool supports_temporal_tiling(VAETemporalDirection direction) const override {
+-            return direction == VAETemporalDirection::DECODE;
++            return direction == VAETemporalDirection::DECODE || supports_wan_encode_blocks();
+         }
+ 
+         int get_temporal_tile_output_scale(VAETemporalDirection direction) const override {
+@@ -1474,11 +1483,49 @@
+             return gf;
+         }
+ 
++        // A single long encode graph can exhaust GGML's fixed metadata arena,
++        // even when all model weights fit. Bound its lifetime per spatial tile.
++        static constexpr int encode_groups_per_graph = 8;
++
++        sd::Tensor<float> encode_blocks(int n_threads, const sd::Tensor<float>& input) {
++            const int64_t groups = 1 + (input.shape()[2] - 1) / 4;
++            auto plan = make_vae_temporal_tile_plan(groups, {encode_groups_per_graph, 0, 1});
++            for (auto& tile : plan.tiles) {
++                tile.start = tile.first ? 0 : 1 + 4 * (tile.start - 1);
++                tile.end = 1 + 4 * (tile.end - 1);
++            }
++            free_cache_ctx_and_buffer();
++            auto output = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& frames, const VAETemporalTile& tile) {
++                auto get_graph = [&]() {
++                    ae.clear_cache();
++                    auto graph = new_graph_custom(10240 * encode_groups_per_graph);
++                    auto ctx = get_context(graph);
++                    auto& features = ae._enc_feat_map;
++                    for (size_t i = 0; !tile.first && i < features.size(); ++i) {
++                        features[i] = ctx.load_cache_tensor("encode:" + std::to_string(i));
++                    }
++                    const int group = tile.first ? 0 : 1 + static_cast<int>((tile.start - 1) / 4);
++                    auto encoded = ae.encode(&ctx, make_input(frames), 1, group, true);
++                    for (size_t i = 0; !tile.last && i < features.size(); ++i) {
++                        ctx.persist_cache_tensor("encode:" + std::to_string(i), features[i]);
++                    }
++                    ggml_build_forward_expand(graph, encoded);
++                    return graph;
++                };
++                return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), input.dim());
++            }, groups);
++            free_cache_ctx_and_buffer();
++            ae.clear_cache();
++            return output;
++        }
++
+         sd::Tensor<float> _compute_temporal_tiled(const int n_threads,
+                                                   const sd::Tensor<float>& input,
+                                                   VAETemporalDirection direction,
+                                                   const VAETemporalTilingConfig& config) override {
+-            GGML_ASSERT(direction == VAETemporalDirection::DECODE);
++            if (direction == VAETemporalDirection::ENCODE) {
++                return _compute(n_threads, input, false);
++            }
+             VAETemporalTilingConfig stateful_config = config;
+             stateful_config.overlap                 = 0;
+             auto plan                               = make_vae_temporal_tile_plan(input.shape()[2], stateful_config);
+@@ -1524,6 +1571,10 @@
+         sd::Tensor<float> _compute(const int n_threads,
+                                    const sd::Tensor<float>& z,
+                                    bool decode_graph) override {
++            if (!decode_graph && supports_wan_encode_blocks() && z.dim() == 5 &&
++                (z.shape()[2] - 1) / 4 >= encode_groups_per_graph) {
++                return encode_blocks(n_threads, z);
++            }
+             sd::Tensor<float> input;
+             if (z.dim() == 4) {
+                 input = z.unsqueeze(2);

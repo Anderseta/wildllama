@@ -1,0 +1,103 @@
+diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -314,6 +314,7 @@
+     class WanAttentionBlock : public GGMLBlock {
+     protected:
+         int64_t dim;
++        int64_t ffn_width;
+ 
+         void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+             enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
+@@ -328,7 +329,7 @@
+                           bool qk_norm         = true,
+                           bool cross_attn_norm = false,
+                           float eps            = 1e-6)
+-            : dim(dim) {
++            : dim(dim), ffn_width(ffn_dim) {
+             blocks["norm1"]     = std::shared_ptr<GGMLBlock>(new LayerNorm(dim, eps, false));
+             blocks["self_attn"] = std::shared_ptr<GGMLBlock>(new WanSelfAttention(dim, num_heads, qk_norm, eps));
+             if (cross_attn_norm) {
+@@ -354,7 +355,8 @@
+                                      ggml_tensor* e,
+                                      ggml_tensor* pe,
+                                      ggml_tensor* context,
+-                                     int64_t context_img_len = 257) {
++                                     int64_t context_img_len = 257,
++                                     int layer = -1) {
+             // x: [N, n_token, dim]
+             // e: [N, 6, dim] or [N, T, 6, dim]
+             // context: [N, context_img_len + context_txt_len, dim]
+@@ -380,19 +382,47 @@
+ 
+             x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[2]));
+ 
++            const bool large_block = layer >= 0 && x->ne[2] == 1 && x->ne[3] == 1 &&
++                                     x->ne[1] * ffn_width * sizeof(float) > (size_t{2} << 30);
++            if (large_block) {
++                sd::ggml_graph_cut::mark_graph_cut(x, "wan.self." + std::to_string(layer), "x");
++            }
+             // cross-attention
+             x = ggml_add(ctx->ggml_ctx,
+                          x,
+                          cross_attn->forward(ctx, norm3->forward(ctx, x), context, context_img_len));
+ 
++            if (large_block) {
++                sd::ggml_graph_cut::mark_graph_cut(x, "wan.cross." + std::to_string(layer), "x");
++            }
+             // ffn
+             y = norm2->forward(ctx, x);
+             y = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[4]));
+             y = modulate_add(ctx->ggml_ctx, y, es[3]);
+ 
+-            y = ffn_0->forward(ctx, y);
+-            y = ggml_ext_gelu(ctx, y, true);
+-            y = ffn_2->forward(ctx, y);
++            auto feed_forward = [&](ggml_tensor* tokens) {
++                auto expanded = ffn_0->forward(ctx, tokens);
++                return ffn_2->forward(ctx, ggml_ext_gelu(ctx, expanded, true));
++            };
++            if (large_block) {
++                // Both projections and GELU act independently on each token. Keep the
++                // expanded temporary bounded and all attention keys/values intact.
++                const int64_t chunk = std::max<int64_t>(8192, ((y->ne[1] + 4095) / 4096) * 256);
++                // Balanced joins use native-sized views. GGML SET cannot address
++                // destinations past 1 GiB on this ABI.
++                auto eval_range = [&](auto&& self, int64_t at, int64_t count) -> ggml_tensor* {
++                    if (count <= chunk) {
++                        return feed_forward(ggml_view_2d(ctx->ggml_ctx, y, y->ne[0], count, y->nb[1], at * y->nb[1]));
++                    }
++                    const int64_t left = ((count + chunk - 1) / chunk / 2) * chunk;
++                    auto first = self(self, at, left);
++                    auto last = self(self, at + left, count - left);
++                    return ggml_concat(ctx->ggml_ctx, first, last, 1);
++                };
++                y = eval_range(eval_range, 0, y->ne[1]);
++            } else {
++                y = feed_forward(y);
++            }
+ 
+             x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
+ 
+@@ -796,7 +826,7 @@
+             for (int i = 0; i < config.num_layers; i++) {
+                 auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
+ 
+-                x = block->forward(ctx, x, e0, pe, context, context_img_len);
++                x = block->forward(ctx, x, e0, pe, context, context_img_len, i);
+ 
+                 auto iter = config.vace_layers_mapping.find(i);
+                 if (iter != config.vace_layers_mapping.end()) {
+@@ -991,7 +1021,11 @@
+                                  float vace_strength                             = 1.f,
+                                  const sd::Tensor<float>& audio_embed_tensor     = {},
+                                  const sd::Tensor<float>& ref_latent_tensor      = {}) {
+-            ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE);
++            const auto& shape = x_tensor.shape();
++            const auto patch_tokens = shape[0] * shape[1] * shape[2] /
++                                      (std::get<0>(config.patch_size) * std::get<1>(config.patch_size) * std::get<2>(config.patch_size));
++            const bool large = patch_tokens * config.ffn_dim * sizeof(float) > (size_t{2} << 30);
++            ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE + (large ? config.num_layers * 256 : 0));
+ 
+             ggml_tensor* x               = make_input(x_tensor);
+             ggml_tensor* timesteps       = make_input(timesteps_tensor);
