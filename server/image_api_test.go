@@ -435,3 +435,24 @@ func TestImageMOSSInstallExposesPresetWithoutChangingActiveProfile(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, "moss_xvstyle\nAn orange lantern beside a window.", generation.Prompt)
 }
+
+func TestVideoAndImageRunnerPanicLeavesQueueHealthy(t *testing.T) {
+	_, v, _, _, runner := newImageTestService(t)
+	fired := false
+	runner.afterSave = func() {
+		if !fired {
+			fired = true
+			panic("fixture: interrupted backend")
+		}
+	}
+	for _, expected := range []string{"failed", "completed"} {
+		job, err := v.enqueue(&imageJob{Kind: "generate", Config: cloneImageConfig(v.config), Profile: v.config.Profiles[0], Request: imageJobRequest{Prompt: "test worker"}})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool { v.mu.Lock(); defer v.mu.Unlock(); return imageTerminal(job.Status) }, 2*time.Second, time.Millisecond)
+		v.mu.Lock()
+		status := job.Status
+		message := job.Error
+		v.mu.Unlock()
+		require.Equal(t, expected, status, message)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -664,9 +665,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		}
 		v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
 		imageStarted = true
-		result, generationErr := engine.Run(job.ctx, runtimeProfile, input, func(progress imagegen.Progress) {
-			v.updateImageProgress(job, progress)
-		})
+		result, generationErr := v.runMedia(job, engine, runtimeProfile, input)
 		if result.Path != "" {
 			var saveErr error
 			if job.Video != nil {
@@ -686,6 +685,18 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		input.GPUResidentFailedAtMiB = result.GPUResidentFailedAtMiB
 	}
 	return nil
+}
+
+// Convert a recoverable runner panic to a job error before releasing its GPU
+// lease. The queue remains available and normal attempts pay one defer per run.
+func (v *imageService) runMedia(job *imageJob, engine imagegen.Runner, profile imagegen.Profile, input imagegen.Request) (result imagegen.Result, err error) {
+	defer func() {
+		if cause := recover(); cause != nil {
+			slog.Error("media runner panicked", "job", job.ID, "cause", cause, "stack", string(debug.Stack()))
+			err = errors.New("Falha interna do gerador. Consulte o log do Wildllama para os detalhes.")
+		}
+	}()
+	return engine.Run(job.ctx, profile, input, func(progress imagegen.Progress) { v.updateImageProgress(job, progress) })
 }
 
 func (v *imageService) admitImageMemory(ctx context.Context, profile imagegen.Profile) (imagegen.Profile, bool, uint64, error) {

@@ -255,16 +255,10 @@ func (s *Server) videoClearHandler(c *gin.Context) {
 				c.JSON(500, gin.H{"error": err.Error()})
 				return
 			}
+			job = &copy
 		}
 		// The durable clear must succeed before discarding the only live step.
-		current := job
-		for _, candidate := range v.jobs {
-			if candidate.ID == job.ID {
-				current = candidate
-				break
-			}
-		}
-		if err := current.dropVideoCheckpoint(); err != nil {
+		if err := job.dropVideoCheckpoint(); err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
