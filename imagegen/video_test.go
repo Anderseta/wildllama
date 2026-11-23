@@ -1,6 +1,8 @@
 package imagegen
 
 import (
+	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,35 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestWanVideoPosterPreservesExactMiddlePacket(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "wan-five-frames.webm"))
+	require.NoError(t, err)
+	// Give each same-sized VP8 keyframe a distinct byte and retain its native packet.
+	marker := []byte{0x9d, 0x01, 0x2a}
+	var offsets []int
+	for at := 0; at < len(data); {
+		i := bytes.Index(data[at:], marker)
+		if i < 0 {
+			break
+		}
+		start := at + i - 3
+		offsets = append(offsets, start)
+		data[start+12] ^= byte(len(offsets))
+		at = start + 13
+	}
+	require.Len(t, offsets, 5)
+	path := filepath.Join(t.TempDir(), "video.webm")
+	require.NoError(t, os.WriteFile(path, data, 0600))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+	poster, err := MiddleVideoWebP(f, len(offsets))
+	require.NoError(t, err)
+	require.Equal(t, "WEBPVP8 ", string(poster[8:16]))
+	size := int(binary.LittleEndian.Uint32(poster[16:20]))
+	require.Equal(t, data[offsets[2]:offsets[2]+size], poster[20:20+size])
+}
 
 func TestWanVideoLateFailurePreservesCompletedFile(t *testing.T) {
 	dir := t.TempDir()

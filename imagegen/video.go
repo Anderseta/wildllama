@@ -2,6 +2,7 @@ package imagegen
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -96,6 +97,47 @@ func checkWebM(path string, frames, width, height int) error {
 		return err
 	}
 	defer file.Close()
+	return scanWanWebM(file, frames, width, height, nil, nil)
+}
+
+// Wan writes independently decodable VP8 keyframes at constant FPS. Rewrap
+// the compressed center frame as WebP without decoding or transcoding it.
+func MiddleVideoWebP(file *os.File, frames int) ([]byte, error) {
+	if frames < 1 || frames > 241 {
+		return nil, errors.New("invalid frame count")
+	}
+	var poster []byte
+	err := scanWanWebM(file, frames, 0, 0, func(offset, size int64) error {
+		if size < 10 || size > 32<<20 {
+			return errors.New("invalid VP8 frame size")
+		}
+		poster = make([]byte, 20+size+(size&1))
+		copy(poster, "RIFF")
+		binary.LittleEndian.PutUint32(poster[4:], uint32(len(poster)-8))
+		copy(poster[8:], "WEBPVP8 ")
+		binary.LittleEndian.PutUint32(poster[16:], uint32(size))
+		if _, err := file.ReadAt(poster[20:20+size], offset); err != nil {
+			return err
+		}
+		if poster[20]&1 != 0 || string(poster[23:26]) != "\x9d\x01\x2a" {
+			return errors.New("middle frame is not a VP8 keyframe")
+		}
+		return nil
+	}, nil)
+	if err == nil && len(poster) == 0 {
+		err = errors.New("middle frame unavailable")
+	}
+	return poster, err
+}
+
+// Read the native writer's COMMENT only for historical records without job metadata.
+func EmbeddedVideoParameters(file *os.File, frames int) ([]byte, error) {
+	var data []byte
+	err := scanWanWebM(file, frames, 0, 0, nil, &data)
+	return data, err
+}
+
+func scanWanWebM(file *os.File, frames, width, height int, middle func(int64, int64) error, comment *[]byte) error {
 	info, err := file.Stat()
 	if err != nil {
 		return err
@@ -103,14 +145,24 @@ func checkWebM(path string, frames, width, height int) error {
 	var header bool
 	var pixelWidth, pixelHeight int
 	count := 0
-	r := bufio.NewReader(file)
+	section := io.NewSectionReader(file, 0, info.Size())
+	r := bufio.NewReader(section)
+	// Keep the read-ahead for adjacent EBML headers; seek over large blocks.
+	position := func() int64 { n, _ := section.Seek(0, io.SeekCurrent); return n - int64(r.Buffered()) }
 	var walk func(int64, int64, int64) error
 	walk = func(start, end, parent int64) error {
+		var tagName string
+		var tagText []byte
 		for start < end {
-			if _, err := file.Seek(start, io.SeekStart); err != nil {
-				return err
+			delta := start - position()
+			if delta >= 0 && delta <= int64(r.Buffered()) {
+				_, _ = r.Discard(int(delta))
+			} else {
+				if _, err := section.Seek(start, io.SeekStart); err != nil {
+					return err
+				}
+				r.Reset(section)
 			}
-			r.Reset(file)
 			id, _, err := webmVint(r, true)
 			if err != nil {
 				return err
@@ -119,11 +171,7 @@ func checkWebM(path string, frames, width, height int) error {
 			if err != nil {
 				return err
 			}
-			pos, err := file.Seek(0, io.SeekCurrent)
-			if err != nil {
-				return err
-			}
-			pos -= int64(r.Buffered())
+			pos := position()
 			if unknown && id != 0x18538067 {
 				return errors.New("unsupported unknown WebM element length")
 			}
@@ -142,6 +190,20 @@ func checkWebM(path string, frames, width, height int) error {
 				if err := walk(pos, pos+size, id); err != nil {
 					return err
 				}
+			case comment != nil && (parent == 0x18538067 && id == 0x1254c367 || parent == 0x1254c367 && id == 0x7373 || parent == 0x7373 && id == 0x67c8):
+				if err := walk(pos, pos+size, id); err != nil {
+					return err
+				}
+			case comment != nil && parent == 0x67c8 && (id == 0x45a3 || id == 0x4487) && size > 0 && size <= 1<<20:
+				value := make([]byte, size)
+				if _, err := io.ReadFull(r, value); err != nil {
+					return err
+				}
+				if id == 0x45a3 {
+					tagName = string(value)
+				} else {
+					tagText = value
+				}
 			case parent == 0xe0 && (id == 0xb0 || id == 0xba):
 				if size < 1 || size > 4 {
 					return errors.New("invalid video track dimensions")
@@ -159,19 +221,41 @@ func checkWebM(path string, frames, width, height int) error {
 				} else {
 					pixelHeight = n
 				}
-			case parent == 0x1f43b675 && id == 0xa3 && size > 4:
+			case parent == 0x1f43b675 && id == 0xa0:
+				if err := walk(pos, pos+size, id); err != nil {
+					return err
+				}
+			case (parent == 0x1f43b675 && id == 0xa3 || parent == 0xa0 && id == 0xa1) && size > 4:
+				if middle != nil && count == frames/2 {
+					track, _, err := webmVint(r, false)
+					if err != nil || track != 1 {
+						return errors.New("invalid Wan video track")
+					}
+					var h [3]byte
+					if _, err = io.ReadFull(r, h[:]); err != nil {
+						return err
+					}
+					offset := position()
+					if h[2]&6 != 0 || offset > pos+size {
+						return errors.New("unsupported laced video frame")
+					}
+					if err := middle(offset, pos+size-offset); err != nil {
+						return err
+					}
+				}
 				count++
-			case parent == 0x1f43b675 && id == 0xa0 && size > 4:
-				count++ // BlockGroup
 			}
 			start = pos + size
+		}
+		if comment != nil && tagName == "COMMENT" && len(tagText) > 0 {
+			*comment = tagText
 		}
 		return nil
 	}
 	if err = walk(0, info.Size(), 0); err != nil {
 		return err
 	}
-	if pixelWidth != width || pixelHeight != height {
+	if width > 0 && (pixelWidth != width || pixelHeight != height) {
 		return fmt.Errorf("invalid WebM: expected %dx%d, found %dx%d", width, height, pixelWidth, pixelHeight)
 	}
 	if count != frames {

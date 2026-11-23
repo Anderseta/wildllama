@@ -360,6 +360,13 @@ func (v *imageService) workQueue(transfer bool) {
 			job.Error = err.Error()
 		}
 		if job.VideoFile != nil {
+			// Retain the final phase timings, including any text restoration,
+			// even after this job leaves the bounded queue history.
+			stored := storedVideo{videoRecord: *job.VideoFile}
+			stored.fromJob(job)
+			if e := writeImageJSON(v.videoRecordPath(job.ID), stored); e != nil {
+				slog.Warn("save final video timings", "id", job.ID, "error", e)
+			}
 			if dropErr := job.dropVideoCheckpoint(); dropErr != nil {
 				job.PersistenceError = dropErr.Error()
 				slog.Warn("remove video checkpoint", "error", dropErr)

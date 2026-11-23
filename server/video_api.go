@@ -78,12 +78,19 @@ type videoRecord struct {
 
 func (v *imageService) registerVideoResult(job *imageJob, result imagegen.Result) error {
 	r := videoRecord{GenerationSeconds: job.PriorVideoSeconds + result.DurationSeconds, ID: job.ID, Path: result.Path, Seed: result.Seed, Created: time.Now().UTC(), Frames: job.Video.Frames, FPS: job.Video.FPS}
-	if err := writeImageJSON(filepath.Join(v.root, "video-records", job.ID+".json"), r); err != nil {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	stored := storedVideo{videoRecord: r}
+	stored.fromJob(job)
+	if err := writeImageJSON(v.videoRecordPath(job.ID), stored); err != nil {
 		return err
 	}
-	v.mu.Lock()
+	if v.videoArchive != nil {
+		v.videoArchive[r.ID] = stored.videoRecord
+	}
+	v.videoRevision++
 	job.VideoFile = &r
-	v.mu.Unlock()
+
 	return nil
 }
 
@@ -113,6 +120,12 @@ func (s *Server) registerVideoRoutes(r *gin.Engine) {
 	r.POST("/api/videos/memory", s.videoMemoryHandler)
 	r.POST("/api/videos/install", s.videoInstallHandler)
 	r.GET("/api/videos/jobs", s.videoJobsHandler)
+	r.GET("/api/videos/gallery", s.videoGalleryHandler)
+	r.DELETE("/api/videos/gallery", s.videoGalleryHandler)
+	r.GET("/api/videos/records/:id", s.videoDetailHandler)
+	r.DELETE("/api/videos/records/:id", s.videoDetailHandler)
+	r.GET("/api/videos/posters/:id", s.videoPosterHandler)
+	r.HEAD("/api/videos/posters/:id", s.videoPosterHandler)
 	r.POST("/api/videos/jobs", s.videoStartHandler)
 	r.POST("/api/videos/jobs/:id/cancel", s.videoCancelHandler)
 	r.POST("/api/videos/jobs/:id/resume", s.videoResumeHandler)
@@ -220,13 +233,17 @@ func (s *Server) videoJobsHandler(c *gin.Context) {
 	v.mu.Lock()
 	for i := len(v.jobs) - 1; i >= 0; i-- {
 		if job := v.jobs[i]; isVideoJob(job) && (!job.HistoryCleared || job.VideoFile != nil) {
+			if c.Query("queue") == "true" && job.VideoFile != nil && (job.Status == "completed" || job.HistoryCleared) {
+				continue
+			}
 			copy := cloneImageJobLocked(job)
 			copy.Generation = nil
 			jobs = append(jobs, copy)
 		}
 	}
+	revision := v.videoRevision
 	v.mu.Unlock()
-	c.JSON(200, gin.H{"jobs": jobs})
+	c.JSON(200, gin.H{"jobs": jobs, "gallery_revision": revision})
 }
 
 // Retain the request identity for retries and any already published video.

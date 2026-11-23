@@ -1,0 +1,60 @@
+diff --git a/src/model/vae/vae.hpp b/src/model/vae/vae.hpp
+--- a/src/model/vae/vae.hpp
++++ b/src/model/vae/vae.hpp
+@@ -253,16 +253,19 @@
+         return encode(n_threads, x, tiling_params, circular_x, circular_y, true);
+     }
+ 
++    bool scales_input_pixels() const { return scale_input; }
++
+     sd::Tensor<float> encode(int n_threads,
+                              sd::Tensor<float> input,
+                              sd_tiling_params_t tiling_params,
+                              bool circular_x,
+                              bool circular_y,
+-                             bool auto_end) {
++                             bool auto_end,
++                             bool input_already_scaled = false) {
+         int64_t t0              = ggml_time_ms();
+         tiling_params           = resolve_tiling_params(tiling_params);
+         sd::Tensor<float> output;
+-        if (scale_input) {
++        if (scale_input && !input_already_scaled) {
+             scale_tensor_to_minus1_1(&input);
+         }
+ 
+diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
+--- a/src/pipeline/video.cpp
++++ b/src/pipeline/video.cpp
+@@ -1037,8 +1037,20 @@
+                 sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B" &&
+                 sd->first_stage_model->get_desc() == "wan_vae" && request->frames > 129;
+             auto encode_clip = [&](int frames) -> sd::Tensor<float> {
+-                sd::Tensor<float> image = sd::full<float>({request->width, request->height, frames, 3, 1}, 0.5f);
+-                if (!start_image.empty()) {
++                const size_t plane = size_t(request->width) * request->height;
++                const bool normalized = end_image.empty() && sd->first_stage_model->get_desc() == "wan_vae" &&
++                    sd->first_stage_model->scales_input_pixels() && start_image.numel() == plane * 3;
++                // Neutral 0.5 is exactly zero in VAE space. Leave the blank frames
++                // zero-initialized and transform only the actual RGB reference.
++                const std::vector<int64_t> shape{request->width, request->height, frames, 3, 1};
++                auto image = normalized ? sd::zeros<float>(shape) : sd::full<float>(shape, 0.5f);
++                if (normalized) {
++                    for (size_t ch = 0; ch < 3; ++ch) {
++                        auto dest = image.data() + ch * frames * plane;
++                        const auto pixels = start_image.data() + ch * plane;
++                        for (size_t i = 0; i < plane; ++i) dest[i] = pixels[i] * 2.0f - 1.0f;
++                    }
++                } else if (!start_image.empty()) {
+                     sd::ops::slice_assign(&image, 2, 0, 1, start_image.unsqueeze(2));
+                 }
+                 if (!end_image.empty()) {
+@@ -1049,7 +1061,7 @@
+                     // Wan's encoder already returns latents. Normalize the owned input clip in place.
+                     sd->generation_progress.report("vae_encode");
+                     auto encoded = sd->first_stage_model->encode(sd->n_threads, std::move(image), sd->vae_tiling_params,
+-                                                                  sd->circular_x, sd->circular_y, true);
++                                                                  sd->circular_x, sd->circular_y, true, normalized);
+                     if (!encoded.empty()) {
+                         return sd->first_stage_model->vae_to_diffusion_latents(encoded);
+                     }

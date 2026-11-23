@@ -172,6 +172,8 @@ type imageJob struct {
 }
 
 type imageService struct {
+	videoArchive      map[string]videoRecord
+	videoRevision     uint64
 	shutdownMu        sync.Mutex
 	videoProfileMu    sync.Mutex
 	mu                sync.Mutex
@@ -299,6 +301,7 @@ func (s *Server) imageService() *imageService {
 			service.configError = "Cannot load image asset catalog: " + err.Error()
 		}
 		service.recoverImageJobStates()
+		service.preserveVideoDetails()
 		for _, job := range service.jobs {
 			job.discoverSavedStep()
 		}
