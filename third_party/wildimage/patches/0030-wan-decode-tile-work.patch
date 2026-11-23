@@ -1,0 +1,87 @@
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -1454,7 +1454,7 @@
+             return gf;
+         }
+ 
+-        ggml_cgraph* build_temporal_tile_graph(const sd::Tensor<float>& z_tensor, int chunk_idx, int decode_frames) {
++        ggml_cgraph* build_temporal_tile_graph(const sd::Tensor<float>& z_tensor, int chunk_idx, int decode_frames, bool has_next_tile) {
+             ggml_cgraph* gf = new_graph_custom(std::max<size_t>(20480, 10240 * z_tensor.shape()[2]));
+ 
+             ae.clear_cache();
+@@ -1471,7 +1471,8 @@
+             ggml_tensor* out = ae.decode_tiled_chunk(&runner_ctx, z, chunk_idx, 1,
+                                                      version == VERSION_WAN2_2_TI2V ? decode_frames : 1);
+ 
+-            for (size_t feat_idx = 0; feat_idx < ae._feat_map.size(); feat_idx++) {
++            // The last tile consumes its predecessor's state. No successor reads its outputs.
++            for (size_t feat_idx = 0; has_next_tile && feat_idx < ae._feat_map.size(); feat_idx++) {
+                 ggml_tensor* feat_cache = ae._feat_map[feat_idx];
+                 if (feat_cache != nullptr) {
+                     runner_ctx.persist_cache_tensor("feat_idx:" + std::to_string(feat_idx), feat_cache);
+@@ -1558,7 +1559,7 @@
+                             (long long)tile.start,
+                             (long long)tile.end);
+                 auto get_graph = [&]() -> ggml_cgraph* {
+-                    return build_temporal_tile_graph(input_tile, static_cast<int>(tile.start), config.decode_frames);
++                    return build_temporal_tile_graph(input_tile, static_cast<int>(tile.start), config.decode_frames, !tile.last);
+                 };
+                 return restore_trailing_singleton_dims(
+                     GGMLRunner::compute(get_graph, n_threads, false),
+diff --git a/src/runtime/tiling.cpp b/src/runtime/tiling.cpp
+--- a/src/runtime/tiling.cpp
++++ b/src/runtime/tiling.cpp
+@@ -111,29 +111,32 @@
+     GGML_ASSERT(overlap_left >= 0 && overlap_right >= 0);
+     GGML_ASSERT(overlap_top >= 0 && overlap_bottom >= 0);
+ 
+-    auto smootherstep_f32 = [](const float x) -> float {
+-        return x * x * x * (x * (6.0f * x - 15.0f) + 10.0f);
++    // Spatial blend weights are shared by every channel and frame. Compute each
++    // axis once. Split wrapped rows at the seam so the inner loop is contiguous.
++    const auto weights = [](int size, int before, int after) {
++        std::vector<float> axis(size, 1.0f);
++        for (int i = 0; i < size; ++i) {
++            float f = 1.0f;
++            if (i < before) f = static_cast<float>(i) / before;
++            if (i >= size - after) f = static_cast<float>(size - i) / after;
++            f = std::clamp(f, 0.0f, 1.0f);
++            axis[i] = f * f * f * (f * (6.0f * f - 15.0f) + 10.0f);
++        }
++        return axis;
+     };
++    const auto wx = weights(static_cast<int>(in_width), overlap_left, overlap_right);
++    const auto wy = weights(static_cast<int>(in_height), overlap_top, overlap_bottom);
++    const int64_t first = std::min(in_width, out_width - x);
+     for (int64_t plane = 0; plane < plane_count; ++plane) {
+         for (int iy = 0; iy < in_height; ++iy) {
+-            float y_f = 1.0f;
+-            if (iy < overlap_top) {
+-                y_f = static_cast<float>(iy) / overlap_top;
+-            }
+-            if (iy >= in_height - overlap_bottom) {
+-                y_f = static_cast<float>(in_height - iy) / overlap_bottom;
+-            }
+-            const float y_weight = smootherstep_f32(std::clamp(y_f, 0.0f, 1.0f));
+-            for (int ix = 0; ix < in_width; ++ix) {
+-                float x_f = 1.0f;
+-                if (ix < overlap_left) {
+-                    x_f = static_cast<float>(ix) / overlap_left;
+-                }
+-                if (ix >= in_width - overlap_right) {
+-                    x_f = static_cast<float>(in_width - ix) / overlap_right;
+-                }
+-                float x_weight = smootherstep_f32(std::clamp(x_f, 0.0f, 1.0f));
+-                (*output)[plane * out_size + out_width * ((y + iy) % out_height) + ((x + ix) % out_width)] += x_weight * y_weight * input[plane * in_size + in_width * iy + ix];
++            const float* src = input.data() + plane * in_size + in_width * iy;
++            float* row = output->data() + plane * out_size + out_width * ((y + iy) % out_height);
++            const float yw = wy[iy];
++            for (int64_t ix = 0; ix < first; ++ix) {
++                row[x + ix] += wx[ix] * yw * src[ix];
++            }
++            for (int64_t ix = first; ix < in_width; ++ix) {
++                row[ix - first] += wx[ix] * yw * src[ix];
+             }
+         }
+     }

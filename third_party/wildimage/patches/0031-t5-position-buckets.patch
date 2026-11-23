@@ -1,0 +1,65 @@
+diff --git a/src/model/te/t5.hpp b/src/model/te/t5.hpp
+--- a/src/model/te/t5.hpp
++++ b/src/model/te/t5.hpp
+@@ -430,14 +430,10 @@
+         ggml_tensor* input_ids      = make_input(input_ids_tensor);
+         ggml_tensor* attention_mask = attention_mask_tensor.empty() ? nullptr : make_input(attention_mask_tensor);
+ 
+-        relative_position_bucket_vec = compute_relative_position_bucket(static_cast<int>(input_ids->ne[0]), static_cast<int>(input_ids->ne[0]));
+-
+-        // for (int i = 0; i < relative_position_bucket_vec.size(); i++) {
+-        //     if (i % 77 == 0) {
+-        //         printf("\n");
+-        //     }
+-        //     printf("%d ", relative_position_bucket_vec[i]);
+-        // }
++        const auto length = static_cast<int>(input_ids->ne[0]);
++        if (relative_position_bucket_vec.size() != static_cast<size_t>(length) * length) {
++            relative_position_bucket_vec = compute_relative_position_bucket(length, length);
++        }
+ 
+         auto relative_position_bucket = ggml_new_tensor_2d(compute_ctx,
+                                                            GGML_TYPE_I32,
+@@ -504,29 +500,19 @@
+ 
+     std::vector<int> compute_relative_position_bucket(int query_length,
+                                                       int key_length) {
+-        std::vector<int> context_position(query_length);
+-        std::vector<int> memory_position(key_length);
+-
+-        for (int i = 0; i < query_length; ++i) {
+-            context_position[i] = i;
+-        }
+-        for (int i = 0; i < key_length; ++i) {
+-            memory_position[i] = i;
+-        }
+-
+-        std::vector<std::vector<int>> relative_position(query_length, std::vector<int>(key_length, 0));
+-        for (int i = 0; i < query_length; ++i) {
+-            for (int j = 0; j < key_length; ++j) {
+-                relative_position[i][j] = memory_position[j] - context_position[i];
+-            }
+-        }
+-
+-        std::vector<int> relative_position_bucket;
+-        for (int i = 0; i < query_length; ++i) {
+-            std::vector<int> result = _relative_position_bucket(relative_position[i], true);
+-            relative_position_bucket.insert(relative_position_bucket.end(), result.begin(), result.end());
+-        }
+-
++        if (query_length <= 0 || key_length <= 0) return {};
++        // Every matrix diagonal has the same relative distance (key - query).
++        // Evaluate the original bucket function once per distance.
++        std::vector<int> distances(static_cast<size_t>(query_length) + key_length - 1);
++        for (size_t i = 0; i < distances.size(); ++i) {
++            distances[i] = static_cast<int>(static_cast<int64_t>(i) - (query_length - 1));
++        }
++        const auto buckets = _relative_position_bucket(distances, true);
++        std::vector<int> relative_position_bucket(static_cast<size_t>(query_length) * key_length);
++        for (int row = 0; row < query_length; ++row) {
++            std::copy_n(buckets.data() + (query_length - 1 - row), key_length,
++                        relative_position_bucket.data() + static_cast<size_t>(row) * key_length);
++        }
+         return relative_position_bucket;
+     }
+ };

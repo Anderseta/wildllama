@@ -1,0 +1,43 @@
+diff --git a/src/model/te/t5.hpp b/src/model/te/t5.hpp
+--- a/src/model/te/t5.hpp
++++ b/src/model/te/t5.hpp
+@@ -242,8 +242,14 @@
+         }
+         if (past_bias != nullptr) {
+             if (mask != nullptr) {
+-                mask = ggml_repeat(ctx->ggml_ctx, mask, past_bias);
+-                mask = ggml_add(ctx->ggml_ctx, mask, past_bias);
++                // ADD broadcasts its second operand. Avoid writing a dense mask per head.
++                if (mask->type == GGML_TYPE_F32 && past_bias->type == GGML_TYPE_F32 &&
++                    sd_backend_is(ctx->backend, "CUDA")) {
++                    mask = ggml_add(ctx->ggml_ctx, past_bias, mask);
++                } else {
++                    mask = ggml_repeat(ctx->ggml_ctx, mask, past_bias);
++                    mask = ggml_add(ctx->ggml_ctx, mask, past_bias);
++                }
+             } else {
+                 mask = past_bias;
+             }
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -86,10 +86,17 @@
+                 lp2 -= (int)cache_x->ne[2];
+             }
+ 
+-            x = ggml_ext_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
++            // With causal history present, CUDA's direct 3D convolution can supply
++            // the zero border itself. Wrapped axes still need their explicit samples.
++            const bool implicit_border = (lp0 || lp1) && lp2 == 0 && x->ne[2] > 1 &&
++                w->ne[2] > 1 && ctx->conv3d_direct_enabled && ggml_is_contiguous(x) &&
++                !ctx->circular_x_enabled && !ctx->circular_y_enabled && sd_backend_is(ctx->backend, "CUDA");
++            if (!implicit_border) {
++                x = ggml_ext_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
++            }
+             return ggml_ext_conv_3d(ctx, x, w, b, in_channels,
+                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
+-                                    0, 0, 0,
++                                    implicit_border ? lp0 : 0, implicit_border ? lp1 : 0, 0,
+                                     std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
+                                     false, ctx->conv3d_direct_enabled, scale, true);
+         }
