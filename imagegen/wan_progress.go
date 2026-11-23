@@ -15,6 +15,7 @@ type wanProgress struct {
 	attempt, base, high, evaluations, evaluation, stepsDone int
 	tile, tiles, chunk, chunks, segment, segments           int
 	samplingSince                                           time.Time
+	hostWeights                                             bool
 }
 
 func (w *wanProgress) restart(cfg float64) {
@@ -42,6 +43,14 @@ func (w *wanProgress) observe(line string, steps int) (Progress, bool) {
 		}
 	}
 	switch {
+	case strings.Contains(line, "auto-fit: --backend") && strings.Contains(line, "--params-backend") && strings.Contains(line, "=cpu"):
+		w.hostWeights = true
+		return Progress{Phase: "preparing", Message: "GPU selecionada para o cálculo, com pesos na RAM", VideoPercent: w.high, VideoAttempt: w.attempt, VideoHostWeights: true}, true
+	case strings.Contains(line, "wan restored ") && strings.Contains(line, "mib of weights from ram"):
+		if w.hostWeights || w.stage != "sample" {
+			return Progress{}, false
+		}
+		w.hostWeights = true
 	case strings.Contains(line, "sampling using ") && w.stage == "":
 		w.stage = "prepare"
 	case strings.Contains(line, "img2vid"):
@@ -118,5 +127,6 @@ func (w *wanProgress) observe(line string, steps int) (Progress, bool) {
 	}
 	w.high = max(w.high, min(99, w.base+int(local*float64(100-w.base)/100)))
 	p.VideoPercent, p.VideoAttempt = w.high, w.attempt
+	p.VideoHostWeights = w.hostWeights
 	return p, true
 }

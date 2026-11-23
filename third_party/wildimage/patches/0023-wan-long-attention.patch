@@ -1,0 +1,17 @@
+diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -175,7 +175,12 @@
+             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
+ 
+             const bool large = N == 1 && mask == nullptr && ctx->flash_attn_enabled && ggml_nbytes(q) > (size_t{1} << 30);
+-            x = large ? attention_by_head(ctx, q, k, v, pe, std::max<int64_t>(8, (num_heads + 7) / 8))
++            // At long sequence lengths, the rotary, flash inputs and each
++            // head-group output coexist with the full Q/K/V projections.
++            // Four heads leave room for the next block of the 14B on 16 GiB.
++            const int64_t group = ggml_nbytes(q) > (size_t{3} << 29)
++                                      ? 4 : std::max<int64_t>(8, (num_heads + 7) / 8);
++            x = large ? attention_by_head(ctx, q, k, v, pe, group)
+                       : Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, dim]
+ 
+             x = o_proj->forward(ctx, x);  // [N, n_token, dim]

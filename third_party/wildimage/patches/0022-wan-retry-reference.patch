@@ -1,58 +1,84 @@
 diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
 --- a/src/pipeline/video.cpp
 +++ b/src/pipeline/video.cpp
-@@ -4,6 +4,8 @@
+@@ -2,8 +2,15 @@
+ #include "generation_info.h"
+ 
  #include <algorithm>
++#include <atomic>
  #include <cmath>
  #include <cstdlib>
-+#include <filesystem>
-+#include <fstream>
++#if defined(_WIN32)
++#include "core/wildimage_ram_budget.h"
++#elif defined(__linux__)
++#include <sys/mman.h>
++#include <sys/stat.h>
++#endif
  #include <optional>
  #include <utility>
  
-@@ -46,6 +48,41 @@
+@@ -46,6 +53,60 @@
          }
          latent = std::move(full);
          return true;
 +    }
 +
-+    // The parent gives GPU attempts of one request the same private directory.
-+    // Shape, components and reference stay fixed for its entire lifetime.
-+    static sd::Tensor<float> restore_wan_reference(const std::filesystem::path& path, std::vector<int64_t> shape) {
-+        if (path.empty()) return {};
-+        std::ifstream in(path, std::ios::binary | std::ios::ate);
-+        int64_t n = 1;
-+        for (auto axis : shape) n *= axis;
-+        if (!in || in.tellg() != static_cast<std::streamoff>(1 + n * sizeof(float))) return {};
-+        in.seekg(0);
-+        int rank = in.get();
++    // The parent owns a fresh, anonymous shared-memory object per job.
++    // Publish the rank last so a killed writer cannot publish a partial payload.
++    struct WanReferenceMemory {
++        unsigned char* data = nullptr;
++        size_t bytes;
++        explicit WanReferenceMemory(const char* name, size_t size) : bytes(size) {
++            if (!name || size == 0) return;
++#if defined(_WIN32)
++            if (std::strncmp(name, "Local\\wildllama-wan-", sizeof("Local\\wildllama-wan-") - 1) != 0) return;
++            HANDLE mapping = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
++            if (mapping) {
++                data = static_cast<unsigned char*>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size));
++                CloseHandle(mapping);
++            }
++#elif defined(__linux__)
++            struct stat info{};
++            if (std::strcmp(name, "fd:3") != 0 || fstat(3, &info) || info.st_size != static_cast<off_t>(size)) return;
++            void* view = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, 3, 0);
++            if (view != MAP_FAILED) data = static_cast<unsigned char*>(view);
++#endif
++        }
++        ~WanReferenceMemory() {
++            if (!data) return;
++#if defined(_WIN32)
++            UnmapViewOfFile(data);
++#elif defined(__linux__)
++            munmap(data, bytes);
++#endif
++        }
++        WanReferenceMemory(const WanReferenceMemory&) = delete;
++        WanReferenceMemory& operator=(const WanReferenceMemory&) = delete;
++    };
++
++    static sd::Tensor<float> restore_wan_reference(const WanReferenceMemory& mem, std::vector<int64_t> shape) {
++        if (!mem.data) return {};
++        const int rank = mem.data[0];
 +        if (rank != 4 && rank != 5) return {};
 +        shape.resize(rank);
 +        sd::Tensor<float> result(shape);
-+        if (!in.read(reinterpret_cast<char*>(result.data()), n * sizeof(float))) return {};
++        if (result.numel() * sizeof(float) != mem.bytes - 1) return {};
++        std::memcpy(result.data(), mem.data + 1, mem.bytes - 1);
 +        return result;
 +    }
 +
-+    static void save_wan_reference(const std::filesystem::path& path, const sd::Tensor<float>& value,
++    static void save_wan_reference(WanReferenceMemory& mem, const sd::Tensor<float>& value,
 +                                   const std::vector<int64_t>& expected) {
-+        if (path.empty() || (value.dim() != 4 && value.dim() != 5) ||
-+            !std::equal(value.shape().begin(), value.shape().end(), expected.begin())) return;
-+        std::error_code ec;
-+        const auto bytes = static_cast<uintmax_t>(value.numel()) * sizeof(float);
-+        auto disk = std::filesystem::space(path.parent_path(), ec);
-+        if (ec || disk.available < bytes + (uintmax_t{256} << 20)) return;
-+        auto part = path;
-+        part += ".part";
-+        std::ofstream out(part, std::ios::binary | std::ios::trunc);
-+        out.put(static_cast<char>(value.dim()));
-+        out.write(reinterpret_cast<const char*>(value.data()), bytes);
-+        out.close();
-+        if (out) std::filesystem::rename(part, path, ec);
-+        std::filesystem::remove(part, ec);
++        if (!mem.data || (value.dim() != 4 && value.dim() != 5) ||
++            !std::equal(value.shape().begin(), value.shape().end(), expected.begin()) ||
++            value.numel() * sizeof(float) != mem.bytes - 1) return;
++        std::memcpy(mem.data + 1, value.data(), mem.bytes - 1);
++        std::atomic_thread_fence(std::memory_order_release);
++        mem.data[0] = static_cast<unsigned char>(value.dim());
      }
  
      static bool stage_wan_weights(SDVersion version) {
-@@ -1029,12 +1066,24 @@
+@@ -1029,12 +1090,25 @@
                  }
                  return {};
              };
@@ -62,13 +88,14 @@ diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
 -                concat_latent = encode_clip(request->frames);
 -            } else if (constant_tail && !concat_latent.empty()) {
 -                LOG_INFO("Wan reference encoded 125 source frames; stationary tail verified for %d", request->frames);
-+            std::filesystem::path retry_file;
++            const char* retry_name = nullptr;
 +            if (sd->version == VERSION_WAN2 && sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B" &&
 +                sd->first_stage_model->get_desc() == "wan_vae") {
-+                if (const char* path = std::getenv("WILDLLAMA_WAN_REFERENCE")) retry_file = std::filesystem::u8path(path);
++                retry_name = std::getenv("WILDLLAMA_WAN_REFERENCE");
 +            }
 +            const std::vector<int64_t> shape{request->width / 8, request->height / 8, (request->frames - 1) / 4 + 1, 16, 1};
-+            auto concat_latent = restore_wan_reference(retry_file, shape);
++            WanReferenceMemory retry(retry_name, 1 + size_t(shape[0]) * shape[1] * shape[2] * shape[3] * sizeof(float));
++            auto concat_latent = restore_wan_reference(retry, shape);
 +            if (concat_latent.empty()) {
 +                concat_latent = encode_clip(constant_tail ? 125 : request->frames);
 +                if (constant_tail && !concat_latent.empty() && !extend_constant_wan_tail(concat_latent, request->frames)) {
@@ -77,7 +104,7 @@ diff --git a/src/pipeline/video.cpp b/src/pipeline/video.cpp
 +                } else if (constant_tail && !concat_latent.empty()) {
 +                    LOG_INFO("Wan reference encoded 125 source frames; stationary tail verified for %d", request->frames);
 +                }
-+                if (!concat_latent.empty()) save_wan_reference(retry_file, concat_latent, shape);
++                if (!concat_latent.empty()) save_wan_reference(retry, concat_latent, shape);
 +            } else {
 +                LOG_INFO("wildvideo reference reused");
              }

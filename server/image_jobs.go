@@ -88,7 +88,7 @@ func (v *imageService) recordProgress(job *imageJob, report imagegen.Progress, c
 		job.Progress.SamplingCurrent, job.Progress.SamplingTotal = current, total
 	}
 	backendChanged := false
-	if phase == "ram_offload" || phase == "cpu_fallback" {
+	if phase == "ram_offload" || phase == "cpu_fallback" || report.VideoHostWeights {
 		backendChanged = !job.RAMOffload
 		job.RAMOffload = true
 	}

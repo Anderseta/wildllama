@@ -106,6 +106,10 @@ func TestWanVideoProgressAcrossSegmentsAndRetry(t *testing.T) {
 	}
 	_, ok := w.observe("|##### | 256/256 - 12.0mb/s", 4)
 	require.False(t, ok)
+	restored, ok := w.observe("wan restored 64.00 mib of weights from ram", 4)
+	require.True(t, ok)
+	require.True(t, restored.VideoHostWeights)
+	require.Equal(t, "sampling", restored.Phase)
 	require.Greater(t, last, 45)
 	w.restart(1)
 	p, ok := w.observe("img2vid", 4)

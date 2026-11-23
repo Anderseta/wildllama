@@ -1,0 +1,195 @@
+diff --git a/src/model_manager.h b/src/model_manager.h
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -35,6 +35,11 @@
+ private:
+     static constexpr size_t MAX_RESIDENCY_BLOCK_BYTES = 1024ULL * 1024ULL * 1024ULL;
+ 
++    struct HostWeight {
++        wildimage_ram::Reservation ram;
++        std::unique_ptr<uint8_t[]> bytes;
++    };
++
+     struct TensorState {
+         std::string name;
+         ggml_tensor* tensor      = nullptr;
+@@ -57,6 +62,7 @@
+         bool staged_to_compute_backend = false;
+         uint64_t applied_lora_epoch    = UINT64_MAX;
+         uint64_t last_use_epoch        = 0;
++        std::unique_ptr<HostWeight> host_weight;
+     };
+ 
+     struct ParamsStorageBlock {
+@@ -141,6 +147,9 @@
+     bool validate_tensor(const TensorState& state) const;
+ 
+     bool load_tensors_to_params_backend(const std::vector<TensorState*>& states);
++    bool wan_weight_tiering_ = std::getenv("WILDLLAMA_WAN_WEIGHT_CACHE") != nullptr;
++    void retain_wan_weights(const ParamsStorageBlock& block);
++    void trim_wan_weights(size_t pending);
+     bool reclaim_ram(size_t pending, const std::vector<TensorState*>& protected_states);
+     bool apply_loras_to_params(const std::vector<TensorState*>& states);
+     bool mmap_params(const std::vector<TensorState*>& states,
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1059,6 +1059,7 @@
+     using ReadGroup = std::pair<ModelLoader::FileId, SDVersion>;
+     using ReadBatch = std::map<std::string, std::vector<ggml_tensor*>>;
+     std::map<ReadGroup, std::vector<ReadBatch>> groups;
++    size_t restored = 0;
+     size_t part_count = 0;
+     for (const auto* state : states) {
+         if (state != nullptr && state->sources.size() > 1 && ggml_backend_buffer_is_host(state->tensor->buffer)) {
+@@ -1087,6 +1088,17 @@
+     for (auto* state : states) {
+         if (state == nullptr)
+             continue;
++        if (state->host_weight) {
++            const size_t bytes = ggml_nbytes(state->tensor);
++            if (state->host_weight->ram.bytes() == bytes && loras_.empty()) {
++                ggml_backend_tensor_set(state->tensor, state->host_weight->bytes.get(), 0, bytes);
++                state->host_weight.reset();
++                state->loaded_to_params_backend = true;
++                restored += bytes;
++                continue;
++            }
++            state->host_weight.reset();
++        }
+         if (state->sources.size() > 1) {
+             if (ggml_backend_buffer_is_host(state->tensor->buffer)) {
+                 const size_t size = ggml_nbytes(state->tensor);
+@@ -1112,6 +1124,7 @@
+         }
+         add_destination(*state, state->name, state->tensor);
+     }
++    if (restored) LOG_INFO("Wan restored %.2f MiB of weights from RAM", restored / 1048576.);
+     for (auto& group : groups) {
+         for (auto& batch : group.second) {
+             std::set<std::string> names;
+@@ -1387,6 +1400,7 @@
+     runtime_residencies_.clear();
+     runtime_owners_.clear();
+     for (auto& state : tensor_states_) {
++        state->host_weight.reset();
+         state->pin_count          = 0;
+         state->applied_lora_epoch = UINT64_MAX;
+     }
+@@ -1717,6 +1731,7 @@
+     for (auto* tensor : tensors) {
+         const auto found = tensor_states_by_tensor_.find(tensor);
+         if (found != tensor_states_by_tensor_.end()) {
++            found->second->host_weight.reset();
+             target_states.insert(found->second);
+         }
+     }
+@@ -2036,6 +2051,55 @@
+     return result;
+ }
+ 
++// A file-backed weight that must leave the GPU can stay in ordinary host RAM.
++// Budget for Windows commit as well as physical RAM. Driver allocations also
++// consume commit, even when the process working set looks small.
++static uint64_t wan_host_space() {
++    const auto memory = wildimage_ram::system_memory();
++    uint64_t available = memory.available;
++#ifdef _WIN32
++    MEMORYSTATUSEX state{};
++    state.dwLength = sizeof(state);
++    if (!GlobalMemoryStatusEx(&state)) return 0;
++    available = std::min<uint64_t>(available, state.ullAvailPageFile);
++#endif
++    const uint64_t reserve = std::max<uint64_t>(5 * wildimage_ram::GiB, memory.total / 10);
++    return available > reserve ? available - reserve : 0;
++}
++
++void ModelManager::retain_wan_weights(const ParamsStorageBlock& block) {
++    if (!wan_weight_tiering_ || !loras_.empty() || block.states.empty()) return;
++    uint64_t space = std::min(wan_host_space(), wildimage_ram::budget().remaining());
++    for (auto* state : block.states) {
++        if (!state || (state->component != ModelComponent::Diffusion && state->component != ModelComponent::HighNoiseDiffusion) ||
++            !state->tensor || state->sources.empty() || state->applied_lora_epoch != UINT64_MAX ||
++            state->tensor->view_src || !ggml_is_contiguous(state->tensor) ||
++            sd_backend_is_cpu(state->compute_backend) || state->split_buffer_type) continue;
++        const size_t bytes = ggml_nbytes(state->tensor);
++        if (!bytes || bytes > space) continue;
++        auto host = std::unique_ptr<HostWeight>(new (std::nothrow) HostWeight);
++        if (!host || !host->ram.try_reset(bytes)) continue;
++        host->bytes.reset(new (std::nothrow) uint8_t[bytes]);
++        if (!host->bytes) continue;
++        ggml_backend_tensor_get(state->tensor, host->bytes.get(), 0, bytes);
++        state->host_weight = std::move(host);
++        space -= bytes;
++    }
++}
++
++void ModelManager::trim_wan_weights(size_t pending) {
++    if (!wan_weight_tiering_) return;
++    auto space = std::min(wan_host_space(), wildimage_ram::budget().remaining());
++    if (space >= pending) return;
++    for (const auto& state : tensor_states_) {
++        if (!state->host_weight) continue;
++        const auto bytes = state->host_weight->ram.bytes();
++        state->host_weight.reset();
++        space += bytes;
++        if (space >= pending) break;
++    }
++}
++
+ bool ModelManager::evict_compute_backend_block(const WeightResidencyBlock& block) {
+     const auto candidates = evictable_compute_backend_blocks(block.backend, {});
+     const auto found      = std::find_if(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+@@ -2054,6 +2118,7 @@
+     }
+     for (auto it = params_storage_blocks_.begin(); it != params_storage_blocks_.end(); ++it) {
+         if ((*it)->buffer == block.buffer) {
++            retain_wan_weights(**it);
+             if (block.requires_demotion) {
+                 for (auto* state : (*it)->states) {
+                     if (state != nullptr) {
+@@ -2106,12 +2171,14 @@
+         wildimage_ram::budget().fail();
+         return false;
+     }
++    if (wan_weight_tiering_) trim_wan_weights(std::min<size_t>(request.pending_allocation_bytes, size_t{512} << 20));
+     const bool ready = execution_engine()->ensure_capacity(*this, request, required_params, preferred_eviction_order, protected_params);
+     if (!ready) wildimage_ram::gpu_failure();
+     return ready;
+ }
+ 
+ bool ModelManager::reclaim_ram(size_t pending, const std::vector<TensorState*>& protected_states) {
++    trim_wan_weights(pending);
+     if(pending<=wildimage_ram::budget().remaining()) return true;
+     std::unordered_set<TensorState*> protected_set(protected_states.begin(),protected_states.end());
+     clear_all_prefetched_params();
+diff --git a/src/model_manager_files.cpp b/src/model_manager_files.cpp
+--- a/src/model_manager_files.cpp
++++ b/src/model_manager_files.cpp
+@@ -68,6 +68,7 @@
+         }
+     }
+     for (auto* state : affected) {
++        state->host_weight.reset();
+         state->metadata_validated = false;
+         state->applied_lora_epoch = UINT64_MAX;
+     }
+diff --git a/src/core/backend_fit.cpp b/src/core/backend_fit.cpp
+--- a/src/core/backend_fit.cpp
++++ b/src/core/backend_fit.cpp
+@@ -469,9 +469,13 @@
+                     weights += component.params_bytes;
+                 }
+                 if (weights > ram_budget - devices[gpu].budget_bytes) {
+-                    ram_budget = 0;
++                    // Account for future WDDM GPU commitments independently from
++                    // the configured host budget. Smaller components can still use RAM.
++                    const int64_t commit = memory.dwLength && memory.ullAvailPageFile
++                        ? int64_t(memory.ullAvailPageFile) : 0;
++                    ram_budget = std::min(ram_budget, std::max<int64_t>(0, commit - devices[gpu].budget_bytes - 5 * 1024 * MiB));
+                     enable_mmap = false;
+-                    LOG_INFO("Wan: streaming nonresident weights with buffered reads to preserve host memory");
++                    LOG_INFO("Wan: GPU first, host allowance for complete components %.0f MiB; buffered model source for remaining blocks", ram_budget / double(MiB));
+                 }
+             }
+ #endif

@@ -639,12 +639,23 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		residentFailedAt = r.GPUResidentFailedAtMiB
 		log.emit(Progress{Phase: "ram_offload", Message: "Reutilizando a execução em GPU com apoio da RAM, validada neste lote."}, true)
 	}
+	var reference wanReference
+	if r.Video != nil && !r.CPUOnly && p.OffloadToCPU && p.ModelID == WanRapidI2V && r.Video.Frames >= 65 {
+		size := int64(p.Width/8)*int64(p.Height/8)*int64(1+(r.Video.Frames-1)/4)*16*4 + 1
+		maxBytes := int64(p.MaxRAMMiB) << 20
+		if size <= 256<<20 && (maxBytes == 0 || size <= maxBytes/16) {
+			reference = newWanReference(size)
+			if reference.close != nil {
+				defer reference.close()
+			}
+		}
+	}
 	var runErr error
 	var decoded image.Image
 	eagerCUDA := false
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
-		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log)
+		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log, reference)
 		select {
 		case diskErr := <-diskGuard:
 			runErr = diskErr
@@ -748,7 +759,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	return result, nil
 }
 
-func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode, eagerCUDA bool, status RunnerStatus, log *progressLog) error {
+func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode, eagerCUDA bool, status RunnerStatus, log *progressLog, reference wanReference) error {
 	args := buildArgumentsForMode(p, r, jobDir, output, seed, mode)
 	if mode == imageRAMCPU {
 		// CPU conditioning gets a separate exact cache namespace. The saved
@@ -760,8 +771,14 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
 	if r.Video != nil {
 		cmd.Env = append(cmd.Env, "WILDLLAMA_VIDEO_PROGRESS=1")
-		if mode != imageRAMCPU && p.OffloadToCPU && r.Video.Frames >= 65 {
-			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_REFERENCE="+filepath.Join(jobDir, "wan-reference.bin"))
+		if mode != imageRAMCPU && (p.Steps > 1 || p.CFGScale > 1) {
+			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_WEIGHT_CACHE=1")
+		}
+		if mode != imageRAMCPU && reference.name != "" {
+			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_REFERENCE="+reference.name)
+			if reference.file != nil {
+				cmd.ExtraFiles = []*os.File{reference.file}
+			}
 		}
 	}
 	if eagerCUDA && mode != imageRAMCPU {
@@ -1068,7 +1085,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	if runtime.GOOS == "windows" && strings.TrimSpace(os.Getenv("WILDIMAGE_CUDA_WAIT")) == "" {
 		set("WILDIMAGE_CUDA_WAIT", "blocking")
 	}
-	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE"} {
+	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_WEIGHT_CACHE"} {
 		set(key, "")
 	}
 	set("PATH", filepath.Dir(config.RunnerPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
