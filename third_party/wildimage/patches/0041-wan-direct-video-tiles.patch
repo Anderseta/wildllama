@@ -1,0 +1,316 @@
+--- a/src/runtime/tiling.h
++++ b/src/runtime/tiling.h
+@@ -13,6 +13,11 @@
+ 
+ using TileProcessCallback = std::function<sd::Tensor<float>(const sd::Tensor<float>&)>;
+ 
++// Chunks of one spatial tile arrive in display order. Each must retain the
++// channel and batch layout of the complete tile.
++using TileChunkSink = std::function<bool(const sd::Tensor<float>&, int64_t first_frame, int64_t total_frames)>;
++using TileChunkProducer = std::function<bool(const sd::Tensor<float>&, const TileChunkSink&)>;
++
+ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
+                                    int output_width,
+                                    int output_height,
+@@ -23,6 +28,7 @@
+                                    bool circular_x,
+                                    bool circular_y,
+                                    const TileProcessCallback& on_processing,
+-                                   bool silent = false);
++                                   bool silent = false,
++                                   const TileChunkProducer& chunks = {});
+ 
+ #endif  // __SD_RUNTIME_TILING_H__
+--- a/src/runtime/tiling.cpp
++++ b/src/runtime/tiling.cpp
+@@ -120,7 +120,8 @@
+                                int overlap_left,
+                                int overlap_right,
+                                int overlap_top,
+-                               int overlap_bottom) {
++                               int overlap_bottom,
++                               int64_t first_frame) {
+     GGML_ASSERT(output != nullptr);
+ 
+     int64_t in_width    = input.shape()[0];
+@@ -131,7 +132,9 @@
+     int64_t out_size    = sd_tensor_plane_size(*output);
+     int64_t plane_count = input.numel() / in_size;
+ 
+-    GGML_ASSERT(output->numel() == plane_count * out_size);
++    const int64_t frames = input.dim() > 2 ? input.shape()[2] : 1;
++    const int64_t total_frames = output->dim() > 2 ? output->shape()[2] : 1;
++    GGML_ASSERT(output->numel() / out_size / total_frames == plane_count / frames);
+     GGML_ASSERT(x >= 0 && y >= 0);
+     GGML_ASSERT(x < out_width && in_width <= out_width);
+     GGML_ASSERT(y < out_height && in_height <= out_height);
+@@ -155,9 +158,11 @@
+     const auto wy = weights(static_cast<int>(in_height), overlap_top, overlap_bottom);
+     const int64_t first = std::min(in_width, out_width - x);
+     for (int64_t plane = 0; plane < plane_count; ++plane) {
++        const int64_t out_plane = frames == total_frames ? plane
++            : (plane / frames) * total_frames + first_frame + (plane % frames);
+         for (int iy = 0; iy < in_height; ++iy) {
+             const float* src = input.data() + plane * in_size + in_width * iy;
+-            float* row = output->data() + plane * out_size + out_width * ((y + iy) % out_height);
++            float* row = output->data() + out_plane * out_size + out_width * ((y + iy) % out_height);
+             const float yw = wy[iy];
+             for (int64_t ix = 0; ix < first; ++ix) {
+                 row[x + ix] += wx[ix] * yw * src[ix];
+@@ -179,7 +184,8 @@
+                                    bool circular_x,
+                                    bool circular_y,
+                                    const TileProcessCallback& on_processing,
+-                                   bool silent) {
++                                   bool silent,
++                                   const TileChunkProducer& chunks) {
+     sd::Tensor<float> output;
+     int input_width  = static_cast<int>(input.shape()[0]);
+     int input_height = static_cast<int>(input.shape()[1]);
+@@ -230,21 +236,33 @@
+             int64_t t1       = ggml_time_ms();
+             auto input_tile  = sd_tensor_split_2d(input, input_tile_width, input_tile_height, x.offset * scale_in, y.offset * scale_in);
+             if (video && tile_count > 0) LOG_INFO("wildvideo tile %d/%d", tile_count, num_tiles);
+-            auto output_tile = on_processing(input_tile);
+-            if (output_tile.empty()) {
+-                return {};
+-            }
+-            GGML_ASSERT(output_tile.shape()[0] == output_tile_width && output_tile.shape()[1] == output_tile_height);
+-            if (output.empty()) {
+-                std::vector<int64_t> output_shape = output_tile.shape();
+-                output_shape[0]                   = output_width;
+-                output_shape[1]                   = output_height;
+-                output                            = sd::Tensor<float>::zeros(std::move(output_shape));
+-            }
+-            sd_tensor_merge_2d(output_tile, &output,
+-                               x.offset * scale_out, y.offset * scale_out,
+-                               x.overlap_before * scale_out, x.overlap_after * scale_out,
+-                               y.overlap_before * scale_out, y.overlap_after * scale_out);
++            int64_t written = 0;
++            auto merge = [&](const sd::Tensor<float>& tile, int64_t first_frame, int64_t total_frames) {
++                const int64_t frames = tile.dim() > 2 ? tile.shape()[2] : 1;
++                if (tile.dim() < (chunks ? 3 : 2) || tile.shape()[0] != output_tile_width || tile.shape()[1] != output_tile_height ||
++                    first_frame != written || total_frames <= written || frames <= 0 ||
++                    frames > total_frames - written) return false;
++                auto shape = tile.shape();
++                shape[0] = output_width;
++                shape[1] = output_height;
++                if (shape.size() > 2) shape[2] = total_frames;
++                if (output.empty()) {
++                    output = sd::Tensor<float>(std::move(shape));
++                } else if (output.shape() != shape) {
++                    return false;
++                }
++                sd_tensor_merge_2d(tile, &output, x.offset * scale_out, y.offset * scale_out,
++                                   x.overlap_before * scale_out, x.overlap_after * scale_out,
++                                   y.overlap_before * scale_out, y.overlap_after * scale_out, first_frame);
++                written += frames;
++                return true;
++            };
++            if (chunks) {
++                if (!chunks(input_tile, merge) || output.empty() || written != output.shape()[2]) return {};
++            } else {
++                auto tile = on_processing(input_tile);
++                if (tile.empty() || !merge(tile, 0, tile.dim() > 2 ? tile.shape()[2] : 1)) return {};
++            }
+             ++tile_count;
+             if (!silent) {
+                 pretty_progress(tile_count, num_tiles, (ggml_time_ms() - t1) / 1000.0f);
+--- a/src/model/vae/vae.hpp
++++ b/src/model/vae/vae.hpp
+@@ -120,6 +120,8 @@
+             (*tensor)[i] = std::max(0.0f, std::min(1.0f, value));
+         }
+     }
++
++    virtual TileChunkProducer decode_tile_chunks(int, const sd_tiling_params_t&) { return {}; }
+ 
+     sd::Tensor<float> tiled_compute(const sd::Tensor<float>& input,
+                                     int n_threads,
+@@ -167,7 +169,9 @@
+                                          circular_x && p_tile_size_w < latent_width,
+                                          circular_y && p_tile_size_h < latent_height,
+                                          on_processing,
+-                                         silent);
++                                         silent,
++                                         decode_graph && input.dim() == 5 && input.shape()[2] > 1 && tiling_params.temporal_tiling
++                                             ? decode_tile_chunks(n_threads, tiling_params) : TileChunkProducer{});
+         set_circular_axes(original_circular_x, original_circular_y);
+         return output;
+     }
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -1670,6 +1670,35 @@
+             if (direction == VAETemporalDirection::ENCODE) {
+                 return _compute(n_threads, input, false);
+             }
++            return with_decode_tiles<sd::Tensor<float>>(n_threads, input, config, [&](const auto& plan, auto&& decode_tile) {
++                return process_vae_temporal_tiles(input, plan, decode_tile,
++                                                  sd_version_is_wan(version) ? 1 + 4 * (input.shape()[2] - 1) : 0);
++            });
++        }
++
++        TileChunkProducer decode_tile_chunks(int n_threads, const sd_tiling_params_t& params) override {
++            if (version != VERSION_WAN2 || ae.is_2D) return {};
++            const auto direction = VAETemporalDirection::DECODE;
++            const auto config = resolve_vae_temporal_tiling_config(params, get_default_temporal_tile_frames(direction),
++                                                                   get_default_temporal_tile_overlap(direction));
++            return [this, n_threads, config](const sd::Tensor<float>& input, const TileChunkSink& sink) {
++                const int64_t total = 1 + 4 * (input.shape()[2] - 1);
++                return with_decode_tiles<bool>(n_threads, input, config, [&](const auto& plan, auto&& decode_tile) {
++                    int64_t written = 0;
++                    for (const auto& tile : plan.tiles) {
++                        auto out = tile.first && tile.last ? decode_tile(input, tile)
++                            : decode_tile(sd::ops::slice(input, 2, tile.start, tile.end), tile);
++                        if (out.empty() || !sink(out, written, total)) return false;
++                        written += out.shape()[2];
++                    }
++                    return written == total;
++                });
++            };
++        }
++
++        template <class Result, class Visit>
++        Result with_decode_tiles(int n_threads, const sd::Tensor<float>& input,
++                               const VAETemporalTilingConfig& config, Visit&& visit) {
+             VAETemporalTilingConfig stateful_config = config;
+             stateful_config.overlap                 = 0;
+             auto plan                               = make_vae_temporal_tile_plan(input.shape()[2], stateful_config);
+@@ -1693,7 +1722,7 @@
+             free_cache_ctx_and_buffer();
+             ae.clear_cache();
+ 
+-            auto output = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& input_tile, const VAETemporalTile& tile) {
++            auto output = visit(plan, [&](const sd::Tensor<float>& input_tile, const VAETemporalTile& tile) {
+                 if (std::getenv("WILDLLAMA_VIDEO_PROGRESS")) LOG_INFO("wildvideo chunk %d/%zu", tile.index, plan.tiles.size());
+                 LOG_VERBOSE("Wan VAE temporal tile %d/%d: latent frames [%lld, %lld)",
+                             tile.index + 1,
+@@ -1706,7 +1735,7 @@
+                 return restore_trailing_singleton_dims(
+                     GGMLRunner::compute(get_graph, n_threads, false),
+                     static_cast<size_t>(input.dim()));
+-            }, sd_version_is_wan(version) ? 1 + 4 * (input.shape()[2] - 1) : 0);
++            });
+ 
+             free_cache_ctx_and_buffer();
+             ae.clear_cache();
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -334,6 +334,33 @@
+             auto k_img = k_img_proj->forward(ctx, context_img);  // [N, context_img_len, dim]
+             k_img      = norm_k_img->forward(ctx, k_img);
+             auto v_img = v_img_proj->forward(ctx, context_img);  // [N, context_img_len, dim]
++
++            // The two CUDA cross-attentions read the same query. GGML flash
++            // accepts token and head strides. Keep the head dimension contiguous
++            // and round K/V to the same F16 values directly in the destination layout.
++            // On short clips the staged 14B used more host memory with this graph layout.
++            if (n_token > 8192 && N == 1 && head_dim == 128 && ctx->flash_attn_enabled && !ctx->sage_attn_enabled &&
++                (ctx->attn_scale <= 0.f || ctx->attn_scale == 1.f) && sd_backend_is(ctx->backend, "CUDA")) {
++                auto c = ctx->ggml_ctx;
++                auto heads_view = [&](ggml_tensor* t) {
++                    auto shaped = ggml_reshape_4d(c, t, head_dim, num_heads, t->ne[1], 1);
++                    return ggml_permute(c, shaped, 0, 2, 1, 3);
++                };
++                auto queries = heads_view(q);
++                auto attend = [&](ggml_tensor* key, ggml_tensor* value) -> ggml_tensor* {
++                    auto k16 = ggml_cast(c, heads_view(key), GGML_TYPE_F16);
++                    auto v16 = ggml_cast(c, heads_view(value), GGML_TYPE_F16);
++                    if (!ggml_backend_supports_op(ctx->backend, k16) || !ggml_backend_supports_op(ctx->backend, v16))
++                        return nullptr;
++                    auto out = ggml_flash_attn_ext(c, queries, k16, v16, nullptr, 1.0f / std::sqrt(float(head_dim)), 0, 0);
++                    if (!ggml_backend_supports_op(ctx->backend, out)) return nullptr;
++                    ggml_prec_set_acc(out, GGML_PREC_F32);
++                    return ggml_reshape_3d(c, out, dim, n_token, 1);
++                };
++                auto image = attend(k_img, v_img);
++                auto text = attend(k, v);
++                if (image && text) return o_proj->forward(ctx, ggml_add(c, text, image));
++            }
+ 
+             // Both branches attend with the same queries. On long clips the
+             // contiguous head-major copy can exceed a GiB per branch and block.
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -1153,7 +1153,8 @@
+ 
+     // Only the staged video runner opts into direct mapped uploads. Other
+     // pipelines and host tensors retain the usual independent worker reads.
+-    const bool wan_upload = enable_mmap && target_tensor_names && std::getenv("WILDLLAMA_VIDEO_PROGRESS");
++    const bool staged_video = target_tensor_names && std::getenv("WILDLLAMA_VIDEO_PROGRESS");
++    const bool wan_upload = enable_mmap && staged_video;
+     int num_threads_to_use = n_threads_;
+ 
+     int64_t start_time = ggml_time_ms();
+@@ -1330,6 +1331,41 @@
+                         copy_to_backend_time_ms.fetch_add(ggml_time_ms() - t0);
+                         bytes_processed.fetch_add(nbytes_to_read);
+                         continue;
++                    }
++
++                    // Some staged components intentionally use buffered file I/O.
++                    // Each worker needs only one transfer window for unchanged weights.
++                    // Split CUDA buffers and tensors that require conversion keep their own loaders.
++                    constexpr size_t upload_window = 8ULL << 20;
++                    if (!mmapped && !is_zip && staged_video && nbytes_to_read > upload_window &&
++                        dst_tensor->buffer && !ggml_backend_buffer_is_host(dst_tensor->buffer) &&
++                        tensor_storage.type == dst_tensor->type && nbytes_to_read == ggml_nbytes(dst_tensor) &&
++                        !tensor_storage.is_f64 && !tensor_storage.is_i64 &&
++                        !tensor_storage.is_f8_e4m3 && !tensor_storage.is_f8_e5m2) {
++                        const char* name = ggml_backend_buffer_name(dst_tensor->buffer);
++                        if (std::strncmp(name, "CUDA", 4) == 0 && name[4] >= '0' && name[4] <= '9' &&
++                            name[4 + std::strspn(name + 4, "0123456789")] == '\0') {
++                            if (read_buffer.size() < upload_window) read_buffer.resize(upload_window);
++                            file.seekg(tensor_storage.offset);
++                            for (size_t at = 0; at < nbytes_to_read && !failed; at += upload_window) {
++                                const size_t count = std::min(upload_window, nbytes_to_read - at);
++                                t0 = ggml_time_ms();
++                                if (!file.read(reinterpret_cast<char*>(read_buffer.data()), count)) {
++                                    LOG_ERROR("incomplete buffered CUDA upload: '%s'", tensor_storage.name.c_str());
++                                    failed = true;
++                                    break;
++                                }
++                                read_time_ms.fetch_add(ggml_time_ms() - t0);
++                                t0 = ggml_time_ms();
++                                {
++                                    std::lock_guard<std::mutex> lock(backend_tensor_set_mutex);
++                                    ggml_backend_tensor_set(dst_tensor, read_buffer.data(), at, count);
++                                }
++                                copy_to_backend_time_ms.fetch_add(ggml_time_ms() - t0);
++                                bytes_processed.fetch_add(count);
++                            }
++                            continue;
++                        }
+                     }
+ 
+                     auto read_data = [&](char* buf, size_t n) -> bool {
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -4,6 +4,7 @@
+ #include <time.h>
+ #include <algorithm>
+ #include <cctype>
++#include <cstdlib>
+ #include <climits>
+ #include <filesystem>
+ #include <functional>
+@@ -663,6 +664,19 @@
+ 
+     sd_set_log_callback(sd_log_cb, (void*)&cli_params);
+     parse_args(argc, argv, cli_params, ctx_params, gen_params);
++
++#ifdef _WIN32
++    // A staged Rapid job changes graphs at tile and component boundaries.
++    // WDDM can retain hundreds of MiB for captures that the job scarcely replays.
++    // This process handles one request. Longer sampling schedules retain the backend default.
++    if (cli_params.mode == VID_GEN && ctx_params.stage_components && std::getenv("WILDLLAMA_VIDEO_PROGRESS") &&
++        gen_params.sample_params.sample_steps > 0 && gen_params.sample_params.sample_steps <= 4 &&
++        ctx_params.high_noise_diffusion_model_path.empty() && !gen_params.hires_enabled && gen_params.custom_sigmas.empty() &&
++        !std::getenv("GGML_CUDA_DISABLE_GRAPHS")) {
++        if (_putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1") == 0)
++            LOG_VERBOSE("Wan staged short schedule: CUDA graph replay disabled");
++    }
++#endif
+ 
+     if (cli_params.mode == METADATA) {
+         MetadataReadOptions options;

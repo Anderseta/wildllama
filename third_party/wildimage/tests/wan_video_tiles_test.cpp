@@ -103,9 +103,60 @@ static void check_sparse_reference(int frames) {
     assert(std::memcmp(actual.data(), expected.data(), actual.numel() * sizeof(float)) == 0);
 }
 
+static void check_streamed_spatial_decode() {
+    using Tensor = sd::Tensor<float>;
+    Tensor input({19, 15, 9, 3, 2});
+    for (int64_t i = 0; i < input.numel(); ++i) input[i] = float(i % 131 - 64) / 31.f;
+    const auto plan = make_vae_temporal_tile_plan(9, {4, 0, 1});
+    auto decode = [](const Tensor& tile, const VAETemporalTile& span) {
+        auto shape = tile.shape();
+        shape[0] *= 2;
+        shape[1] *= 2;
+        shape[2] = shape[2] * 4 - (span.first ? 3 : 0);
+        Tensor out(shape);
+        const auto src_plane = tile.shape()[0] * tile.shape()[1];
+        const auto dst_plane = shape[0] * shape[1];
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            const auto pix = i % dst_plane;
+            const auto plane = i / dst_plane;
+            const auto f = (plane % shape[2] + (span.first ? 3 : 0)) / 4;
+            out[i] = tile[((plane / shape[2]) * tile.shape()[2] + f) * src_plane +
+                          (pix / shape[0] / 2) * tile.shape()[0] + (pix % shape[0]) / 2];
+        }
+        return out;
+    };
+    auto dense = [&](const Tensor& tile) { return process_vae_temporal_tiles(tile, plan, decode, 33); };
+    auto run = [&](const TileChunkProducer& producer) {
+        return process_tiles_2d(input, 38, 30, 2, 9, 8, .25f, true, true, dense, true, producer);
+    };
+    auto stream = [&](const Tensor& tile, const TileChunkSink& sink) {
+        int64_t at = 0;
+        for (const auto& span : plan.tiles) {
+            auto out = decode(sd::ops::slice(tile, 2, span.start, span.end), span);
+            if (!sink(out, at, 33)) return false;
+            at += out.shape()[2];
+        }
+        return true;
+    };
+    const auto expected = run({});
+    const auto actual = run(stream);
+    assert(!actual.empty() && actual.shape() == expected.shape());
+    assert(std::memcmp(expected.data(), actual.data(), actual.numel() * sizeof(float)) == 0);
+    assert(run([&](const Tensor& tile, const TileChunkSink& sink) {
+        return stream(tile, [&](const Tensor& out, int64_t at, int64_t total) {
+            return at == 0 && sink(out, at, total);
+        });
+    }).empty());
+    assert(run([](const Tensor&, const TileChunkSink&) { return true; }).empty());
+    assert(run([](const Tensor& tile, const TileChunkSink& sink) {
+        return sink(Tensor({tile.shape()[0] * 2, tile.shape()[1] * 2}), 0, 1);
+    }).empty());
+}
+
 int main() {
     check_wan_decode_plan();
     ggml_time_init();
+    check_streamed_spatial_decode();
     check_sparse_reference(5);
     check_sparse_reference(33);
     check_sparse_reference(109);
