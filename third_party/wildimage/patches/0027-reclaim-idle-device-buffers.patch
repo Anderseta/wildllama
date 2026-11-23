@@ -1,0 +1,41 @@
+diff --git a/src/core/execution_engine.cpp b/src/core/execution_engine.cpp
+--- a/src/core/execution_engine.cpp
++++ b/src/core/execution_engine.cpp
+@@ -879,6 +879,26 @@
+         if (initial.fits()) {
+             return true;
+         }
++        // CUDA may retain already freed buffers of the wrong size for the
++        // next segment. The allocation precheck runs before CUDA's allocator
++        // gets a chance to evict those buffers itself. Trim only on pressure.
++        auto trim_idle_cuda = [&](const DeviceMemoryCapacity& before) {
++            if (!before.valid || before.requires_reclamation ||
++                before.required_device_bytes <= before.available_device_bytes ||
++                before.required_budget_bytes > before.available_budget_bytes ||
++                !sd_backend_is(request.compute_backend, "CUDA")) {
++                return false;
++            }
++            sd_backend_clear_buffer_cache(request.compute_backend);
++            const auto after = capacity();
++            if (after.fits(true)) {
++                LOG_DEBUG("reclaimed idle CUDA buffers for the next allocation on %s",
++                          ggml_backend_name(request.compute_backend));
++                return true;
++            }
++            return false;
++        };
++        if (trim_idle_cuda(initial)) return true;
+         for (auto& entry : sessions_) {
+             auto& session = *entry.second;
+             if (session.owner_id() != request.owner_id && session.workspace_.release()) {
+@@ -931,7 +951,9 @@
+             }
+         }
+         auto available = capacity();
+-        if (available.fits(true)) {
++        // Retiring other workspaces or evicting weights above may have
++        // returned more idle allocations to CUDA's cache.
++        if (available.fits(true) || trim_idle_cuda(available)) {
+             return true;
+         }
+         if (sd_backend_is(request.compute_backend, "Vulkan") &&
