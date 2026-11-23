@@ -1,7 +1,46 @@
 diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
 --- a/src/model/diffusion/wan.hpp
 +++ b/src/model/diffusion/wan.hpp
-@@ -314,6 +314,7 @@
+@@ -100,6 +100,27 @@
+         }
+     };
+ 
++    // Independent attention heads share positions but never mix before the
++    // output projection. Keep every key and value for the whole sequence.
++    inline ggml_tensor* attention_by_head(GGMLRunnerContext* ctx, ggml_tensor* q, ggml_tensor* k,
++                                          ggml_tensor* v, ggml_tensor* pe, int64_t group_size) {
++        auto c = ctx->ggml_ctx;
++        auto compute_range = [&](auto&& self, int64_t first, int64_t count) -> ggml_tensor* {
++            if (count <= group_size) {
++                auto heads = [&](ggml_tensor* tensor) {
++                    return ggml_view_4d(c, tensor, tensor->ne[0], count, tensor->ne[2], tensor->ne[3],
++                                        tensor->nb[1], tensor->nb[2], tensor->nb[3], first * tensor->nb[1]);
++                };
++                return Rope::attention(ctx, heads(q), heads(k), heads(v), pe, nullptr);
++            }
++            const int64_t left = ((count + group_size - 1) / group_size / 2) * group_size;
++            auto a = self(self, first, left);
++            auto b = self(self, first + left, count - left);
++            return ggml_concat(c, a, b, 0);
++        };
++        return compute_range(compute_range, 0, q->ne[1]);
++    }
++
+     class WanSelfAttention : public GGMLBlock {
+     public:
+         int64_t num_heads;
+@@ -153,7 +174,9 @@
+             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
+             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
+ 
+-            x = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, dim]
++            const bool large = N == 1 && mask == nullptr && ctx->flash_attn_enabled && ggml_nbytes(q) > (size_t{1} << 30);
++            x = large ? attention_by_head(ctx, q, k, v, pe, std::max<int64_t>(8, (num_heads + 7) / 8))
++                      : Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, dim]
+ 
+             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
+             return x;
+@@ -314,6 +337,7 @@
      class WanAttentionBlock : public GGMLBlock {
      protected:
          int64_t dim;
@@ -9,7 +48,7 @@ diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
  
          void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
              enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
-@@ -328,7 +329,7 @@
+@@ -328,7 +352,7 @@
                            bool qk_norm         = true,
                            bool cross_attn_norm = false,
                            float eps            = 1e-6)
@@ -18,7 +57,7 @@ diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
              blocks["norm1"]     = std::shared_ptr<GGMLBlock>(new LayerNorm(dim, eps, false));
              blocks["self_attn"] = std::shared_ptr<GGMLBlock>(new WanSelfAttention(dim, num_heads, qk_norm, eps));
              if (cross_attn_norm) {
-@@ -354,7 +355,8 @@
+@@ -354,7 +378,8 @@
                                       ggml_tensor* e,
                                       ggml_tensor* pe,
                                       ggml_tensor* context,
@@ -28,7 +67,7 @@ diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
              // x: [N, n_token, dim]
              // e: [N, 6, dim] or [N, T, 6, dim]
              // context: [N, context_img_len + context_txt_len, dim]
-@@ -380,19 +382,47 @@
+@@ -380,19 +405,47 @@
  
              x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[2]));
  
@@ -79,7 +118,7 @@ diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
  
              x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
  
-@@ -796,7 +826,7 @@
+@@ -796,7 +849,7 @@
              for (int i = 0; i < config.num_layers; i++) {
                  auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
  
@@ -88,7 +127,7 @@ diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
  
                  auto iter = config.vace_layers_mapping.find(i);
                  if (iter != config.vace_layers_mapping.end()) {
-@@ -991,7 +1021,11 @@
+@@ -991,7 +1044,12 @@
                                   float vace_strength                             = 1.f,
                                   const sd::Tensor<float>& audio_embed_tensor     = {},
                                   const sd::Tensor<float>& ref_latent_tensor      = {}) {
@@ -96,8 +135,9 @@ diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
 +            const auto& shape = x_tensor.shape();
 +            const auto patch_tokens = shape[0] * shape[1] * shape[2] /
 +                                      (std::get<0>(config.patch_size) * std::get<1>(config.patch_size) * std::get<2>(config.patch_size));
-+            const bool large = patch_tokens * config.ffn_dim * sizeof(float) > (size_t{2} << 30);
-+            ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE + (large ? config.num_layers * 256 : 0));
++            const bool large = patch_tokens * config.ffn_dim * sizeof(float) > (size_t{2} << 30) ||
++                               patch_tokens * config.dim * sizeof(float) > (size_t{1} << 30);
++            ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE + (large ? config.num_layers * 768 : 0));
  
              ggml_tensor* x               = make_input(x_tensor);
              ggml_tensor* timesteps       = make_input(timesteps_tensor);

@@ -113,7 +113,12 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	require.Contains(t, memory.Body.String(), `"latent_frames":56`)
 	require.NotContains(t, memory.Body.String(), "previous_run")
 	estimate.FPS = 30
-	require.JSONEq(t, memory.Body.String(), call("POST", "/api/videos/memory?mode=i2v", estimate).Body.String())
+	second := call("POST", "/api/videos/memory?mode=i2v", estimate)
+	require.Equal(t, 200, second.Code)
+	for _, response := range []string{memory.Body.String(), second.Body.String()} {
+		require.Contains(t, response, `"rgb_float_bytes":1059102720`)
+		require.Contains(t, response, `"wan14b_qkv_bytes":5367398400`)
+	}
 	stored, err := service.loadVideoProfile("i2v")
 	require.NoError(t, err)
 	require.Equal(t, profile, stored)

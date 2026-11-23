@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/imagegen"
 )
 
@@ -133,7 +134,18 @@ func (s *Server) videoMemoryHandler(c *gin.Context) {
 	}
 	v := s.imageService()
 	profile := p.runtimeProfile(mode)
-	result := gin.H{"rgb_float_bytes": p.RGBFloatBytes(p.Width, p.Height), "latent_frames": 1 + (p.Frames-1)/4}
+	latentFrames := 1 + (p.Frames-1)/4
+	// Wan Rapid 14B has width 5120 and three F32 Q/K/V projections. Its
+	// spatial VAE stride is 8 and its transformer uses 2x2 latent patches.
+	tokens := int64(p.Width/16) * int64(p.Height/16) * int64(latentFrames)
+	result := gin.H{"rgb_float_bytes": p.RGBFloatBytes(p.Width, p.Height), "latent_frames": latentFrames,
+		"wan14b_qkv_bytes": tokens * 5120 * 3 * 4}
+	if mem, err := discover.GetCPUMem(); err == nil {
+		result["free_ram_bytes"] = mem.FreeMemory
+		if mem.CommitLimit > 0 {
+			result["available_commit_bytes"] = mem.CommitAvailable
+		}
+	}
 	v.mu.Lock()
 	nearest := 242
 	for i := len(v.jobs) - 1; i >= 0; i-- {
