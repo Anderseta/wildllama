@@ -1,0 +1,216 @@
+diff --git a/src/model/common/rope.hpp b/src/model/common/rope.hpp
+--- a/src/model/common/rope.hpp
++++ b/src/model/common/rope.hpp
+@@ -795,8 +795,37 @@
+                                                     int theta,
+                                                     const std::vector<int>& axes_dim,
+                                                     int t_offset = 0) {
+-        std::vector<std::vector<float>> ids = gen_vid_ids(t, h, w, pt, ph, pw, bs, t_offset);
+-        return embed_nd(ids, bs, static_cast<float>(theta), axes_dim);
++        // A Wan grid repeats the same rotation for every position on each axis.
++        // Build the three short axis tables before writing the final matrix once.
++        if (axes_dim.size() != 3) {
++            return embed_nd(gen_vid_ids(t, h, w, pt, ph, pw, bs, t_offset), bs, static_cast<float>(theta), axes_dim);
++        }
++        const int nt = (t + pt / 2) / pt, nh = (h + ph / 2) / ph, nw = (w + pw / 2) / pw;
++        if (!nt || !nh || !nw || !bs) return {};
++        const auto table = [&](int count, int offset, int dim) {
++            return rope(linspace<float>(static_cast<float>(offset), 1.f * count - 1 + offset, count),
++                        dim, static_cast<float>(theta));
++        };
++        const auto times = table(nt, t_offset, axes_dim[0]);
++        const auto rows = table(nh, 0, axes_dim[1]);
++        const auto cols = table(nw, 0, axes_dim[2]);
++        const size_t stride = times.front().size() + rows.front().size() + cols.front().size();
++        const size_t batch_size = size_t(nt) * nh * nw * stride;
++        std::vector<float> result(batch_size * bs);
++        auto dst = result.begin();
++        for (const auto& time : times) {
++            for (const auto& row : rows) {
++                for (const auto& col : cols) {
++                    dst = std::copy(time.begin(), time.end(), dst);
++                    dst = std::copy(row.begin(), row.end(), dst);
++                    dst = std::copy(col.begin(), col.end(), dst);
++                }
++            }
++        }
++        for (int batch = 1; batch < bs; ++batch) {
++            dst = std::copy_n(result.begin(), batch_size, dst);
++        }
++        return result;
+     }
+ 
+     __STATIC_INLINE__ std::vector<std::vector<float>> gen_lingbot_video_ids(int t,
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -1428,11 +1428,46 @@
+                        version);
+         }
+ 
++        // Wan stores one contiguous spatial/time slab per channel and batch.
++        // Traverse it directly instead of broadcasting statistics twice over the clip.
++        template<bool encode>
++        static sd::Tensor<float> unit_scale_latents(const sd::Tensor<float>& input, const sd::Tensor<float>& mean,
++                                                    const sd::Tensor<float>& deviation) {
++            sd::Tensor<float> output(input.shape());
++            if (input.empty()) return output;
++            const int64_t channels = mean.numel();
++            const int64_t span = input.numel() / (channels * input.shape().back());
++            sd::parallel_for(0, input.numel(), 65536, [&](int64_t begin, int64_t end) {
++                while (begin < end) {
++                    const auto group = begin / span;
++                    const int64_t stop = std::min(end, (group + 1) * span);
++                    const float m = mean.data()[group % channels], s = deviation.data()[group % channels];
++                    for (; begin < stop; ++begin) {
++                        if constexpr (encode) {
++                            output.data()[begin] = (input.data()[begin] - m) / s;
++                        } else {
++                            // Preserve the separate FP32 multiply on hosts that contract multiply/add.
++#if defined(__FMA__) || defined(__ARM_FEATURE_FMA) || defined(__AVX2__) || defined(_M_ARM64) || defined(_M_FP_FAST)
++                            const volatile float scaled = input.data()[begin] * s;
++#else
++                            const float scaled = input.data()[begin] * s;
++#endif
++                            output.data()[begin] = scaled + m;
++                        }
++                    }
++                }
++            });
++            return output;
++        }
++
+         sd::Tensor<float> diffusion_to_vae_latents(const sd::Tensor<float>& latents) override {
+             if (version == VERSION_MING_IMAGE) {
+                 return latents / 8.0064f;
+             }
+             auto [mean_tensor, std_tensor] = get_latents_mean_std(latents);
++            if (sd_version_is_wan(version) && scale_factor == 1.f && (latents.dim() == 4 || latents.dim() == 5)) {
++                return unit_scale_latents<false>(latents, mean_tensor, std_tensor);
++            }
+             return (latents * std_tensor) / scale_factor + mean_tensor;
+         }
+ 
+@@ -1441,6 +1476,9 @@
+                 return latents * 8.0064f;
+             }
+             auto [mean_tensor, std_tensor] = get_latents_mean_std(latents);
++            if (sd_version_is_wan(version) && scale_factor == 1.f && (latents.dim() == 4 || latents.dim() == 5)) {
++                return unit_scale_latents<true>(latents, mean_tensor, std_tensor);
++            }
+             return ((latents - mean_tensor) * scale_factor) / std_tensor;
+         }
+ 
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -3051,10 +3051,9 @@
+     if (sd_version_is_pid(version) || sd_version_is_minit2i(version) || version == VERSION_IRIS) {
+         return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
+     }
+-    auto image_latents                = version == VERSION_P_H3_IMAGE && x.dim() == 5
+-                                            ? sd::ops::slice(x, 3, 0, get_latent_channel())
+-                                            : x;
+-    auto latents                      = first_stage_model->diffusion_to_vae_latents(image_latents);
++    auto latents = version == VERSION_P_H3_IMAGE && x.dim() == 5
++                       ? first_stage_model->diffusion_to_vae_latents(sd::ops::slice(x, 3, 0, get_latent_channel()))
++                       : first_stage_model->diffusion_to_vae_latents(x);
+     auto tiling_params                = first_stage_model->resolve_tiling_params(vae_tiling_params);
+     const bool prefer_temporal_tiling = decode_video && latents.dim() == 5 && latents.shape()[2] > 1 &&
+                                         first_stage_model->can_temporal_tile_decode();
+diff --git a/src/core/cuda/modulate.cu b/src/core/cuda/modulate.cu
+--- a/src/core/cuda/modulate.cu
++++ b/src/core/cuda/modulate.cu
+@@ -26,6 +26,20 @@
+                 }
+                 float value = __fadd_rn(x[xi], __fmul_rn(x[xi], scale[si]));
+                 dst[i]      = shift ? __fadd_rn(value, shift[hi]) : value;
++            }
++        }
++
++        // The Wan timestep supplies one contiguous scale/shift vector for all tokens.
++        // One block owns a channel stripe; rows use the same coefficients.
++        static __global__ void modulate_rows(const float* x, const float* scale, const float* shift, float* dst,
++                                             int width, int64_t rows) {
++            const int c = blockIdx.x * blockDim.x + threadIdx.x;
++            if (c >= width) return;
++            const float s = scale[c], h = shift[c];
++            for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
++                const int64_t i = row * width + c;
++                const float value = x[i];
++                dst[i] = __fadd_rn(__fadd_rn(value, __fmul_rn(value, s)), h);
+             }
+         }
+ 
+@@ -70,8 +84,18 @@
+             auto stream           = static_cast<CUDAStream>(context.stream);
+             auto* output          = static_cast<float*>(alias ? ggml_backend_buffer_get_base(e->workspace) : dst->data);
+             const unsigned blocks = unsigned(std::min<int64_t>((p.count + 255) / 256, 65535));
+-            modulate<<<blocks, 256, 0, stream>>>(static_cast<const float*>(x->data), static_cast<const float*>(scale->data),
+-                                                 shift ? static_cast<const float*>(shift->data) : nullptr, output, p);
++            const int64_t width = x->ne[0];
++            if (shift && width > 0 && width <= INT32_MAX - 255 && ggml_is_contiguous(x) &&
++                ggml_is_vector(scale) && ggml_is_vector(shift) && scale->ne[0] == width && shift->ne[0] == width &&
++                scale->nb[0] == sizeof(float) && shift->nb[0] == sizeof(float)) {
++                const int64_t rows = p.count / width;
++                const dim3 grid(static_cast<unsigned>((width + 255) / 256), static_cast<unsigned>(std::min<int64_t>(65535, rows)));
++                modulate_rows<<<grid, 256, 0, stream>>>(static_cast<const float*>(x->data), static_cast<const float*>(scale->data),
++                                                       static_cast<const float*>(shift->data), output, static_cast<int>(width), rows);
++            } else {
++                modulate<<<blocks, 256, 0, stream>>>(static_cast<const float*>(x->data), static_cast<const float*>(scale->data),
++                                                     shift ? static_cast<const float*>(shift->data) : nullptr, output, p);
++            }
+             if (cuda_last_error() != cuda_success || (alias && cuda_copy_async(dst->data, output, ggml_nbytes(dst), stream) != cuda_success)) {
+                 return GGML_STATUS_FAILED;
+             }
+diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -379,6 +379,17 @@
+         return x;
+     }
+ 
++    static ggml_tensor* modulate_norm(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* scale, ggml_tensor* shift) {
++        // Timestep per clip. Time-dependent modulation still needs its original reshape.
++        if (sd_backend_is(ctx->backend, "CUDA") && ggml_is_contiguous(x) && ggml_is_vector(scale) && ggml_is_vector(shift) &&
++            x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && shift->type == GGML_TYPE_F32 &&
++            x->ne[0] == scale->ne[0] && x->ne[0] == shift->ne[0]) {
++            return ggml_ext_modulate(ctx, x, shift, scale);
++        }
++        x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, x, scale));
++        return modulate_add(ctx->ggml_ctx, x, shift);
++    }
++
+     class WanAttentionBlock : public GGMLBlock {
+     protected:
+         int64_t dim;
+@@ -444,8 +455,7 @@
+ 
+             // self-attention
+             auto y = norm1->forward(ctx, x);
+-            y      = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[1]));
+-            y      = modulate_add(ctx->ggml_ctx, y, es[0]);
++            y      = modulate_norm(ctx, y, es[1], es[0]);
+             y      = self_attn->forward(ctx, y, pe);
+ 
+             x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[2]));
+@@ -465,8 +475,7 @@
+             }
+             // ffn
+             y = norm2->forward(ctx, x);
+-            y = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[4]));
+-            y = modulate_add(ctx->ggml_ctx, y, es[3]);
++            y = modulate_norm(ctx, y, es[4], es[3]);
+ 
+             auto feed_forward = [&](ggml_tensor* tokens) {
+                 auto expanded = ffn_0->forward(ctx, tokens);
+@@ -588,8 +597,7 @@
+             auto head = std::dynamic_pointer_cast<Linear>(blocks["head"]);
+ 
+             x = norm->forward(ctx, x);
+-            x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, x, es[1]));
+-            x = modulate_add(ctx->ggml_ctx, x, es[0]);
++            x = modulate_norm(ctx, x, es[1], es[0]);
+             x = head->forward(ctx, x);
+             return x;
+         }

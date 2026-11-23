@@ -1,0 +1,52 @@
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -1151,6 +1151,9 @@
+     std::atomic<int64_t> convert_time_ms(0);
+     std::atomic<uint64_t> bytes_processed(0);
+ 
++    // Only the staged video runner opts into direct mapped uploads. Other
++    // pipelines and host tensors retain the usual independent worker reads.
++    const bool wan_upload = enable_mmap && target_tensor_names && std::getenv("WILDLLAMA_VIDEO_PROGRESS");
+     int num_threads_to_use = n_threads_;
+ 
+     int64_t start_time = ggml_time_ms();
+@@ -1207,7 +1210,7 @@
+         }
+         // Named inference destinations are independent. Dispatch reads in file
+         // order so workers do not seek back and forth between transformer layers.
+-        if (target_tensor_names && !fdata.is_zip && !fdata.mmapped) {
++        if (target_tensor_names && !fdata.is_zip && (!fdata.mmapped || wan_upload)) {
+             std::sort(tensors_to_process.begin(), tensors_to_process.end(),
+                       [](const TensorStorage* a, const TensorStorage* b) { return a->offset < b->offset; });
+         }
+@@ -1305,6 +1308,29 @@
+                     }
+ 
+                     size_t nbytes_to_read = tensor_storage.nbytes_to_read();
++
++                    if (wan_upload && mmapped && !is_zip && dst_tensor->buffer &&
++                        !ggml_backend_buffer_is_host(dst_tensor->buffer) &&
++                        std::strncmp(ggml_backend_buffer_name(dst_tensor->buffer), "CUDA", 4) == 0 &&
++                        tensor_storage.type == dst_tensor->type && !tensor_storage.is_f64 && !tensor_storage.is_i64 &&
++                        !tensor_storage.is_f8_e4m3 && !tensor_storage.is_f8_e5m2 &&
++                        nbytes_to_read == ggml_nbytes(dst_tensor)) {
++                        // The synchronous GGML upload consumes these immutable bytes before returning.
++                        // Do not materialize a second, tensor-sized host buffer for each worker.
++                        if (tensor_storage.offset >= mmapped->size() || nbytes_to_read > mmapped->size() - tensor_storage.offset) {
++                            LOG_ERROR("mapped tensor exceeds file bounds: '%s'", tensor_storage.name.c_str());
++                            failed = true;
++                            break;
++                        }
++                        t0 = ggml_time_ms();
++                        {
++                            std::lock_guard<std::mutex> lock(backend_tensor_set_mutex);
++                            ggml_backend_tensor_set(dst_tensor, mmapped->data() + tensor_storage.offset, 0, nbytes_to_read);
++                        }
++                        copy_to_backend_time_ms.fetch_add(ggml_time_ms() - t0);
++                        bytes_processed.fetch_add(nbytes_to_read);
++                        continue;
++                    }
+ 
+                     auto read_data = [&](char* buf, size_t n) -> bool {
+                         if (zip != nullptr) {
