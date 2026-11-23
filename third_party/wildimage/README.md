@@ -137,3 +137,10 @@ VAE paths and the runtime directory on an idle authorized GPU. It generates two
 fixed-seed images in one context and compares decoded pixels after weight eviction
 and reload.
 Full-image A/B validation must also cover the existing FP8/LoRA editing path.
+
+### Wan diffusion diagnostics
+
+Set `WILDLLAMA_WAN_TIMINGS=1` when starting Wildllama to log weight preparation
+and graph execution time for each segmented Wan diffusion evaluation. Standalone
+`sd-cli` runs also need `WILDLLAMA_VIDEO_PROGRESS=1`. Both intervals use wall
+time at existing segment boundaries. Graph execution can overlap weight uploads.

@@ -1,0 +1,464 @@
+--- a/src/core/cuda/rope.cu
++++ b/src/core/cuda/rope.cu
+@@ -86,11 +86,11 @@
+         int64_t pe[4];
+     };
+ 
+-    template <bool interleaved>
++    template <bool interleaved, typename Output>
+     static __global__ void rope_apply_f32(
+         const float* x,
+         const float* pe,
+-        float* dst,
++        void* dst,
+         int64_t half_dim,
+         int64_t rot_half,
+         int64_t heads,
+@@ -111,7 +111,7 @@
+         const float* x_row  = x + head * strides.x[1] + token * strides.x[2] + batch * strides.x[3];
+         const float a       = x_row[i0 * strides.x[0]];
+         const float b       = x_row[i1 * strides.x[0]];
+-        float* out          = dst + row * half_dim * 2;
++        Output* out         = static_cast<Output*>(dst) + row * half_dim * 2;
+         if (j >= rot_half) {
+             out[i0] = a;
+             out[i1] = b;
+@@ -130,6 +130,24 @@
+         }
+     }
+ 
++#if defined(SD_CUDA_VENDOR_CUDA)
++    // One warp handles half a 128-wide Wan head. Map heads and tokens directly
++    // to the grid and write both rounded channels in one aligned store.
++    static __global__ void wan_rope_key_f16(const float* x, const float* pe, half2* out,
++                                            int64_t tokens, RopeApplyStrides strides) {
++        const int pair = threadIdx.x % 64;
++        const int64_t token = int64_t(blockIdx.x) * 4 + threadIdx.x / 64;
++        if (token >= tokens) return;
++        const auto head = blockIdx.y;
++        const auto* row = x + head * strides.x[1] + token * strides.x[2];
++        const auto* m = pe + pair * strides.pe[2] + token * strides.pe[3];
++        const float a = row[2 * pair], b = row[2 * pair + 1];
++        const float u = __fadd_rn(__fmul_rn(a, m[0]), __fmul_rn(b, m[strides.pe[0]]));
++        const float v = __fadd_rn(__fmul_rn(a, m[strides.pe[1]]), __fmul_rn(b, m[strides.pe[0] + strides.pe[1]]));
++        out[(head * tokens + token) * 64 + pair] = __floats2half2_rn(u, v);
++    }
++#endif
++
+     static bool rope_interleaved(const ggml_tensor* rope) {
+         int32_t value;
+         std::memcpy(&value, ggml_ext_op_attributes(rope), sizeof(value));
+@@ -149,7 +167,8 @@
+     static bool rope_supports(ggml_backend_dev_t, const ggml_tensor* rope, void*) {
+         const auto* x  = rope->src[0];
+         const auto* pe = rope->src[1];
+-        if (!x || !pe || x->type != GGML_TYPE_F32 || pe->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 ||
++        if (!x || !pe || x->type != GGML_TYPE_F32 || pe->type != GGML_TYPE_F32 ||
++            rope->type != (ggml_ext_op_get(rope) == sd_ggml_rope_f16_op() ? GGML_TYPE_F16 : GGML_TYPE_F32) ||
+             x->ne[0] % 2 || pe->ne[0] != 2 || pe->ne[1] != 2 || pe->ne[2] <= 0 || pe->ne[2] > x->ne[0] / 2 ||
+             pe->ne[3] != x->ne[2] || !ggml_is_contiguous(rope) || rope->ne[0] != x->ne[0] ||
+             rope->ne[1] != x->ne[2] || rope->ne[2] != x->ne[1] * x->ne[3] || rope->ne[3] != 1 ||
+@@ -345,10 +364,23 @@
+                 strides.x[i]  = x->nb[i] / 4;
+                 strides.pe[i] = pe->nb[i] / 4;
+             }
+-            const int64_t pairs = ggml_nelements(x) / 2;
+-            auto kernel         = rope_interleaved(rope) ? rope_apply_f32<true> : rope_apply_f32<false>;
+-            kernel<<<static_cast<unsigned int>((pairs + 255) / 256), 256, 0, stream>>>(static_cast<const float*>(x->data), static_cast<const float*>(pe->data),
+-                                                                                       static_cast<float*>(output), x->ne[0] / 2, pe->ne[2], x->ne[1], x->ne[2], pairs, strides);
++#if defined(SD_CUDA_VENDOR_CUDA)
++            if (dst->type == GGML_TYPE_F16 && rope_interleaved(rope) && x->ne[0] == 128 &&
++                x->ne[3] == 1 && x->ne[1] <= 65535 && pe->ne[2] == 64 && strides.x[0] == 1 &&
++                (reinterpret_cast<uintptr_t>(output) % alignof(half2)) == 0) {
++                dim3 grid(static_cast<unsigned>((x->ne[2] + 3) / 4), static_cast<unsigned>(x->ne[1]));
++                wan_rope_key_f16<<<grid, 256, 0, stream>>>(static_cast<const float*>(x->data), static_cast<const float*>(pe->data),
++                                                           static_cast<half2*>(output), x->ne[2], strides);
++            } else
++#endif
++            {
++                const int64_t pairs = ggml_nelements(x) / 2;
++                auto kernel = dst->type == GGML_TYPE_F16
++                                  ? (rope_interleaved(rope) ? rope_apply_f32<true, half> : rope_apply_f32<false, half>)
++                                  : (rope_interleaved(rope) ? rope_apply_f32<true, float> : rope_apply_f32<false, float>);
++                kernel<<<static_cast<unsigned int>((pairs + 255) / 256), 256, 0, stream>>>(static_cast<const float*>(x->data), static_cast<const float*>(pe->data),
++                                                                                           output, x->ne[0] / 2, pe->ne[2], x->ne[1], x->ne[2], pairs, strides);
++            }
+             error = cuda_last_error();
+         }
+         if (error == cuda_success && alias)
+@@ -368,6 +400,9 @@
+         desc.destroy              = rope_destroy;
+         desc.execute              = rope_execute;
+         GGML_ASSERT(ggml_ext_register_kernel_ex(device, &desc, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
++        desc.name      = "sd.rope_apply.f16." SD_CUDA_NAME ".v1";
++        desc.custom_op = sd_ggml_rope_f16_op();
++        GGML_ASSERT(ggml_ext_register_kernel_ex(device, &desc, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
+         desc.name      = "sd.rms_norm_mul_rope." SD_CUDA_NAME ".v1";
+         desc.op        = GGML_OP_RMS_NORM;
+         desc.custom_op = nullptr;
+--- a/src/core/execution_engine.cpp
++++ b/src/core/execution_engine.cpp
+@@ -580,7 +580,8 @@
+         SegmentGraphBindings bindings(session_.cut_cache_, plan, graph);
+         SegmentWeightPipeline weights(manager, session_.backend_, session_.owner_id(),
+                                       graph, plan, params_tensor_set_,
+-                                      segmented && manager != nullptr && manager->prefetch_enabled());
++                                      segmented && manager != nullptr && manager->prefetch_enabled(),
++                                      task_.description.compare(0, 3, "Wan") == 0);
+ 
+         std::map<ggml_backend_t, size_t> peak_compute_bytes;
+         auto track_compute_buffer = [&](ggml_backend_t backend) {
+@@ -592,6 +593,8 @@
+         const bool video_progress = std::getenv("WILDLLAMA_VIDEO_PROGRESS") != nullptr &&
+                                     task_.description.compare(0, 3, "Wan") == 0 &&
+                                     !plan.segments.empty() && plan.segments.front().group_name.rfind("wan.", 0) == 0;
++        const bool profile_diffusion = video_progress && std::getenv("WILDLLAMA_WAN_TIMINGS");
++        int64_t weight_us = 0, execute_us = 0;
+         int64_t last_video_report = 0;
+         if (video_progress) LOG_INFO("wildvideo segment 0/%zu", plan.segments.size());
+         for (size_t index = 0; index < plan.segments.size(); ++index) {
+@@ -663,9 +666,11 @@
+                 }
+                 return ready;
+             };
++            auto phase_start = profile_diffusion ? ggml_time_us() : 0;
+             if (!weights.segment_start(index, ensure_capacity)) {
+                 return fail_segment("weight preparation");
+             }
++            if (profile_diffusion) weight_us += ggml_time_us() - phase_start;
+             // Preparing weights can execute LoRA graphs and reclaim an idle workspace.
+             if (!session_.workspace_.prepare(measurement)) {
+                 last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
+@@ -701,9 +706,11 @@
+             }
+             LOG_DEBUG("%s executing segment %zu/%zu: %s", task_.description.c_str(),
+                       index + 1, plan.segments.size(), segment.group_name.c_str());
++            if (profile_diffusion) phase_start = ggml_time_us();
+             if (!execute_segment(segment_graph, n_threads, [&]() { weights.submit_next(); })) {
+                 return fail_segment("execution");
+             }
++            if (profile_diffusion) execute_us += ggml_time_us() - phase_start;
+             auto cache_status = session_.cache_.capture(segment_graph);
+             if (cache_status == GGML_STATUS_SUCCESS) {
+                 cache_status = session_.cut_cache_.capture(graph, segment, task_.description.c_str());
+@@ -737,6 +744,10 @@
+                     last_video_report = now;
+                 }
+             }
++        }
++        if (profile_diffusion) {
++            LOG_INFO("Wan segment wall time (%zu segments): weight preparation %.1f ms, graph execution %.1f ms",
++                     plan.segments.size(), weight_us / 1000.0, execute_us / 1000.0);
+         }
+         if (segments_changed || peak_compute_bytes != session_.logged_compute_bytes_) {
+             for (const auto& entry : peak_compute_bytes) {
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -1,6 +1,7 @@
+ #include "core/ggml_extend.h"
+ 
+ #include <cmath>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <utility>
+ #include <vector>
+@@ -593,6 +594,23 @@
+     }
+ }
+ 
++ggml_tensor* ggml_ext_attention_key_f16(GGMLRunnerContext* runner_ctx, ggml_tensor* key) {
++#ifndef SD_USE_UPSTREAM_GGML
++    // The Wan flash path already rounds the rotated key to half. Store it directly
++    // from the FP32 rotation and avoid materializing and rereading the FP32 output.
++    if (key->op == GGML_OP_CUSTOM && key->ne[0] == 128 &&
++        ggml_ext_op_get(key) == sd_ggml_rope_op() && std::getenv("WILDLLAMA_VIDEO_PROGRESS") &&
++        sd_backend_is(runner_ctx->backend, "CUDA")) {
++        ggml_tensor* inputs[] = {key->src[0], key->src[1]};
++        auto fused = ggml_ext_op_create(runner_ctx->ggml_ctx, sd_ggml_rope_f16_op(), inputs, 2, ggml_ext_op_attributes(key));
++        if (fused && ggml_backend_supports_op(runner_ctx->backend, fused)) {
++            return fused;
++        }
++    }
++#endif
++    return ggml_cast(runner_ctx->ggml_ctx, key, GGML_TYPE_F16);
++}
++
+ ggml_tensor* ggml_ext_attention_qk_heads(GGMLRunnerContext* runner_ctx, ggml_tensor* tensor, int64_t width, int64_t heads, int64_t batch) {
+     auto ctx = runner_ctx->ggml_ctx;
+     const auto tokens = tensor->ne[1];
+@@ -663,7 +681,7 @@
+         if (kv_scale != 1.0f) {
+             k_in = ggml_ext_scale(runner_ctx, k_in, kv_scale);
+         }
+-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
++        k_in = ggml_ext_attention_key_f16(runner_ctx, k_in);
+ 
+         if (kv_scale != 1.0f) {
+             v_in = ggml_ext_scale(runner_ctx, v_in, kv_scale);
+--- a/src/core/ggml_extend.h
++++ b/src/core/ggml_extend.h
+@@ -258,6 +258,8 @@
+ 
+ // x: F32 [head_dim, heads, tokens, batch], pe: F32 [2, 2, rot_dim/2, tokens].
+ // Returns [head_dim, tokens, heads*batch]; channels beyond rot_dim are unchanged.
++ggml_tensor* ggml_ext_attention_key_f16(GGMLRunnerContext* runner_ctx, ggml_tensor* key);
++
+ ggml_tensor* ggml_ext_rope_apply(GGMLRunnerContext* runner_ctx,
+                                  ggml_tensor* x,
+                                  ggml_tensor* pe,
+--- a/src/core/ggml_extensions.cpp
++++ b/src/core/ggml_extensions.cpp
+@@ -115,6 +115,24 @@
+     static const ggml_ext_op_t op = [] {
+         const ggml_ext_op_desc desc = {GGML_EXT_ABI_VERSION, "sd.rope_apply.v1", sizeof(int32_t), rope_infer};
+         auto result                 = ggml_ext_register_op(&desc);
++        GGML_ASSERT(result);
++        return result;
++    }();
++    return op;
++}
++
++static bool rope_f16_infer(ggml_tensor* const* inputs, int count, const void* attributes, ggml_ext_tensor_desc* out) {
++    if (!rope_infer(inputs, count, attributes, out)) {
++        return false;
++    }
++    out->type = GGML_TYPE_F16;
++    return true;
++}
++
++ggml_ext_op_t sd_ggml_rope_f16_op() {
++    static const ggml_ext_op_t op = [] {
++        const ggml_ext_op_desc desc = {GGML_EXT_ABI_VERSION, "sd.rope_apply.f16.v1", sizeof(int32_t), rope_f16_infer};
++        auto result = ggml_ext_register_op(&desc);
+         GGML_ASSERT(result);
+         return result;
+     }();
+--- a/src/core/ggml_extensions.h
++++ b/src/core/ggml_extensions.h
+@@ -15,6 +15,7 @@
+ size_t sd_ggml_modulate_workspace_size(const ggml_tensor* node);
+ 
+ ggml_ext_op_t sd_ggml_rope_op();
++ggml_ext_op_t sd_ggml_rope_f16_op();
+ 
+ bool sd_ggml_rope_describe(const ggml_tensor* node);
+ 
+--- a/src/core/segment_weight_pipeline.cpp
++++ b/src/core/segment_weight_pipeline.cpp
+@@ -25,19 +25,20 @@
+         ggml_cgraph* graph,
+         const ggml_graph_cut::Plan& plan,
+         const std::unordered_set<const ggml_tensor*>& params,
+-        bool enabled)
++        bool enabled, bool opportunistic_only)
+         : residency_manager_(residency_manager),
+           compute_backend_(compute_backend),
+           owner_id_(owner_id),
+-          enabled_(enabled && residency_manager != nullptr) {
+-        segment_params_.resize(plan.segments.size());
++          enabled_(enabled && residency_manager != nullptr),
++          opportunistic_only_(opportunistic_only) {
++        eviction_order_.resize(plan.segments.size());
+         for (size_t segment_index = 0; segment_index < plan.segments.size(); ++segment_index) {
+             std::unordered_set<ggml_tensor*> seen;
+             for (ggml_tensor* tensor :
+                  ggml_graph_cut::param_tensors(graph, plan.segments[segment_index])) {
+                 ggml_tensor* param = canonical_param(tensor, params);
+                 if (param != nullptr && seen.insert(param).second) {
+-                    segment_params_[segment_index].push_back(param);
++                    eviction_order_[plan.segments.size() - 1 - segment_index].push_back(param);
+                 }
+             }
+         }
+@@ -49,16 +50,12 @@
+     }
+ 
+     size_t SegmentWeightPipeline::next_parameter_segment(size_t segment_index) const {
+-        for (size_t next = segment_index + 1; next < segment_params_.size(); ++next) {
+-            if (!segment_params_[next].empty()) {
++        for (size_t next = segment_index + 1; next < eviction_order_.size(); ++next) {
++            if (!params(next).empty()) {
+                 return next;
+             }
+         }
+         return SIZE_MAX;
+-    }
+-
+-    std::vector<std::vector<ggml_tensor*>> SegmentWeightPipeline::preferred_eviction_order() const {
+-        return {segment_params_.rbegin(), segment_params_.rend()};
+     }
+ 
+     void SegmentWeightPipeline::disable() {
+@@ -84,18 +81,18 @@
+     bool SegmentWeightPipeline::ensure_segment_capacity(
+         size_t segment_index,
+         const std::vector<DeviceMemoryRequest>& requests) {
+-        if (segment_index >= segment_params_.size()) {
++        if (segment_index >= eviction_order_.size()) {
+             return false;
+         }
+         auto manager = residency_manager_.lock();
+         if (manager == nullptr) {
+-            return segment_params_[segment_index].empty();
+-        }
+-        std::vector<ggml_tensor*> protected_params = segment_params_[segment_index];
++            return this->params(segment_index).empty();
++        }
++        std::vector<ggml_tensor*> protected_params = this->params(segment_index);
+         protected_params.insert(protected_params.end(), queued_params_.begin(), queued_params_.end());
+         for (const auto& request : requests) {
+-            if (!manager->ensure_compute_backend_capacity(request, segment_params_[segment_index],
+-                                                          preferred_eviction_order(), protected_params)) {
++            if (!manager->ensure_compute_backend_capacity(request, this->params(segment_index),
++                                                          eviction_order_, protected_params)) {
+                 return false;
+             }
+         }
+@@ -110,12 +107,12 @@
+         }
+         auto manager = residency_manager_.lock();
+         if (manager == nullptr) {
+-            return segment_params_[segment_index].empty();
+-        }
+-        if (!manager->prepare_params(segment_params_[segment_index])) {
++            return this->params(segment_index).empty();
++        }
++        if (!manager->prepare_params(this->params(segment_index))) {
+             return false;
+         }
+-        pinned_params_ = segment_params_[segment_index];
++        pinned_params_ = this->params(segment_index);
+         return true;
+     }
+ 
+@@ -141,11 +138,11 @@
+         }
+ 
+         std::unordered_set<ggml_tensor*> active_params(
+-            segment_params_[segment_index].begin(),
+-            segment_params_[segment_index].end());
++            this->params(segment_index).begin(),
++            this->params(segment_index).end());
+         std::vector<ggml_tensor*> params;
+-        params.reserve(segment_params_[next_segment].size());
+-        for (ggml_tensor* param : segment_params_[next_segment]) {
++        params.reserve(this->params(next_segment).size());
++        for (ggml_tensor* param : this->params(next_segment)) {
+             if (active_params.find(param) == active_params.end()) {
+                 params.push_back(param);
+             }
+@@ -165,21 +162,24 @@
+             return;
+         }
+         if (!residency.async_prefetch_supported) {
+-            disable();
++            if (!opportunistic_only_) disable();
+             return;
+         }
+ 
+         DeviceMemoryRequest backend_request        = request;
+         backend_request.compute_backend            = compute_backend_;
+         backend_request.owner_id                   = owner_id_;
+-        std::vector<ggml_tensor*> protected_params = segment_params_[segment_index];
+-        protected_params.insert(protected_params.end(), params.begin(), params.end());
+-        if (!manager->ensure_compute_backend_capacity(backend_request,
+-                                                      params,
+-                                                      preferred_eviction_order(),
+-                                                      protected_params)) {
+-            disable();
+-            return;
++        if (opportunistic_only_) {
++            // Wan's next segment can have a very different activation budget.
++            // Skip speculation under pressure and try again at the next boundary.
++            if (!manager->fits_compute_backend_capacity(backend_request, params)) return;
++        } else {
++            auto protected_params = this->params(segment_index);
++            protected_params.insert(protected_params.end(), params.begin(), params.end());
++            if (!manager->ensure_compute_backend_capacity(backend_request, params, eviction_order_, protected_params)) {
++                disable();
++                return;
++            }
+         }
+         switch (manager->prepare_prefetch_params(owner_id_, params)) {
+             case WeightPrefetchResult::Scheduled:
+@@ -189,7 +189,7 @@
+             case WeightPrefetchResult::AlreadyResident:
+                 return;
+             case WeightPrefetchResult::Unsupported:
+-                disable();
++                if (!opportunistic_only_) disable();
+                 return;
+             case WeightPrefetchResult::Failed:
+                 disable();
+--- a/src/core/segment_weight_pipeline.h
++++ b/src/core/segment_weight_pipeline.h
+@@ -25,14 +25,15 @@
+         std::weak_ptr<DeviceResidencyManager> residency_manager_;
+         ggml_backend_t compute_backend_ = nullptr;
+         uintptr_t owner_id_             = 0;
+-        std::vector<std::vector<ggml_tensor*>> segment_params_;
++        // Stored in eviction order, furthest segment first.
++        std::vector<std::vector<ggml_tensor*>> eviction_order_;
+         std::vector<ggml_tensor*> queued_params_;
+         std::vector<ggml_tensor*> pinned_params_;
+         size_t queued_segment_ = SIZE_MAX;
+         bool enabled_          = true;
++        bool opportunistic_only_ = false;
+ 
+         size_t next_parameter_segment(size_t segment_index) const;
+-        std::vector<std::vector<ggml_tensor*>> preferred_eviction_order() const;
+         void disable();
+         void activate(size_t segment_index);
+         void clear();
+@@ -45,10 +46,10 @@
+             ggml_cgraph* graph,
+             const ggml_graph_cut::Plan& plan,
+             const std::unordered_set<const ggml_tensor*>& params,
+-            bool enabled = true);
++            bool enabled, bool opportunistic_only);
+         ~SegmentWeightPipeline();
+ 
+-        const std::vector<ggml_tensor*>& params(size_t index) const { return segment_params_[index]; }
++        const std::vector<ggml_tensor*>& params(size_t index) const { return eviction_order_[eviction_order_.size() - 1 - index]; }
+         bool ensure_segment_capacity(size_t segment_index,
+                                      const std::vector<DeviceMemoryRequest>& requests);
+         bool segment_start(size_t segment_index, const std::function<bool()>& ensure_capacity);
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -129,7 +129,7 @@
+         constexpr int64_t tile = 8192;
+         auto c = ctx->ggml_ctx;
+         const int64_t dim = x->ne[0], tokens = x->ne[1], heads = k->ne[1], head_dim = k->ne[0];
+-        k = ggml_cast(c, Rope::apply_rope(ctx, k, pe), GGML_TYPE_F16);
++        k = ggml_ext_attention_key_f16(ctx, Rope::apply_rope(ctx, k, pe));
+         auto permuted_v = ggml_permute(c, v, 0, 2, 1, 3);
+         v = ggml_cast(c, permuted_v, GGML_TYPE_F16);
+         if (!ggml_backend_supports_op(ctx->backend, v)) {
+--- a/src/model_loader.h
++++ b/src/model_loader.h
+@@ -136,8 +136,23 @@
+         return raw.index_in_zip < 0 && raw.file_index < file_paths_.size() ? file_paths_[raw.file_index] : std::string{};
+     }
+     std::string readonly_weight_path(size_t index) const {
+-        if (index >= file_data.size() || file_data[index].is_zip || file_data[index].mapping_writable) return {};
+-        return file_data[index].path;
++        if (index >= file_paths_.size()) return {};
++        // file_data omits shards with no selected tensors; file_index retains its catalog position.
++        auto matches = [index](const ModelFileData& file) {
++            return !file.tensors.empty() && file.tensors.front().file_index == index;
++        };
++        const ModelFileData* file = nullptr;
++        if (index < file_data.size() && matches(file_data[index])) {
++            file = &file_data[index];
++        } else {
++            for (const auto& candidate : file_data) {
++                if (matches(candidate)) {
++                    file = &candidate;
++                    break;
++                }
++            }
++        }
++        return file && !file->is_zip && !file->mapping_writable ? file->path : std::string{};
+     }
+     void release_unused_readonly_maps();
+     void process_model_files(bool enable_mmap = false, bool writable_mmap = true);
