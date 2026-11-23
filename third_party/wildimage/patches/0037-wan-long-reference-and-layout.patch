@@ -1,0 +1,204 @@
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -658,6 +658,13 @@
+         }
+     };
+ 
++    // Graph-local values only. Later causal layers still run for every group.
++    struct NeutralEncoderPrefix {
++        ggml_tensor* output = nullptr;
++        int next_feature = 0;
++        int next_block = 0;
++    };
++
+     class Encoder3d : public GGMLBlock {
+     protected:
+         bool wan2_2;
+@@ -747,7 +754,7 @@
+                              int64_t b,
+                              std::vector<ggml_tensor*>& feat_cache,
+                              int& feat_idx,
+-                             int chunk_idx) {
++                             int chunk_idx, NeutralEncoderPrefix* neutral_prefix = nullptr) {
+             // x: [b*c, t, h, w]
+             GGML_ASSERT(b == 1);
+             auto conv1    = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv1"]);
+@@ -757,8 +764,18 @@
+             auto head_0   = std::dynamic_pointer_cast<RMS_norm>(blocks["head.0"]);
+             auto head_2   = std::dynamic_pointer_cast<CausalConv3d>(blocks["head.2"]);
+ 
+-            // conv1
+-            if (is_2D) {
++            // With four-frame groups, group 7 starts at frame 25. The input
++            // convolution and four residual blocks before the second downsample
++            // see at most 21 source frames, including its temporal convolution.
++            // Their inputs and outgoing causal history are stationary by then.
++            const bool eligible = neutral_prefix && chunk_idx >= 7 && !wan2_2 && !is_2D &&
++                                  num_res_blocks == 2 && temperal_downsample.size() >= 2 &&
++                                  !temperal_downsample[0] && temperal_downsample[1];
++            const bool reuse = eligible && neutral_prefix->output;
++            if (reuse) {
++                x = neutral_prefix->output;
++                feat_idx = neutral_prefix->next_feature;
++            } else if (is_2D) {
+                 auto conv1 = std::dynamic_pointer_cast<Conv2dBut3d>(blocks["conv1"]);
+                 x          = conv1->forward(ctx, x);
+             } else if (feat_cache.size() > 0) {
+@@ -785,8 +802,8 @@
+             for (int u : dim_mult) {
+                 dims.push_back(dim * u);
+             }
+-            int index = 0;
+-            for (int i = 0; i < dims.size() - 1; i++) {
++            int index = reuse ? neutral_prefix->next_block : 0;
++            for (int i = reuse ? 2 : 0; i < dims.size() - 1; i++) {
+                 if (wan2_2) {
+                     auto layer = std::dynamic_pointer_cast<Down_ResidualBlock>(blocks["downsamples." + std::to_string(index++)]);
+ 
+@@ -803,6 +820,9 @@
+ 
+                         x = layer->forward(ctx, x, b, feat_cache, feat_idx, chunk_idx);
+                     }
++                }
++                if (eligible && i == 1) {
++                    *neutral_prefix = {x, feat_idx, index};
+                 }
+                 // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.encoder.down." + std::to_string(i), "x");
+             }
+@@ -1186,7 +1206,7 @@
+                             ggml_tensor* x,
+                             int64_t b = 1,
+                             int first_group = 0,
+-                            bool streaming = false) {
++                            bool streaming = false, bool neutral_tail = false) {
+             // x: [b*c, t, h, w]
+             GGML_ASSERT(b == 1);
+             GGML_ASSERT(decode_only == false);
+@@ -1209,13 +1229,14 @@
+             // Later graphs start on a four-frame boundary and reuse the previous graph's features.
+             const int64_t groups = first_group == 0 ? 1 + (x->ne[2] - 1) / 4 : x->ne[2] / 4;
+             ggml_tensor* out = nullptr;
++            NeutralEncoderPrefix prefix;
+             int64_t offset = 0;
+             for (int i = 0; i < groups; ++i) {
+                 const int group = first_group + i;
+                 const int count = group == 0 ? 1 : 4;
+                 _enc_conv_idx = 0;
+                 auto in = ggml_ext_slice(ctx, x, 2, offset, offset + (is_2D ? 1 : count));
+-                auto encoded = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, group);
++                auto encoded = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, group, neutral_tail ? &prefix : nullptr);
+                 out = out ? ggml_concat(ctx->ggml_ctx, out, encoded, 2) : encoded;
+                 offset += count;
+             }
+@@ -1535,6 +1556,29 @@
+ 
+         sd::Tensor<float> encode_blocks(int n_threads, const sd::Tensor<float>& input) {
+             const int64_t groups = 1 + (input.shape()[2] - 1) / 4;
++            // Check the actual tiled VAE input. End frames, video edits, signed zero
++            // or any other non-neutral sample use the ordinary causal encoder.
++            bool neutral_tail = version == VERSION_WAN2 && !ae.wan2_2 && !ae.is_2D &&
++                                input.dim() == 5 && input.shape()[3] == 3 && input.shape()[4] == 1 &&
++                                groups > encode_groups_per_graph && std::getenv("WILDLLAMA_VIDEO_PROGRESS") &&
++                                sd_backend_is(runtime_backend, "CUDA");
++            if (neutral_tail) {
++                const size_t plane = size_t(input.shape()[0]) * input.shape()[1];
++                const size_t channel = plane * input.shape()[2];
++                const size_t bytes = (channel - plane) * sizeof(float);
++                // memcmp implements a vectorized exact zero check without a second clip buffer.
++                static constexpr unsigned char zero[4096] = {};
++                for (int c = 0; c < 3 && neutral_tail; ++c) {
++                    auto ptr = reinterpret_cast<const unsigned char*>(input.data() + c * channel + plane);
++                    for (size_t at = 0; at < bytes; at += sizeof(zero)) {
++                        if (std::memcmp(ptr + at, zero, std::min(sizeof(zero), bytes - at))) {
++                            neutral_tail = false;
++                            break;
++                        }
++                    }
++                }
++            }
++            if (neutral_tail) LOG_VERBOSE("Wan VAE: sharing the stationary reference encoder prefix across neutral groups");
+             auto plan = make_vae_temporal_tile_plan(groups, {encode_groups_per_graph, 0, 1});
+             for (auto& tile : plan.tiles) {
+                 tile.start = tile.first ? 0 : 1 + 4 * (tile.start - 1);
+@@ -1552,7 +1596,7 @@
+                         features[i] = ctx.load_cache_tensor("encode:" + std::to_string(i));
+                     }
+                     const int group = tile.first ? 0 : 1 + static_cast<int>((tile.start - 1) / 4);
+-                    auto encoded = ae.encode(&ctx, make_input(frames), 1, group, true);
++                    auto encoded = ae.encode(&ctx, make_input(frames), 1, group, true, neutral_tail);
+                     for (size_t i = 0; !tile.last && i < features.size(); ++i) {
+                         ctx.persist_cache_tensor("encode:" + std::to_string(i), features[i]);
+                     }
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -593,6 +593,14 @@
+     }
+ }
+ 
++ggml_tensor* ggml_ext_attention_qk_heads(GGMLRunnerContext* runner_ctx, ggml_tensor* tensor, int64_t width, int64_t heads, int64_t batch) {
++    auto ctx = runner_ctx->ggml_ctx;
++    const auto tokens = tensor->ne[1];
++    auto shaped = ggml_reshape_4d(ctx, tensor, width, heads, tokens, batch);
++    auto ordered = ggml_ext_cont(runner_ctx, ggml_permute(ctx, shaped, 0, 2, 1, 3));
++    return ggml_reshape_3d(ctx, ordered, width, tokens, heads * batch);
++}
++
+ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* runner_ctx,
+                                     ggml_tensor* q,
+                                     ggml_tensor* k,
+@@ -626,14 +634,8 @@
+         d_head    = C / n_head;
+         n_kv_head = k->ne[0] / d_head;
+ 
+-        q = ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N);              // [N, L_q, n_head, d_head]
+-        q = ggml_ext_cont(runner_ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [N, n_head, L_q, d_head]
+-        q = ggml_reshape_3d(ctx, q, d_head, L_q, n_head * N);             // [N * n_head, L_q, d_head]
+-
+-        k = ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N);           // [N, L_k, n_kv_head, d_head]
+-        k = ggml_ext_cont(runner_ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [N, n_kv_head, L_k, d_head]
+-        k = ggml_reshape_3d(ctx, k, d_head, L_k, n_kv_head * N);          // [N * n_kv_head, L_k, d_head]
+-
++        q = ggml_ext_attention_qk_heads(runner_ctx, q, d_head, n_head, N);
++        k = ggml_ext_attention_qk_heads(runner_ctx, k, d_head, n_kv_head, N);
+         v = ggml_reshape_4d(ctx, v, d_head, n_kv_head, L_k, N);  // [N, L_k, n_kv_head, d_head]
+     } else {
+         L_q       = q->ne[1];
+diff --git a/src/core/ggml_extend.h b/src/core/ggml_extend.h
+--- a/src/core/ggml_extend.h
++++ b/src/core/ggml_extend.h
+@@ -168,6 +168,8 @@
+ 
+ ggml_tensor* ggml_ext_cast_f32(GGMLRunnerContext* runner_ctx, ggml_tensor* a);
+ 
++ggml_tensor* ggml_ext_attention_qk_heads(GGMLRunnerContext* runner_ctx, ggml_tensor* tensor, int64_t width, int64_t heads, int64_t batch);
++
+ // q: [N, L_q, C(n_head*d_head)] or [N*n_head, L_q, d_head]
+ // k: [N, L_k, n_kv_head*d_head] or [N*n_kv_head, L_k, d_head]
+ // v: [N, L_k, n_kv_head*d_head] or [N, L_k, n_kv_head, d_head]
+diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -334,8 +334,19 @@
+             k_img      = norm_k_img->forward(ctx, k_img);
+             auto v_img = v_img_proj->forward(ctx, context_img);  // [N, context_img_len, dim]
+ 
+-            auto img_x = ggml_ext_attention_ext(ctx, q, k_img, v_img, num_heads, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
+-            x          = ggml_ext_attention_ext(ctx, q, k, v, num_heads, nullptr, false, ctx->flash_attn_enabled);          // [N, n_token, dim]
++            // Both branches attend with the same queries. On long clips the
++            // contiguous head-major copy can exceed a GiB per branch and block.
++            const bool shared_layout = n_token > 8192 && sd_backend_is(ctx->backend, "CUDA");
++            auto queries = shared_layout ? ggml_ext_attention_qk_heads(ctx, q, head_dim, num_heads, N) : q;
++            auto attend = [&](ggml_tensor* keys, ggml_tensor* values) {
++                if (shared_layout) {
++                    keys = ggml_ext_attention_qk_heads(ctx, keys, head_dim, num_heads, N);
++                    values = ggml_reshape_4d(ctx->ggml_ctx, values, head_dim, num_heads, values->ne[1], N);
++                }
++                return ggml_ext_attention_ext(ctx, queries, keys, values, num_heads, nullptr, shared_layout, ctx->flash_attn_enabled);
++            };
++            auto img_x = attend(k_img, v_img);
++            x = attend(k, v);
+ 
+             x = ggml_add(ctx->ggml_ctx, x, img_x);
+ 
