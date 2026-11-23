@@ -115,7 +115,15 @@ func TestWanVideoProgressAcrossSegmentsAndRetry(t *testing.T) {
 	p, ok := w.observe("img2vid", 4)
 	require.True(t, ok)
 	require.Equal(t, 2, p.VideoAttempt)
-	require.GreaterOrEqual(t, p.VideoPercent, last)
+	require.Equal(t, last, p.VideoPercent)
+	for _, event := range []string{"wildvideo reference reused", "generate_video 480x832x221", "wildvideo segment 122/122", "|### | 1/4 - 259.66s/it", "wildvideo segment 1/122"} {
+		p, ok = w.observe(event, 4)
+		require.True(t, ok, event)
+		require.Equal(t, last, p.VideoPercent, event)
+	}
+	p, ok = w.observe("wildvideo segment 122/122", 4)
+	require.True(t, ok)
+	require.Equal(t, 58, p.VideoPercent)
 }
 
 func TestWanVideoModesAndArguments(t *testing.T) {

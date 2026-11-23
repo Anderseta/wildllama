@@ -1,0 +1,90 @@
+diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -121,6 +121,42 @@
+         return compute_range(compute_range, 0, q->ne[1]);
+     }
+ 
++    // For long CUDA clips, keep one shared Flash Attention K/V bank. Each query
++    // tile sees the complete key sequence. Rotary positions are sliced in the
++    // original coordinate system, and normalization still spans all channels.
++    inline ggml_tensor* wan_flash_query_tiles(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe,
++                                              ggml_tensor* k, ggml_tensor* v, Linear& q_proj, UnaryBlock& norm_q) {
++        constexpr int64_t tile = 8192;
++        auto c = ctx->ggml_ctx;
++        const int64_t dim = x->ne[0], tokens = x->ne[1], heads = k->ne[1], head_dim = k->ne[0];
++        k = ggml_cast(c, Rope::apply_rope(ctx, k, pe), GGML_TYPE_F16);
++        auto permuted_v = ggml_permute(c, v, 0, 2, 1, 3);
++        v = ggml_cast(c, permuted_v, GGML_TYPE_F16);
++        if (!ggml_backend_supports_op(ctx->backend, v)) {
++            v = ggml_cast(c, ggml_ext_cont(ctx, permuted_v), GGML_TYPE_F16);
++        }
++        v = ggml_reshape_3d(c, v, head_dim, tokens, heads);
++        auto range = [&](auto&& self, int64_t first, int64_t count) -> ggml_tensor* {
++            if (count > tile) {
++                const int64_t left = ((count + tile - 1) / tile / 2) * tile;
++                auto a = self(self, first, left);
++                if (!a) return nullptr;
++                auto b = self(self, first + left, count - left);
++                return b ? ggml_concat(c, a, b, 1) : nullptr;
++            }
++            auto input = ggml_view_2d(c, x, dim, count, x->nb[1], first * x->nb[1]);
++            auto pos = ggml_view_4d(c, pe, pe->ne[0], pe->ne[1], pe->ne[2], count,
++                                    pe->nb[1], pe->nb[2], pe->nb[3], first * pe->nb[3]);
++            auto q = norm_q.forward(ctx, q_proj.forward(ctx, input));
++            q = Rope::apply_rope(ctx, ggml_reshape_4d(c, q, head_dim, heads, count, 1), pos);
++            auto out = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f / sqrt((float)head_dim), 0, 0);
++            if (!ggml_backend_supports_op(ctx->backend, out)) return nullptr;
++            ggml_prec_set_acc(out, GGML_PREC_F32);
++            return ggml_reshape_3d(c, out, dim, count, 1);
++        };
++        return range(range, 0, tokens);
++    }
++
+     class WanSelfAttention : public GGMLBlock {
+     public:
+         int64_t num_heads;
+@@ -164,16 +200,20 @@
+             auto norm_q = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_q"]);
+             auto norm_k = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_k"]);
+ 
+-            auto q = q_proj->forward(ctx, x);
+-            q      = norm_q->forward(ctx, q);
+-            auto k = k_proj->forward(ctx, x);
+-            k      = norm_k->forward(ctx, k);
+-            auto v = v_proj->forward(ctx, x);  // [N, n_token, n_head*d_head]
+-
+-            q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
++            auto k = norm_k->forward(ctx, k_proj->forward(ctx, x));
++            auto v = v_proj->forward(ctx, x);
+             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
+             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
+ 
++            if (N == 1 && !mask && n_token > 8192 && head_dim == 128 && pe->ne[3] == n_token &&
++                ctx->flash_attn_enabled && !ctx->sage_attn_enabled &&
++                (ctx->attn_scale <= 0.f || ctx->attn_scale == 1.f) && sd_backend_is(ctx->backend, "CUDA")) {
++                if (auto output = wan_flash_query_tiles(ctx, x, pe, k, v, *q_proj, *norm_q)) {
++                    return o_proj->forward(ctx, output);
++                }
++            }
++            auto q = norm_q->forward(ctx, q_proj->forward(ctx, x));
++            q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, n_token, N);
+             const bool large = N == 1 && mask == nullptr && ctx->flash_attn_enabled && ggml_nbytes(q) > (size_t{1} << 30);
+             // At long sequence lengths, the rotary, flash inputs and each
+             // head-group output coexist with the full Q/K/V projections.
+diff --git a/src/core/execution_engine.cpp b/src/core/execution_engine.cpp
+--- a/src/core/execution_engine.cpp
++++ b/src/core/execution_engine.cpp
+@@ -1006,6 +1006,12 @@
+         if (!success) {
+             result.output = {};
+             session.workspace_.release();
++        } else if (task.description.compare(0, 3, "Wan") == 0 && session.logged_segment_count_ > 1 &&
++                   session.workspace_.bytes(session.backend_) >= (size_t{1} << 30)) {
++            // A completed large Wan evaluation has published its output. Its last
++            // scratch arena is replaceable. Drop it before the next noise step
++            // competes for physical VRAM, keeping reusable conditioning intact.
++            session.workspace_.release();
+         }
+         session.executing_ = false;
+         sync_residency(session);

@@ -11,16 +11,15 @@ import (
 // The percentage estimates overall work. It advances on native events, never on a timer.
 // The step counter comes from the sampler; segment counters subdivide an evaluation.
 type wanProgress struct {
-	stage                                                   string
-	attempt, base, high, evaluations, evaluation, stepsDone int
-	tile, tiles, chunk, chunks, segment, segments           int
-	samplingSince                                           time.Time
-	hostWeights                                             bool
+	stage                                             string
+	attempt, high, evaluations, evaluation, stepsDone int
+	tile, tiles, chunk, chunks, segment, segments     int
+	samplingSince                                     time.Time
+	hostWeights                                       bool
 }
 
 func (w *wanProgress) restart(cfg float64) {
-	attempt, base := w.attempt+1, w.high
-	*w = wanProgress{attempt: attempt, base: base, high: base, evaluations: 1, tiles: 1}
+	*w = wanProgress{attempt: w.attempt + 1, high: w.high, evaluations: 1, tiles: 1}
 	if cfg > 1 {
 		w.evaluations = 2
 	}
@@ -61,7 +60,7 @@ func (w *wanProgress) observe(line string, steps int) (Progress, bool) {
 		w.stage = "text"
 	case strings.Contains(line, "wildvideo reference reused"):
 		w.stage = "text"
-		w.high = max(w.high, w.base+int(25*float64(100-w.base)/100))
+		w.high = max(w.high, 25)
 		return Progress{Phase: "encoding", Message: "Referência recuperada da tentativa anterior", VideoPercent: w.high, VideoAttempt: w.attempt}, true
 	case strings.Contains(line, "wildvideo stage negative"):
 		w.stage = "negative"
@@ -125,7 +124,9 @@ func (w *wanProgress) observe(line string, steps int) (Progress, bool) {
 	case "save":
 		p.Phase, p.Message, local = "saving", "Finalizando e gravando o arquivo WebM", 99
 	}
-	w.high = max(w.high, min(99, w.base+int(local*float64(100-w.base)/100)))
+	// Replayed steps only catch up to the previous attempt. Crediting them
+	// twice makes a failed second step appear close to the end of the clip.
+	w.high = max(w.high, min(99, int(local)))
 	p.VideoPercent, p.VideoAttempt = w.high, w.attempt
 	p.VideoHostWeights = w.hostWeights
 	return p, true
