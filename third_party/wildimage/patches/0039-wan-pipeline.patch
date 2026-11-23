@@ -1,0 +1,439 @@
+diff --git a/src/core/cuda/cute_attention.cu b/src/core/cuda/cute_attention.cu
+--- a/src/core/cuda/cute_attention.cu
++++ b/src/core/cuda/cute_attention.cu
+@@ -38,6 +38,7 @@
+ #include <cuda_runtime.h>
+ #include <cutlass/numeric_conversion.h>
+ #include <climits>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <cute/tensor.hpp>
+@@ -535,9 +536,24 @@
+            q->ne[2] <= 65535 && q->ne[3] <= 65535 && ggml_nelements(q) <= INT_MAX && ggml_nelements(k) <= INT_MAX;
+ }
+ 
+-static bool attention_preferred(ggml_backend_dev_t, const ggml_tensor* node, void*) {
++static bool attention_preferred(ggml_backend_dev_t device, const ggml_tensor* node, void*) {
+     const auto* q = node->src[0];
+     const auto* k = node->src[1];
++    // These two private node names are used by the offline benchmark only.
++    if (std::strcmp(node->name, "wan.bench.native") == 0) return false;
++    if (std::strcmp(node->name, "wan.bench.cute") == 0) return true;
++    // An offline calibration may opt one exact GPU/driver/shape into native FA.
++    // Untested and numerically different shapes keep the established dispatch.
++    static const char* calibrated = std::getenv("WILDLLAMA_WAN_NATIVE_SHAPE");
++    if (calibrated && std::strcmp(node->name, "wan.self.full") == 0 && q->ne[0] == 128 &&
++        k->type == GGML_TYPE_F16 && node->src[2]->type == GGML_TYPE_F16 && q->ne[3] == 1) {
++        const auto* gpu = cuda_device(device);
++        static const int driver = [] { int v = 0; cudaDriverGetVersion(&v); return v; }();
++        char key[256];
++        if (gpu && std::snprintf(key, sizeof(key), "%s/%d/%lld/%lld/%lld", gpu->properties.name,
++                                 driver, (long long)q->ne[1], (long long)k->ne[1], (long long)q->ne[2]) > 0 &&
++            std::strcmp(key, calibrated) == 0) return false;
++    }
+     if (q->ne[0] == 40 || q->ne[0] == 72)
+         return q->ne[1] >= 512 && k->ne[1] >= 512;
+     if (q->ne[0] == 80 || q->ne[0] == 96 || q->ne[0] == 112)
+diff --git a/src/core/segment_weight_pipeline.cpp b/src/core/segment_weight_pipeline.cpp
+--- a/src/core/segment_weight_pipeline.cpp
++++ b/src/core/segment_weight_pipeline.cpp
+@@ -113,6 +113,29 @@
+             return false;
+         }
+         pinned_params_ = this->params(segment_index);
++        // Disk hints need no staging buffer. Issue them even when this segment
++        // reuses all activation allocations and has no GPU prefetch request.
++        static const bool hint_files = [] {
++#ifdef _WIN32
++            const auto* value = std::getenv("WILDLLAMA_WAN_FILE_HINT");
++            if (value) return std::strcmp(value, "1") == 0;
++            return std::getenv("WILDLLAMA_VIDEO_PROGRESS") != nullptr &&
++                   std::getenv("WILDLLAMA_WAN_WEIGHT_CACHE") != nullptr;
++#else
++            return false;
++#endif
++        }();
++        if (hint_files && opportunistic_only_ && manager->prefetch_enabled()) {
++            const auto next = next_parameter_segment(segment_index);
++            if (next != SIZE_MAX) {
++                try {
++                    wildimage_ram::OptionalWork optional;
++                    manager->hint_next_disk_weights(this->params(next));
++                } catch (const std::bad_alloc&) {
++                    // Optional read-ahead must never interrupt the active segment.
++                }
++            }
++        }
+         return true;
+     }
+ 
+diff --git a/src/device_residency_manager.h b/src/device_residency_manager.h
+--- a/src/device_residency_manager.h
++++ b/src/device_residency_manager.h
+@@ -90,6 +90,7 @@
+     virtual bool prepare_params(const std::vector<ggml_tensor*>& tensors)                 = 0;
+     virtual void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) = 0;
+     virtual void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors)   = 0;
++    virtual void hint_next_disk_weights(const std::vector<ggml_tensor*>&) {}
+     virtual WeightResidencyInfo inspect_compute_backend_params(
+         const std::vector<ggml_tensor*>& tensors) const          = 0;
+     virtual void update_runtime_residency(uintptr_t owner_id,
+diff --git a/src/model/diffusion/wan.hpp b/src/model/diffusion/wan.hpp
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -150,6 +150,7 @@
+             auto q = norm_q.forward(ctx, q_proj.forward(ctx, input));
+             q = Rope::apply_rope(ctx, ggml_reshape_4d(c, q, head_dim, heads, count, 1), pos);
+             auto out = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f / sqrt((float)head_dim), 0, 0);
++            ggml_set_name(out, "wan.self.full");
+             if (!ggml_backend_supports_op(ctx->backend, out)) return nullptr;
+             ggml_prec_set_acc(out, GGML_PREC_F32);
+             return ggml_reshape_3d(c, out, dim, count, 1);
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -658,7 +658,7 @@
+         }
+     };
+ 
+-    // Graph-local values only. Later causal layers still run for every group.
++    // The output belongs to the current graph or its committed runner cache.
+     struct NeutralEncoderPrefix {
+         ggml_tensor* output = nullptr;
+         int next_feature = 0;
+@@ -1206,7 +1206,8 @@
+                             ggml_tensor* x,
+                             int64_t b = 1,
+                             int first_group = 0,
+-                            bool streaming = false, bool neutral_tail = false) {
++                            bool streaming = false, bool neutral_tail = false,
++                            NeutralEncoderPrefix* carried_prefix = nullptr) {
+             // x: [b*c, t, h, w]
+             GGML_ASSERT(b == 1);
+             GGML_ASSERT(decode_only == false);
+@@ -1229,14 +1230,15 @@
+             // Later graphs start on a four-frame boundary and reuse the previous graph's features.
+             const int64_t groups = first_group == 0 ? 1 + (x->ne[2] - 1) / 4 : x->ne[2] / 4;
+             ggml_tensor* out = nullptr;
+-            NeutralEncoderPrefix prefix;
++            NeutralEncoderPrefix local_prefix;
++            auto* prefix = neutral_tail ? (carried_prefix ? carried_prefix : &local_prefix) : nullptr;
+             int64_t offset = 0;
+             for (int i = 0; i < groups; ++i) {
+                 const int group = first_group + i;
+                 const int count = group == 0 ? 1 : 4;
+                 _enc_conv_idx = 0;
+                 auto in = ggml_ext_slice(ctx, x, 2, offset, offset + (is_2D ? 1 : count));
+-                auto encoded = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, group, neutral_tail ? &prefix : nullptr);
++                auto encoded = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, group, prefix);
+                 out = out ? ggml_concat(ctx->ggml_ctx, out, encoded, 2) : encoded;
+                 offset += count;
+             }
+@@ -1585,6 +1587,10 @@
+                 tile.end = 1 + 4 * (tile.end - 1);
+             }
+             free_cache_ctx_and_buffer();
++            // Only these indices cross graph lifetimes. The runner owns the device tensor.
++            int prefix_feature = 0;
++            int prefix_block = 0;
++            const bool carry_prefix = neutral_tail && !std::getenv("WILDLLAMA_WAN_DISABLE_PREFIX_CACHE");
+             auto output = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& frames, const VAETemporalTile& tile) {
+                 if (std::getenv("WILDLLAMA_VIDEO_PROGRESS")) LOG_INFO("wildvideo chunk %d/%zu", tile.index, plan.tiles.size());
+                 auto get_graph = [&]() {
+@@ -1592,12 +1598,34 @@
+                     auto graph = new_graph_custom(10240 * encode_groups_per_graph);
+                     auto ctx = get_context(graph);
+                     auto& features = ae._enc_feat_map;
+-                    for (size_t i = 0; !tile.first && i < features.size(); ++i) {
++                    NeutralEncoderPrefix prefix;
++                    if (carry_prefix && !tile.first) {
++                        prefix = {ctx.load_cache_tensor("wan.encode.neutral"), prefix_feature, prefix_block};
++                    }
++                    const bool committed_prefix = prefix.output != nullptr;
++                    for (size_t i = committed_prefix ? prefix.next_feature : 0; !tile.first && i < features.size(); ++i) {
+                         features[i] = ctx.load_cache_tensor("encode:" + std::to_string(i));
+                     }
+                     const int group = tile.first ? 0 : 1 + static_cast<int>((tile.start - 1) / 4);
+-                    auto encoded = ae.encode(&ctx, make_input(frames), 1, group, true, neutral_tail);
+-                    for (size_t i = 0; !tile.last && i < features.size(); ++i) {
++                    auto encoded = ae.encode(&ctx, make_input(frames), 1, group, true, neutral_tail, &prefix);
++                    // The prefix replaces the first layers' larger causal histories.
++                    // Save it once, only if the replacement fits in the bytes it displaces.
++                    bool retain = committed_prefix;
++                    if (carry_prefix && !tile.last && !retain && prefix.output) {
++                        size_t displaced = 0;
++                        for (int i = 0; i < prefix.next_feature; ++i) {
++                            if (features[i]) displaced += ggml_nbytes(features[i]);
++                        }
++                        if (ggml_nbytes(prefix.output) <= displaced) {
++                            auto stable = ggml_ext_cont(&ctx, prefix.output);
++                            ctx.persist_cache_tensor("wan.encode.neutral", stable);
++                            ctx.expand_graph(stable);
++                            prefix_feature = prefix.next_feature;
++                            prefix_block = prefix.next_block;
++                            retain = true;
++                        }
++                    }
++                    for (size_t i = retain ? prefix.next_feature : 0; !tile.last && i < features.size(); ++i) {
+                         ctx.persist_cache_tensor("encode:" + std::to_string(i), features[i]);
+                     }
+                     ggml_build_forward_expand(graph, encoded);
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -2112,6 +2112,107 @@
+     return true;
+ }
+ 
++void ModelManager::hint_next_disk_weights(const std::vector<ggml_tensor*>& tensors) {
++#ifdef _WIN32
++    static const bool trace = std::getenv("WILDLLAMA_WAN_TIMINGS") != nullptr;
++    if (wan_file_hint_.valid() && wan_file_hint_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
++    struct Range { void* address; SIZE_T bytes; };
++    using Hint = BOOL (WINAPI *)(HANDLE, ULONG_PTR, Range*, ULONG);
++    static const auto hint = reinterpret_cast<Hint>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory"));
++    if (!hint) return;
++    const uint64_t headroom = std::min(wan_host_space(), wildimage_ram::budget().remaining());
++    size_t left = static_cast<size_t>(std::min<uint64_t>(32ULL << 20, headroom / 16));
++    if (left < (4U << 20)) {
++        static std::atomic<bool> reported{false};
++        if (trace && !reported.exchange(true)) LOG_INFO("Wan read-ahead: skipped under host memory pressure");
++        return;
++    }
++    // Keep one look-ahead window on one ordinary, read-only weight shard.
++    std::vector<std::pair<size_t, size_t>> spans;
++    std::string path;
++    for (auto* tensor : tensors) {
++        auto it = tensor_states_by_tensor_.find(tensor);
++        if (it == tensor_states_by_tensor_.end()) continue;
++        const auto& state = *it->second;
++        if (state.residency_mode != ResidencyMode::Disk || state.host_weight ||
++            state.loaded_to_params_backend || state.staged_to_compute_backend || state.sources.size() != 1) continue;
++        const auto& raw = state.sources.front();
++        const auto bytes = raw.nbytes_to_read();
++        if (raw.index_in_zip >= 0 || bytes <= 0 || !ggml_is_quantized(raw.type)) continue;
++        // A hint reads a fresh read-only mapping. Writable/source-conversion metadata
++        // used to bind weight tensors is unnecessary for this advisory operation.
++        const auto& loader = state.source_file ? source_loader(state.source_file) : model_loader_;
++        auto file = loader.plain_weight_path(raw);
++        if (file.empty() || (!path.empty() && file != path)) continue;
++        path = std::move(file);
++        spans.emplace_back(raw.offset, static_cast<size_t>(bytes));
++    }
++    if (spans.empty()) {
++        static std::atomic<bool> reported{false};
++        if (trace && !reported.exchange(true)) LOG_INFO("Wan read-ahead: no eligible file ranges in segment");
++        return;
++    }
++    try {
++        wan_file_hint_ = std::async(std::launch::async, [path = std::move(path), spans = std::move(spans), left]() mutable {
++            // MSVC may reuse a worker thread. Restore its priority on every exit.
++            struct BackgroundPriority {
++                bool active = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != 0;
++                ~BackgroundPriority() {
++                    if (active) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
++                }
++            } priority;
++            // Auto-fit may explicitly disable whole-file mappings under WDDM.
++            // A short-lived read-only window also warms the cache for buffered reads.
++            using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
++            const auto fd = CreateFileW(std::filesystem::u8path(path).c_str(), GENERIC_READ,
++                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
++                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++            if (fd == INVALID_HANDLE_VALUE) return;
++            Handle file(fd, CloseHandle);
++            LARGE_INTEGER file_size{};
++            if (!GetFileSizeEx(fd, &file_size) || file_size.QuadPart <= 0) return;
++            Handle mapping(CreateFileMappingW(fd, nullptr, PAGE_READONLY, 0, 0, nullptr), CloseHandle);
++            if (!mapping) return;
++            SYSTEM_INFO system{};
++            GetSystemInfo(&system);
++            const size_t alignment = system.dwAllocationGranularity;
++            if (!alignment) return;
++            const auto size = static_cast<size_t>(file_size.QuadPart);
++            std::sort(spans.begin(), spans.end());
++            size_t previous_end = 0, accepted = 0, windows = 0;
++            for (const auto& span : spans) {
++                if (!left || windows == 8) break;
++                if (span.first >= size) continue;
++                const auto end = span.first + std::min(span.second, size - span.first);
++                if (end <= previous_end) continue;
++                const auto first = std::max(previous_end, span.first);
++                const auto offset = first - first % alignment;
++                const auto length = std::min(left, end - offset);
++                if (length <= first - offset) break;
++                auto* view = MapViewOfFile(mapping.get(), FILE_MAP_READ, DWORD(uint64_t(offset) >> 32),
++                                           DWORD(offset), length);
++                if (!view) break;
++                Range range{view, length};
++                const bool ok = hint(GetCurrentProcess(), 1, &range, 0);
++                UnmapViewOfFile(view);
++                if (!ok) break;
++                accepted += length;
++                left -= length;
++                previous_end = offset + length;
++                ++windows;
++            }
++            if (trace && accepted) {
++                static std::atomic<bool> reported{false};
++                if (!reported.exchange(true))
++                    std::fprintf(stderr, "Wan read-ahead: first accepted file-page hint %.1f MiB\n", accepted / 1048576.);
++            }
++        });
++    } catch (const std::system_error&) {
++        // A denied worker is equivalent to an unsupported page hint.
++    }
++#endif
++}
++
+ bool ModelManager::bind_clean_wan_weight(const TensorState& state, HostWeight& host) {
+ #ifdef _WIN32
+     if (state.source_file || state.sources.size() != 1) return false;
+diff --git a/src/model_manager.h b/src/model_manager.h
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -3,6 +3,7 @@
+ 
+ #include <cstdint>
+ #include <list>
++#include <future>
+ #include <map>
+ #include <memory>
+ #include <set>
+@@ -101,6 +102,8 @@
+         std::vector<TensorState*> states;
+     };
+ 
++    // The task captures its own read-only view. It never touches tensor state.
++    std::future<void> wan_file_hint_;
+     ModelLoader model_loader_;
+     // Auxiliary models retain their own catalogs and conversion settings.
+     std::map<ModelLoader::FileId, ModelLoader> model_sources_;
+@@ -298,6 +301,7 @@
+     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+     void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+     void evict_inactive_components(const std::set<ModelComponent>& components, bool release_file_maps = false);
++    void hint_next_disk_weights(const std::vector<ggml_tensor*>& tensors) override;
+     WeightResidencyInfo inspect_compute_backend_params(
+         const std::vector<ggml_tensor*>& tensors) const override;
+     void update_runtime_residency(uintptr_t owner_id,
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -3057,6 +3057,25 @@
+     auto tiling_params                = first_stage_model->resolve_tiling_params(vae_tiling_params);
+     const bool prefer_temporal_tiling = decode_video && latents.dim() == 5 && latents.shape()[2] > 1 &&
+                                         first_stage_model->can_temporal_tile_decode();
++    const auto original_tiling = tiling_params;
++    bool trial_layout = false;
++    auto vae_backend = backend_for(SDBackendModule::VAE);
++    const char* policy = std::getenv("WILDLLAMA_WAN_DECODE_TILES");
++    if (policy && std::strcmp(policy, "adaptive") == 0 && version == VERSION_WAN2 &&
++        prefer_temporal_tiling && !circular_x && !circular_y && vae_backend && sd_backend_is(vae_backend, "CUDA")) {
++        size_t free = 0, total = 0;
++        ggml_backend_dev_memory(ggml_backend_get_device(vae_backend), &free, &total);
++        const auto cap = max_graph_vram_bytes_for_module(SDBackendModule::VAE);
++        const auto reserve = wildimage_ram::budget().gpu_reserve_bytes.load();
++        const auto available = free <= total && free > reserve ? std::min<size_t>(free - reserve, cap ? cap : SIZE_MAX) : 0;
++        const auto host = std::min(wildimage_ram::budget().remaining(), wildimage_ram::system_memory().available / 2);
++        trial_layout = sd_plan_wan_decode_tiles(tiling_params, latents.shape()[0], latents.shape()[1],
++                                                first_stage_model->get_scale_factor(), available, host);
++        if (trial_layout) {
++            LOG_INFO("Wan adaptive decode: %dx%d pixels, %d latent frames per group",
++                     tiling_params.tile_size_w, tiling_params.tile_size_h, tiling_params.extra_tiling_args ? 2 : 4);
++        }
++    }
+     for (;;) {
+         int tile_size_w = static_cast<int>(latents.shape()[0]);
+         int tile_size_h = static_cast<int>(latents.shape()[1]);
+@@ -3066,7 +3085,27 @@
+                                                latents.shape()[0], latents.shape()[1])) {
+             return {};
+         }
+-        auto decoded = first_stage_model->decode(n_threads, latents, tiling_params, decode_video, circular_x, circular_y);
++        sd::Tensor<float> decoded;
++        bool allocation_failed = false;
++        {
++            wildimage_ram::OptionalWork optional(trial_layout);
++            try {
++                decoded = first_stage_model->decode(n_threads, latents, tiling_params, decode_video, circular_x, circular_y);
++            } catch (const wildimage_ram::Exceeded&) {
++                if (!trial_layout) throw;
++                allocation_failed = true;
++            } catch (const std::bad_alloc&) {
++                if (!trial_layout) throw;
++                allocation_failed = true;
++            }
++        }
++        if (trial_layout && decoded.empty() &&
++            (allocation_failed || first_stage_model->last_compute_status() == GGML_STATUS_ALLOC_FAILED)) {
++            tiling_params = original_tiling;
++            trial_layout = false;
++            LOG_INFO("Wan adaptive decode: retrying with the original tile layout");
++            continue;
++        }
+         if (sd_version_is_minimax_h3_image(version) && !decoded.empty() && decoded.dim() == 5) {
+             decoded = decoded.squeeze(2);
+         }
+diff --git a/src/runtime/tiling.cpp b/src/runtime/tiling.cpp
+--- a/src/runtime/tiling.cpp
++++ b/src/runtime/tiling.cpp
+@@ -1,6 +1,8 @@
+ #include "runtime/tiling.h"
+ 
+ #include <algorithm>
++#include <climits>
++#include <cmath>
+ #include <cstdint>
+ #include <utility>
+ #include <vector>
+@@ -53,6 +55,31 @@
+         tiles.push_back({offset, before, after});
+     }
+     return tiles;
++}
++
++bool sd_plan_wan_decode_tiles(sd_tiling_params_t& params, int64_t latent_w, int64_t latent_h,
++                              int scale, uint64_t gpu_bytes, uint64_t host_bytes) {
++    constexpr uint64_t gib = uint64_t(1) << 30;
++    if (!params.enabled || !params.temporal_tiling || params.tile_size_w || params.tile_size_h ||
++        params.rel_size_w || params.rel_size_h || (params.extra_tiling_args && *params.extra_tiling_args) ||
++        scale <= 0 || scale > 256 || latent_w < 1 || latent_h < 1 ||
++        latent_w > INT_MAX / scale || latent_h > INT_MAX / scale || !std::isfinite(params.target_overlap) ||
++        gpu_bytes < 6 * gib || host_bytes < gib) return false;
++
++    const int w = static_cast<int>(latent_w), h = static_cast<int>(latent_h);
++    const int base_w = std::min(w, 256 / scale), base_h = std::min(h, 256 / scale);
++    const float overlap = std::clamp(params.target_overlap, 0.f, 0.5f);
++    auto work = [&](int dimension, int tile) {
++        return static_cast<uint64_t>(sd_tiling_plan_axis(dimension, tile, overlap, false).size()) * tile;
++    };
++    const auto base_x = work(w, base_w), base_y = work(h, base_h);
++    const int wide = std::min(w, 512 / scale), tall = std::min(h, 512 / scale);
++    const double x_ratio = double(work(w, wide)) / base_x, y_ratio = double(work(h, tall)) / base_y;
++    if (x_ratio >= 1 && y_ratio >= 1) return false;
++    params.tile_size_w = scale * (x_ratio <= y_ratio ? wide : base_w);
++    params.tile_size_h = scale * (x_ratio <= y_ratio ? base_h : tall);
++    if (gpu_bytes < 10 * gib || host_bytes < 2 * gib) params.extra_tiling_args = "temporal_tile_frames=2";
++    return true;
+ }
+ 
+ static int64_t sd_tensor_plane_size(const sd::Tensor<float>& tensor) {
+diff --git a/src/runtime/tiling.h b/src/runtime/tiling.h
+--- a/src/runtime/tiling.h
++++ b/src/runtime/tiling.h
+@@ -3,7 +3,13 @@
+ 
+ #include <functional>
+ 
++#include "stable-diffusion.h"
++
+ #include "core/tensor.hpp"
++
++// Choose the least redundant one-axis enlargement that fits the Wan decode trial.
++bool sd_plan_wan_decode_tiles(sd_tiling_params_t& params, int64_t latent_w, int64_t latent_h,
++                              int scale, uint64_t gpu_bytes, uint64_t host_bytes);
+ 
+ using TileProcessCallback = std::function<sd::Tensor<float>(const sd::Tensor<float>&)>;
+ 

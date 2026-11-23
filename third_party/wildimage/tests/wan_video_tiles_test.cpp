@@ -58,7 +58,29 @@ static uint64_t assembly_peak(bool direct) {
     return budget.peak();
 }
 
+static void check_wan_decode_plan() {
+    constexpr uint64_t gib = uint64_t(1) << 30;
+    sd_tiling_params_t defaults = {true, true, 0, 0, .5f, 0, 0, nullptr};
+    auto params = defaults;
+    assert(!sd_plan_wan_decode_tiles(params, 128, 96, 8, 5 * gib, 4 * gib));
+    assert(!sd_plan_wan_decode_tiles(params, 128, 96, 8, 12 * gib, gib - 1));
+    assert(!sd_plan_wan_decode_tiles(params, 32, 24, 8, 12 * gib, 4 * gib));
+    assert(params.tile_size_w == 0 && params.extra_tiling_args == nullptr);
+    assert(sd_plan_wan_decode_tiles(params, 128, 96, 8, 12 * gib, 4 * gib));
+    assert(params.tile_size_w == 256 && params.tile_size_h == 512);
+    assert(params.target_overlap == .5f && params.extra_tiling_args == nullptr);
+    assert(!sd_plan_wan_decode_tiles(params, 96, 128, 8, 12 * gib, 4 * gib));
+    params = defaults;
+    assert(sd_plan_wan_decode_tiles(params, 96, 128, 8, 8 * gib, 4 * gib));
+    assert(params.tile_size_w == 512 && params.tile_size_h == 256);
+    assert(std::strcmp(params.extra_tiling_args, "temporal_tile_frames=2") == 0);
+    params = defaults;
+    params.extra_tiling_args = "temporal_tile_frames=1";
+    assert(!sd_plan_wan_decode_tiles(params, 96, 128, 8, 12 * gib, 4 * gib));
+}
+
 int main() {
+    check_wan_decode_plan();
     ggml_time_init();
     const auto previous_peak = assembly_peak(false);
     const auto direct_peak = assembly_peak(true);

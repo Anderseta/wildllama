@@ -144,3 +144,36 @@ Set `WILDLLAMA_WAN_TIMINGS=1` when starting Wildllama to log weight preparation
 and graph execution time for each segmented Wan diffusion evaluation. Standalone
 `sd-cli` runs also need `WILDLLAMA_VIDEO_PROGRESS=1`. Both intervals use wall
 time at existing segment boundaries. Graph execution can overlap weight uploads.
+
+
+### Wan video execution controls
+
+The CUDA reference encoder carries the stationary early-layer activation between
+eight-group graphs within a single spatial tile. Reuse requires the validated
+Wan VAE layout, a bitwise-zero input tail, and a replacement activation that
+fits within the size of the displaced causal history. The runner releases it at
+the end of each tile. Set `WILDLLAMA_WAN_DISABLE_PREFIX_CACHE=1` for an A/B run.
+
+The Wildllama process environment also controls decode tiling and Windows read-ahead.
+
+* `WILDLLAMA_WAN_DECODE_TILES=adaptive` tries a larger tile on the axis that
+  reduces overlapping work most. The planner checks free and configured memory,
+  preserves explicit tile settings, and can shorten the temporal group when
+  headroom is limited. A failed trial allocation retries the original layout.
+  Spatial context changes at tile boundaries can change the decoded pixels.
+* Windows Wan video generation with weight tiering enabled uses bounded file
+  read-ahead by default. One low-priority worker maps small windows of the next
+  segment's weights, up to 32 MiB per request, even when auto-fit selects buffered
+  reads. Physical memory, system commit and the host budget bound each request.
+  Set `WILDLLAMA_WAN_FILE_HINT=0` to disable it. With timing diagnostics enabled
+  the runner reports the first accepted hint.
+
+The offline native fixture in `tests/wan_backend_benchmark.cpp` compares full
+attention using the installed GGML backend and the matching compiled media
+objects. Pass the backend DLL directory, query length, key length, head count,
+and a fixture output path or `-`. Use `conv` in place of the query length for a
+3D convolution, with the next two arguments giving width and channel count.
+Saved input and output tensors are FP32 in GGML order. One optional dispatch
+override, `WILDLLAMA_WAN_NATIVE_SHAPE`, applies only to tiled Wan D128
+self-attention on an exact `GPU name/CUDA driver API version/Q/K/heads` match.
+Benchmark a new backend and compare generated frames before selecting an override.
