@@ -98,17 +98,17 @@ diff --git a/src/model_manager.cpp b/src/model_manager.cpp
 +    if (state.source_file || state.sources.size() != 1) return false;
 +    const auto& raw = state.sources.front();
 +    if (!ggml_is_quantized(raw.type) || raw.type != state.tensor->type ||
-+        raw.index_in_zip >= 0 || raw.file_index >= model_loader_.file_data.size() ||
++        raw.index_in_zip >= 0 ||
 +        raw.is_f64 || raw.is_i64 || raw.is_f8_e4m3 || raw.is_f8_e5m2 ||
 +        raw.is_int8_tensorwise || raw.w4_convrot_kind || raw.int8_convrot ||
 +        !std::equal(state.tensor->ne, state.tensor->ne + GGML_MAX_DIMS, raw.ne) ||
 +        raw.nbytes_to_read() != static_cast<int64_t>(host.ram.bytes())) return false;
-+    const auto& file = model_loader_.file_data[raw.file_index];
-+    if (file.is_zip || file.mapping_writable) return false;
++    const auto path = model_loader_.readonly_weight_path(raw.file_index);
++    if (path.empty()) return false;
 +    auto& entry = wan_sources_[raw.file_index];
 +    auto mapping = entry.lock();
 +    if (!mapping) {
-+        mapping = MmapWrapper::create(file.path, false);
++        mapping = MmapWrapper::create(path, false);
 +        if (!mapping) return false;
 +        entry = mapping;
 +    }
@@ -198,3 +198,17 @@ diff --git a/src/model_manager_files.cpp b/src/model_manager_files.cpp
      auto affected = states;
      for (const auto& block : params_storage_blocks_) {
          if (std::any_of(block->states.begin(), block->states.end(), [&](TensorState* state) { return states.count(state) != 0; })) {
+diff --git a/src/model_loader.h b/src/model_loader.h
+--- a/src/model_loader.h
++++ b/src/model_loader.h
+@@ -131,6 +131,10 @@
+     const std::map<std::string, std::string>& get_metadata() const { return metadata_; }
+     void set_n_threads(int n_threads);
+     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
++    std::string readonly_weight_path(size_t index) const {
++        if (index >= file_data.size() || file_data[index].is_zip || file_data[index].mapping_writable) return {};
++        return file_data[index].path;
++    }
+     void release_unused_readonly_maps();
+     void process_model_files(bool enable_mmap = false, bool writable_mmap = true);
+     std::vector<MmapTensorStore> mmap_tensors(std::map<std::string, ggml_tensor*>& tensors,
