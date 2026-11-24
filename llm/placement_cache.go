@@ -35,7 +35,7 @@ func placementKey(path string, model *gguf.Model, opts api.Options, devices []ml
 	var environment []string
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "LLAMA_ARG_") || strings.HasPrefix(key, "GGML_") || key == "OLLAMA_FLASH_ATTENTION" || key == "OLLAMA_KV_CACHE_TYPE" {
+		if strings.HasPrefix(key, "LLAMA_ARG_") || strings.HasPrefix(key, "GGML_") || key == "OLLAMA_FLASH_ATTENTION" || key == "OLLAMA_KV_CACHE_TYPE" || key == "WILDLLAMA_FP8_KV" {
 			environment = append(environment, entry)
 		}
 	}

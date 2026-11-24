@@ -80,7 +80,7 @@ func TestEstimateServerVRAMQwen35Hybrid(t *testing.T) {
 	for _, item := range []struct {
 		kind string
 		kv   uint64
-	}{{"q8_0", 2176 << 20}, {"f16", 4 << 30}, {"bf16", 4 << 30}} {
+	}{{"q8_0", 2176 << 20}, {"f8_e4m3", 2 << 30}, {"f16", 4 << 30}, {"bf16", 4 << 30}} {
 		t.Run(item.kind, func(t *testing.T) {
 			opts.RunnerEnv = map[string]string{"OLLAMA_KV_CACHE_TYPE": item.kind}
 			e := EstimateServerVRAM("", f, opts, 1)
@@ -129,10 +129,14 @@ func TestEstimateServerVRAMTransformerAndHeadDimensions(t *testing.T) {
 	base["llama.attention.head_count_kv"] = uint32(2)
 	base["llama.attention.key_length"] = uint32(128)
 	base["llama.attention.value_length"] = uint32(64)
-	opts.RunnerEnv = map[string]string{"LLAMA_ARG_CACHE_TYPE_K": "q8_0", "LLAMA_ARG_CACHE_TYPE_V": "q4_0"}
+	opts.RunnerEnv = map[string]string{"LLAMA_ARG_CACHE_TYPE_K": "q8_0", "LLAMA_ARG_CACHE_TYPE_V": "q4_0", "WILDLLAMA_FP8_KV": "0"}
 	e = EstimateServerVRAM("", loadTestGGUF(t, base), opts, 1)
 	if !e.Valid || e.KV != (272+72)*4096 {
 		t.Fatalf("explicit K/V dimensions, formats or block metadata ignored: %+v", e)
+	}
+	opts.RunnerEnv["WILDLLAMA_FP8_KV"] = "1"
+	if e := EstimateServerVRAM("", loadTestGGUF(t, base), opts, 1); !e.Valid || e.KV != 384*4096 {
+		t.Fatalf("FP8 admission underestimated selected layout: %+v", e)
 	}
 	delete(base, "llama.attention.head_count_kv") // native default is MHA, not one KV head
 	opts.RunnerEnv = nil

@@ -515,6 +515,11 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	adaptivePrefixSupported := adaptivePrefixRequested && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, adaptivePrefixCacheEnvironment)
 	setAdaptivePrefixCacheEnvironment(childEnvs, adaptivePrefixRequested, adaptivePrefixSupported)
 	setCUDATuningEnvironment(childEnvs, exe, launch.gpus, launch.gpuLibs)
+	// Older runners ignore this preference. The current runner checks K/V writes
+	// and attention kernels against the actual placement for target and draft.
+	if gpuNativeEnvironment(launch.opts, "WILDLLAMA_FP8_KV") == "" {
+		childEnvs["WILDLLAMA_FP8_KV"] = "1"
+	}
 	setCUDAKernelDefaults(childEnvs, launch)
 	SetupLlamaServerCommandEnv(cmd, exe, launch.gpuLibs, childEnvs)
 

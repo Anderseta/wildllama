@@ -152,6 +152,7 @@ const (
 	TensorTypeNVFP4
 	TensorTypeQ1_0
 	TensorTypeQ2_0
+	TensorTypeF8E4M3
 )
 
 func (tt TensorType) NumBytes() float64 {
@@ -204,7 +205,7 @@ func (tt TensorType) typeSize() int64 {
 		return 2 + tt.blockSize()/4 + tt.blockSize()/16
 	case tensorTypeIQ4_XS:
 		return 2 + 2 + tt.blockSize()/2 + tt.blockSize()/64
-	case TensorTypeI8:
+	case TensorTypeI8, TensorTypeF8E4M3:
 		return 1
 	case TensorTypeI16:
 		return 2
@@ -233,7 +234,7 @@ func (tt TensorType) typeSize() int64 {
 
 func (tt TensorType) blockSize() int64 {
 	switch tt {
-	case TensorTypeF32,
+	case TensorTypeF32, TensorTypeF8E4M3,
 		TensorTypeF16,
 		TensorTypeI8,
 		TensorTypeI16,
@@ -348,6 +349,8 @@ func (tt TensorType) String() string {
 		return "q1_0"
 	case TensorTypeQ2_0:
 		return "q2_0"
+	case TensorTypeF8E4M3:
+		return "f8_e4m3"
 	default:
 		return "unknown"
 	}

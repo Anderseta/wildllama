@@ -1,18 +1,18 @@
 # Optional VRAM savings
 
 These runner switches trade allocation reuse or attention-kernel selection for
-less device memory. Each is independent, disabled unless explicitly set to `1`,
-and can be saved in a model's `runner_env`. Wildgoose groups them under
+less device memory. Each switch is independent and can be saved in a model's `runner_env`. Wildgoose groups them under
 **Model profile → VRAM → Economia de VRAM**, with a gain/cost description and
 additional help for each switch. Save and apply the profile to reload its runner.
 
-They do not change model weights, stored KV precision, logical context, sampling,
+They do not change model weights, logical context, sampling,
 draft depth, or the configured managed CUDA quota. Unsupported layouts retain
 the conventional path. A runner advertising a switch is not a promise that
 every model, backend, adapter, or graph can use its optimized path.
 
 | Runner environment | Memory behavior | Possible cost |
 | --- | --- | --- |
+| `WILDLLAMA_FP8_KV` | Defaults on in WildLlama. Stores attention keys and values in OCP FP8 E4M3 on supported layouts, including compatible draft contexts. One byte per value, half the FP16 storage and 16/17 of Q8_0. | Rounding can change logits. Lower-bit caches can grow. Set to 0 to use the configured K/V formats. Device support and context length determine throughput. |
 | `WILDLLAMA_COMPUTE_GROWTH` | Reserve attention-related compute graphs against a growing physical-row high-water mark instead of the complete logical context. | Synchronized scheduler/graph reconstruction at growth boundaries; long histories eventually need larger arenas. |
 | `WILDLLAMA_COMPACT_ATTN_MASK` | Compatible CUDA Flash Attention consumes compact causal/sequence metadata instead of a complete dense mask. | Additional visibility calculations inside attention; throughput depends on the kernel and shape. |
 | `WILDLLAMA_CUDA_POOL_TRIM` | Return eligible unused CUDA scratch allocations after a synchronized phase, retaining a warm allowance and release hysteresis. | Later allocations or graph captures may have to be rebuilt. |

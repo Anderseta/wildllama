@@ -49,6 +49,12 @@ func TestEstimateServerVRAMQwen35MTPHead(t *testing.T) {
 	if got := EstimateServerVRAM("", model, opts, 1); !got.Valid || got.KV != (2176+272)<<20 {
 		t.Fatalf("native draft cache overrides were ignored: %+v", got)
 	}
+	opts.RunnerEnv["OLLAMA_KV_CACHE_TYPE"] = "f8_e4m3"
+	t.Setenv("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K", "f8_e4m3")
+	t.Setenv("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V", "f8_e4m3")
+	if got := EstimateServerVRAM("", model, opts, 1); !got.Valid || got.KV != (2048+256)<<20 || got.Recurrent != mtp.Recurrent {
+		t.Fatalf("FP8 must scale only the target and draft KV payload: %+v", got)
+	}
 	t.Setenv("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V", "unknown")
 	if EstimateServerVRAM("", model, opts, 1).Valid {
 		t.Fatal("unknown draft cache precision must not be admitted")

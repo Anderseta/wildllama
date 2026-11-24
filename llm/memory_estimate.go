@@ -80,6 +80,7 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 		return e
 	}
 	var recurrent uint64
+	preferFP8 := gpuNativeEnvironment(opts, "WILDLLAMA_FP8_KV") != "0"
 	for layer := uint64(0); layer < trunkLayers+mtpLayers; layer++ {
 		isMTP := layer >= trunkLayers
 		recr, ok := false, true
@@ -137,6 +138,11 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 			committedContext = context
 		}
 		row := vramAdd(kvRowBytes(vramMul(kvHeads, keyDim), strings.ToLower(layerK)), kvRowBytes(vramMul(kvHeads, valueDim), strings.ToLower(layerV)))
+		// Admission must cover either precision until native device/layout probes
+		// resolve the preference. FP8 may be larger than a 4- or 5-bit fallback.
+		if preferFP8 {
+			row = max(row, vramMul(kvHeads, vramAdd(keyDim, valueDim)))
+		}
 		layerContext := context
 		if swaPattern != nil && swaPattern[layer] {
 			layerContext, committedContext = swaContext, swaContext
@@ -270,6 +276,8 @@ func kvRowBytes(values uint64, kind string) uint64 {
 	var block, size uint64 = 1, 2
 	switch kind {
 	case "f16", "bf16", "":
+	case "f8_e4m3":
+		size = 1
 	case "f32":
 		size = 4
 	case "q8_0":

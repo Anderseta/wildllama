@@ -171,6 +171,7 @@ func TestCurrentTensorTypes(t *testing.T) {
 		blockSize int64
 		typeSize  int64
 	}{
+		{value: TensorTypeF8E4M3, number: 43, name: "f8_e4m3", blockSize: 1, typeSize: 1},
 		{value: TensorTypeMXFP4, number: 39, name: "mxfp4", blockSize: 32, typeSize: 17},
 		{value: TensorTypeNVFP4, number: 40, name: "nvfp4", blockSize: 64, typeSize: 36},
 		{value: TensorTypeQ1_0, number: 41, name: "q1_0", blockSize: 128, typeSize: 18},

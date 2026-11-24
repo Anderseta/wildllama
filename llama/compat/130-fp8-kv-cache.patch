@@ -1,0 +1,3048 @@
+FP8 E4M3 storage and kernels adapted from ggml-org/llama.cpp PRs 27512, 28392 and 28413 (MIT).
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index e0ece24a23ab761e4e87c55c96c77b752d9f9ee3..2ba2fe25fe73346b7c43cb83b326c93425e9fd95 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -305,6 +305,7 @@ const std::vector<ggml_type> kv_cache_types = {
+     GGML_TYPE_F32,
+     GGML_TYPE_F16,
+     GGML_TYPE_BF16,
++    GGML_TYPE_F8_E4M3,
+     GGML_TYPE_Q8_0,
+     GGML_TYPE_Q4_0,
+     GGML_TYPE_Q4_1,
+@@ -1472,7 +1473,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         [](common_params &) {
+             // Feature discovery must describe this native executable rather
+             // than infer support from its path or a retained wrapper version.
+-            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_IMAGE_HANDOFF_MIB","WILDLLAMA_EXACT_GPU_TOP_K","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE","WILDLLAMA_MTP_RESPONSE_LOOKUP","WILDLLAMA_MTP_AUTO_STRATEGY","WILDLLAMA_MTP_EARLY_STOP","WILDLLAMA_SINGLE_PREFILL_TUNE","WILDLLAMA_CHECKPOINT_DIRECT_READ"]})json");
++            printf("%s\n", R"json({"schema":1,"environment":["WILDLLAMA_FP8_KV","WILDLLAMA_GRAPH_VARIANTS_MIB","WILDLLAMA_DRY_BACKEND","WILDLLAMA_DECODE_OVERLAP","WILDLLAMA_MTP_DEVICE_STATE","WILDLLAMA_MTP_DEVICE_STATE_MIB","GGML_CUDA_DENSE_OPT","WILDLLAMA_KV_CACHE_PAGING","WILDLLAMA_VERIFY_DEVICE_MIB","WILDLLAMA_PREFIX_DISK_PAGE_CACHE_MIB","WILDLLAMA_PAGED_ATTENTION","WILDLLAMA_COMPUTE_GROWTH","WILDLLAMA_COMPACT_ATTN_MASK","WILDLLAMA_CUDA_POOL_TRIM","WILDLLAMA_PAGED_DRAFT","WILDLLAMA_MMPROJ_ON_DEMAND","WILDLLAMA_PREFIX_RAM_ADAPTIVE","WILDLLAMA_GDN_COMPACT_ROLLBACK","WILDLLAMA_MTP_SELECTIVE_CATCHUP","WILDLLAMA_GPU_THINKING_SAMPLE","WILDLLAMA_CUDA_IQ3_COLUMN_REUSE","WILDLLAMA_MTP_BLOCK_VERIFY","WILDLLAMA_MTP_BLOCK_PREVIEW","WILDLLAMA_CUDA_Q4_HEAD_SINGLE","WILDLLAMA_MTP_PROPOSAL_TUNE","WILDLLAMA_MTP_DYNAMIC_VOCAB","WILDLLAMA_MTP_GPU_DISTRIBUTION","WILDLLAMA_GDN_COMPACT_EXTENDED","WILDLLAMA_CUDA_IQ3_FAST_SIGN","WILDLLAMA_MTP_GPU_VERIFY","WILDLLAMA_MTP_PACKED_HEAD","WILDLLAMA_GDN_REUSE_REPLAY","WILDLLAMA_NGRAM_FEEDBACK","WILDLLAMA_CUDA_TOKEN_REUSE","WILDLLAMA_CUDA_L2_REUSE","WILDLLAMA_IMAGE_HANDOFF_MIB","WILDLLAMA_EXACT_GPU_TOP_K","WILDLLAMA_MTP_EDIT_LOOKUP","WILDLLAMA_MTP_REUSE_TARGET_FENCE","WILDLLAMA_MTP_RESPONSE_LOOKUP","WILDLLAMA_MTP_AUTO_STRATEGY","WILDLLAMA_MTP_EARLY_STOP","WILDLLAMA_SINGLE_PREFILL_TUNE","WILDLLAMA_CHECKPOINT_DIRECT_READ"]})json");
+             exit(0);
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 35252a83a5eaa585d36b1adc4ec16833ab8b9a31..7fc2487f49e689bcca8457013942a36b5988cb83 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -205,7 +205,7 @@ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copie
+ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
+ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
+ option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+-set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
++set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;f8_e4m3-f8_e4m3" CACHE STRING
+                                             "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
+ option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+ option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
+diff --git a/ggml/cmake/common.cmake b/ggml/cmake/common.cmake
+index 42b65a58051c83927a24f64329e8967b19730756..c8d232294740bcf676417585e82ba7b9014b02df 100644
+--- a/ggml/cmake/common.cmake
++++ b/ggml/cmake/common.cmake
+@@ -58,7 +58,7 @@ endfunction()
+ 
+ # Determines which FlashAttention vector kernel template instances to compile, returns them in OUT_SRCS.
+ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
+-    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16)
++    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16 f8_e4m3)
+ 
+     string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
+     string(STRIP   "${FA_QUANTS}" FA_QUANTS)
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 456d079296b3f614d840fbbb48a9b16ac4998319..edd1a7e4ebcc04f195986b9bb23010cd811e7d1f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -381,6 +381,8 @@ extern "C" {
+     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
+     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
+ 
++    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
++
+     struct ggml_object;
+     struct ggml_context;
+     struct ggml_cgraph;
+@@ -430,7 +432,8 @@ extern "C" {
+         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+         GGML_TYPE_Q1_0    = 41,
+         GGML_TYPE_Q2_0    = 42,
+-        GGML_TYPE_COUNT   = 43,
++        GGML_TYPE_F8_E4M3 = 43,
++        GGML_TYPE_COUNT   = 44,
+     };
+ 
+     // [TAG_GGML_PREC]
+@@ -486,6 +489,7 @@ extern "C" {
+         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
+         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
++        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
+     };
+ 
+     // available tensor operations:
+diff --git a/ggml/src/ggml-cpu/common.h b/ggml/src/ggml-cpu/common.h
+index abbadc359c5addac941f8add92674061c8b790bf..2c62e6976fe4851a318c183be01ba051de9955c1 100644
+--- a/ggml/src/ggml-cpu/common.h
++++ b/ggml/src/ggml-cpu/common.h
+@@ -43,6 +43,14 @@ static inline float f32_to_f32(float x) {
+     return x;
+ }
+ 
++static inline float f8_e4m3_to_f32(ggml_fp8_e4m3_t x) {
++    return ggml_f8_e4m3_to_fp32(x.bits);
++}
++
++static inline ggml_fp8_e4m3_t f32_to_f8_e4m3(float x) {
++    return { ggml_fp32_to_f8_e4m3(x) };
++}
++
+ // TODO - merge this into the traits table, after using row-based conversions
+ template <class T>
+ struct type_conversion_table;
+@@ -65,6 +73,12 @@ struct type_conversion_table<ggml_bf16_t> {
+     static constexpr ggml_bf16_t (*from_f32)(float) = f32_to_bf16;
+ };
+ 
++template <>
++struct type_conversion_table<ggml_fp8_e4m3_t> {
++    static constexpr float (*to_f32)(ggml_fp8_e4m3_t) = f8_e4m3_to_f32;
++    static constexpr ggml_fp8_e4m3_t (*from_f32)(float) = f32_to_f8_e4m3;
++};
++
+ template <>
+ struct type_conversion_table<int32_t> {
+     static constexpr float (*to_f32)(int32_t) = i32_to_f32;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 21f6549218dc498ed6080498b64daf9043a7d68b..a9e1d55351dcd9c0547865bdeb4a38aedfb78a5d 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -86,6 +86,9 @@ float ggml_table_f32_e8m0_half[1 << 8];
+ // precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
+ float ggml_table_f32_ue4m3[1 << 8];
+ 
++// Signed FP8 needs its own table: UE4M3 ignores the sign, halves values for NVFP4, and maps NaN to zero.
++float ggml_table_f32_f8_e4m3[1 << 8];
++
+ #if defined(__ARM_ARCH)
+ struct ggml_arm_arch_features_type {
+     int sve_cnt;
+@@ -296,6 +299,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+         .vec_dot_type             = GGML_TYPE_Q8_0,
+         .nrows                    = 1,
+     },
++    [GGML_TYPE_F8_E4M3] = {
++        .from_float               = quantize_row_f8_e4m3,
++        .vec_dot                  = ggml_vec_dot_f8_e4m3_f32,
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
+     [GGML_TYPE_Q2_K] = {
+         .from_float               = quantize_row_q2_K,
+         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,
+@@ -2965,7 +2974,7 @@ struct ggml_cplan ggml_graph_plan(
+                 case GGML_OP_ADD_ID:
+                 case GGML_OP_ADD1:
+                     {
+-                        if (ggml_is_quantized(node->src[0]->type)) {
++                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3) {
+                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                         }
+                     } break;
+@@ -3013,7 +3022,7 @@ struct ggml_cplan ggml_graph_plan(
+                     } break;
+                 case GGML_OP_OUT_PROD:
+                     {
+-                        if (ggml_is_quantized(node->src[0]->type) ||
++                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3 ||
+                             node->src[0]->type == GGML_TYPE_F16) {
+                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                         }
+@@ -4003,6 +4012,7 @@ void ggml_cpu_init(void) {
+             // initialize UE4M3 table (256 entries)
+             for (int i = 0; i < (1 << 8); ++i) {
+                 ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
++                ggml_table_f32_f8_e4m3[i] = ggml_f8_e4m3_to_fp32(i);
+             }
+ 
+             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 70bf058ba2ab9028a53f343f9da044047218f7cd..a16a84d90c7a0a800000d38680bb05f1819319fd 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -538,26 +538,36 @@ void ggml_compute_forward_dup(
+     switch (src0->type) {
+         case GGML_TYPE_F16:
+             {
+-                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_fp16_t>(params, dst);
+-                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_bf16_t>(params, dst);
+-                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp16_t, float      >(params, dst);
++                /**/ if (dst->type == GGML_TYPE_F16)     ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_fp16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_BF16)    ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_bf16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_F32)     ggml_compute_forward_dup_flt<ggml_fp16_t, float      >(params, dst);
++                else if (dst->type == GGML_TYPE_F8_E4M3) ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_fp8_e4m3_t>(params, dst);
+                 else ggml_compute_forward_dup_to_q<ggml_fp16_t>(params, dst);
+             } break;
+         case GGML_TYPE_BF16:
+             {
+-                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_fp16_t>(params, dst);
+-                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_bf16_t>(params, dst);
+-                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_bf16_t, float      >(params, dst);
++                /**/ if (dst->type == GGML_TYPE_F16)     ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_fp16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_BF16)    ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_bf16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_F32)     ggml_compute_forward_dup_flt<ggml_bf16_t, float      >(params, dst);
++                else if (dst->type == GGML_TYPE_F8_E4M3) ggml_compute_forward_dup_flt<ggml_bf16_t, ggml_fp8_e4m3_t>(params, dst);
+                 else ggml_compute_forward_dup_to_q<ggml_bf16_t>(params, dst);
+             } break;
+         case GGML_TYPE_F32:
+             {
+-                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<float, ggml_fp16_t>(params, dst);
+-                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<float, ggml_bf16_t>(params, dst);
+-                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<float, float      >(params, dst);
+-                else if (dst->type == GGML_TYPE_I32)  ggml_compute_forward_dup_flt<float, int32_t    >(params, dst);
++                /**/ if (dst->type == GGML_TYPE_F16)     ggml_compute_forward_dup_flt<float, ggml_fp16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_BF16)    ggml_compute_forward_dup_flt<float, ggml_bf16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_F32)     ggml_compute_forward_dup_flt<float, float      >(params, dst);
++                else if (dst->type == GGML_TYPE_F8_E4M3) ggml_compute_forward_dup_flt<float, ggml_fp8_e4m3_t>(params, dst);
++                else if (dst->type == GGML_TYPE_I32)     ggml_compute_forward_dup_flt<float, int32_t    >(params, dst);
+                 else ggml_compute_forward_dup_to_q<float>(params, dst);
+             } break;
++        case GGML_TYPE_F8_E4M3:
++            {
++                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_fp8_e4m3_t, ggml_fp16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp8_e4m3_t, ggml_bf16_t>(params, dst);
++                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp8_e4m3_t, float      >(params, dst);
++                else GGML_ABORT("not implemented");
++            } break;
+         case GGML_TYPE_I32:
+             {
+                 if (dst->type == GGML_TYPE_F32) ggml_compute_forward_dup_flt<int32_t, float>(params, dst);
+@@ -606,8 +616,9 @@ static void ggml_compute_forward_add_q_f32(
+     GGML_ASSERT(nb1 <= nb2);
+     GGML_ASSERT(nb2 <= nb3);
+ 
+-    GGML_ASSERT(ggml_is_quantized(src0->type));
++    GGML_ASSERT(ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F8_E4M3);
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(ne00 % ggml_blck_size(type) == 0);
+ 
+     // rows per thread
+     const int dr = (nr + nth - 1)/nth;
+@@ -637,8 +648,6 @@ static void ggml_compute_forward_add_q_f32(
+         float * src1_row = (float *)((char *) src1->data + (i11*nb11 + i12*nb12 + i13*nb13));
+         void  * dst_row  = (void *) ((char *)  dst->data + ( i1*nb1  +  i2*nb2  +  i3*nb3));
+ 
+-        assert(ne00 % 32 == 0);
+-
+         // unquantize row from src0 to temp buffer
+         dequantize_row_q(src0_row, wdata, ne00);
+         // add src1
+@@ -674,6 +683,7 @@ void ggml_compute_forward_add(
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_F8_E4M3:
+         case GGML_TYPE_Q2_K:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+@@ -951,7 +961,7 @@ static void ggml_compute_forward_add1_q_f32(
+     GGML_ASSERT(nb1 <= nb2);
+     GGML_ASSERT(nb2 <= nb3);
+ 
+-    GGML_ASSERT(ggml_is_quantized(src0->type));
++    GGML_ASSERT(ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F8_E4M3);
+     GGML_ASSERT(dst->type == src0->type);
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+ 
+@@ -1126,6 +1136,7 @@ void ggml_compute_forward_add1(
+         case GGML_TYPE_Q8_1:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_F8_E4M3:
+         case GGML_TYPE_Q2_K:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+@@ -1257,6 +1268,7 @@ void ggml_compute_forward_acc(
+         case GGML_TYPE_Q8_1:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_F8_E4M3:
+         case GGML_TYPE_Q2_K:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+@@ -4926,6 +4938,7 @@ void ggml_compute_forward_out_prod(
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_F8_E4M3:
+         case GGML_TYPE_Q2_K:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+@@ -5245,6 +5258,7 @@ void ggml_compute_forward_set(
+         case GGML_TYPE_Q8_1:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_F8_E4M3:
+         case GGML_TYPE_Q2_K:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+@@ -5470,6 +5484,7 @@ void ggml_compute_forward_get_rows(
+         case GGML_TYPE_Q8_1:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_F8_E4M3:
+         case GGML_TYPE_Q2_K:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+@@ -6230,6 +6245,7 @@ void ggml_compute_forward_clamp(
+         case GGML_TYPE_Q8_1:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_F8_E4M3:
+         case GGML_TYPE_Q2_K:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 5e36459f8cbc5900b375d2189414307393471a6b..44ea9fae55f119ca3f45b6de1c8122dfc978e40b 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -3,6 +3,7 @@
+ 
+ #include "ggml-cpu-impl.h"
+ #include "simd-mappings.h"
++#include "vec.h"
+ #include "ggml-quants.h"
+ #include "quants.h"
+ 
+@@ -62,6 +63,10 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
+     quantize_row_nvfp4_ref(x, y, k);
+ }
+ 
++void quantize_row_f8_e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
++    quantize_row_f8_e4m3_ref(x, y, k);
++}
++
+ //
+ // 2-6 bit quantization in super-blocks
+ //
+@@ -362,6 +367,49 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+     *s = sumf;
+ }
+ 
++void ggml_vec_dot_f8_e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(nrc == 1);
++    UNUSED(nrc);
++    UNUSED(bx);
++    UNUSED(by);
++    UNUSED(bs);
++
++    const ggml_fp8_e4m3_t * GGML_RESTRICT x = vx;
++    const float * GGML_RESTRICT y = vy;
++
++    float sumf = 0.0f;
++    int pos = 0;
++#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
++    GGML_F32_VEC sum[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
++    const int np = n - n % GGML_F32_STEP;
++    for (; pos < np; pos += GGML_F32_STEP) {
++        for (int j = 0; j < GGML_F32_ARR; ++j) {
++            const int offset = pos + j*GGML_F32_EPR;
++            GGML_F32_VEC ax;
++#if defined(__AVX512F__) && defined(__AVX512BW__)
++            const __m128i codes = _mm_loadu_si128((const __m128i *) (x + offset));
++            ax = _mm512_i32gather_ps(_mm512_cvtepu8_epi32(codes), ggml_table_f32_f8_e4m3, sizeof(float));
++#elif defined(__AVX2__) && !defined(__AVX512F__)
++            const __m128i codes = _mm_loadl_epi64((const __m128i *) (x + offset));
++            ax = _mm256_i32gather_ps(ggml_table_f32_f8_e4m3, _mm256_cvtepu8_epi32(codes), sizeof(float));
++#else
++            float values[GGML_F32_EPR];
++            for (int k = 0; k < GGML_F32_EPR; ++k) {
++                values[k] = ggml_table_f32_f8_e4m3[x[offset + k].bits];
++            }
++            ax = GGML_F32_VEC_LOAD(values);
++#endif
++            sum[j] = GGML_F32_VEC_FMA(sum[j], ax, GGML_F32_VEC_LOAD(y + offset));
++        }
++    }
++    GGML_F32_VEC_REDUCE(sumf, sum);
++#endif
++    for (; pos < n; ++pos) {
++        sumf += ggml_table_f32_f8_e4m3[x[pos].bits] * y[pos];
++    }
++    *s = sumf;
++}
++
+ void ggml_vec_dot_q5_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+     const int qk = QK8_0;
+     const int nb = n / qk;
+diff --git a/ggml/src/ggml-cpu/quants.h b/ggml/src/ggml-cpu/quants.h
+index 93ea7eeffe5b00ad2c612aac49b7983c12949525..f04be52f54af928b9f71eb8c8566b9e948d2dd79 100644
+--- a/ggml/src/ggml-cpu/quants.h
++++ b/ggml/src/ggml-cpu/quants.h
+@@ -23,6 +23,7 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
+ 
+ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
++void quantize_row_f8_e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+ 
+ void quantize_row_q2_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+ void quantize_row_q3_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+@@ -40,6 +41,7 @@ void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
+ // Dot product
+ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_f8_e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+diff --git a/ggml/src/ggml-cpu/simd-mappings.h b/ggml/src/ggml-cpu/simd-mappings.h
+index b7b390db42a0765f3f4a6830e3b488c7eac1217b..7b86e8ad9a79f54eb7358fe514d14ec28ab71adf 100644
+--- a/ggml/src/ggml-cpu/simd-mappings.h
++++ b/ggml/src/ggml-cpu/simd-mappings.h
+@@ -127,6 +127,8 @@ extern float ggml_table_f32_e8m0_half[1 << 8];
+ // defined in ggml-cpu.c, initialized in ggml_cpu_init()
+ extern float ggml_table_f32_ue4m3[1 << 8];
+ 
++extern float ggml_table_f32_f8_e4m3[1 << 8];
++
+ // Use lookup table for E8M0 on x86 (faster than bit manipulation)
+ #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
+ #define GGML_CPU_E8M0_TO_FP32_HALF(x) ggml_table_f32_e8m0_half[(uint8_t)(x)]
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 297d9ffc9d4afeac2ee0eb93f1775ce0f0c6e308..dce8827ae8f18feb18d6c6aa3b6c6e23a7be8a2d 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -163,7 +163,7 @@ if (CUDAToolkit_FOUND)
+     if (GGML_STATIC)
+         if (WIN32)
+             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
+-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
++            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
+         else ()
+             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.1")
+                 target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
+@@ -172,7 +172,7 @@ if (CUDAToolkit_FOUND)
+             endif()
+         endif()
+     else()
+-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
++        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+     endif()
+ 
+     if (GGML_CUDA_NO_VMM)
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 8ab55b0f7f82cd7e096d905fea9781c827b5660f..3f6df6fc5bd0edc70714b2ce6959d379b6d77b17 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -392,6 +392,10 @@ static bool blackwell_mma_available(const int cc) {
+            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
+ }
+ 
++static bool fp8_mma_hardware_available(const int cc) {
++    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_RUBIN;
++}
++
+ // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
+ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
+     GGML_ASSERT(tensor != nullptr);
+@@ -887,6 +891,67 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
+ #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+ }
+ 
++static __host__ __device__ __forceinline__ float ggml_cuda_f8_e4m3_to_fp32(uint8_t x) {
++#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    __nv_fp8_e4m3 xf;
++    xf.__x = x;
++    return static_cast<float>(xf);
++#else
++    const uint8_t magnitude = x & 0x7F;
++    if (magnitude == 0x7F) {
++        return NAN;
++    }
++
++    const int exp = (magnitude >> 3) & 0x0F;
++    const int man = magnitude & 0x07;
++    float value;
++    if (exp == 0) {
++        value = ldexpf((float) man, -9);
++    } else {
++        value = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
++    }
++    return x & 0x80 ? -value : value;
++#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++}
++
++static __host__ __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_f8_e4m3(float x) {
++#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
++#elif !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__MUSA_ARCH__)
++    // ggml_cuda_cast also runs on the host, where __float2int_rn is not available.
++    return ggml_fp32_to_f8_e4m3(x);
++#else
++    const uint8_t sign = signbit(x) ? 0x80 : 0;
++    x = fabsf(x);
++
++    if (isnan(x)) {
++        return sign | 0x7F;
++    }
++    if (x == 0.0f) {
++        return sign;
++    }
++    if (isinf(x) || x >= 448.0f) {
++        return sign | 0x7E;
++    }
++    if (x < 0.015625f) {
++        return sign | (uint8_t) __float2int_rn(x * 512.0f);
++    }
++
++    int exp;
++    const float mantissa = frexpf(x, &exp) * 2.0f;
++    int encoded_exp = exp + 6;
++    int encoded_man = __float2int_rn((mantissa - 1.0f) * 8.0f);
++    if (encoded_man == 8) {
++        encoded_man = 0;
++        encoded_exp++;
++    }
++    if (encoded_exp > 15 || (encoded_exp == 15 && encoded_man > 6)) {
++        return sign | 0x7E;
++    }
++    return sign | (uint8_t) (encoded_exp << 3) | (uint8_t) encoded_man;
++#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++}
++
+ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
+ #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
+     if (!(x > 0.0f)) {
+@@ -1504,6 +1569,9 @@ struct ggml_backend_cuda_context {
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
++    cublasLtHandle_t cublaslt_handles[GGML_CUDA_MAX_DEVICES] = {};
++#endif
+ 
+     int curr_stream_no = 0;
+ 
+@@ -1598,6 +1666,16 @@ struct ggml_backend_cuda_context {
+         return cublas_handles[device][curr_stream_no];
+     }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
++    cublasLtHandle_t cublaslt_handle() {
++        if (cublaslt_handles[device] == nullptr) {
++            ggml_cuda_set_device(device);
++            CUBLAS_CHECK(cublasLtCreate(&cublaslt_handles[device]));
++        }
++        return cublaslt_handles[device];
++    }
++#endif
++
+     // pool
+     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
+ 
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index e0d5c88d83b5b4e299db1a4d190ba2fedbb56552..4e63542573175a6be7b856445a7cf32c57d91cbb 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -471,6 +471,16 @@ static __global__ void convert_unary_cont_vec4(
+         return;
+     }
+ 
++#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if constexpr (std::is_same_v<src_t, ggml_fp8_e4m3_t> && std::is_same_v<dst_t, half>) {
++        uint32_t bits;
++        ggml_cuda_memcpy_1<sizeof(bits)>(&bits, (const uint8_t *) vx + 4*i);
++        half2 pairs[2] = {__nv_cvt_fp8x2_to_halfraw2(uint16_t(bits), __NV_E4M3),
++                          __nv_cvt_fp8x2_to_halfraw2(uint16_t(bits >> 16), __NV_E4M3)};
++        ggml_cuda_memcpy_1<sizeof(pairs)>(y + 4*i, pairs);
++        return;
++    }
++#endif
+     const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i];
+ 
+     cvt_vec4<dst_t> yv;
+@@ -555,6 +565,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
+             return dequantize_row_mxfp4_cuda;
+         case GGML_TYPE_NVFP4:
+             return dequantize_row_nvfp4_cuda;
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
+         case GGML_TYPE_F32:
+             return convert_unary_cont_cuda<float>;
+         case GGML_TYPE_F16:
+@@ -615,6 +627,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+             return dequantize_row_mxfp4_cuda;
+         case GGML_TYPE_NVFP4:
+             return dequantize_row_nvfp4_cuda;
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
+         case GGML_TYPE_F32:
+             return convert_unary_cont_cuda<float>;
+         case GGML_TYPE_BF16:
+@@ -672,6 +686,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return dequantize_row_mxfp4_cuda;
+         case GGML_TYPE_NVFP4:
+             return dequantize_row_nvfp4_cuda;
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
+         case GGML_TYPE_F16:
+             return convert_unary_cont_cuda<half>;
+         case GGML_TYPE_BF16:
+@@ -699,6 +715,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_cuda<ggml_fp8_e4m3_t>;
+         case GGML_TYPE_BF16:
+             return convert_unary_cuda<nv_bfloat16>;
+         default:
+@@ -724,6 +742,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_cuda<ggml_fp8_e4m3_t>;
+         case GGML_TYPE_F16:
+             return convert_unary_cuda<half, nv_bfloat16>;
+         default:
+@@ -749,6 +769,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_cuda<ggml_fp8_e4m3_t>;
+         case GGML_TYPE_BF16:
+             return convert_unary_cuda<nv_bfloat16, float>;
+         default:
+diff --git a/ggml/src/ggml-cuda/convert.cuh b/ggml/src/ggml-cuda/convert.cuh
+index 101ffeb2acb2bf8d5f06a1263a48059ced43a069..778fb27057edd46be5d73b83cc3b5457ad5543fe 100644
+--- a/ggml/src/ggml-cuda/convert.cuh
++++ b/ggml/src/ggml-cuda/convert.cuh
+@@ -38,6 +38,36 @@ template<typename dst_t, typename src_t>
+  __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {
+     if constexpr (std::is_same_v<dst_t, src_t>) {
+         return x;
++    } else if constexpr (std::is_same_v<dst_t, ggml_fp8_e4m3_t>) {
++        return { ggml_cuda_fp32_to_f8_e4m3(ggml_cuda_cast<float>(x)) };
++    } else if constexpr (std::is_same_v<src_t, ggml_fp8_e4m3_t>) {
++#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#if CUDART_VERSION >= 13040
++        if constexpr (std::is_same_v<dst_t, nv_bfloat16>) {
++            return static_cast<nv_bfloat16>(__nv_cvt_fp8_to_bf16raw(x.bits, __NV_E4M3));
++        }
++#endif
++        if constexpr (std::is_same_v<dst_t, half>) {
++            return static_cast<half>(__nv_cvt_fp8_to_halfraw(x.bits, __NV_E4M3));
++        }
++#endif
++        return ggml_cuda_cast<dst_t>(ggml_cuda_f8_e4m3_to_fp32(x.bits));
++#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    } else if constexpr (std::is_same_v<src_t, __nv_fp8x2_e4m3> && std::is_same_v<dst_t, nv_bfloat162>) {
++#if CUDART_VERSION >= 13040
++        return static_cast<nv_bfloat162>(__nv_cvt_fp8x2_to_bf162raw(x.__x, __NV_E4M3));
++#else
++        return make_bfloat162(
++            ggml_cuda_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x.__x & 0xFF)),
++            ggml_cuda_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x.__x >> 8)));
++#endif
++    } else if constexpr (std::is_same_v<src_t, __nv_fp8x2_e4m3> && std::is_same_v<dst_t, float2>) {
++#if CUDART_VERSION >= 13040
++        return ggml_cuda_cast<float2>(ggml_cuda_cast<nv_bfloat162>(x));
++#else
++        return __half22float2(static_cast<half2>(__nv_cvt_fp8x2_to_halfraw2(x.__x, __NV_E4M3)));
++#endif
++#endif
+     } else if constexpr(std::is_same_v<dst_t, nv_bfloat16>) {
+         return __float2bfloat16(float(x));
+     } else if constexpr(std::is_same_v<src_t, nv_bfloat16>) {
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index 90a06b97bbc6e9f3936827cbf61e8c191303e043..f1f1bf2dabccb91e7d965acf99e517fd5f081f7a 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -477,6 +477,41 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
+                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
++    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F8_E4M3) {
++        ggml_cpy_scalar_cuda<uint8_t, uint8_t>
++            (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F8_E4M3) {
++        if (contiguous_srcs) {
++            ggml_cpy_scalar_contiguous_cuda<float, ggml_fp8_e4m3_t>
++                (src0_ddc, src1_ddc, ne, main_stream);
++        } else {
++            ggml_cpy_scalar_cuda<float, ggml_fp8_e4m3_t>
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++        }
++    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F8_E4M3) {
++        if (contiguous_srcs) {
++            ggml_cpy_scalar_contiguous_cuda<half, ggml_fp8_e4m3_t>
++                (src0_ddc, src1_ddc, ne, main_stream);
++        } else {
++            ggml_cpy_scalar_cuda<half, ggml_fp8_e4m3_t>
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++        }
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F8_E4M3) {
++        if (contiguous_srcs) {
++            ggml_cpy_scalar_contiguous_cuda<nv_bfloat16, ggml_fp8_e4m3_t>
++                (src0_ddc, src1_ddc, ne, main_stream);
++        } else {
++            ggml_cpy_scalar_cuda<nv_bfloat16, ggml_fp8_e4m3_t>
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++        }
++    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F32) {
++        if (contiguous_srcs) {
++            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_t, float>
++                (src0_ddc, src1_ddc, ne, main_stream);
++        } else {
++            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_t, float>
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++        }
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+         if (can_be_transposed) {
+             ggml_cpy_scalar_cuda<float, float, true>
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index a797e83ac5f165287cf4c6c04d577c515773b4f7..3df6d278816f061fe8d1c0b23912f8f1ca6bd983 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -168,6 +168,47 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
+     return sum;
+ }
+ 
++template <int D, int nthreads>
++static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
++    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
++
++    const uint8_t * K_f8 = (const uint8_t *) K_c;
++    GGML_UNUSED(Q_q8);
++    GGML_UNUSED(Q_ds_v);
++
++    float sum = 0.0f;
++
++#pragma unroll
++    for (int k_KQ_0 = 0; k_KQ_0 < D; k_KQ_0 += nthreads*4) {
++#if defined(FP8_AVAILABLE) && defined(V_DOT2_F32_F16_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        // The paired conversion is exact. Accumulate in FP32 in scalar lane order.
++        uint32_t bits;
++        ggml_cuda_memcpy_1<sizeof(bits)>(&bits, K_f8 + k_KQ_0 + (threadIdx.x % nthreads)*4);
++#pragma unroll
++        for (int pair = 0; pair < 2; ++pair) {
++            const half2 k = __nv_cvt_fp8x2_to_halfraw2(uint16_t(bits >> (16*pair)), __NV_E4M3);
++            const half2 q = ((const half2 *) Q_v)[k_KQ_0/(2*nthreads) + pair];
++            sum += __low2float(k) * __low2float(q);
++            sum += __high2float(k) * __high2float(q);
++        }
++#else
++        uint8_t tmp[4];
++        ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, K_f8 + k_KQ_0 + (threadIdx.x % nthreads)*4);
++#pragma unroll
++        for (int k_KQ_1 = 0; k_KQ_1 < 4; ++k_KQ_1) {
++            const float k = ggml_cuda_f8_e4m3_to_fp32(tmp[k_KQ_1]);
++#ifdef V_DOT2_F32_F16_AVAILABLE
++            sum += k * __half2float(((const half *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
++#else
++            sum += k * ((const float *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
++#endif // V_DOT2_F32_F16_AVAILABLE
++        }
++#endif
++    }
++
++    return sum;
++}
++
+ template<int D, int nthreads>
+ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
+     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+@@ -451,6 +492,34 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
+     }
+ }
+ 
++template <typename T, int ne>
++static __device__ __forceinline__ void dequantize_V_f8_e4m3(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
++    static_assert(ne == 2 || ne == 4, "bad ne");
++    static_assert(std::is_same_v<T, half> || std::is_same_v<T, float>, "unsupported type");
++#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#pragma unroll
++    for (int l = 0; l < ne; l += 2) {
++        uint16_t pair;
++        ggml_cuda_memcpy_1<sizeof(pair)>(&pair, (const uint8_t *) vx + i0 + l);
++        const half2 values = __nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3);
++        if constexpr (std::is_same_v<T, half>) {
++            ggml_cuda_memcpy_1<sizeof(values)>((half *) dst + l, &values);
++        } else {
++            ((float *) dst)[l] = __low2float(values);
++            ((float *) dst)[l+1] = __high2float(values);
++        }
++    }
++#else
++    ggml_fp8_e4m3_t tmp[ne];
++    ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, (const ggml_fp8_e4m3_t *) vx + i0);
++
++#pragma unroll
++    for (int l = 0; l < ne; ++l) {
++        ((T *) dst)[l] = ggml_cuda_cast<T>(tmp[l]);
++    }
++#endif
++}
++
+ template <typename T, int ne>
+ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+     const block_q4_0 * x = (const block_q4_0 *) vx;
+@@ -684,6 +753,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
+         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_BF16) {
+         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_F8_E4M3) {
++        return vec_dot_fattn_vec_KQ_f8_e4m3<D, nthreads>;
+     } else {
+         static_assert(type_K == -1, "bad type");
+         return nullptr;
+@@ -706,6 +777,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+         return dequantize_V_q8_0<T, ne>;
+     } else if constexpr (type_V == GGML_TYPE_BF16) {
+         return dequantize_V_bf16<float, ne>;
++    } else if constexpr (type_V == GGML_TYPE_F8_E4M3) {
++        return dequantize_V_f8_e4m3<T, ne>;
+     } else {
+         static_assert(type_V == -1, "bad type");
+         return nullptr;
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 92e9e71fe2e912efd901d095134fe3486ba3f28e..db91192bc89c4768a153e7e96927d2e473c1125f 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -121,7 +121,7 @@ static __global__ void flash_attn_ext_vec(
+     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
+ 
+     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
+-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
++    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16 && type_K != GGML_TYPE_F8_E4M3;
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
+ #else
+@@ -246,6 +246,27 @@ static __global__ void flash_attn_ext_vec(
+         }
+ 
+         __syncthreads();
++    } else if constexpr (type_K == GGML_TYPE_F8_E4M3) {
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++            const float * Q_j = (const float *) (Q + j*nb01);
++#pragma unroll
++            for (int i0 = 0; i0 < D; i0 += nthreads_KQ*4) {
++                const int i = i0 + (threadIdx.x % nthreads_KQ)*4;
++                float4 tmp = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++                if (ncols == 1 || ic0 + j < int(ne01.z)) {
++                    ggml_cuda_memcpy_1<sizeof(tmp)>(&tmp, Q_j + i);
++                }
++#ifdef V_DOT2_F32_F16_AVAILABLE
++                const half2 scale_h2 = make_half2(scale, scale);
++                Q_reg[j][i0/(2*nthreads_KQ) + 0] = __hmul2(make_half2(tmp.x, tmp.y), scale_h2);
++                Q_reg[j][i0/(2*nthreads_KQ) + 1] = __hmul2(make_half2(tmp.z, tmp.w), scale_h2);
++#else
++                Q_reg[j][i0/(2*nthreads_KQ) + 0] = make_float2(tmp.x*scale, tmp.y*scale);
++                Q_reg[j][i0/(2*nthreads_KQ) + 1] = make_float2(tmp.z*scale, tmp.w*scale);
++#endif
++            }
++        }
+     } else {
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+         const half2 scale_h2 = make_half2(scale, scale);
+@@ -688,6 +709,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q5_1); \
+     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q8_0); \
+     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_BF16); \
++    extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_F8_E4M3); \
+ 
+ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_F16)
+ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q4_0)
+@@ -696,6 +718,7 @@ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q5_0)
+ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q5_1)
+ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q8_0)
+ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_BF16)
++EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_F8_E4M3)
+ 
+ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_F16)
+ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q4_0)
+@@ -704,6 +727,7 @@ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q5_0)
+ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q5_1)
+ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q8_0)
+ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_BF16)
++EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_F8_E4M3)
+ 
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_F16)
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q4_0)
+@@ -712,3 +736,4 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
++EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_F8_E4M3)
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index b6ff6b96cb3a8a9a5019e9f8ad84884ef3e3ff97..8a96d0d977d57315acf779502388a572dc2a4570 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -454,6 +454,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q5_1, F16)
+     FATTN_VEC_CASES_ALL_D(Q8_0, F16)
+     FATTN_VEC_CASES_ALL_D(BF16, F16)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, F16)
+ 
+     FATTN_VEC_CASES_ALL_D(F16,  Q4_0)
+     FATTN_VEC_CASES_ALL_D(Q4_0, Q4_0)
+@@ -462,6 +463,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q5_1, Q4_0)
+     FATTN_VEC_CASES_ALL_D(Q8_0, Q4_0)
+     FATTN_VEC_CASES_ALL_D(BF16, Q4_0)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q4_0)
+ 
+     FATTN_VEC_CASES_ALL_D(F16,  Q4_1)
+     FATTN_VEC_CASES_ALL_D(Q4_0, Q4_1)
+@@ -470,6 +472,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q5_1, Q4_1)
+     FATTN_VEC_CASES_ALL_D(Q8_0, Q4_1)
+     FATTN_VEC_CASES_ALL_D(BF16, Q4_1)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q4_1)
+ 
+     FATTN_VEC_CASES_ALL_D(F16,  Q5_0)
+     FATTN_VEC_CASES_ALL_D(Q4_0, Q5_0)
+@@ -478,6 +481,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_0)
+     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_0)
+     FATTN_VEC_CASES_ALL_D(BF16, Q5_0)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q5_0)
+ 
+     FATTN_VEC_CASES_ALL_D(F16,  Q5_1)
+     FATTN_VEC_CASES_ALL_D(Q4_0, Q5_1)
+@@ -486,6 +490,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_1)
+     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_1)
+     FATTN_VEC_CASES_ALL_D(BF16, Q5_1)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q5_1)
+ 
+     FATTN_VEC_CASES_ALL_D(F16,  Q8_0)
+     FATTN_VEC_CASES_ALL_D(Q4_0, Q8_0)
+@@ -494,6 +499,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q5_1, Q8_0)
+     FATTN_VEC_CASES_ALL_D(Q8_0, Q8_0)
+     FATTN_VEC_CASES_ALL_D(BF16, Q8_0)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q8_0)
+ 
+     FATTN_VEC_CASES_ALL_D(F16,  BF16)
+     FATTN_VEC_CASES_ALL_D(Q4_0, BF16)
+@@ -502,6 +508,16 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q5_1, BF16)
+     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
+     FATTN_VEC_CASES_ALL_D(BF16, BF16)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, BF16)
++
++    FATTN_VEC_CASES_ALL_D(F16, F8_E4M3)
++    FATTN_VEC_CASES_ALL_D(Q4_0, F8_E4M3)
++    FATTN_VEC_CASES_ALL_D(Q4_1, F8_E4M3)
++    FATTN_VEC_CASES_ALL_D(Q5_0, F8_E4M3)
++    FATTN_VEC_CASES_ALL_D(Q5_1, F8_E4M3)
++    FATTN_VEC_CASES_ALL_D(Q8_0, F8_E4M3)
++    FATTN_VEC_CASES_ALL_D(BF16, F8_E4M3)
++    FATTN_VEC_CASES_ALL_D(F8_E4M3, F8_E4M3)
+ 
+     return nullptr;
+ }
+@@ -545,6 +561,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
+         case GGML_TYPE_Q5_0:
+         case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q8_0:
++        case GGML_TYPE_F8_E4M3:
+             return true;
+         default:
+             return false;
+@@ -653,6 +670,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
++    // On SM120 direct FP8 reads avoid conversion launches for short histories.
++    // At longer lengths the grouped MMA path wins back its conversion cost.
++    if (can_use_vector_kernel && K->type == GGML_TYPE_F8_E4M3 && V->type == GGML_TYPE_F8_E4M3 &&
++            cc == GGML_CUDA_CC_BLACKWELL && K->ne[1] <= 512 && Q->ne[1] <= 4 &&
++            ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type)) {
++        return BEST_FATTN_KERNEL_VEC;
++    }
++
+     // If Turing tensor cores are available, use them:
+     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+         if (can_use_vector_kernel) {
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fdec42208c8f24c9dcc11a5588e449a4e048821
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -0,0 +1,206 @@
++#include "fp8.cuh"
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
++
++struct fp8_abs_src {
++    const float * x;
++    int64_t ne0;
++    int64_t ne1;
++    int64_t ne2;
++    int64_t s1;
++    int64_t s2;
++    int64_t s3;
++
++    __device__ float operator()(int64_t i) const {
++        const int64_t i0 = i % ne0;
++        i /= ne0;
++        const int64_t i1 = i % ne1;
++        i /= ne1;
++        const int64_t i2 = i % ne2;
++        const int64_t i3 = i / ne2;
++        const float value = fabsf(x[i0 + i1*s1 + i2*s2 + i3*s3]);
++        return isfinite(value) ? value : 448.0f;
++    }
++};
++
++static __global__ void fp8_amax_partials(fp8_abs_src src, int64_t ne, float * partials) {
++    float amax = 0.0f;
++    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < ne; i += (int64_t) blockDim.x*gridDim.x) {
++        amax = fmaxf(amax, src(i));
++    }
++
++    __shared__ float shared[WARP_SIZE];
++    amax = block_reduce<block_reduce_method::MAX, 256>(amax, shared);
++    if (threadIdx.x == 0) {
++        partials[blockIdx.x] = amax;
++    }
++}
++
++static __global__ void fp8_amax_final(const float * partials, int n, float * amax) {
++    float value = 0.0f;
++    for (int i = threadIdx.x; i < n; i += blockDim.x) {
++        value = fmaxf(value, partials[i]);
++    }
++
++    __shared__ float shared[WARP_SIZE];
++    value = block_reduce<block_reduce_method::MAX, 256>(value, shared);
++    if (threadIdx.x == 0) {
++        *amax = value;
++    }
++}
++
++static __global__ void quantize_fp8_e4m3(
++        const float * __restrict__ x, uint8_t * __restrict__ y, const float * __restrict__ amax,
++        float * __restrict__ scale, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne, int64_t s1, int64_t s2, int64_t s3) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= ne) {
++        return;
++    }
++
++    int64_t tmp = i / ne0;
++    const int64_t i0 = i - tmp*ne0;
++    const int64_t i1 = tmp % ne1;
++    tmp /= ne1;
++    const int64_t i2 = tmp % ne2;
++    const int64_t i3 = tmp / ne2;
++
++    const float d = *amax > 0.0f ? *amax / 448.0f : 1.0f;
++    y[i] = ggml_cuda_fp32_to_f8_e4m3(x[i0 + i1*s1 + i2*s2 + i3*s3] / d);
++    if (i == 0) {
++        *scale = d;
++    }
++}
++
++static void fp8_set_batch(cublasLtMatrixLayout_t desc, int32_t count, int64_t stride) {
++    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &count, sizeof(count)));
++    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof(stride)));
++}
++
++static void fp8_destroy_matmul(
++        cublasLtMatmulDesc_t op_desc, cublasLtMatrixLayout_t a_desc, cublasLtMatrixLayout_t b_desc,
++        cublasLtMatrixLayout_t d_desc) {
++    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(d_desc));
++    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(b_desc));
++    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(a_desc));
++    CUBLAS_CHECK(cublasLtMatmulDescDestroy(op_desc));
++}
++
++bool ggml_cuda_mul_mat_fp8(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const ggml_tensor * weight_scale) {
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if (!fp8_mma_hardware_available(cc) || src0->type != GGML_TYPE_F8_E4M3 || src1->type != GGML_TYPE_F32 ||
++            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || src0->ne[0] % 16 != 0 || src0->ne[1] % 16 != 0 ||
++            src0->nb[0] != sizeof(uint8_t) || src0->nb[1] != (size_t) src0->ne[0] || src1->nb[0] != sizeof(float) ||
++            !ggml_cuda_is_aligned(src0, 16) || !ggml_cuda_is_aligned(dst, 16)) {
++        return false;
++    }
++
++    GGML_ASSERT(!weight_scale || (weight_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scale) && ggml_nelements(weight_scale) == 1));
++
++    GGML_TENSOR_BINARY_OP_LOCALS
++    GGML_ASSERT(ne10 == ne00);
++    GGML_ASSERT(ne0 == ne01);
++    GGML_ASSERT(ne12 % ne02 == 0);
++    GGML_ASSERT(ne13 % ne03 == 0);
++
++    cudaStream_t stream = ctx.stream();
++    const int64_t ne_src1 = ggml_nelements(src1);
++    ggml_cuda_pool_alloc<uint8_t> src1_fp8(ctx.pool(), ne_src1);
++    ggml_cuda_pool_alloc<float> src1_scale(ctx.pool(), 1);
++    ggml_cuda_pool_alloc<float> src1_amax(ctx.pool(), 1);
++
++    const fp8_abs_src abs_src = {
++        (const float *) src1->data, ne10, ne11, ne12,
++        (int64_t) (nb11 / sizeof(float)), (int64_t) (nb12 / sizeof(float)), (int64_t) (nb13 / sizeof(float))
++    };
++    const int reduce_blocks = std::min<int64_t>((ne_src1 + 255)/256, 1024);
++    ggml_cuda_pool_alloc<float> reduce_tmp(ctx.pool(), reduce_blocks);
++    fp8_amax_partials<<<reduce_blocks, 256, 0, stream>>>(abs_src, ne_src1, reduce_tmp.ptr);
++    fp8_amax_final<<<1, 256, 0, stream>>>(reduce_tmp.ptr, reduce_blocks, src1_amax.ptr);
++
++    quantize_fp8_e4m3<<<(ne_src1 + 255)/256, 256, 0, stream>>>(
++        (const float *) src1->data, src1_fp8.ptr, src1_amax.ptr, src1_scale.ptr, ne10, ne11, ne12, ne_src1,
++        nb11 / sizeof(float), nb12 / sizeof(float), nb13 / sizeof(float));
++    CUDA_CHECK(cudaGetLastError());
++
++    cublasLtMatmulDesc_t op_desc;
++    cublasLtMatrixLayout_t a_desc;
++    cublasLtMatrixLayout_t b_desc;
++    cublasLtMatrixLayout_t d_desc;
++    CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
++    const cublasOperation_t trans_a = CUBLAS_OP_T;
++    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
++    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
++        op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &src1_scale.ptr, sizeof(src1_scale.ptr)));
++    if (weight_scale) {
++        const float * scale_ptr = (const float *) weight_scale->data;
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
++            op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_ptr, sizeof(scale_ptr)));
++    }
++    const int64_t r2 = ne12 / ne02;
++    const int64_t r3 = ne13 / ne03;
++
++    // src1 batches that share a src0 matrix are adjacent in the compact src1 copy and in dst, fold them into N
++    const int64_t n = ne11*(ne02 == 1 ? r2*r3 : r2);
++
++    // batch the remaining matmuls with a fixed src0 stride, or issue one batched call per i3 if there is none
++    int64_t batch_count = ne02;
++    int64_t stride_a    = nb02;
++    int64_t n_calls     = ne13;
++    if (ne02 == 1) {
++        batch_count = ne03;
++        stride_a    = nb03;
++        n_calls     = 1;
++    } else if (r3 == 1 && (ne03 == 1 || nb03 == ne02*nb02)) {
++        batch_count = ne02*ne03;
++        n_calls     = 1;
++    }
++
++    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_8F_E4M3, ne00, ne01, ne00));
++    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_8F_E4M3, ne10, n, ne10));
++    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, ne0, n, ne0));
++    if (batch_count > 1) {
++        fp8_set_batch(a_desc, batch_count, stride_a);
++        fp8_set_batch(b_desc, batch_count, ne10*n);
++        fp8_set_batch(d_desc, batch_count, ne0*n);
++    }
++
++    // TODO: Allow workspace in the heuristic search for potential performance gains.
++    // cuBLASLt takes caller-owned workspace per matmul call.
++    cublasLtMatmulPreference_t preference;
++    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
++    cublasLtMatmulHeuristicResult_t heuristic;
++    int returned = 0;
++    const cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
++        ctx.cublaslt_handle(), op_desc, a_desc, b_desc, d_desc, d_desc, preference, 1, &heuristic, &returned);
++    CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
++    if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
++        fp8_destroy_matmul(op_desc, a_desc, b_desc, d_desc);
++        return false;
++    }
++
++    const float alpha = 1.0f;
++    const float beta = 0.0f;
++    for (int64_t i3 = 0; i3 < n_calls; ++i3) {
++        const char * a = (const char *) src0->data + (i3/r3)*nb03;
++        const uint8_t * b = src1_fp8.ptr + i3*ne12*ne11*ne10;
++        float * d = (float *) ((char *) dst->data + i3*dst->nb[3]);
++        CUBLAS_CHECK(cublasLtMatmul(ctx.cublaslt_handle(), op_desc, &alpha, a, a_desc, b, b_desc,
++            &beta, d, d_desc, d, d_desc, &heuristic.algo, nullptr, 0, stream));
++    }
++
++    fp8_destroy_matmul(op_desc, a_desc, b_desc, d_desc);
++    return true;
++}
++
++#else
++
++bool ggml_cuda_mul_mat_fp8(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const ggml_tensor * weight_scale) {
++    GGML_UNUSED_VARS(ctx, src0, src1, dst, weight_scale);
++    return false;
++}
++
++#endif
+diff --git a/ggml/src/ggml-cuda/fp8.cuh b/ggml/src/ggml-cuda/fp8.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..069349ed9ddbc71bc2e041ad5d2429a2b6efc2fd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fp8.cuh
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include "common.cuh"
++
++bool ggml_cuda_mul_mat_fp8(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const ggml_tensor * weight_scale = nullptr);
+diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+index d97e8fdb0f401a9f68394c915aa564e1cee321ac..09b7f02b8f85af440873b53fb8acf98309003f1d 100644
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -316,6 +316,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
+             get_rows_cuda_float((const nv_bfloat16 *) src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
++        case GGML_TYPE_F8_E4M3:
++            get_rows_cuda_float((const ggml_fp8_e4m3_t *) src0_d, src1_d, dst_d,
++                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            break;
+         case GGML_TYPE_Q1_0:
+             get_rows_cuda_q<QK1_0, QR1_0, dequantize_q1_0>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 83c67ad7902da31e76ee8315bcebd20c83881e08..f6d5e54e2fe2c2ec8134788a03a1f0f56ad81687 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -34,6 +34,7 @@
+ #include "ggml-cuda/diagmask.cuh"
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
++#include "ggml-cuda/fp8.cuh"
+ #include "ggml-attn-mask-compact.h"
+ #include "ggml-cuda/pool-trim-policy.h"
+ #include "ggml-cuda/paged-attn.cuh"
+@@ -1058,6 +1059,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+                 CUDA_CHECK(ggml_cuda_device_free(cublas_workspaces[i][j], i));
+             }
+         }
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
++        if (cublaslt_handles[i]) CUBLAS_CHECK(cublasLtDestroy(cublaslt_handles[i]));
++#endif
+     }
+ }
+ 
+@@ -2077,7 +2081,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
+     ggml_type compute_type = src0->type;
+-    if (ggml_is_quantized(compute_type)) {
++    if (ggml_is_quantized(compute_type) || compute_type == GGML_TYPE_F8_E4M3) {
+         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
+         compute_type = GGML_TYPE_F32;
+@@ -2248,7 +2252,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+     return true;
+ }
+ 
+-static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
++static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, const ggml_tensor * gate = nullptr) {
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+@@ -2256,12 +2260,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+ 
+     bool use_mul_mat_vec_f =
+-        (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
++        (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
++         src0->type == GGML_TYPE_F8_E4M3) &&
+         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+ 
+     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+-    use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
++    use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0, cc, warp_size, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
++
++    if (gate && !ggml_cuda_should_use_mmvf(gate->src[0], cc, warp_size, is_mul_mat_id ? src1->ne[2] : src1->ne[1])) {
++        return false;
++    }
+ 
+     //we only support fusion for ncols_dst = 1
+     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+@@ -2285,11 +2294,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+ 
+-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    bool use_mul_mat_vec_q = ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]) && !bad_padding_clear &&
++                             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+ 
+     // fusion is not universally faster on Pascal
+-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+@@ -2422,17 +2431,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+ 
+-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+-        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
++    if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)) {
++        // The custom vector kernel can be used over batched cuBLAS GEMM.
+         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+-    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
++    // A transposed vector can still use MMVF (i.e. ne01 == 1)
+     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
+             && src0->type == GGML_TYPE_F32
+             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+-            && ggml_cuda_should_use_mmvf(src1->type, cc, warp_size, src1->ne, src1->nb, /*ne11 =*/ 1)) {
++            && ggml_cuda_should_use_mmvf(src1, cc, warp_size, /*ne11 =*/ 1)) {
+         ggml_tensor dst_vec = *dst;
+         dst_vec.ne[0] = ne11;
+         dst_vec.ne[1] = 1;
+@@ -2474,6 +2483,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    if (src0->type == GGML_TYPE_F8_E4M3 && ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst)) {
++        return;
++    }
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }
+ 
+@@ -2682,7 +2694,6 @@ static const ggml_backend_cuda_tuning_api ggml_cuda_resident_tuning_api {
+ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+-
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+ 
+     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+@@ -2694,7 +2705,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+                 return false;
+             }
+-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
++        } else if (src0->type == GGML_TYPE_F8_E4M3 &&
++                ggml_cuda_should_use_mmvf(src0, cc, warp_size, dst->ne[2])) {
++            return false;
++        } else if (src0->type != GGML_TYPE_F8_E4M3 && GGML_CUDA_CC_IS_AMD(cc)) {
+             return false;
+         }
+     }
+@@ -2720,7 +2734,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+ 
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+@@ -2733,8 +2747,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                     return;
+                 }
++            } else if (src0->type == GGML_TYPE_F8_E4M3 &&
++                    ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne2)) {
++                ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
++                return;
+             } else {
+-                if (GGML_CUDA_CC_IS_AMD(cc)) {
++                if (src0->type != GGML_TYPE_F8_E4M3 && GGML_CUDA_CC_IS_AMD(cc)) {
+                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                     return;
+                 }
+@@ -2760,7 +2778,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     GGML_ASSERT(nb2  % nb1  == 0);
+ 
+     const ggml_type type_src1_sorted = (src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc))
+-        || ggml_is_quantized(src0->type) ? GGML_TYPE_F32 : src0->type;
++        || ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F8_E4M3 ? GGML_TYPE_F32 : src0->type;
+     const ggml_type type_dst_sorted  = GGML_TYPE_F32;
+     const size_t ts_src1_sorted = ggml_type_size(type_src1_sorted);
+     const size_t ts_dst_sorted  = ggml_type_size(type_dst_sorted);
+@@ -5168,7 +5186,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+ 
+         const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
+-        if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 ||
++        if ((mm_node->src[0]->type != GGML_TYPE_NVFP4 && mm_node->src[0]->type != GGML_TYPE_F8_E4M3) || scale_node->type != GGML_TYPE_F32 ||
+                 scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
+                 !ggml_are_same_shape(scale_node, mm_node)) {
+             return nullptr;
+@@ -5188,7 +5206,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+ 
+         const ggml_tensor * scale = reshape->src[0];
+-        if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 ||
++        if ((mm_node->src[0]->type != GGML_TYPE_NVFP4 && mm_node->src[0]->type != GGML_TYPE_F8_E4M3) || scale_node->type != GGML_TYPE_F32 ||
+                 scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != mm_node->src[0]->ne[2] ||
+                 !ggml_are_same_shape(scale_node, mm_node)) {
+             return nullptr;
+@@ -5289,6 +5307,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op     = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
+ 
++                if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n, gate_n)) {
++                    ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
++                    fused_mul_mat_vec = true;
++                    fused_node_count  = n_ops;
++                    break;
++                }
++
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                     fused_mul_mat_vec = true;
+@@ -5383,6 +5408,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op     = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
+ 
++                if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n, gate_n)) {
++                    ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
++                    fused_mul_mat_vec = true;
++                    fused_node_count  = n_ops;
++                    break;
++                }
++
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                     fused_mul_mat_vec = true;
+@@ -5432,7 +5464,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src1 = up_n->src[1];
+             const ggml_tensor * ids  = up_n->src[2];
+ 
+-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
++            if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n, gate_n)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate_n->src[0];
+                 fusion_data.x_bias    = up_bias_tensor;
+@@ -5475,7 +5507,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
+ 
+-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
++            if (ggml_cuda_should_fuse_mul_mat_vec_f(up, gate)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+@@ -5580,6 +5612,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             fusion_data.x_bias  = bias;
+             fusion_data.x_scale = scale;
+ 
++            if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
++                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
++                fused_mul_mat_vec = true;
++                fused_node_count  = n_ops;
++                break;
++            }
++
++            if (op == GGML_OP_MUL_MAT && !with_bias && src0->type == GGML_TYPE_F8_E4M3 &&
++                    ggml_get_op_params_i32(mm_node, 3) != GGML_PREC_F32 &&
++                    ggml_cuda_mul_mat_fp8(*cuda_ctx, src0, src1, scale_node, scale)) {
++                return 1;
++            }
++
+             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -7069,6 +7114,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_Q8_0:
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_NVFP4:
++                    case GGML_TYPE_F8_E4M3:
+                     case GGML_TYPE_Q2_K:
+                     case GGML_TYPE_Q3_K:
+                     case GGML_TYPE_Q4_K:
+@@ -7106,6 +7152,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_Q5_0:
+                     case GGML_TYPE_Q5_1:
+                     case GGML_TYPE_Q8_0:
++                    case GGML_TYPE_F8_E4M3:
+                     case GGML_TYPE_Q2_K:
+                     case GGML_TYPE_Q3_K:
+                     case GGML_TYPE_Q4_K:
+@@ -7135,7 +7182,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             {
+                 return (
+                            (
+-                               (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
++                               (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F8_E4M3 ||
+                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
+                                op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                                op->src[0]->type == GGML_TYPE_F32
+@@ -7156,6 +7203,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             {
+                 ggml_type src0_type = op->src[0]->type;
+                 ggml_type src1_type = op->src[1]->type;
++                if (src0_type == GGML_TYPE_F8_E4M3 && src1_type == GGML_TYPE_F8_E4M3) {
++                    return true;
++                }
++                if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_BF16) &&
++                    src1_type == GGML_TYPE_F8_E4M3) {
++                    return true;
++                }
++                if (src0_type == GGML_TYPE_F8_E4M3 && src1_type == GGML_TYPE_F32) {
++                    return true;
++                }
+                 if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_F16) &&
+                     (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_BF16 || src1_type == GGML_TYPE_F16)
+                 ) {
+@@ -7613,12 +7670,21 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ 
+     {
+         const auto & info = ggml_cuda_info();
++        bool has_fp8 = false;
++        bool has_fp4 = false;
+         for (int id = 0; id < info.device_count; ++id) {
+-            if (blackwell_mma_available(info.devices[id].cc)) {
+-                features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
++            has_fp8 |= fp8_mma_hardware_available(info.devices[id].cc);
++            has_fp4 |= blackwell_mma_available(info.devices[id].cc);
++            if (has_fp8 && has_fp4) {
+                 break;
+             }
+         }
++        if (has_fp8) {
++            features.push_back({ "NATIVE_FP8", "1"});
++        }
++        if (has_fp4) {
++            features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
++        }
+     }
+ 
+     #undef _STRINGIFY
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 752d28c4f2e2a5a911ce3245b261283babadb470..842c98f4f257c9e5c01c5d86e67415f6a75a3d50 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -5,6 +5,14 @@
+ #include "mmf.cuh"
+ #include "convert.cuh"
+ 
++static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t * x, const int col2) {
++#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    return ggml_cuda_cast<float2>(reinterpret_cast<const __nv_fp8x2_e4m3 *>(x)[col2]);
++#else
++    return make_float2(ggml_cuda_cast<float>(x[2*col2]), ggml_cuda_cast<float>(x[2*col2 + 1]));
++#endif
++}
++
+ template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+ static __global__ void mul_mat_vec_f(
+         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -56,16 +64,24 @@ static __global__ void mul_mat_vec_f(
+     bool use_gate = false;
+     bool use_bias = false;
+     bool use_gate_bias = false;
++    bool use_scale = false;
++    bool use_gate_scale = false;
+     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
+     float glu_limit = 0.0f;
+     const T * gate_x = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
++    const float * x_scale = nullptr;
++    const float * gate_scale = nullptr;
+ 
+     if constexpr (has_fusion) {
+         use_gate = fusion.gate != nullptr;
+         use_bias = fusion.x_bias != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr;
++        if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
++            use_scale = fusion.x_scale != nullptr;
++            use_gate_scale = fusion.gate_scale != nullptr && use_gate;
++        }
+         glu_op = fusion.glu_op;
+         glu_limit = fusion.glu_limit;
+ 
+@@ -81,6 +97,12 @@ static __global__ void mul_mat_vec_f(
+         } else {
+             use_gate_bias = false;
+         }
++        if (use_scale) {
++            x_scale = static_cast<const float *>(fusion.x_scale);
++        }
++        if (use_gate_scale) {
++            gate_scale = static_cast<const float *>(fusion.gate_scale);
++        }
+     }
+ 
+     if (use_gate) {
+@@ -97,8 +119,6 @@ static __global__ void mul_mat_vec_f(
+         }
+     }
+ 
+-    const float2 * y2 = (const float2 *) y;
+-
+     extern __shared__ char data_mmv[];
+     float * buf_iw = (float *) data_mmv;
+     [[maybe_unused]] float * buf_iw_gate = nullptr;
+@@ -128,6 +148,7 @@ static __global__ void mul_mat_vec_f(
+     }
+ 
+     if constexpr (std::is_same_v<T, float>) {
++        const float2 * y2 = (const float2 *) y;
+         const float2 * x2 = (const float2 *) x;
+         [[maybe_unused]] const float2 * gate_x2 = nullptr;
+         if constexpr (has_fusion) {
+@@ -160,6 +181,7 @@ static __global__ void mul_mat_vec_f(
+             }
+         }
+     } else if constexpr (std::is_same_v<T, half>) {
++        const float2 * y2 = (const float2 *) y;
+         const half2 * x2 = (const half2 *) x;
+         [[maybe_unused]] const half2 * gate_x2 = nullptr;
+         if constexpr (has_fusion) {
+@@ -235,6 +257,7 @@ static __global__ void mul_mat_vec_f(
+ #endif // FP16_AVAILABLE
+         }
+     } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
++        const float2 * y2 = (const float2 *) y;
+ //TODO: add support for ggml_cuda_mad for hip_bfloat162
+ #if defined(GGML_USE_HIP)
+         const int * x2 = (const int *) x;
+@@ -301,6 +324,28 @@ static __global__ void mul_mat_vec_f(
+             }
+         }
+ #endif
++    } else if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
++        const float2 * y2 = (const float2 *) y;
++        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++            const float2 tmpx = mmvf_load_fp8x2(x, col2);
++            float2 tmpx_gate = {};
++            if constexpr (has_fusion) {
++                if (use_gate) {
++                    tmpx_gate = mmvf_load_fp8x2(gate_x, col2);
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                const float2 tmpy = y2[j*stride_col_y2 + col2];
++                ggml_cuda_mad(sumf[j], tmpx, tmpy);
++
++                if constexpr (has_fusion) {
++                    if (use_gate) {
++                        ggml_cuda_mad(sumf_gate[j], tmpx_gate, tmpy);
++                    }
++                }
++            }
++        }
+     } else {
+         static_assert(std::is_same_v<T, void>, "unsupported type");
+     }
+@@ -348,12 +393,18 @@ static __global__ void mul_mat_vec_f(
+     float value = sumf[tid];
+ 
+     if constexpr (has_fusion) {
++        if (use_scale) {
++            value *= x_scale[ids ? channel_x : 0];
++        }
+         if (use_bias) {
+             value += x_bias[tid*stride_col_dst + row];
+         }
+ 
+         if (use_gate) {
+             float gate_value = sumf_gate[tid];
++            if (use_gate_scale) {
++                gate_value *= gate_scale[ids ? channel_x : 0];
++            }
+             if (use_gate_bias) {
+                 gate_value += gate_bias[tid*stride_col_dst + row];
+             }
+@@ -380,7 +431,11 @@ static __global__ void mul_mat_vec_f(
+     dst[tid*stride_col_dst + row] = value;
+ 
+     if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, glu_op, glu_limit, gate_x, x_bias, gate_bias,
++            x_scale, gate_scale, sumf_gate);
++    }
++    if constexpr (!std::is_same_v<T, ggml_fp8_e4m3_t>) {
++        GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale);
+     }
+ }
+ 
+@@ -395,7 +450,8 @@ static void mul_mat_vec_f_switch_fusion(
+ 
+     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
+ 
+-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
++    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
++        fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+     if constexpr (ncols_dst == 1) {
+         if (has_fusion) {
+             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
+@@ -649,6 +705,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+     GGML_ASSERT(        nb10       == ts_src1);
+     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+     GGML_ASSERT(        nb0        == ts_dst);
++    GGML_ASSERT(src0->type != GGML_TYPE_F8_E4M3 || (uintptr_t) src0->data % alignof(uint16_t) == 0);
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
+@@ -662,6 +719,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+     if (fusion) {
+         GGML_ASSERT( !ids || dst->ne[2] == 1);
+         GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_F8_E4M3);
+         if (fusion->x_bias) {
+             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+@@ -670,6 +728,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+         }
+         if (fusion->gate) {
+             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
++            GGML_ASSERT(src0->type != GGML_TYPE_F8_E4M3 || (uintptr_t) fusion->gate->data % alignof(uint16_t) == 0);
+             fusion_local.gate = fusion->gate->data;
+         }
+         if (fusion->gate_bias) {
+@@ -678,6 +737,18 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+             fusion_local.gate_bias = fusion->gate_bias->data;
+         }
++        if (fusion->x_scale) {
++            GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
++            GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
++            GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
++            fusion_local.x_scale = fusion->x_scale->data;
++        }
++        if (fusion->gate_scale) {
++            GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
++            GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
++            GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
++            fusion_local.gate_scale = fusion->gate_scale->data;
++        }
+         fusion_local.glu_op = fusion->glu_op;
+         fusion_local.glu_limit = fusion->glu_limit;
+     }
+@@ -722,6 +793,12 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
+         } break;
++        case GGML_TYPE_F8_E4M3: {
++            const ggml_fp8_e4m3_t * src0_d = (const ggml_fp8_e4m3_t *) src0->data;
++            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
++                ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
++                ne03, ne3, s03, s13, s3, ids_stride, prec, ctx.stream());
++        } break;
+         default:
+             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
+     }
+@@ -788,7 +865,11 @@ void ggml_cuda_op_mul_mat_vec_f(
+     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
+ }
+ 
+-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
++bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11) {
++    const ggml_type type = src0->type;
++    const int64_t * src0_ne = src0->ne;
++    const size_t * src0_nb = src0->nb;
++
+     if (src0_ne[0] % 2 != 0) {
+         return false;
+     }
+@@ -798,11 +879,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
+         return false;
+     }
+ 
+-    // Pointers not aligned to the size of half2/nv_bfloat162/float2 would result in a crash:
+-    for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+-        if (src0_nb[i] % (2*ts) != 0) {
+-            return false;
+-        }
++    if (!ggml_cuda_is_aligned(src0, 2*ts)) {
++        return false;
+     }
+ 
+     switch (type) {
+@@ -882,6 +960,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
+                 return ne11 <= MMVF_MAX_BATCH_SIZE;
+             }
+             return ne11 <= MMVF_MAX_BATCH_SIZE;
++        case GGML_TYPE_F8_E4M3:
++            return ne11 <= MMVF_MAX_BATCH_SIZE;
+         default:
+             return false;
+     }
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index 350b5cc064c6938e77534704fed93931178ff116..5a2477b079b2685f40ad55f958ce92d7f9c5f24d 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -11,4 +11,4 @@ void ggml_cuda_op_mul_mat_vec_f(
+     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+     const int64_t src1_padded_row_size, cudaStream_t stream);
+ 
+-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
++bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);
+diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+index 4659970651e59538842d72cfb4d30815c1fd7f25..4be3e649b73be4b028b8afbc1c8c509afe688c5f 100644
+--- a/ggml/src/ggml-cuda/set-rows.cu
++++ b/ggml/src/ggml-cuda/set-rows.cu
+@@ -257,6 +257,16 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+             nb1, nb2, nb3,
+             stream
+         );
++    } else if (dst->type == GGML_TYPE_F8_E4M3) {
++        set_rows_cuda(
++            src0_d, src1_d, (ggml_fp8_e4m3_t *) dst->data,
++            ne00, ne01, ne02, ne03,
++            ne10, ne11, ne12, ne13,
++            nb01, nb02, nb03,
++            nb10, nb11, nb12,
++            nb1, nb2, nb3,
++            stream
++        );
+     } else if (dst->type == GGML_TYPE_Q4_0) {
+         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
+             src0_d, src1_d, (block_q4_0*)dst->data,
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae9672a9e56770c03f2fae1d822d9997144eb9b0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_BF16, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_BF16, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_BF16, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..2afaefa838bdc1cd4d7f350d36675dd1ce7e6519
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-bf16.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..9dfb9c45e7a9e010145c45c1dacf31dbcf71fb94
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-bf16.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_BF16);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_BF16);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-f16.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e7570d36fee3ebb739fdcab4f11f0b581558338
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-f16.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c380e54c8d8fc3d4761991a520455b2c6a948cc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q4_0.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe22bb964257c5688bd7014176867097bdafd78e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q4_0.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q4_1.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..317273afc206ed956228598ff077561919f73437
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q4_1.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_1);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_1);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q5_0.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..e05b1ee381ab690aba53ba1997d89019a9933b91
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q5_0.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_0);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_0);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q5_1.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..6cc6386873cce9396ca8f0cbdbe5dc9250bff586
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q5_1.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_1);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_1);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q8_0.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a88e240b0ce0d938255a8f65ffc6aa2a417cbdb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3-q8_0.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..44b4d4fc9dc99be1af53d7108d6c0a08e3b1e29c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..f16490953e448fa24da717817972083d8d840663
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_1, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_1, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_1, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..6dab7b408a6879285a9bae672970af903628396d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_0, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_0, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_0, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cdaa289f39c355b41b5d35b3eaa0612eabdb004
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_1, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_1, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-f8_e4m3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-f8_e4m3.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..2556c8c82a3a902b447a4230ab152f5aa9926ec1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-f8_e4m3.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3);
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index 7be409bd36ab44684e526e352a5840f1d02516e4..427db00e0bf5c4b1e8cfedf98ff9910f342c94a4 100644
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -8,7 +8,7 @@ HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
+ # DKQ -> DV override for asymmetric head dims.
+ HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128}
+ 
+-TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16"]
++TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16", "GGML_TYPE_F8_E4M3"]
+ 
+ SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+ 
+diff --git a/ggml/src/ggml-cuda/vendors/cuda.h b/ggml/src/ggml-cuda/vendors/cuda.h
+index 323c98019347addaea77a80ed2ca41b9c4853a3b..86c1ed9ce9b648f351ec25f4663e7e6955eb8dcf 100644
+--- a/ggml/src/ggml-cuda/vendors/cuda.h
++++ b/ggml/src/ggml-cuda/vendors/cuda.h
+@@ -3,6 +3,7 @@
+ #include <cuda_runtime.h>
+ #include <cuda.h>
+ #include <cublas_v2.h>
++#include <cublasLt.h>
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ 
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index ae26e0c23b461b716ed5f91977a419e10556087b..4dc55e78e218997c6781f54222401fc403da8078 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -512,6 +512,7 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+ // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
+ // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
+ static inline float ggml_ue4m3_to_fp32(uint8_t x) {
++    // TODO: reject invalid unsigned E4M3 scales instead of decoding NaN as zero or ignoring the sign bit.
+     if (x == 0 || x == 0x7F) {
+         return 0.0f;
+     }
+@@ -527,6 +528,7 @@ static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+ }
+ 
+ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
++    // TODO: use ties-to-even rounding, allow subnormal carry, and preserve finite values with exponent field 15.
+     if (!(x > 0.0f)) {
+         return 0;
+     }
+@@ -564,6 +566,62 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
+     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+ }
+ 
++static inline float ggml_f8_e4m3_to_fp32(uint8_t x) {
++    const uint8_t ax = x & 0x7F;
++    if (ax == 0x7F) {
++        // OCP FP8 defines both 0x7F and 0xFF as NaN; the sign need not be preserved.
++        return NAN;
++    }
++
++    const int exp = (ax >> 3) & 0xF;
++    const int man = ax & 0x7;
++    // OCP FP8 rev. 1.1, section 5.1: subnormal magnitude = M * 2^-9; normal magnitude = (1 + M / 8) * 2^(E - 7).
++    const float value = exp == 0
++        ? ldexpf((float) man, -9)
++        : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
++    return x & 0x80 ? -value : value;
++}
++
++static inline int ggml_round_to_nearest_even(float x) {
++    const int value = (int) floorf(x);
++    const float fraction = x - value;
++    return fraction > 0.5f || (fraction == 0.5f && (value & 1)) ? value + 1 : value;
++}
++
++// Supports saturating conversion only; infinities and overflow clamp to +/-448.
++static inline uint8_t ggml_fp32_to_f8_e4m3(float x) {
++    const uint8_t sign = signbit(x) ? 0x80 : 0;
++    x = fabsf(x);
++
++    if (isnan(x)) {
++        // OCP FP8 leaves NaN sign handling to the implementation; use canonical 0x7F.
++        return 0x7F;
++    }
++    if (x == 0.0f) {
++        return sign;
++    }
++    if (isinf(x) || x >= 448.0f) {
++        return sign | 0x7E;
++    }
++    if (x < 0.015625f) {
++        // OCP FP8 rev. 1.1, section 5.1: subnormal magnitude = M * 2^(1 - bias - m) = M / 512.
++        return sign | (uint8_t) ggml_round_to_nearest_even(x * 512.0f);
++    }
++
++    int exp;
++    const float mantissa = frexpf(x, &exp) * 2.0f;
++    int encoded_exp = exp + 6;
++    int encoded_man = ggml_round_to_nearest_even((mantissa - 1.0f) * 8.0f);
++    if (encoded_man == 8) {
++        encoded_man = 0;
++        encoded_exp++;
++    }
++    if (encoded_exp > 15 || (encoded_exp == 15 && encoded_man > 6)) {
++        return sign | 0x7E;
++    }
++    return sign | (uint8_t) (encoded_exp << 3) | (uint8_t) encoded_man;
++}
++
+ /**
+  * Converts brain16 to float32.
+  *
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index d1bce8bad85ae6d99ed4fb374fc033b14ccde45c..de50894fcc935dd64da809ac8fbf45dae46632c9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1516,6 +1516,7 @@ static bool ggml_metal_supports_mul_mat_op(
+         bool src0_f16_has_mv,
+         bool mm_path) {
+     if (!has_simdgroup_reduction ||
++        op->src[0]->type == GGML_TYPE_F8_E4M3 ||
+         op->src[0]->type == GGML_TYPE_NVFP4 ||
+         op->src[0]->type == GGML_TYPE_TQ1_0) {
+         return false;
+@@ -1923,7 +1924,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+             }
+         case GGML_OP_GET_ROWS:
+             return op->src[0]->type != GGML_TYPE_NVFP4 &&
+-                   op->src[0]->type != GGML_TYPE_TQ1_0;
++                   op->src[0]->type != GGML_TYPE_TQ1_0 &&
++                   op->src[0]->type != GGML_TYPE_F8_E4M3;
+         case GGML_OP_SET_ROWS:
+             {
+                 if (op->src[0]->type == GGML_TYPE_F16) {
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 7750a72ce61b9ddf4aa6b63f60b07e5283147e9f..f87e53121d2ba06267689e41a84201011ccf8128 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -416,6 +416,22 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
+     }
+ }
+ 
++void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, ggml_fp8_e4m3_t * GGML_RESTRICT y, int64_t k) {
++    for (int64_t i = 0; i < k; ++i) {
++        uint32_t bits;
++        memcpy(&bits, &x[i], sizeof(bits));
++        const uint32_t mag = bits & 0x7fffffffU;
++        // For finite normal E4M3 values only the bias and mantissa width
++        // change. Round away the low 20 bits, breaking ties toward even.
++        if (mag >= 0x3c800000U && mag <= 0x43e00000U) { // 2^-6 through 448
++            const uint32_t rounded = mag - (120U << 23) + 0x7ffffU + ((mag >> 20) & 1);
++            y[i].bits = (uint8_t) ((bits >> 24 & 0x80) | (rounded >> 20));
++        } else {
++            y[i].bits = ggml_fp32_to_f8_e4m3(x[i]);
++        }
++    }
++}
++
+ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+     static const int qk = QK1_0;
+ 
+@@ -611,6 +627,23 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
+     }
+ }
+ 
++void dequantize_row_f8_e4m3(const ggml_fp8_e4m3_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    // CPU attention decodes a V row for every visited key. This immutable
++    // 1 KiB table also works before backend initialization and in other DLLs.
++#define E4M3_OCTAVE(x) (x)*8, (x)*9, (x)*10, (x)*11, (x)*12, (x)*13, (x)*14, (x)*15
++#define E4M3_HALF(s, zero) \
++    zero, (s)/512, (s)/256, (s)*3/512, (s)/128, (s)*5/512, (s)*3/256, (s)*7/512, \
++    E4M3_OCTAVE((s)/512), E4M3_OCTAVE((s)/256), E4M3_OCTAVE((s)/128), E4M3_OCTAVE((s)/64), \
++    E4M3_OCTAVE((s)/32), E4M3_OCTAVE((s)/16), E4M3_OCTAVE((s)/8), E4M3_OCTAVE((s)/4), \
++    E4M3_OCTAVE((s)/2), E4M3_OCTAVE(s), E4M3_OCTAVE((s)*2), E4M3_OCTAVE((s)*4), \
++    E4M3_OCTAVE((s)*8), E4M3_OCTAVE((s)*16), \
++    (s)*256, (s)*288, (s)*320, (s)*352, (s)*384, (s)*416, (s)*448, NAN
++    static const float decoded[256] = { E4M3_HALF(1.f, 0.0f), E4M3_HALF(-1.f, -0.0f) };
++#undef E4M3_HALF
++#undef E4M3_OCTAVE
++    for (int64_t i = 0; i < k; ++i) y[i] = decoded[x[i].bits];
++}
++
+ //
+ // 2-6 bit quantization in super-blocks
+ //
+@@ -2312,6 +2345,12 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+ }
+ 
++size_t quantize_f8_e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
++    GGML_UNUSED(quant_weights);
++    quantize_row_f8_e4m3_ref(src, dst, (int64_t)nrow*n_per_row);
++    return nrow * ggml_row_size(GGML_TYPE_F8_E4M3, n_per_row);
++}
++
+ // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
+ 
+ void quantize_row_tq1_0_ref(const float * GGML_RESTRICT x, block_tq1_0 * GGML_RESTRICT y, int64_t k) {
+@@ -5535,10 +5574,20 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+             } break;
+         case GGML_TYPE_NVFP4:
+             {
+-                // UE4M3 scales are uint8_t — all byte values are valid
++                // TODO: validate each unsigned E4M3 scale; NaN encodings and scales with the sign bit set are invalid.
+                 GGML_UNUSED(data);
+                 GGML_UNUSED(nb);
+             } break;
++        case GGML_TYPE_F8_E4M3:
++            {
++                const ggml_fp8_e4m3_t * q = (const ggml_fp8_e4m3_t *) data;
++                for (size_t i = 0; i < nb; ++i) {
++                    if ((q[i].bits & 0x7F) == 0x7F) {
++                        fprintf(stderr, "%s: found NaN at index %zu in row of %zu F8_E4M3 values\n", __func__, i, nb);
++                        return false;
++                    }
++                }
++            } break;
+         case GGML_TYPE_Q2_K:
+             {
+                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q2_K, data, nb, d, dmin);
+diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
+index 75188f1af180e3592f3c94bc4077989fb817c359..ca36d13695c82adf362ec7acb4e3247cd9653cdf 100644
+--- a/ggml/src/ggml-quants.h
++++ b/ggml/src/ggml-quants.h
+@@ -25,6 +25,7 @@ GGML_API void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 *
+ 
+ GGML_API void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k);
+ GGML_API void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k);
++GGML_API void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, ggml_fp8_e4m3_t * GGML_RESTRICT y, int64_t k);
+ 
+ GGML_API void quantize_row_q2_K_ref(const float * GGML_RESTRICT x, block_q2_K * GGML_RESTRICT y, int64_t k);
+ GGML_API void quantize_row_q3_K_ref(const float * GGML_RESTRICT x, block_q3_K * GGML_RESTRICT y, int64_t k);
+@@ -54,6 +55,7 @@ GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GG
+ 
+ GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++GGML_API void dequantize_row_f8_e4m3(const ggml_fp8_e4m3_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ 
+ GGML_API void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_q3_K(const block_q3_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+@@ -104,6 +106,7 @@ GGML_API size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTR
+ 
+ GGML_API size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
++GGML_API size_t quantize_f8_e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ 
+ GGML_API void iq2xs_init_impl(enum ggml_type type);
+ GGML_API void iq2xs_free_impl(enum ggml_type type);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9cc4be2821c97e201c6a7bd66cadd6a52f4f7491..37f34d5fd6341f887270fd9e451339ba4be42834 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -775,6 +775,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
+     },
++    [GGML_TYPE_F8_E4M3] = {
++        .type_name                = "f8_e4m3",
++        .blck_size                = 1,
++        .type_size                = sizeof(ggml_fp8_e4m3_t),
++        .is_quantized             = false,
++        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
++        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
++    },
+     [GGML_TYPE_Q2_K] = {
+         .type_name                = "q2_K",
+         .blck_size                = QK_K,
+@@ -1458,6 +1466,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
+         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
+         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
+         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
++        case GGML_FTYPE_MOSTLY_F8_E4M3:       wtype = GGML_TYPE_F8_E4M3; break;
+         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
+         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
+         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
+@@ -8285,6 +8294,7 @@ size_t ggml_quantize_chunk(
+         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
++        case GGML_TYPE_F8_E4M3: result = quantize_f8_e4m3(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_Q3_K:    result = quantize_q3_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index b8cfa3a85e7b32c2038a385556f023af1202c2c6..cd89b4abd270733f8805f2ff66b35efe65bfecc8 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -6283,6 +6283,7 @@ class GGMLQuantizationType(IntEnum):
+     NVFP4   = 40
+     Q1_0    = 41
+     Q2_0    = 42
++    F8_E4M3 = 43
+ 
+ 
+ class ExpertGatingFuncType(IntEnum):
+@@ -6339,6 +6340,7 @@ class LlamaFileType(IntEnum):
+     MOSTLY_NVFP4         = 39  # except 1d tensors
+     MOSTLY_Q1_0          = 40  # except 1d tensors
+     MOSTLY_Q2_0          = 41  # except 1d tensors
++    MOSTLY_F8_E4M3       = 42  # except 1d tensors
+ 
+     GUESSED              = 1024  # not specified in the model file
+ 
+@@ -6502,6 +6504,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
+     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
+     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
++    GGMLQuantizationType.F8_E4M3: (1, 1),
+ }
+ 
+ 
+diff --git a/gguf-py/gguf/quants.py b/gguf-py/gguf/quants.py
+index cc0772913becc23c42ea38cd76a8874fbb447e27..713c2296dcd749346c497a9d0f99e3028853ca49 100644
+--- a/gguf-py/gguf/quants.py
++++ b/gguf-py/gguf/quants.py
+@@ -817,6 +817,23 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
+         return (d * vals.astype(np.float32)).reshape(n_super, 64)
+ 
+ 
++class F8_E4M3(__Quant, qtype=GGMLQuantizationType.F8_E4M3):
++    @classmethod
++    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
++        bits = blocks.astype(np.uint8)
++        sign = np.where(bits & 0x80, np.float32(-1.0), np.float32(1.0))
++        magnitude = bits & 0x7F
++        exponent = magnitude >> 3
++        mantissa = magnitude & 0x07
++        values = np.where(
++            exponent == 0,
++            np.ldexp(mantissa.astype(np.float32), -9),
++            np.ldexp(1.0 + mantissa.astype(np.float32) / 8.0, exponent.astype(np.int32) - 7),
++        )
++        values = np.where(magnitude == 0x7F, np.nan, sign * values)
++        return values.astype(np.float32, copy=False)
++
++
+ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
+     ksigns: bytes = (
+         b"\x00\x81\x82\x03\x84\x05\x06\x87\x88\x09\x0a\x8b\x0c\x8d\x8e\x0f"
+diff --git a/gguf-py/gguf/scripts/gguf_convert_endian.py b/gguf-py/gguf/scripts/gguf_convert_endian.py
+index 3b20998c68a79e7c225dad11c11543b285f65027..7e8b2f1be7eefcceae41ad8d6b7540b13aad30d6 100644
+--- a/gguf-py/gguf/scripts/gguf_convert_endian.py
++++ b/gguf-py/gguf/scripts/gguf_convert_endian.py
+@@ -40,6 +40,7 @@ byteswap_tensors: dict[gguf.GGMLQuantizationType, tuple[tuple[int, type[np.unsig
+     gguf.GGMLQuantizationType.TQ2_0:  ((64,  np.uint16),),                                 # d
+     gguf.GGMLQuantizationType.MXFP4:  (),                                                  # noop
+     gguf.GGMLQuantizationType.NVFP4:  (),                                                  # noop
++    gguf.GGMLQuantizationType.F8_E4M3: (),                                                 # noop
+ }
+ 
+ 
+diff --git a/include/llama.h b/include/llama.h
+index 1660a3fdd995768ceb60f721f28a3d8e0bfc4077..e24c60f502f6a993e49d8d8b860832f38c437e83 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -158,6 +158,7 @@ extern "C" {
+         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
+         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
+         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
++        LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
+ 
+         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
+     };
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c06561da2a89a99d45a31d9d6b66464e2f1198bc..0476d78ddb767a97dc05961ff586e4dcafd5bf7c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,3 +1,5 @@
++#include <set>
++#include <tuple>
+ #include "llama-context.h"
+ #include "llama-draft-head.h"
+ #include "llama-model-ram.h"
+@@ -5832,6 +5834,71 @@ llama_context_params llama_context_default_params() {
+     return result;
+ }
+ 
++// Architectures with direct cache consumers bypass the shared scale handling.
++static bool llama_fp8_cache_arch(const llama_model & model) {
++    return !(model.hparams.is_mla() ||
++            model.arch == LLM_ARCH_DEEPSEEK32 ||
++            model.arch == LLM_ARCH_DEEPSEEK4 ||
++            model.arch == LLM_ARCH_GLM_DSA ||
++            model.arch == LLM_ARCH_DOTS3NOTE ||
++            model.arch == LLM_ARCH_HY_V4 ||
++            model.arch == LLM_ARCH_MINIMAX_M3 ||
++            model.arch == LLM_ARCH_QWEN4EXP ||
++            model.arch == LLM_ARCH_DFLASH);
++}
++
++// Probe just metadata on the device that owns each distinct K/V layout. In
++// particular, accepting the dtype on the CPU does not prove CUDA can write it.
++static bool llama_can_prefer_fp8_kv(const llama_model & model, const llama_context_params & params) {
++    if (!llama_fp8_cache_arch(model) || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
++        return false;
++    }
++    const auto & hp = model.hparams;
++    const bool mtp = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
++    const uint32_t first = mtp ? hp.n_layer() : 0;
++    const uint32_t last = mtp ? hp.n_layer_all : hp.n_layer();
++    std::set<std::tuple<ggml_backend_dev_t, uint32_t, uint32_t, uint32_t, uint32_t>> tested;
++    for (uint32_t il = first; il < last; ++il) {
++        if (!hp.has_kv(il) || (!mtp && hp.is_recr(il)) || hp.n_head_kv(il) == 0) continue;
++        auto * dev = params.offload_kqv ? model.dev_layer(il) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        const auto dk = hp.n_embd_head_k(il), dv = hp.n_embd_head_v(il);
++        const auto h = hp.n_head(il), hk = hp.n_head_kv(il);
++        if (!dev || !dk || !dv || !h || h % hk) return false;
++        if (!tested.emplace(dev, dk, dv, h, hk).second) continue;
++        ggml_context_ptr ctx(ggml_init({24 * ggml_tensor_overhead(), nullptr, true}));
++        if (!ctx) return false;
++        auto * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
++        for (const auto d : {dk, dv}) {
++            auto * rows = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F8_E4M3, d * hk, 256);
++            auto * src = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, d * hk, 1);
++            if (!ggml_backend_dev_supports_op(dev, ggml_set_rows(ctx.get(), rows, src, ids))) return false;
++        }
++        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
++            // The unfused CPU path stores V transposed, one scalar per row,
++            // and accumulates both products against FP32 activations.
++            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) return false;
++            auto * vt = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F8_E4M3, 1, 256 * dv * hk);
++            auto * value = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, 1);
++            if (!ggml_backend_dev_supports_op(dev, ggml_set_rows(ctx.get(), vt, value, ids))) return false;
++            for (const auto width : {dk, uint32_t(256)}) {
++                auto * weights = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F8_E4M3, width, 256);
++                auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, 1);
++                if (!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx.get(), weights, input))) return false;
++            }
++            continue;
++        }
++        auto * k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F8_E4M3, dk, 256, hk);
++        auto * v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F8_E4M3, dv, 256, hk);
++        for (const int tokens : {1, 32}) {
++            auto * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dk, tokens, h);
++            auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 256, tokens);
++            auto * attention = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.f, 0.f, 0.f);
++            if (!ggml_backend_dev_supports_op(dev, attention)) return false;
++        }
++    }
++    return !tested.empty();
++}
++
+ llama_context * llama_init_from_model(
+                  llama_model * model,
+         llama_context_params   params) {
+@@ -5874,6 +5941,44 @@ llama_context * llama_init_from_model(
+         return nullptr;
+     }
+ 
++    const char * prefer_fp8 = std::getenv("WILDLLAMA_FP8_KV");
++    if (prefer_fp8 && std::strcmp(prefer_fp8, "1") == 0 && model->hparams.causal_attn) {
++        if (llama_can_prefer_fp8_kv(*model, params)) {
++            params.type_k = params.type_v = GGML_TYPE_F8_E4M3;
++            LLAMA_LOG_INFO("%s: using FP8 E4M3 for %s K/V\n", __func__,
++                           params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "MTP" : "model");
++        } else {
++            LLAMA_LOG_INFO("%s: FP8 K/V unavailable for this model or device layout; retaining %s/%s\n",
++                           __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
++        }
++    }
++    const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
++    if (fp8_cache && !llama_fp8_cache_arch(*model)) {
++        LLAMA_LOG_ERROR("%s: FP8 cache is not supported for architecture '%s'\n", __func__, llm_arch_name(model->arch));
++        return nullptr;
++    }
++
++    if (fp8_cache) {
++        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
++            if (!model->hparams.has_kv(il)) {
++                continue;
++            }
++
++            for (ggml_tensor * scale : { model->layers[il].k_cache_s, model->layers[il].v_cache_s }) {
++                if (!scale || !scale->data) {
++                    continue;
++                }
++
++                float value;
++                ggml_backend_tensor_get(scale, &value, 0, sizeof(value));
++                if (!std::isfinite(value) || value == 0.0f) {
++                    LLAMA_LOG_ERROR("%s: FP8 cache scale '%s' must be finite and nonzero\n", __func__, ggml_get_name(scale));
++                    return nullptr;
++                }
++            }
++        }
++    }
++
+     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index bc8d024c0ce679ab2b267190786c7e737712523b..66753ee350d88ff0febad705b28293e82e14ee06 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2401,12 +2401,16 @@ ggml_tensor * llm_graph_context::build_ffn(
+         return false;
+     };
+ 
+-    GGML_ASSERT(!up_s   || !up_b   || !up   || up->type   != GGML_TYPE_NVFP4);
+-    GGML_ASSERT(!gate_s || !gate_b || !gate || gate->type != GGML_TYPE_NVFP4);
+-    GGML_ASSERT(!down_s || !down_b || !down || down->type != GGML_TYPE_NVFP4);
+-    GGML_ASSERT(!up_s   || !up   || up->type   != GGML_TYPE_NVFP4 || !has_lora(up));
+-    GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
+-    GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
++    auto is_scaled_low_precision = [](ggml_tensor * w) {
++        return w && (w->type == GGML_TYPE_NVFP4 || w->type == GGML_TYPE_F8_E4M3);
++    };
++
++    GGML_ASSERT(!up_s   || !up_b   || !is_scaled_low_precision(up));
++    GGML_ASSERT(!gate_s || !gate_b || !is_scaled_low_precision(gate));
++    GGML_ASSERT(!down_s || !down_b || !is_scaled_low_precision(down));
++    GGML_ASSERT(!up_s   || !is_scaled_low_precision(up)   || !has_lora(up));
++    GGML_ASSERT(!gate_s || !is_scaled_low_precision(gate) || !has_lora(gate));
++    GGML_ASSERT(!down_s || !is_scaled_low_precision(down) || !has_lora(down));
+ 
+     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+     cb(tmp, "ffn_up", il);
+@@ -3753,6 +3757,43 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+ }
+ 
++static void build_attn_scale_kv_inputs(
++        ggml_context * ctx,
++        const llama_kv_cache_context * mctx,
++        ggml_tensor * & q,
++        ggml_tensor * & k,
++        ggml_tensor * & v,
++        int32_t il) {
++    if (ggml_tensor * scale = mctx->get_k_scale(il)) {
++        // Store K/s and move its dequant scale to Q: (Q*s) dot (K/s) = Q dot K.
++        q = ggml_mul(ctx, q, scale);
++        if (k) {
++            k = ggml_div(ctx, k, scale);
++        }
++    }
++
++    if (v) {
++        // Store V/s here and restore its dequant scale after the weighted sum.
++        ggml_tensor * scale = mctx->get_v_scale(il);
++        if (scale) {
++            v = ggml_div(ctx, v, scale);
++        }
++    }
++}
++
++static ggml_tensor * build_attn_scale_kv_output(
++        ggml_context * ctx,
++        const llama_kv_cache_context * mctx,
++        ggml_tensor * cur,
++        int32_t il) {
++    if (ggml_tensor * scale = mctx->get_v_scale(il)) {
++        // P*(V/s)*s = P*V.
++        cur = ggml_mul(ctx, cur, scale);
++    }
++
++    return cur;
++}
++
+ ggml_tensor * llm_graph_context::build_attn(
+         llm_graph_input_attn_kv * inp,
+         ggml_tensor * wo,
+@@ -3780,12 +3821,12 @@ ggml_tensor * llm_graph_context::build_attn(
+     // these nodes are added to the graph together so that they are not reordered
+     // by doing so, the number of splits in the graph is reduced
+     // expand k later to enable rope fusion which directly writes into k-v cache
++    const auto * mctx_cur = inp->mctx;
++    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+     ggml_build_forward_expand(gf, q_cur);
+     ggml_build_forward_expand(gf, v_cur);
+     ggml_build_forward_expand(gf, k_cur);
+ 
+-    const auto * mctx_cur = inp->mctx;
+-
+     // Unsupported attention extras keep their original dense implementation.
+     // Disable sparse reclamation and commit its physical span only when inputs
+     // are actually populated, never during worst-case graph reservation.
+@@ -3829,6 +3870,7 @@ ggml_tensor * llm_graph_context::build_attn(
+         paged_table, paged_table ? mctx_cur->get_paged_page_tokens() : 0, contiguous ? int64_t(first_row) : -1, &dense_fast);
+     if (dense_fast) { inp->self_paged_dense_fast = true; inp->self_paged_first_row = first_row; }
+     if (paged_table) { mctx_cur->confirm_paged_layer(il); }
++    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (inp->self_v_rot) {
+@@ -4075,6 +4117,11 @@ ggml_tensor * llm_graph_context::build_attn(
+         }
+     }
+ 
++    const auto * mctx_iswa = inp->mctx;
++    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
++
++    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
++
+     // these nodes are added to the graph together so that they are not reordered
+     // by doing so, the number of splits in the graph is reduced
+     ggml_build_forward_expand(gf, q_cur);
+@@ -4087,10 +4134,6 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_build_forward_expand(gf, v_cur);
+     }
+ 
+-    const auto * mctx_iswa = inp->mctx;
+-
+-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+-
+     // whole seq fits into batch in training mode
+     const bool use_kv_cur = cparams.training && k_cur && v_cur;
+     if (use_kv_cur) {
+@@ -4119,6 +4162,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+ 
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (v_rot) {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 3031e2cbc626fb2c4406c29f91f95f20a9624d4b..82e9018107187e1ffb03e3f711b13d2c148fb8ec 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -541,7 +541,7 @@ llama_kv_cache::llama_kv_cache(
+ 
+         map_layer_ids[il] = layers.size();
+ 
+-        layers.push_back({ il, k, v, k_stream, v_stream, });
++        layers.push_back({ il, k, v, model.layers[il].k_cache_s, model.layers[il].v_cache_s, k_stream, v_stream, });
+     }
+ 
+     if (reuse) {
+@@ -2104,6 +2104,30 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+ }
+ 
++static bool is_type_scaled(ggml_type type) {
++    return type == GGML_TYPE_F8_E4M3;
++}
++
++ggml_tensor * llama_kv_cache::get_k_scale(int32_t il) const {
++    if (!is_type_scaled(type_k())) {
++        return nullptr;
++    }
++
++    const int32_t ikv = map_layer_ids.at(il);
++
++    return layers[ikv].k_scale;
++}
++
++ggml_tensor * llama_kv_cache::get_v_scale(int32_t il) const {
++    if (!is_type_scaled(type_v())) {
++        return nullptr;
++    }
++
++    const int32_t ikv = map_layer_ids.at(il);
++
++    return layers[ikv].v_scale;
++}
++
+ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+     GGML_UNUSED(sinfo);
+ 
+@@ -2807,19 +2831,19 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
+                                 : hparams.rope_type;
+     ggml_tensor * tmp;
+ 
+-    if (ggml_is_quantized(cur->type)) {
++    if (ggml_is_quantized(cur->type) || cur->type == GGML_TYPE_F8_E4M3) {
+         // dequantize to f32 -> RoPE -> quantize back
+         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
+ 
+         // rotate back
+-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
++        if (rot) tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+ 
+         tmp = ggml_rope_ext(ctx, tmp,
+                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+ 
+         // rotate fwd
+-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
++        if (rot) tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+ 
+         tmp = ggml_cpy(ctx, tmp, cur);
+     } else {
+@@ -3848,6 +3872,14 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
+     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ }
+ 
++ggml_tensor * llama_kv_cache_context::get_k_scale(int32_t il) const {
++    return kv->get_k_scale(il);
++}
++
++ggml_tensor * llama_kv_cache_context::get_v_scale(int32_t il) const {
++    return kv->get_v_scale(il);
++}
++
+ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 1063817c7b61767bf253d70c2a7f5f2d53bf23f5..8e3d8e1b5723c25e46b4bb70a0308a55b771d4f1 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -224,6 +224,9 @@ public:
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+ 
++    ggml_tensor * get_k_scale(int32_t il) const;
++    ggml_tensor * get_v_scale(int32_t il) const;
++
+     // store k_cur and v_cur in the cache based on the provided head location
+     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+@@ -294,6 +297,8 @@ private:
+ 
+         ggml_tensor * k;
+         ggml_tensor * v;
++        ggml_tensor * k_scale;
++        ggml_tensor * v_scale;
+ 
+         std::vector<ggml_tensor *> k_stream;
+         std::vector<ggml_tensor *> v_stream;
+@@ -507,6 +512,9 @@ public:
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+ 
++    ggml_tensor * get_k_scale(int32_t il) const;
++    ggml_tensor * get_v_scale(int32_t il) const;
++
+     // store k_cur and v_cur in the cache based on the provided head location
+     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
+     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index d1d96d49a86c41e478e6d0dde4523fde7a7b3fc6..931c68ca9ee7c785a0f1fb4675efdc586c652388 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -42,6 +42,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
+         case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
+         case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
++        case LLAMA_FTYPE_MOSTLY_F8_E4M3:   name = LLAMA_FTYPE_PREFIX "F8_E4M3"; break;
+         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
+         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
+         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
+@@ -791,6 +792,7 @@ llama_model_loader::llama_model_loader(
+             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
+             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
++            case GGML_TYPE_F8_E4M3: ftype = LLAMA_FTYPE_MOSTLY_F8_E4M3; break;
+             default:
+                 {
+                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index f5849ae5fe5dc8ceb231776f9ab700aa791d6476..c19cc0fb1963eb012c078f9ac52a1dab0932c930 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1770,6 +1770,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         for (int i = 0; i < n_layer_all; ++i) {
+             auto & layer = layers[i];
+ 
++            if (hparams.has_kv(i)) {
++                layer.k_cache_s = create_tensor(tn(LLM_TENSOR_ATTN_K, "k_scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.v_cache_s = create_tensor(tn(LLM_TENSOR_ATTN_V, "v_scale", i), {1}, TENSOR_NOT_REQUIRED);
++
++                if ((layer.k_cache_s && layer.k_cache_s->type != GGML_TYPE_F32) ||
++                    (layer.v_cache_s && layer.v_cache_s->type != GGML_TYPE_F32)) {
++                    throw std::runtime_error(format("KV cache scales for layer %d must be F32", i));
++                }
++            }
++
+             // attention weight scales (per-tensor, shape {1})
+             if (!layer.wq_s && layer.wq) {
+                 layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+@@ -1907,13 +1917,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+         // output scales
+-        if (output && output->type == GGML_TYPE_NVFP4) {
++        if (output) {
+             // weight scale
+-            if (!output_s) {
++            if (!output_s && (ml.get_weight(tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) ||
++                              gguf_find_tensor(ml.metadata, tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) >= 0)) {
+                 output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
+             }
+             // input scale
+-            if (!output_in_s) {
++            if (!output_in_s && (ml.get_weight(tn(LLM_TENSOR_OUTPUT, "input_scale").str().c_str()) ||
++                                 gguf_find_tensor(ml.metadata, tn(LLM_TENSOR_OUTPUT, "input_scale").str().c_str()) >= 0)) {
+                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
+             }
+         }
+@@ -1927,12 +1939,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         can_prefetch.insert(per_layer_tok_embd);
+     }
+ 
+-    // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+-    // If sidecar scales exist, the output weight must be an actual output tensor.
+-    GGML_ASSERT(!(output && tok_embd &&
++    if (output && tok_embd &&
+             strcmp(output->name, tok_embd->name) == 0 &&
+-            output->type == GGML_TYPE_NVFP4 &&
+-            (output_s || output_in_s)));
++            (output_s || output_in_s)) {
++        throw std::runtime_error("output scales require a separate output weight");
++    }
+     // populate tensors_by_name
+     for (auto & [_, ctx_ptr] : ml.ctx_map) {
+         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+diff --git a/src/llama-model.h b/src/llama-model.h
+index a082b8f3108b13f4a6abd11bef8acffc6589b549..1e9fe8539a5bff24ec347d95eb366d2ab30c9f52 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -290,6 +290,8 @@ struct llama_layer {
+     struct ggml_tensor * wq        = nullptr;
+     struct ggml_tensor * wk        = nullptr;
+     struct ggml_tensor * wv        = nullptr;
++    struct ggml_tensor * k_cache_s = nullptr;
++    struct ggml_tensor * v_cache_s = nullptr;
+     struct ggml_tensor * wo        = nullptr;
+     struct ggml_tensor * wqkv      = nullptr;
+     struct ggml_tensor * wg        = nullptr;
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index b8f96bcef30fc94e147fd3dfc04a8f9af25a3488..b465ee915b91b84672206cb188c77dc9f66aa31a 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -226,7 +226,7 @@ static void llama_tensor_dequantize_impl(
+     const size_t nelements, const int nthread
+ ) {
+     const ggml_type_traits * qtype = ggml_get_type_traits(type);
+-    if (ggml_is_quantized(type)) {
++    if (ggml_is_quantized(type) || type == GGML_TYPE_F8_E4M3) {
+         if (qtype->to_float == NULL) {
+             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(type)));
+         }
+@@ -240,7 +240,7 @@ static void llama_tensor_dequantize_impl(
+             ggml_fp16_to_fp32_row((const ggml_fp16_t *)data, f32_output, nelements);
+         } else if (type == GGML_TYPE_BF16) {
+             ggml_bf16_to_fp32_row((const ggml_bf16_t *)data, f32_output, nelements);
+-        } else if (ggml_is_quantized(type)) {
++        } else if (ggml_is_quantized(type) || type == GGML_TYPE_F8_E4M3) {
+             qtype->to_float(data, f32_output, nelements);
+         } else {
+             GGML_ABORT("fatal error"); // unreachable
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index 98fafd917b443516ff68c316100641266e2d8fa4..fd082cc7f2166f4dee9812c9f508bd6e7a8baa39 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -321,11 +321,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen3next::graph::build_qkvz
+ 
+     if (model.layers[il].wqkv) {
+         // optimized path
+-        ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input);
++        ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+         qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+         cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+ 
+-        ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input);
++        ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+         cb(z, "z", il);
+ 
+         return { qkv_mixed, z };
+diff --git a/tests/test-fp8-kv.cpp b/tests/test-fp8-kv.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..418c419a11e6c3144d37402918ce736ca1873eb7
+--- /dev/null
++++ b/tests/test-fp8-kv.cpp
+@@ -0,0 +1,140 @@
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <vector>
++
++static void check(bool ok, const char * reason) {
++    if (!ok) throw std::runtime_error(reason);
++}
++
++struct measurement {
++    std::vector<float> output;
++    size_t bytes;
++    double milliseconds;
++};
++
++// Build the same strided K/V views used during grouped-query attention.
++// Populate both banks through SET_ROWS and measure only repeated attention.
++static measurement run(ggml_backend_t backend, ggml_type type, int length, int tokens, bool cuda) {
++    constexpr int d = 256, heads = 24, kv_heads = 4;
++    ggml_context_ptr ctx(ggml_init({64 * ggml_tensor_overhead() + 2 * ggml_graph_overhead_custom(64, false), nullptr, true}));
++    auto * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, length);
++    auto * writes = ggml_new_graph_custom(ctx.get(), 64, false);
++    size_t cache_bytes = 0;
++    auto bank = [&](ggml_tensor ** data) {
++        auto * cache = ggml_new_tensor_2d(ctx.get(), type, d * kv_heads, length);
++        cache_bytes += ggml_nbytes(cache);
++        *data = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, d * kv_heads, length);
++        ggml_build_forward_expand(writes, ggml_set_rows(ctx.get(), cache, *data, ids));
++        return ggml_permute(ctx.get(), ggml_reshape_3d(ctx.get(), cache, d, kv_heads, length), 0, 2, 1, 3);
++    };
++    ggml_tensor * sk, * sv;
++    auto * k = bank(&sk);
++    auto * v = bank(&sv);
++    auto * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, d, tokens, heads);
++    auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, length, tokens);
++    auto * out = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.f/std::sqrt(float(d)), 0, 0);
++    auto * attention = ggml_new_graph_custom(ctx.get(), 64, false);
++    ggml_build_forward_expand(attention, out);
++    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
++    check(bool(buf), "tensor allocation");
++    std::mt19937 generator(3128);
++    std::uniform_real_distribution<float> random(-1.5f, 1.5f);
++    for (auto * tensor : {sk, sv, q}) {
++        std::vector<float> data(ggml_nelements(tensor));
++        for (auto & x : data) x = random(generator);
++        ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
++    }
++    std::vector<int64_t> indices(length);
++    std::iota(indices.begin(), indices.end(), 0);
++    ggml_backend_tensor_set(ids, indices.data(), 0, ggml_nbytes(ids));
++    std::vector<ggml_fp16_t> causal(length*tokens);
++    for (int i = 0; i < tokens; i++) {
++        std::fill(causal.begin()+i*length+length-tokens+i+1, causal.begin()+(i+1)*length, ggml_fp32_to_fp16(-INFINITY));
++    }
++    ggml_backend_tensor_set(mask, causal.data(), 0, ggml_nbytes(mask));
++    check(ggml_backend_graph_compute(backend, writes) == GGML_STATUS_SUCCESS, "cache write");
++    auto compute = [&] {
++        check(ggml_backend_graph_compute(backend, attention) == GGML_STATUS_SUCCESS, "attention");
++        ggml_backend_synchronize(backend);
++    };
++    compute();
++    std::vector<double> samples;
++    for (int i = 0; i < (cuda ? 31 : 3); i++) {
++        auto start = std::chrono::steady_clock::now();
++        compute();
++        samples.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
++    }
++    std::sort(samples.begin(), samples.end());
++    measurement result{{}, cache_bytes, samples[samples.size()/2]};
++    result.output.resize(ggml_nelements(out));
++    ggml_backend_tensor_get(out, result.output.data(), 0, ggml_nbytes(out));
++    return result;
++}
++
++int main(int argc, char ** argv) {
++    try {
++        uint8_t codes[256]; float values[256];
++        for (int i = 0; i < 256; ++i) codes[i] = uint8_t(i);
++        ggml_get_type_traits(GGML_TYPE_F8_E4M3)->to_float(codes, values, 256);
++        for (int i = 0; i < 256; ++i) {
++            const int mag = i & 127, exponent = mag >> 3, mantissa = mag & 7;
++            if (mag == 127) { check(std::isnan(values[i]), "E4M3 NaN"); continue; }
++            const float absolute = exponent ? std::ldexp(float(8 + mantissa), exponent - 10) : std::ldexp(float(mantissa), -9);
++            check(values[i] == (i < 128 ? absolute : -absolute) && std::signbit(values[i]) == (i >= 128), "E4M3 decode");
++        }
++        const auto encode = [](float x) {
++            uint8_t encoded;
++            ggml_get_type_traits(GGML_TYPE_F8_E4M3)->from_float_ref(&x, &encoded, 1);
++            return encoded;
++        };
++        for (int mag = 0; mag < 126; ++mag) {
++            const float midpoint = (values[mag] + values[mag+1]) * 0.5f;
++            for (int sign : {0, 128}) {
++                auto code = [&](float v) { return encode(sign ? -v : v); };
++                check(code(std::nextafter(midpoint, 0.f)) == (sign | mag), "below E4M3 midpoint");
++                check(code(midpoint) == (sign | (mag + (mag & 1))), "E4M3 ties-to-even");
++                check(code(std::nextafter(midpoint, INFINITY)) == (sign | (mag+1)), "above E4M3 midpoint");
++            }
++        }
++        check(encode(-0.0f) == 128 && encode(INFINITY) == 126 && encode(-INFINITY) == 254 &&
++              encode(NAN) == 127, "E4M3 saturation or special encoding");
++        const bool cuda = argc > 1 && std::strcmp(argv[1], "--cuda") == 0;
++        auto registry = ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH);
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++        if (cuda) registry = ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH);
++#else
++        if (cuda) return 77;
++#endif
++        if (!registry || !ggml_backend_reg_dev_count(registry)) return cuda ? 77 : 1;
++        ggml_backend_ptr backend(ggml_backend_dev_init(ggml_backend_reg_dev_get(registry, 0), nullptr));
++        check(bool(backend), "backend initialization");
++        for (int count : {1, 4, 32}) {
++            const int length = cuda ? 4096 : 256;
++            auto reference = run(backend.get(), GGML_TYPE_F16, length, count, cuda);
++            auto q8 = run(backend.get(), GGML_TYPE_Q8_0, length, count, cuda);
++            auto fp8 = run(backend.get(), GGML_TYPE_F8_E4M3, length, count, cuda);
++            check(fp8.bytes == size_t(length)*256*4*2 && fp8.bytes*2 == reference.bytes && fp8.bytes*17 == q8.bytes*16, "storage");
++            double error = 0, norm = 0;
++            for (size_t i = 0; i < reference.output.size(); i++) {
++                double delta = fp8.output[i] - reference.output[i];
++                error += delta*delta;
++                norm += double(reference.output[i])*reference.output[i];
++            }
++            const double nrmse = std::sqrt(error/norm);
++            std::printf("%s length=%d q=%d fp16_ms=%.4f q8_ms=%.4f fp8_ms=%.4f fp8_bytes=%zu relative_rmse=%.5f\n",
++                ggml_backend_name(backend.get()), length, count, reference.milliseconds, q8.milliseconds, fp8.milliseconds, fp8.bytes, nrmse);
++            check(std::isfinite(nrmse) && nrmse < 0.07, "FP8 attention accuracy");
++        }
++        return 0;
++    } catch (const std::exception & err) { std::fprintf(stderr, "%s\n", err.what()); return 1; }
++}
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+index 10ebd3c085a88a359d3dbeabad2b0cfe2df5d67a..26a0357f6b076e58711b721cceae861f1c97cf2c 100644
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -201,12 +201,12 @@ struct session {
+     common_speculative_ptr spec;
+     bool target_nextn_required = true;
+     explicit session(llama_model * model, uint32_t sequences = 1, llama_model * head = nullptr,
+-                     common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP, bool routed = false) {
++                     common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP, bool routed = false, bool fp8 = false) {
+         target_nextn_required = type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+         auto cp = llama_context_default_params();
+         cp.n_ctx = 128*sequences; cp.n_batch = cp.n_ubatch = 64; cp.n_seq_max = sequences; cp.n_rs_seq = 2;
+         cp.n_threads = cp.n_threads_batch = 1;
+-        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++        cp.flash_attn_type = fp8 ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+         target.reset(llama_init_from_model(model, cp));
+         require(bool(target), "target context unavailable");
+         cp.ctx_other = target.get();
+@@ -451,6 +451,30 @@ int main(int argc, char ** argv) {
+             test_compact_rollback(argv[2]);
+             return 0;
+         }
++        if (argc == 2 && (std::strcmp(argv[1], "--fp8") == 0 || std::strcmp(argv[1], "--fp8-cuda") == 0)) {
++            const bool gpu = std::strcmp(argv[1], "--fp8-cuda") == 0;
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            if (gpu && !ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH)) return 77;
++#else
++            if (gpu) return 77;
++#endif
++#ifdef _WIN32
++            _putenv_s("WILDLLAMA_FP8_KV", "1");
++#else
++            setenv("WILDLLAMA_FP8_KV", "1", 1);
++#endif
++            auto weights = tiny_model(gpu, 128);
++            session test(weights.get(), 1, nullptr, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, false, true);
++            test.prefill({11, 12, 13});
++            auto state = test.save();
++            test.process(14, 3);
++            auto expected = test.logits();
++            test.clear();
++            require(test.restore(state), "FP8 paired restore failed");
++            test.process(14, 3);
++            require(test.logits() == expected, "FP8 paired continuation changed");
++            return 0;
++        }
+         auto model = tiny_model();
+         require(llama_model_size(model.get()) < 4*1024*1024, "fixture exceeds 4 MiB");
+         // Exercise the public draft API on a real small recurrent model. The

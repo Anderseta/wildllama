@@ -46,6 +46,7 @@ const (
 	fileTypeNVFP4
 	fileTypeQ1_0
 	fileTypeQ2_0
+	fileTypeF8E4M3
 
 	FileTypeUnknown FileType = 1024
 )
@@ -124,6 +125,8 @@ func (t FileType) String() string {
 		return "Q1_0"
 	case fileTypeQ2_0:
 		return "Q2_0"
+	case fileTypeF8E4M3:
+		return "F8_E4M3"
 	default:
 		return "unknown"
 	}
