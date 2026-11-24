@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     ok &= compare_attention(gpu, 4097, 1, 1);
     ok &= compare_cross(gpu, 128, 129, 77, 0);
     ok &= compare_cross(gpu, 128, 257, 77, 37);
-    ok &= compare_cross(gpu, 64, 127, 4097, 61);
+    ok &= compare_cross(gpu, 64, 127, 16385, 61);
     ggml_backend_free(gpu);
     return ok ? 0 : 1;
 }

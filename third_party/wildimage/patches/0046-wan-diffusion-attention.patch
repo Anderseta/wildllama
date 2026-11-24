@@ -217,7 +217,7 @@
          auto* km  = reinterpret_cast<float*>(data + work.k_mean);
          auto* out = reinterpret_cast<half*>(data + work.output);
 -        sage_key_mean<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const float*>(k->data), km, lk);
-+        const bool parallel = !PLUS_PLUS && lk >= 4096 && lk <= 65535 * sage_rows_per_tile && std::strcmp(dst->name, "wan.sage_fp8") == 0;
++        const bool parallel = !PLUS_PLUS && lk >= 16384 && lk <= 65535 * sage_rows_per_tile && std::strcmp(dst->name, "wan.sage_fp8") == 0;
 +        if (parallel) {
 +            const int tiles = (lk + sage_rows_per_tile - 1) / sage_rows_per_tile;
 +            auto* partials = reinterpret_cast<float2*>(ki);
