@@ -11,6 +11,7 @@ import (
 // The percentage estimates overall work. It advances on native events, never on a timer.
 // The step counter comes from the sampler; segment counters subdivide an evaluation.
 type wanProgress struct {
+	attentionUsed                                     string
 	savedStep, resumedStep                            int
 	stage                                             string
 	attempt, high, evaluations, evaluation, stepsDone int
@@ -29,6 +30,14 @@ func (w *wanProgress) restart(cfg float64) {
 func (w *wanProgress) observe(line string, steps int) (Progress, bool) {
 	if w.attempt == 0 {
 		w.restart(1)
+	}
+	switch line {
+	case "wildvideo attention sage_fp8":
+		w.attentionUsed = WanAttentionSageFP8
+		return Progress{}, false
+	case "wildvideo attention cute":
+		w.attentionUsed = WanAttentionCuTe
+		return Progress{}, false
 	}
 	steps = max(1, steps)
 	rawBar := strings.HasPrefix(line, "|") && !byteRatePattern.MatchString(line)

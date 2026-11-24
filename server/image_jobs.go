@@ -662,8 +662,10 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			}
 			beforeImageFree = free
 		}
-		if cpuOnly && job.Video != nil && !job.Video.AllowCPUFallback {
-			return errors.New("VRAM disponível insuficiente para iniciar o vídeo. Libere VRAM ou habilite a tentativa na CPU no perfil de vídeo.")
+		if cpuOnly {
+			if err := job.Video.CPUFallbackError(); err != nil {
+				return err
+			}
 		}
 		input.CPUOnly = cpuOnly
 		v.setImageComputeBackend(job, cpuOnly)

@@ -131,6 +131,7 @@ type Progress struct {
 }
 
 type Result struct {
+	VideoAttentionUsed     string  `json:"video_attention_used,omitempty"`
 	Path                   string  `json:"path"`
 	MIMEType               string  `json:"mime_type"`
 	Width                  int     `json:"width"`

@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	manifest, err := json.Marshal(map[string]any{
-		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true, "wan_video_staging": true, "wan_sage_fp8": true},
+		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true, "wan_video_staging": true, "wan_diffusion_sage_fp8": true},
 		"files": []map[string]any{{"name": filepath.Base(exe), "size": len(data), "sha256": digest(data)}},
 	})
 	if err != nil {

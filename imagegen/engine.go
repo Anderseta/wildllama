@@ -91,7 +91,7 @@ func (e *Engine) Status() RunnerStatus {
 				MOSSEdit          bool `json:"moss_edit"`
 				WanExtendedUMT5   bool `json:"wan_extended_umt5"`
 				WanVideoStaging   bool `json:"wan_video_staging"`
-				WanSageFP8        bool `json:"wan_sage_fp8"`
+				WanSageFP8        bool `json:"wan_diffusion_sage_fp8"`
 				InpaintCrop       bool `json:"inpaint_crop"`
 			} `json:"features"`
 			Files []struct {
@@ -641,8 +641,8 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	mode := imageGPUResident
 	residentFailedAt := 0
 	if r.CPUOnly {
-		if r.Video != nil && !r.Video.AllowCPUFallback {
-			return Result{}, errors.New("VRAM disponível insuficiente para iniciar o vídeo. Libere VRAM ou habilite a tentativa na CPU no perfil de vídeo.")
+		if cpuErr := r.Video.CPUFallbackError(); cpuErr != nil {
+			return Result{}, cpuErr
 		}
 		mode = imageRAMCPU
 	} else if p.OffloadToCPU && p.MaxVRAMMiB > 0 && p.MaxVRAMMiB <= r.GPUResidentFailedAtMiB {
@@ -753,10 +753,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			mode = imageRAMGPU
 			log.emit(Progress{Phase: "ram_offload", Message: "Os pesos e buffers não couberam na GPU; usando RAM dentro do orçamento e mantendo o cálculo na GPU."}, true)
 		} else {
-			if r.Video != nil && !r.Video.AllowCPUFallback {
-				const explanation = "O cálculo excedeu a VRAM disponível ou o orçamento da GPU mesmo com os pesos na RAM. Reduza os quadros ou a resolução, ou habilite a tentativa na CPU."
-				log.emit(Progress{Phase: "gpu_memory_limit", Message: explanation}, true)
-				err = fmt.Errorf("%s %w", explanation, err)
+			if cpuErr := r.Video.CPUFallbackError(); cpuErr != nil {
+				log.emit(Progress{Phase: "gpu_memory_limit", Message: cpuErr.Error()}, true)
+				err = errors.Join(cpuErr, err)
 				break
 			}
 			mode = imageRAMCPU
@@ -777,7 +776,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			}
 			return Result{}, err
 		}
-		return Result{Path: finalPath, MIMEType: "video/webm", Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}, runErr
+		attentionUsed := log.wan.attentionUsed
+		if mode == imageRAMCPU {
+			attentionUsed = "cpu"
+		}
+		return Result{Path: finalPath, MIMEType: "video/webm", VideoAttentionUsed: attentionUsed, Width: p.Width, Height: p.Height, Seed: seed, DurationSeconds: time.Since(start).Seconds(), RunnerRevision: runnerStatus.Revision}, runErr
 	}
 	if decoded == nil {
 		log.emit(Progress{Phase: "validating_output", Message: "Verificando o PNG salvo"}, true)

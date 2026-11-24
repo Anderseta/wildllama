@@ -29,6 +29,20 @@ func (v VideoOptions) AttentionPreference() string {
 	return v.AttentionBackend
 }
 
+// CPUFallbackError applies both at admission and after the two CUDA attempts.
+func (v *VideoOptions) CPUFallbackError() error {
+	if v == nil {
+		return nil
+	}
+	if v.AttentionPreference() == WanAttentionSageFP8 {
+		return errors.New("SageAttention FP8 exige uma GPU CUDA compatível. Libere VRAM ou escolha CuTe para permitir a tentativa na CPU.")
+	}
+	if !v.AllowCPUFallback {
+		return errors.New("VRAM insuficiente para o vídeo. Reduza os quadros ou a resolução, libere VRAM ou habilite a tentativa na CPU.")
+	}
+	return nil
+}
+
 func (p Profile) IsWanRapid() bool { return p.ModelID == WanRapidI2V || p.ModelID == WanRapidT2V }
 
 // The Wan pipeline holds an RGB float32 clip on the host for VAE conditioning

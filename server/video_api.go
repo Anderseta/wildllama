@@ -67,6 +67,7 @@ func (p videoProfile) validate(mode string) error {
 }
 
 type videoRecord struct {
+	AttentionUsed     string    `json:"attention_used,omitempty"`
 	GenerationSeconds float64   `json:"generation_seconds,omitempty"`
 	ID                string    `json:"id"`
 	Path              string    `json:"path"`
@@ -77,7 +78,7 @@ type videoRecord struct {
 }
 
 func (v *imageService) registerVideoResult(job *imageJob, result imagegen.Result) error {
-	r := videoRecord{GenerationSeconds: job.PriorVideoSeconds + result.DurationSeconds, ID: job.ID, Path: result.Path, Seed: result.Seed, Created: time.Now().UTC(), Frames: job.Video.Frames, FPS: job.Video.FPS}
+	r := videoRecord{AttentionUsed: result.VideoAttentionUsed, GenerationSeconds: job.PriorVideoSeconds + result.DurationSeconds, ID: job.ID, Path: result.Path, Seed: result.Seed, Created: time.Now().UTC(), Frames: job.Video.Frames, FPS: job.Video.FPS}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	stored := storedVideo{videoRecord: r}

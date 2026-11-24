@@ -1,0 +1,266 @@
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -3,6 +3,7 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <map>
+@@ -102,10 +103,31 @@
+         }
+     };
+ 
++    inline bool wan_sage_requested() {
++        static const bool enabled = [] {
++            const char* value = std::getenv("WILDLLAMA_WAN_ATTENTION");
++            return value && std::strcmp(value, "sage_fp8") == 0;
++        }();
++        return enabled;
++    }
++
++    // This setting belongs to the isolated video worker. Stop with a regular
++    // exit code so the parent can report an incompatible device without retrying.
++    [[noreturn]] inline void wan_sage_unavailable() {
++        std::fprintf(stderr, "SageAttention FP8 requires supported CUDA attention for every Wan diffusion block. Select CuTe or update the media runtime.\n");
++        std::fflush(stderr);
++        std::_Exit(77);
++    }
++
++    inline int64_t wan_head_group(int64_t width, int64_t tokens) {
++        return std::max<int64_t>(1, (192LL << 20) / (width * tokens * sizeof(float)));
++    }
++
+     // Independent attention heads share positions but never mix before the
+     // output projection. Keep every key and value for the whole sequence.
+     inline ggml_tensor* attention_by_head(GGMLRunnerContext* ctx, ggml_tensor* q, ggml_tensor* k,
+-                                          ggml_tensor* v, ggml_tensor* pe, int64_t group_size, bool sage_fp8 = false) {
++                                          ggml_tensor* v, ggml_tensor* pe, int64_t group_size, bool sage_fp8 = false,
++                                          ggml_tensor* image_k = nullptr, ggml_tensor* image_v = nullptr) {
+         auto c = ctx->ggml_ctx;
+         auto compute_range = [&](auto&& self, int64_t first, int64_t count) -> ggml_tensor* {
+             if (count <= group_size) {
+@@ -117,17 +139,24 @@
+                 if (sage_fp8) {
+                     // Keep every token in each head. Quantize K/V once per head and
+                     // layer, including on long clips. Sage returns [D, heads, L, 1].
+-                    auto query = Rope::apply_rope(ctx, heads(q), pe);
+-                    auto key   = Rope::apply_rope(ctx, heads(k), pe);
+-                    auto value = ggml_permute(c, heads(v), 0, 2, 1, 3);
+-                    auto half  = ggml_cast(c, value, GGML_TYPE_F16);
+-                    if (!ggml_backend_supports_op(ctx->backend, half)) {
+-                        half = ggml_cast(c, ggml_ext_cont(ctx, value), GGML_TYPE_F16);
+-                    }
+-                    auto out = ggml_ext_sage_attn(ctx, ggml_ext_cont(ctx, query), ggml_ext_cont(ctx, key),
+-                                                  half, 1.f / std::sqrt(float(q->ne[0])), GGML_SAGE_ATTN_2);
+-                    if (!out || !ggml_backend_supports_op(ctx->backend, out)) return nullptr;
+-                    ggml_set_name(out, "wan.self.sage_fp8");
++                    auto ordered = [&](ggml_tensor* t) {
++                        t = heads(t);
++                        return ggml_ext_cont(ctx, pe ? Rope::apply_rope(ctx, t, pe) : ggml_permute(c, t, 0, 2, 1, 3));
++                    };
++                    auto query = ordered(q);
++                    auto attend = [&](ggml_tensor* key, ggml_tensor* values) {
++                        auto value = ggml_permute(c, heads(values), 0, 2, 1, 3);
++                        auto half = ggml_cast(c, value, GGML_TYPE_F16);
++                        if (!ggml_backend_supports_op(ctx->backend, half))
++                            half = ggml_cast(c, ggml_ext_cont(ctx, value), GGML_TYPE_F16);
++                        auto out = ggml_ext_sage_attn(ctx, query, ordered(key), half,
++                                                      1.f / std::sqrt(float(q->ne[0])), GGML_SAGE_ATTN_2);
++                        if (!out || !ggml_backend_supports_op(ctx->backend, out)) wan_sage_unavailable();
++                        ggml_set_name(out, "wan.sage_fp8");
++                        return out;
++                    };
++                    auto out = attend(k, v);
++                    if (image_k) out = ggml_add(c, out, attend(image_k, image_v));
+                     return ggml_reshape_3d(c, out, q->ne[0] * count, q->ne[2], 1);
+                 }
+ #endif
+@@ -228,27 +257,14 @@
+             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
+ 
+ #ifndef SD_USE_UPSTREAM_GGML
+-            // Video-only selection. Cross-attention to text/reference and the VAE
+-            // keep their ordinary precision and their existing optimized layouts.
+-            static const bool request_fp8 = [] {
+-                const char* backend = std::getenv("WILDLLAMA_WAN_ATTENTION");
+-                return backend && std::strcmp(backend, "sage_fp8") == 0;
+-            }();
+-            if (request_fp8 && N == 1 && !mask && (head_dim == 64 || head_dim == 128) &&
+-                x->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && pe->ne[3] == n_token &&
+-                ctx->flash_attn_enabled && (ctx->attn_scale <= 0.f || ctx->attn_scale == 1.f) &&
+-                sd_backend_is(ctx->backend, "CUDA")) {
++            if (wan_sage_requested()) {
++                if (N != 1 || mask || (head_dim != 64 && head_dim != 128) || x->type != GGML_TYPE_F32 ||
++                    k->type != GGML_TYPE_F32 || pe->ne[3] != n_token || (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) ||
++                    !sd_backend_is(ctx->backend, "CUDA")) wan_sage_unavailable();
+                 auto query = norm_q->forward(ctx, q_proj->forward(ctx, x));
+                 query = ggml_reshape_4d(ctx->ggml_ctx, query, head_dim, num_heads, n_token, 1);
+-                // Bound each group's FP32 projection to 192 MiB (or one head).
+-                const int64_t group = std::max<int64_t>(1, (192LL << 20) / (head_dim * n_token * sizeof(float)));
+-                if (auto out = attention_by_head(ctx, query, k, v, pe, group, true)) {
+-                    static const bool logged = [] { LOG_INFO("Wan self-attention: SageAttention FP8 (INT8 Q/K, FP32 accumulation)"); return true; }();
+-                    (void)logged;
+-                    return o_proj->forward(ctx, out);
+-                }
+-                static const bool logged = [] { LOG_WARN("Wan SageAttention FP8 unavailable for this operation; using Flash Attention"); return true; }();
+-                (void)logged;
++                auto out = attention_by_head(ctx, query, k, v, pe, wan_head_group(head_dim, n_token), true);
++                return o_proj->forward(ctx, out);
+             }
+ #endif
+             if (N == 1 && !mask && n_token > 8192 && head_dim == 128 && pe->ne[3] == n_token &&
+@@ -286,6 +302,18 @@
+                                      ggml_tensor* context,
+                                      int64_t context_img_len) = 0;
+     };
++
++#ifndef SD_USE_UPSTREAM_GGML
++    inline ggml_tensor* wan_sage_cross(GGMLRunnerContext* ctx, int64_t heads, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
++                                       ggml_tensor* image_k = nullptr, ggml_tensor* image_v = nullptr) {
++        const int64_t d = q->ne[0] / heads;
++        if (q->ne[2] != 1 || (d != 64 && d != 128) || (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) ||
++            !sd_backend_is(ctx->backend, "CUDA")) wan_sage_unavailable();
++        auto split = [&](ggml_tensor* t) { return ggml_reshape_4d(ctx->ggml_ctx, t, d, heads, t->ne[1], 1); };
++        return attention_by_head(ctx, split(q), split(k), split(v), nullptr, wan_head_group(d, q->ne[1]), true,
++                                 image_k ? split(image_k) : nullptr, image_v ? split(image_v) : nullptr);
++    }
++#endif
+ 
+     class WanT2VCrossAttention : public WanCrossAttention {
+     public:
+@@ -318,6 +346,9 @@
+             k      = norm_k->forward(ctx, k);
+             auto v = v_proj->forward(ctx, context);  // [N, n_context, dim]
+ 
++#ifndef SD_USE_UPSTREAM_GGML
++            if (wan_sage_requested()) return o_proj->forward(ctx, wan_sage_cross(ctx, num_heads, q, k, v));
++#endif
+             x = ggml_ext_attention_ext(ctx, q, k, v, num_heads, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
+ 
+             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
+@@ -380,6 +411,9 @@
+             k_img      = norm_k_img->forward(ctx, k_img);
+             auto v_img = v_img_proj->forward(ctx, context_img);  // [N, context_img_len, dim]
+ 
++#ifndef SD_USE_UPSTREAM_GGML
++            if (wan_sage_requested()) return o_proj->forward(ctx, wan_sage_cross(ctx, num_heads, q, k, v, k_img, v_img));
++#endif
+             // The two CUDA cross-attentions read the same query. GGML flash
+             // accepts token and head strides. Keep the head dimension contiguous
+             // and round K/V to the same F16 values directly in the destination layout.
+--- a/src/core/cuda/sage_attention.cu
++++ b/src/core/cuda/sage_attention.cu
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <climits>
+ #include <cstring>
++#include <cstdio>
+ #include <map>
+ #include "sageattention/attn.cuh"
+ #include "sageattention/attn_fp8.cuh"
+@@ -222,6 +223,51 @@
+         }
+     }
+ 
++    // Coalesced, tiled first pass for long sequences. Store both partials in
++    // the not-yet-written INT8 key buffer. The second pass runs on the same stream.
++    static constexpr int sage_rows_per_tile = 256;
++    template <int D>
++    static __global__ void sage_partial_stats(const float* keys, const half* values, float2* partials, int length) {
++        const int channel = blockIdx.x * 32 + threadIdx.x % 32;
++        const int row = threadIdx.x / 32;
++        const int start = blockIdx.z * sage_rows_per_tile;
++        const int end = min(length, start + sage_rows_per_tile);
++        const size_t base = size_t(blockIdx.y) * length * D + channel;
++        float sum = 0.f, peak = 1e-7f;
++        for (int t = start + row; t < end; t += 8) {
++            sum += keys[base + size_t(t) * D];
++            peak = fmaxf(peak, fabsf(__half2float(values[base + size_t(t) * D])));
++        }
++        __shared__ float sums[256], peaks[256];
++        sums[threadIdx.x] = sum;
++        peaks[threadIdx.x] = peak;
++        __syncthreads();
++        if (row == 0) {
++            for (int i = 1; i < 8; ++i) {
++                sum += sums[threadIdx.x + i * 32];
++                peak = fmaxf(peak, peaks[threadIdx.x + i * 32]);
++            }
++            partials[(size_t(blockIdx.y) * gridDim.z + blockIdx.z) * D + channel] = make_float2(sum, peak);
++        }
++    }
++
++    template <int D>
++    static __global__ void sage_finish_stats(const float2* partials, float* means, float* scales, int tiles, int length) {
++        const int index = blockIdx.y * D + threadIdx.x;
++        // One independent channel per lane. Accumulate the short list of FP32
++        // partial sums in FP64 to limit rounding error even for offset keys.
++        const size_t begin = size_t(index / D) * tiles * D + index % D;
++        double sum = 0.;
++        float peak = 1e-7f;
++        for (int tile = 0; tile < tiles; ++tile) {
++            const float2 part = partials[begin + size_t(tile) * D];
++            sum += part.x;
++            peak = fmaxf(peak, part.y);
++        }
++        means[index] = static_cast<float>(sum / length);
++        scales[index] = peak / 448.f;
++    }
++
+     template <int D, bool PLUS_PLUS>
+     static void sage_attn_fp8(cudaStream_t stream, ggml_tensor* dst, char* data, const SageWorkspace& work, float scale) {
+         const ggml_tensor* q = dst->src[0];
+@@ -237,13 +283,22 @@
+         auto* vs  = reinterpret_cast<float*>(data + work.v_scale);
+         auto* km  = reinterpret_cast<float*>(data + work.k_mean);
+         auto* out = reinterpret_cast<half*>(data + work.output);
+-        sage_key_mean<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const float*>(k->data), km, lk);
++        const bool parallel = !PLUS_PLUS && lk >= 4096 && lk <= 65535 * sage_rows_per_tile && std::strcmp(dst->name, "wan.sage_fp8") == 0;
++        if (parallel) {
++            const int tiles = (lk + sage_rows_per_tile - 1) / sage_rows_per_tile;
++            auto* partials = reinterpret_cast<float2*>(ki);
++            sage_partial_stats<D><<<dim3(D / 32, hk * batch, tiles), 256, 0, stream>>>(
++                static_cast<const float*>(k->data), static_cast<const half*>(v->data), partials, lk);
++            sage_finish_stats<D><<<dim3(1, hk * batch), D, 0, stream>>>(partials, km, vs, tiles, lk);
++        } else {
++            sage_key_mean<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const float*>(k->data), km, lk);
++        }
+         sage_quantize_per_thread<D, false><<<dim3(GGML_PAD(lq, 128) / 32, hq * batch), 256, 0, stream>>>(
+             static_cast<const float*>(q->data), nullptr, qi, qs, lq);
+         sage_quantize_per_thread<D, true><<<dim3(padded / 64, hk * batch), 128, 0, stream>>>(
+             static_cast<const float*>(k->data), km, ki, ks, lk);
+         // The smaller V range keeps the FP16 instruction accumulator finite in SageAttention2++.
+-        sage_value_scale<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const half*>(v->data), vs, lk, PLUS_PLUS ? 2.25f : 448.0f);
++        if (!parallel) sage_value_scale<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const half*>(v->data), vs, lk, PLUS_PLUS ? 2.25f : 448.0f);
+         sage_quantize_value<D><<<dim3(padded / 32, hk * batch), 256, 0, stream>>>(static_cast<const half*>(v->data), vs, vi, lk, padded);
+         auto kernel = sageattention::qk_int_sv_f8_attn_kernel<128, 64, 32, 64, D,
+                                                               sageattention::DataType::kInt8, sageattention::QuantGranularity::kPerThread,
+@@ -345,7 +400,12 @@
+             sage_attn<64>(stream, nodes[0], data, mode, params.scale);
+         else
+             sage_attn<128>(stream, nodes[0], data, mode, params.scale);
+-        return cudaGetLastError() == cudaSuccess ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
++        if (cudaGetLastError() != cudaSuccess) return GGML_STATUS_FAILED;
++        if (mode == GGML_SAGE_ATTN_2 && std::strcmp(nodes[0]->name, "wan.sage_fp8") == 0) {
++            static const bool reported = [] { std::fputs("wildvideo attention sage_fp8\n", stderr); return true; }();
++            (void)reported;
++        }
++        return GGML_STATUS_SUCCESS;
+     }
+ 
+     void register_sage_attention(ggml_backend_dev_t device) {
+--- a/src/core/cuda/cute_attention.cu
++++ b/src/core/cuda/cute_attention.cu
+@@ -801,6 +801,10 @@
+     }
+     if (error != cudaSuccess)
+         return GGML_STATUS_FAILED;
++    if (std::strcmp(attn->name, "wan.self.full") == 0) {
++        static const bool reported = [] { std::fputs("wildvideo attention cute\n", stderr); return true; }();
++        (void)reported;
++    }
+     if (plan.direct_output)
+         return GGML_STATUS_SUCCESS;
+     int convrot_group;

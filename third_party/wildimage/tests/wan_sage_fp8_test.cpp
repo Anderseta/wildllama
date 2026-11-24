@@ -5,6 +5,25 @@
 #include "core/probe/backend_probe.h"
 #include "model/diffusion/wan.hpp"
 
+static bool compare_outputs(BackendProbeGraph& baseline, BackendProbeGraph& candidate,
+                            const char* label, int queries, double max_error) {
+    if (!ggml_are_same_shape(baseline.output, candidate.output)) return false;
+    std::vector<float> a(ggml_nelements(baseline.output)), b(a.size());
+    ggml_backend_tensor_get(baseline.output, a.data(), 0, a.size() * sizeof(float));
+    ggml_backend_tensor_get(candidate.output, b.data(), 0, b.size() * sizeof(float));
+    double diff = 0, signal = 0, peak = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return false;
+        const double err = a[i] - b[i];
+        diff += err * err;
+        signal += double(a[i]) * a[i];
+        peak = std::max(peak, std::abs(err));
+    }
+    const double relative = std::sqrt(diff / signal);
+    std::printf("%s queries=%d relative_rms=%.6f max_abs=%.6f\n", label, queries, relative, peak);
+    return relative < .05 && peak < max_error;
+}
+
 static bool compare_attention(ggml_backend_t gpu, int tokens, int heads, int group) {
     BackendProbeGraph baseline(gpu, 512), candidate(gpu, 512);
     for (auto* graph : {&baseline, &candidate}) {
@@ -30,21 +49,55 @@ static bool compare_attention(ggml_backend_t gpu, int tokens, int heads, int gro
         ggml_backend_tensor_set(pe, rotation.data(), 0, ggml_nbytes(pe));
         if (graph->run() < 0) return false;
     }
-    if (!ggml_are_same_shape(baseline.output, candidate.output)) return false;
-    std::vector<float> a(ggml_nelements(baseline.output)), b(a.size());
-    ggml_backend_tensor_get(baseline.output, a.data(), 0, a.size() * sizeof(float));
-    ggml_backend_tensor_get(candidate.output, b.data(), 0, b.size() * sizeof(float));
-    double diff = 0, signal = 0, peak = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return false;
-        const double err = a[i] - b[i];
-        diff += err * err;
-        signal += double(a[i]) * a[i];
-        peak = std::max(peak, std::abs(err));
+    return compare_outputs(baseline, candidate, "self", tokens, .02);
+}
+
+// One salient token competes with many near-uniform logits. A distant channel
+// has a large value at that same token. Distinct peaks/signs in the two I2V
+// branches catch concatenated softmaxes, skipped references and layout errors.
+static bool compare_cross(ggml_backend_t gpu, int d, int queries, int text_len, int image_len) {
+    constexpr int heads = 3;
+    BackendProbeGraph baseline(gpu, 512), candidate(gpu, 512);
+    for (auto* graph : {&baseline, &candidate}) {
+        GGMLRunnerContext ctx{};
+        ctx.backend = gpu;
+        ctx.ggml_ctx = graph->ctx;
+        ctx.flash_attn_enabled = true;
+        auto input = [&](int tokens) {
+            auto t = ggml_new_tensor_3d(graph->ctx, GGML_TYPE_F32, d * heads, tokens, 1);
+            graph->inputs.push_back(t);
+            return t;
+        };
+        auto q = input(queries), k = input(text_len), v = input(text_len);
+        auto ik = image_len ? input(image_len) : nullptr;
+        auto iv = image_len ? input(image_len) : nullptr;
+        if (graph == &baseline) {
+            auto attend = [&](ggml_tensor* keys, ggml_tensor* values) {
+                return ggml_ext_attention_ext(&ctx, q, keys, values, heads, nullptr, false, true);
+            };
+            graph->output = attend(k, v);
+            if (image_len) graph->output = ggml_add(graph->ctx, graph->output, attend(ik, iv));
+        } else {
+            graph->output = WAN::wan_sage_cross(&ctx, heads, q, k, v, ik, iv);
+        }
+        if (!graph->supported() || !graph->allocate() || !graph->initialize_f32_inputs()) return false;
+        for (auto* t : graph->inputs) {
+            std::vector<float> data(ggml_nelements(t));
+            ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+            for (int pos = 0; pos < t->ne[1]; ++pos) {
+                for (int h = 0; h < heads; ++h) {
+                    auto row = data.data() + (pos * heads + h) * d;
+                    const int peak = int(t->ne[1]) - 1 - h;
+                    if (t == q) row[h] = 8.f;
+                    else if (t == k || t == ik) row[h] = 5.f + (pos == peak ? 20.f : 0.f);
+                    else if (pos == peak) row[d - 1 - h] = t == v ? 6.f : -2.f;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+        if (graph->run() < 0) return false;
     }
-    double relative = std::sqrt(diff / signal);
-    std::printf("tokens=%d heads=%d group=%d relative_rms=%.6f max_abs=%.6f\n", tokens, heads, group, relative, peak);
-    return relative < .05 && peak < .02;
+    return compare_outputs(baseline, candidate, image_len ? "reference+text" : "text", queries, .08);
 }
 
 int main(int argc, char** argv) {
@@ -53,7 +106,12 @@ int main(int argc, char** argv) {
     auto gpu = ggml_backend_init_by_name("CUDA0", nullptr);
     if (!gpu) return 3;
     sd_ggml_register_extensions(gpu);
-    const bool ok = compare_attention(gpu, 256, 4, 4) && compare_attention(gpu, 137, 5, 2);
+    bool ok = compare_attention(gpu, 256, 4, 4);
+    ok &= compare_attention(gpu, 137, 5, 2);
+    ok &= compare_attention(gpu, 4097, 1, 1);
+    ok &= compare_cross(gpu, 128, 129, 77, 0);
+    ok &= compare_cross(gpu, 128, 257, 77, 37);
+    ok &= compare_cross(gpu, 64, 127, 4097, 61);
     ggml_backend_free(gpu);
     return ok ? 0 : 1;
 }

@@ -98,22 +98,25 @@ func TestWanVideoCPUFallbackRequiresOptIn(t *testing.T) {
 	t.Setenv("WILDIMAGE_FAKE_CHILD", "gpu-oom-then-cpu")
 	t.Setenv("WILDLLAMA_WAN_ATTENTION", "inherited-value-must-be-ignored")
 	for _, tc := range []struct {
-		name     string
-		allow    bool
-		backends []string
+		name      string
+		attention string
+		allow     bool
+		backends  []string
 	}{
-		{"default", false, []string{"cuda0", "cuda0"}},
-		{"opt-in", true, []string{"cuda0", "cuda0", "cpu"}},
+		{"default", "", false, []string{"cuda0", "cuda0"}},
+		{"strict", WanAttentionSageFP8, true, []string{"cuda0", "cuda0"}},
+		{"opt-in", "", true, []string{"cuda0", "cuda0", "cpu"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			log := filepath.Join(dir, tc.name+".jsonl")
 			t.Setenv("WILDIMAGE_FAKE_ATTEMPTS", log)
 			r := Request{Prompt: "literal --prompt ; &", OutputPath: filepath.Join(config.OutputDir, tc.name+".webm"), Video: &VideoOptions{Frames: 5, FPS: 16, AllowCPUFallback: tc.allow}}
-			if tc.allow {
-				r.Video.AttentionBackend = WanAttentionSageFP8
-			}
+			r.Video.AttentionBackend = tc.attention
 			t.Setenv("WILDIMAGE_FAKE_EXPECT_WAN_ATTENTION", r.Video.AttentionBackend)
 			_, err := engine.Run(t.Context(), p, r, nil)
+			if tc.attention == WanAttentionSageFP8 {
+				require.ErrorContains(t, err, "SageAttention")
+			}
 			if !tc.allow {
 				require.ErrorContains(t, err, "VRAM")
 			}
@@ -124,6 +127,19 @@ func TestWanVideoCPUFallbackRequiresOptIn(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWanVideoAttentionTracksExecution(t *testing.T) {
+	var w wanProgress
+	w.observe("selected sage_fp8", 4)
+	require.Empty(t, w.attentionUsed)
+	_, publish := w.observe("wildvideo attention sage_fp8", 4)
+	require.False(t, publish)
+	require.Equal(t, WanAttentionSageFP8, w.attentionUsed)
+	w.restart(1)
+	require.Empty(t, w.attentionUsed)
+	w.observe("wildvideo attention cute", 4)
+	require.Equal(t, WanAttentionCuTe, w.attentionUsed)
 }
 
 func TestWanVideoProgressAcrossSegmentsAndRetry(t *testing.T) {

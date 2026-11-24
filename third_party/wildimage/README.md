@@ -149,12 +149,16 @@ time at existing segment boundaries. Graph execution can overlap weight uploads.
 ### Wan video execution controls
 
 Video profiles accept `attention_backend` values `cute` (default) and `sage_fp8`.
-The latter selects native SageAttention2 for compatible CUDA self-attention,
-with INT8 queries and keys, FP8 probability/value products and FP32 accumulation.
-Each head sees the full sequence. Large inputs are processed in head groups
-to bound temporary attention storage. Text/image cross-attention, encoders and
-VAE keep their usual precision. Unsupported operations retain the existing
-dispatch. The gallery records the requested preference so runs can be compared.
+Wan RAPID uses SageAttention2 for every diffusion self-attention and cross-attention
+block when selected. Queries and keys use INT8, probability/value products use FP8,
+and accumulation uses FP32. Each head sees every key. Image-to-video retains the
+two independent text and reference softmaxes and sums their outputs. Larger head
+groups are split to limit temporary projection storage. For long sequences the
+key means and value scales share a tiled reduction in the existing key scratch
+buffer. Text/vision encoders and VAE run at their usual precision. This mode
+requires a compatible CUDA device even when weights are offloaded to RAM. An
+unsupported attention operator or insufficient GPU memory ends the attempt.
+The gallery records observed kernels separately from the profile preference.
 
 The CUDA reference encoder carries the stationary early-layer activation between
 eight-group graphs within a single spatial tile. Reuse requires the validated

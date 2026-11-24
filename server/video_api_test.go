@@ -33,7 +33,7 @@ func (r *videoTestRunner) Run(ctx context.Context, p imagegen.Profile, input ima
 		return imagegen.Result{}, err
 	}
 	err := os.WriteFile(input.OutputPath, r.payload, 0600)
-	return imagegen.Result{Path: input.OutputPath, MIMEType: "video/webm", Seed: input.Seed}, err
+	return imagegen.Result{Path: input.OutputPath, MIMEType: "video/webm", VideoAttentionUsed: imagegen.WanAttentionSageFP8, Seed: input.Seed}, err
 }
 func TestWanPackageActivatesOnlyAfterSuccessAndPreservesEdits(t *testing.T) {
 	_, s, _, _, _ := newImageTestService(t)
@@ -161,6 +161,7 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	require.NotNil(t, runner.request.Video)
 	require.Equal(t, imagegen.WanAttentionSageFP8, runner.request.Video.AttentionPreference())
 	require.Contains(t, call("GET", "/api/videos/records/"+id, nil).Body.String(), `"attention_preference":"sage_fp8"`)
+	require.Contains(t, call("GET", "/api/videos/records/"+id, nil).Body.String(), `"attention_used":"sage_fp8"`)
 	require.Len(t, runner.request.ReferenceImages, 1)
 	require.Contains(t, events.snapshot(), "restore_text")
 	require.Contains(t, call("GET", "/api/videos/jobs", nil).Body.String(), `"seed":"5232021495785965240"`)
