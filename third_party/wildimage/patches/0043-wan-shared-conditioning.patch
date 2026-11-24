@@ -1,0 +1,22 @@
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -924,9 +924,16 @@
+                 c = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, c, 1, 0, 2, 3));                      // [N, t_len*h_len*w_len, dim]
+             }
+             sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+-            // sd::ggml_graph_cut::mark_graph_cut(e, "wan.prelude", "e");
+-            // sd::ggml_graph_cut::mark_graph_cut(e0, "wan.prelude", "e0");
+-            // sd::ggml_graph_cut::mark_graph_cut(context, "wan.prelude", "context");
++            // Each denoising pass projects its prompt, image and scalar timestep once.
++            // The segmented executor otherwise walks back through these projections
++            // for every transformer block. The cut cache is local to this graph.
++            if (config.model_type == "i2v" && clip_fea && config.vace_layers == 0 &&
++                ggml_nelements(e) == config.dim && ggml_nbytes(context) <= (size_t{32} << 20) &&
++                sd_backend_is(ctx->backend, "CUDA") && std::getenv("WILDLLAMA_VIDEO_PROGRESS")) {
++                sd::ggml_graph_cut::mark_graph_cut(e, "wan.prelude", "timestep");
++                sd::ggml_graph_cut::mark_graph_cut(e0, "wan.prelude", "time_projection");
++                sd::ggml_graph_cut::mark_graph_cut(context, "wan.prelude", "conditioning");
++            }
+             if (c != nullptr) {
+                 sd::ggml_graph_cut::mark_graph_cut(c, "wan.prelude", "c");
+             }

@@ -1,0 +1,80 @@
+--- a/src/model_loader.h
++++ b/src/model_loader.h
+@@ -129,6 +129,11 @@
+     String2TensorStorage& get_tensor_storage_map() { return tensor_storage_map; }
+     const String2TensorStorage& get_tensor_storage_map() const { return tensor_storage_map; }
+     const std::map<std::string, std::string>& get_metadata() const { return metadata_; }
++    static constexpr size_t staged_upload_window = size_t{8} << 20;
++    size_t staged_upload_workspace(size_t destinations) const {
++        const size_t workers = n_threads_ > 0 ? static_cast<size_t>(n_threads_) : 1;
++        return (destinations < workers ? destinations : workers) * staged_upload_window;
++    }
+     void set_n_threads(int n_threads);
+     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
+     // TensorStorage.file_index addresses the original shard list, including skipped empty shards.
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -1,3 +1,4 @@
++#include <type_traits>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -1336,7 +1337,17 @@
+                     // Some staged components intentionally use buffered file I/O.
+                     // Each worker needs only one transfer window for unchanged weights.
+                     // Split CUDA buffers and tensors that require conversion keep their own loaders.
+-                    constexpr size_t upload_window = 8ULL << 20;
++                    auto grow_scratch = [staged_video](auto& storage, size_t bytes) {
++                        if (bytes <= storage.size()) return;
++                        // Each read or conversion overwrites the scratch data. Release the old
++                        // allocation first so growth cannot temporarily consume two buffers.
++                        if (staged_video && bytes > storage.capacity()) {
++                            std::decay_t<decltype(storage)> empty;
++                            storage.swap(empty);
++                        }
++                        storage.resize(bytes);
++                    };
++                    constexpr size_t upload_window = staged_upload_window;
+                     if (!mmapped && !is_zip && staged_video && nbytes_to_read > upload_window &&
+                         dst_tensor->buffer && !ggml_backend_buffer_is_host(dst_tensor->buffer) &&
+                         tensor_storage.type == dst_tensor->type && nbytes_to_read == ggml_nbytes(dst_tensor) &&
+@@ -1345,7 +1356,7 @@
+                         const char* name = ggml_backend_buffer_name(dst_tensor->buffer);
+                         if (std::strncmp(name, "CUDA", 4) == 0 && name[4] >= '0' && name[4] <= '9' &&
+                             name[4 + std::strspn(name + 4, "0123456789")] == '\0') {
+-                            if (read_buffer.size() < upload_window) read_buffer.resize(upload_window);
++                            grow_scratch(read_buffer, upload_window);
+                             file.seekg(tensor_storage.offset);
+                             for (size_t at = 0; at < nbytes_to_read && !failed; at += upload_window) {
+                                 const size_t count = std::min(upload_window, nbytes_to_read - at);
+@@ -1426,11 +1437,6 @@
+ 
+                     // Reads and conversions overwrite their whole byte range. Keep
+                     // the high-water size instead of zero-filling reused capacity.
+-                    auto grow_scratch = [](auto& storage, size_t bytes) {
+-                        if (bytes > storage.size()) {
+-                            storage.resize(bytes);
+-                        }
+-                    };
+                     char* read_buf    = nullptr;
+                     char* target_buf  = nullptr;
+                     char* convert_buf = nullptr;
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1148,8 +1148,14 @@
+                 return true;
+             };
+             const auto file = group.first.first;
+-            bool success    = file == 0 ? model_loader_.load_tensors(callback, enable_mmap_, &names)
+-                                        : source_loader(file).load_file_tensors(file, group.first.second, callback, names, enable_mmap_);
++            auto& loader = file == 0 ? model_loader_ : source_loader(file);
++            if (wan_weight_tiering_) {
++                // Evicted GPU weights are only a cache. Reserve the next foreground
++                // readers' upload windows before starting their worker threads.
++                trim_wan_weights(loader.staged_upload_workspace(names.size()));
++            }
++            bool success = file == 0 ? model_loader_.load_tensors(callback, enable_mmap_, &names)
++                                     : loader.load_file_tensors(file, group.first.second, callback, names, enable_mmap_);
+             if (!success || loaded != names)
+                 return false;
+             for (auto& entry : batch) {
