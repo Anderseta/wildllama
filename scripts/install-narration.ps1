@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory)][string]$WildllamaRoot,
     [string]$ModelsDir = $env:OLLAMA_MODELS,
     [string]$Python = 'python',
-    [string]$Uv = 'uv'
+    [string]$Uv = 'uv',
+    [switch]$WithIndexTTS,
+    [string]$IndexPython = '3.10'
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath($WildllamaRoot)
@@ -33,6 +35,31 @@ foreach ($spec in @(
     & $py -c "import sys; from huggingface_hub import snapshot_download; snapshot_download('Qwen/'+sys.argv[1], revision=sys.argv[2],local_dir=sys.argv[3],allow_patterns=['*.safetensors','*.json','*.txt'])" $spec[2] $spec[3] (Join-Path $voice $spec[2])
     if ($LASTEXITCODE) { throw "Falha ao baixar $($spec[2]). Execute novamente para retomar." }
 }
+$assets = Join-Path $PSScriptRoot '../narration/install_assets.py'
+$assetArgs = @($assets, $voice)
+if ($WithIndexTTS) {
+    $src = Join-Path $runtime 'index-src'
+    $revision = 'd9e41aac89fd00b3d71497fddb287b7f24613712'
+    if (!(Test-Path -LiteralPath $src)) {
+        git clone --no-checkout https://github.com/index-tts/index-tts $src
+        if ($LASTEXITCODE) {throw 'Falha ao baixar o IndexTTS2.'}
+        git -C $src checkout --detach $revision
+        if ($LASTEXITCODE) {throw 'Revisão IndexTTS2 indisponível.'}
+    }
+    if ((git -C $src rev-parse HEAD) -ne $revision) {throw 'Verifique a revisão instalada do IndexTTS2.'}
+    $dir = Join-Path $runtime 'index'
+    $py = Join-Path $dir 'Scripts/python.exe'
+    if (!(Test-Path -LiteralPath $py)) { & $Uv venv --python $IndexPython $dir; if ($LASTEXITCODE) {throw 'Use Python 3.10 ou 3.11 para o IndexTTS2.'} }
+    & $Uv pip install --python $py --index-url https://download.pytorch.org/whl/cu128 'torch==2.8.0+cu128' 'torchaudio==2.8.0+cu128' 'torchvision==0.23.0+cu128'
+    if ($LASTEXITCODE) {throw 'Falha ao instalar PyTorch para IndexTTS2.'}
+    & $Uv pip install --python $py -e $src
+    if ($LASTEXITCODE) {throw 'Falha ao instalar as dependências do IndexTTS2.'}
+    $assetArgs += '--index'
+}
+& (Join-Path $runtime 'aligner/Scripts/python.exe') @assetArgs
+if ($LASTEXITCODE) {throw 'Falha ao instalar os recursos de narração.'}
 [void][IO.Directory]::CreateDirectory($library)
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../narration/worker.py') -Destination (Join-Path $library 'worker.py')
+foreach ($file in 'worker.py','voice_engines.py','speech_plan.py') {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "../narration/$file") -Destination (Join-Path $library $file)
+}
 Write-Output "Narração instalada. Modelos em $voice."

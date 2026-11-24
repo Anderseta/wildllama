@@ -11,27 +11,14 @@ import sys
 import time
 import wave
 
-TTS = "Qwen3-TTS-12Hz-1.7B-Base"
+from speech_plan import speech_plan, caption_times
+from voice_engines import QWEN, INDEX, QwenVoice, IndexVoice, transcribe
+
 ALIGN = "Qwen3-ForcedAligner-0.6B"
 
 
 def progress(percent, message):
     print("@narration " + json.dumps({"percent": percent, "message": message}), flush=True)
-
-
-def split_text(text, limit=340):
-    parts, line = [], ""
-    for word in text.split():
-        if line and (len(line) + len(word) > limit or
-                     (len(line) > limit // 2 and re.search(r"""[.!?]["')]*$""", line))):
-            parts.append(line)
-            line = ""
-        line = (line + " " + word).strip()
-    if line:
-        parts.append(line)
-    if not parts or any(len(part) > limit * 2 for part in parts):
-        raise ValueError("O texto precisa conter palavras separadas por espaços.")
-    return parts
 
 
 def ff(*args):
@@ -54,42 +41,35 @@ def load_model(cls, directory):
                                local_files_only=True)
 
 
+def read_reference(path, work):
+    import soundfile as sf
+    ref = work / "reference.wav"
+    ff(*audio_input(path), "-vn", "-t", "61", "-ac", "1", "-ar", "24000", ref)
+    samples, sr = sf.read(ref, dtype="float32")
+    ref.unlink()
+    if not sr <= len(samples) <= sr * 60:
+        raise ValueError("Use uma amostra de voz de 1 a 60 segundos.")
+    return samples, sr
+
+
 def synth(root, cfg, work):
     progress(1, "Iniciando o motor de voz")
     import numpy as np
     import soundfile as sf
-    from qwen_tts import Qwen3TTSModel
-    progress(2, "Carregando o modelo de voz")
-    ref = work / "reference.wav"
-    ff(*audio_input(cfg["reference"]), "-vn", "-t", "61", "-ac", "1", "-ar", "24000", ref)
-    ref_audio, sr = sf.read(ref, dtype="float32")
-    ref.unlink()
-    if len(ref_audio) > sr * 60:
-        raise ValueError("Selecione uma amostra de voz de até 60 segundos.")
-    if len(ref_audio) < sr:
-        raise ValueError("Use uma amostra de voz com pelo menos um segundo.")
-    model = load_model(Qwen3TTSModel, root / TTS)
-    transcript = cfg.get("transcript", "").strip()
-    progress(6, "Lendo a voz de referência")
-    voice = model.create_voice_clone_prompt(ref_audio=(ref_audio, sr), ref_text=transcript or None,
-                                           x_vector_only_mode=not transcript)
-    chunks = split_text(cfg["text"])
-    for i, text in enumerate(chunks):
-        progress(8 + int(58 * i / len(chunks)), f"Narrando trecho {i + 1} de {len(chunks)}")
-        # Count completed acoustic blocks without moving a tensor off the GPU.
-        blocks = 0
-        def count_block(_module, _inputs, _outputs):
-            nonlocal blocks
-            blocks += 1
-            if blocks % 24 == 0:
-                progress(8 + int(58 * i / len(chunks)),
-                         f"Narrando trecho {i + 1} de {len(chunks)} · {blocks} blocos de áudio")
-        handle = model.model.talker.register_forward_hook(count_block)
-        try:
-            audios, rate = model.generate_voice_clone(text=text, language="English", voice_clone_prompt=voice)
-        finally:
-            handle.remove()
-        pcm = np.asarray(audios[0], dtype=np.float32).reshape(-1)
+    index = cfg.get("engine") == "index"
+    progress(2, "Carregando " + (INDEX if index else QWEN))
+    engine = IndexVoice(root) if index else QwenVoice(root, load_model)
+    chunks = speech_plan(cfg)
+    for i, chunk in enumerate(chunks):
+        settings = cfg.get("directions", {}).get(str(chunk["paragraph"]), cfg.get("directions", {}).get("default", {}))
+        reference = cfg["reference"] if index else settings.get("reference") or cfg["reference"]
+        transcript = settings.get("transcript","") if settings.get("reference") else cfg.get("transcript","")
+        pct = 8 + int(58 * i / len(chunks))
+        message = f"Narrando trecho {i+1} de {len(chunks)}"
+        progress(pct, message)
+        audio, rate = engine.speak(chunk["spoken"], reference, transcript, settings, work, read_reference,
+                                   lambda n: progress(pct, f"{message} · {n} blocos de áudio"))
+        pcm = np.asarray(audio, dtype=np.float32).reshape(-1)
         if not pcm.size or not np.isfinite(pcm).all():
             raise RuntimeError("A síntese produziu áudio inválido.")
         sf.write(work / "segment.wav", pcm, rate)
@@ -107,28 +87,25 @@ def align(root, cfg, work):
     from qwen_asr import Qwen3ForcedAligner
     progress(68, "Carregando o alinhador")
     model = load_model(Qwen3ForcedAligner, root / ALIGN)
-    chunks = split_text(cfg["text"])
+    chunks = speech_plan(cfg)
     offset, captions = 0, []
     with wave.open(str(work / "speech.wav"), "wb") as combined:
         combined.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
-        for i, text in enumerate(chunks):
+        for i, chunk in enumerate(chunks):
             progress(69 + int(13 * i / len(chunks)), f"Sincronizando trecho {i + 1} de {len(chunks)}")
             p = work / f"{i}.wav"
             samples, sr = sf.read(p, dtype="float32")
-            marks = list(model.align(audio=(samples, sr), text=text, language="English")[0])
+            marks = list(model.align(audio=(samples, sr), text=chunk["spoken"], language="English")[0])
             if not marks:
                 raise RuntimeError(f"Sem alinhamento para o trecho {i + 1}.")
-            # The English aligner strips punctuation. Recover it from the original
-            # whitespace-delimited words whenever its token boundaries match.
-            words = [w for w in text.split() if any(ch.isalnum() for ch in w)]
-            for index, mark in enumerate(marks):
-                start = max(0., min(len(samples) / sr, mark.start_time))
-                end = max(start, min(len(samples) / sr, mark.end_time))
-                label = words[index] if len(words) == len(marks) else mark.text
-                captions.append([offset / sr + start, offset / sr + end, label])
+            captions.extend(caption_times(chunk["units"], marks, len(samples)/sr, offset/sr))
             with wave.open(str(p), "rb") as part:
                 combined.writeframes(part.readframes(part.getnframes()))
             offset += len(samples)
+            if chunk["paragraph_end"]:
+                silence = round(sr * cfg.get("pauseMs", 350) / 1000)
+                combined.writeframes(bytes(2 * silence))
+                offset += silence
             p.unlink()
     save_json(work / "words.json", captions)
     progress(82, "Texto sincronizado")
@@ -230,12 +207,18 @@ def save_json(path, data):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=["run", "synth", "align"])
+    parser.add_argument("stage", choices=["run", "synth", "align", "transcribe"])
     parser.add_argument("job", type=Path)
     parser.add_argument("models", type=Path)
     parser.add_argument("runtime", type=Path)
     opts = parser.parse_args()
     job = opts.job.resolve()
+    if opts.stage == "transcribe":
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as folder:
+            text = transcribe(opts.models, str(job), Path(folder), read_reference, load_model)
+            print("@transcript " + json.dumps(text), flush=True)
+        return
     cfg = json.loads((job / "request.json").read_text("utf-8-sig"))
     work = job / "working"
     if opts.stage == "synth":
@@ -245,7 +228,7 @@ def main():
     start = time.monotonic()
     work.mkdir(exist_ok=False)
     try:
-        for stage, env in (("synth", "tts"), ("align", "aligner")):
+        for stage, env in (("synth", "index" if cfg.get("engine") == "index" else "tts"), ("align", "aligner")):
             py = opts.runtime / env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
             subprocess.run([str(py), "-u", __file__, stage, str(job), str(opts.models), str(opts.runtime)], check=True)
         duration = render(cfg, work)
@@ -253,7 +236,10 @@ def main():
             os.replace(work / name, job / name)
         save_json(job / "record.json", dict(id=cfg["id"], created_at=cfg["created_at"], frames=math.ceil(duration * cfg["fps"]),
                   fps=cfg["fps"], generation_seconds=round(time.monotonic()-start, 2), path=str(job.parent / cfg["id"] / "video.mp4"),
-                  details=dict(prompt=cfg["text"], model=TTS, width=cfg["width"], height=cfg["height"],
+                  details=dict(prompt=cfg["text"], model=INDEX if cfg.get("engine") == "index" else QWEN, pause_ms=cfg.get("pauseMs",350),
+                               pronunciations=cfg.get("pronunciations",[]),
+                               directions={k: {**{a:v for a,v in d.items() if a in ("emotion","strength")},
+                                               "reference":Path(d.get("reference","")).name} for k,d in cfg.get("directions",{}).items()}, width=cfg["width"], height=cfg["height"],
                                speed=cfg["speed"], pitch=cfg["pitch"], captions=cfg["captions"],
                                reference=Path(cfg["reference"]).name, background=Path(cfg["background"]).name)))
         progress(100, "Vídeo salvo")
