@@ -55,6 +55,7 @@ def load_model(cls, directory):
 
 
 def synth(root, cfg, work):
+    progress(1, "Iniciando o motor de voz")
     import numpy as np
     import soundfile as sf
     from qwen_tts import Qwen3TTSModel
@@ -101,9 +102,10 @@ def synth(root, cfg, work):
 
 
 def align(root, cfg, work):
+    progress(67, "Iniciando o motor de alinhamento")
     import soundfile as sf
     from qwen_asr import Qwen3ForcedAligner
-    progress(67, "Carregando o alinhador")
+    progress(68, "Carregando o alinhador")
     model = load_model(Qwen3ForcedAligner, root / ALIGN)
     chunks = split_text(cfg["text"])
     offset, captions = 0, []
