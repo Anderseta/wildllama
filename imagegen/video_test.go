@@ -96,6 +96,7 @@ func TestWanVideoCPUFallbackRequiresOptIn(t *testing.T) {
 	p := testProfile(t, dir)
 	p.ModelID, p.Sampler, p.Scheduler, p.Sigmas = WanRapidT2V, "euler_a", "beta", ""
 	t.Setenv("WILDIMAGE_FAKE_CHILD", "gpu-oom-then-cpu")
+	t.Setenv("WILDLLAMA_WAN_ATTENTION", "inherited-value-must-be-ignored")
 	for _, tc := range []struct {
 		name     string
 		allow    bool
@@ -108,6 +109,10 @@ func TestWanVideoCPUFallbackRequiresOptIn(t *testing.T) {
 			log := filepath.Join(dir, tc.name+".jsonl")
 			t.Setenv("WILDIMAGE_FAKE_ATTEMPTS", log)
 			r := Request{Prompt: "literal --prompt ; &", OutputPath: filepath.Join(config.OutputDir, tc.name+".webm"), Video: &VideoOptions{Frames: 5, FPS: 16, AllowCPUFallback: tc.allow}}
+			if tc.allow {
+				r.Video.AttentionBackend = WanAttentionSageFP8
+			}
+			t.Setenv("WILDIMAGE_FAKE_EXPECT_WAN_ATTENTION", r.Video.AttentionBackend)
 			_, err := engine.Run(t.Context(), p, r, nil)
 			if !tc.allow {
 				require.ErrorContains(t, err, "VRAM")

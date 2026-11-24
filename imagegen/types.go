@@ -152,6 +152,7 @@ type RunnerStatus struct {
 	RAMBudgetSupported         bool   `json:"ram_budget_supported"`
 	WanExtendedUMT5Supported   bool   `json:"wan_extended_umt5_supported,omitempty"`
 	WanVideoStagingSupported   bool   `json:"wan_video_staging_supported,omitempty"`
+	WanSageFP8Supported        bool   `json:"wan_sage_fp8_supported,omitempty"`
 	MOSSEditSupported          bool   `json:"moss_edit_supported,omitempty"`
 	InpaintCropSupported       bool   `json:"inpaint_crop_supported,omitempty"`
 }

@@ -18,17 +18,18 @@ import (
 )
 
 type videoDetails struct {
-	Prompt    string           `json:"prompt"`
-	Negative  string           `json:"negative_prompt"`
-	Model     string           `json:"model"`
-	Width     int              `json:"width"`
-	Height    int              `json:"height"`
-	Steps     int              `json:"steps"`
-	CFG       float64          `json:"cfg_scale"`
-	Sampler   string           `json:"sampler"`
-	Scheduler string           `json:"scheduler"`
-	Backend   string           `json:"backend,omitempty"`
-	Timings   *imageJobTimings `json:"timings,omitempty"`
+	Prompt              string           `json:"prompt"`
+	Negative            string           `json:"negative_prompt"`
+	Model               string           `json:"model"`
+	Width               int              `json:"width"`
+	Height              int              `json:"height"`
+	Steps               int              `json:"steps"`
+	CFG                 float64          `json:"cfg_scale"`
+	Sampler             string           `json:"sampler"`
+	Scheduler           string           `json:"scheduler"`
+	Backend             string           `json:"backend,omitempty"`
+	AttentionPreference string           `json:"attention_preference,omitempty"`
+	Timings             *imageJobTimings `json:"timings,omitempty"`
 }
 type storedVideo struct {
 	videoRecord
@@ -42,6 +43,9 @@ func (r *storedVideo) fromJob(j *imageJob) {
 	g := j.Generation
 	p := g.Profile
 	r.Details = &videoDetails{Prompt: g.Prompt, Negative: g.NegativePrompt, Model: filepath.Base(p.DiffusionModel), Width: p.Width, Height: p.Height, Steps: p.Steps, CFG: p.CFGScale, Sampler: p.Sampler, Scheduler: p.Scheduler, Backend: j.ComputeBackend, Timings: j.imageTimingSnapshot(time.Now())}
+	if j.Video != nil {
+		r.Details.AttentionPreference = j.Video.AttentionPreference()
+	}
 	if r.GenerationSeconds <= 0 && r.Details.Timings != nil {
 		r.GenerationSeconds = r.Details.Timings.RunSeconds
 	}

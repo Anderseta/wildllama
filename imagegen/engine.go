@@ -91,6 +91,7 @@ func (e *Engine) Status() RunnerStatus {
 				MOSSEdit          bool `json:"moss_edit"`
 				WanExtendedUMT5   bool `json:"wan_extended_umt5"`
 				WanVideoStaging   bool `json:"wan_video_staging"`
+				WanSageFP8        bool `json:"wan_sage_fp8"`
 				InpaintCrop       bool `json:"inpaint_crop"`
 			} `json:"features"`
 			Files []struct {
@@ -144,6 +145,7 @@ func (e *Engine) Status() RunnerStatus {
 		status.MOSSEditSupported = manifest.Features.MOSSEdit
 		status.WanExtendedUMT5Supported = manifest.Features.WanExtendedUMT5
 		status.WanVideoStagingSupported = manifest.Features.WanVideoStaging
+		status.WanSageFP8Supported = manifest.Features.WanSageFP8
 		status.InpaintCropSupported = manifest.Features.InpaintCrop
 	}
 	if !status.RAMBudgetSupported {
@@ -496,6 +498,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	if r.Video != nil && !runnerStatus.WanVideoStagingSupported {
 		return Result{}, errors.New("update the Wildllama media runtime to enable staged Wan video generation")
 	}
+	if r.Video != nil && r.Video.AttentionPreference() == WanAttentionSageFP8 && !runnerStatus.WanSageFP8Supported {
+		return Result{}, errors.New("atualize o runtime de vídeo do WildLlama para usar SageAttention FP8, ou selecione CuTe")
+	}
 	if p.UsesMOSSEdit() && len(r.ReferenceImages) > 0 && !runnerStatus.MOSSEditSupported {
 		return Result{}, errors.New("the image runner does not support MOSS edits")
 	}
@@ -823,6 +828,9 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
 	if r.Video != nil {
 		cmd.Env = append(cmd.Env, "WILDLLAMA_VIDEO_PROGRESS=1")
+		if mode != imageRAMCPU && r.Video.AttentionPreference() == WanAttentionSageFP8 {
+			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_ATTENTION="+WanAttentionSageFP8)
+		}
 		if mode != imageRAMCPU && (p.Steps > 1 || p.CFGScale > 1) {
 			cmd.Env = append(cmd.Env, "WILDLLAMA_WAN_WEIGHT_CACHE=1")
 		}
@@ -1135,7 +1143,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	if runtime.GOOS == "windows" && strings.TrimSpace(os.Getenv("WILDIMAGE_CUDA_WAIT")) == "" {
 		set("WILDIMAGE_CUDA_WAIT", "blocking")
 	}
-	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_STEP", "WILDLLAMA_WAN_WEIGHT_CACHE"} {
+	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_STEP", "WILDLLAMA_WAN_WEIGHT_CACHE", "WILDLLAMA_WAN_ATTENTION"} {
 		set(key, "")
 	}
 	set("PATH", filepath.Dir(config.RunnerPath)+string(os.PathListSeparator)+os.Getenv("PATH"))

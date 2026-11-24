@@ -98,6 +98,7 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(profile.Vision, weights, 0600))
 	profile.Width, profile.Height, profile.Frames = 64, 64, 5
+	profile.AttentionBackend = imagegen.WanAttentionSageFP8
 	hd := profile
 	hd.Width, hd.Height = 1280, 720
 	require.NoError(t, hd.validate("i2v"))
@@ -110,6 +111,10 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	}
 	saved := call("PUT", "/api/videos/config?mode=i2v", profile)
 	require.Equal(t, 200, saved.Code, saved.Body.String())
+	invalid := profile
+	invalid.AttentionBackend = "unknown"
+	require.Equal(t, 400, call("PUT", "/api/videos/config?mode=i2v", invalid).Code)
+	require.Contains(t, call("GET", "/api/videos/config?mode=t2v", nil).Body.String(), `"attention_backend":"cute"`)
 	estimate := profile
 	estimate.Width, estimate.Height, estimate.Frames, estimate.FPS = 480, 832, 221, 22
 	memory := call("POST", "/api/videos/memory?mode=i2v", estimate)
@@ -154,6 +159,8 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 		return len(value.Jobs) == 1 && value.Jobs[0].Status == "completed"
 	}, 3*time.Second, 10*time.Millisecond)
 	require.NotNil(t, runner.request.Video)
+	require.Equal(t, imagegen.WanAttentionSageFP8, runner.request.Video.AttentionPreference())
+	require.Contains(t, call("GET", "/api/videos/records/"+id, nil).Body.String(), `"attention_preference":"sage_fp8"`)
 	require.Len(t, runner.request.ReferenceImages, 1)
 	require.Contains(t, events.snapshot(), "restore_text")
 	require.Contains(t, call("GET", "/api/videos/jobs", nil).Body.String(), `"seed":"5232021495785965240"`)

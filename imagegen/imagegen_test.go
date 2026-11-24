@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -50,7 +51,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	manifest, err := json.Marshal(map[string]any{
-		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true, "wan_video_staging": true},
+		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true, "wan_video_staging": true, "wan_sage_fp8": true},
 		"files": []map[string]any{{"name": filepath.Base(exe), "size": len(data), "sha256": digest(data)}},
 	})
 	if err != nil {
@@ -112,6 +113,15 @@ func fakeChild(mode string) {
 		}
 	}
 	if path := os.Getenv("WILDIMAGE_FAKE_ATTEMPTS"); path != "" {
+		if want, ok := os.LookupEnv("WILDIMAGE_FAKE_EXPECT_WAN_ATTENTION"); ok {
+			if values["--backend"] == "cpu" {
+				want = ""
+			}
+			if os.Getenv("WILDLLAMA_WAN_ATTENTION") != want || slices.Contains(os.Args, "--sage-attn") {
+				fmt.Fprintln(os.Stderr, "unexpected video attention selection")
+				os.Exit(8)
+			}
+		}
 		encoded, _ := json.Marshal(os.Args[1:])
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {

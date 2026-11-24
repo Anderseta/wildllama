@@ -33,7 +33,7 @@ type videoProfile struct {
 }
 
 func defaultVideoProfile() videoProfile {
-	return videoProfile{Width: 832, Height: 480, Steps: 4, CFG: 1, VideoOptions: imagegen.VideoOptions{Frames: 33, FPS: 16}, Reserve: imagegen.DefaultVRAMReserveMiB}
+	return videoProfile{Width: 832, Height: 480, Steps: 4, CFG: 1, VideoOptions: imagegen.VideoOptions{Frames: 33, FPS: 16, AttentionBackend: imagegen.WanAttentionCuTe}, Reserve: imagegen.DefaultVRAMReserveMiB}
 }
 
 func (p videoProfile) runtimeProfile(mode string) imageProfile {
@@ -174,7 +174,7 @@ func (s *Server) videoMemoryHandler(c *gin.Context) {
 		if previous.ModelID != profile.ModelID || previous.Width != p.Width || previous.Height != p.Height ||
 			previous.DiffusionModel != p.Diffusion || previous.TextEncoder != p.Encoder || previous.VAE != p.VAE ||
 			previous.VisionEncoder != p.Vision || previous.Tokenizer != p.Vocabulary || previous.MaxRAMMiB != p.RAM ||
-			previous.VRAMReserveMiB != p.Reserve || previous.CFGScale != p.CFG {
+			previous.VRAMReserveMiB != p.Reserve || previous.CFGScale != p.CFG || job.Video.AttentionPreference() != p.AttentionPreference() {
 			continue
 		}
 		distance := max(job.Video.Frames-p.Frames, p.Frames-job.Video.Frames)
@@ -212,6 +212,7 @@ func (s *Server) videoConfigHandler(c *gin.Context) {
 			c.JSON(400, gin.H{"error": err.Error()})
 			return
 		}
+		p.AttentionBackend = p.AttentionPreference()
 		if err := writeImageJSON(filepath.Join(v.root, "video-"+mode+".json"), p); err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return

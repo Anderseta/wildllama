@@ -148,6 +148,14 @@ time at existing segment boundaries. Graph execution can overlap weight uploads.
 
 ### Wan video execution controls
 
+Video profiles accept `attention_backend` values `cute` (default) and `sage_fp8`.
+The latter selects native SageAttention2 for compatible CUDA self-attention,
+with INT8 queries and keys, FP8 probability/value products and FP32 accumulation.
+Each head sees the full sequence. Large inputs are processed in head groups
+to bound temporary attention storage. Text/image cross-attention, encoders and
+VAE keep their usual precision. Unsupported operations retain the existing
+dispatch. The gallery records the requested preference so runs can be compared.
+
 The CUDA reference encoder carries the stationary early-layer activation between
 eight-group graphs within a single spatial tile. Reuse requires the validated
 Wan VAE layout, a bitwise-zero input tail, and a replacement activation that

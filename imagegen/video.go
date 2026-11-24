@@ -12,10 +12,21 @@ import (
 const WanRapidI2V = "wan-rapid-v10-i2v"
 const WanRapidT2V = "wan-rapid-v10-t2v"
 
+const WanAttentionCuTe = "cute"
+const WanAttentionSageFP8 = "sage_fp8"
+
 type VideoOptions struct {
-	Frames           int  `json:"frames"`
-	FPS              int  `json:"fps"`
-	AllowCPUFallback bool `json:"allow_cpu_fallback,omitempty"`
+	Frames           int    `json:"frames"`
+	FPS              int    `json:"fps"`
+	AllowCPUFallback bool   `json:"allow_cpu_fallback,omitempty"`
+	AttentionBackend string `json:"attention_backend,omitempty"`
+}
+
+func (v VideoOptions) AttentionPreference() string {
+	if v.AttentionBackend == "" {
+		return WanAttentionCuTe
+	}
+	return v.AttentionBackend
 }
 
 func (p Profile) IsWanRapid() bool { return p.ModelID == WanRapidI2V || p.ModelID == WanRapidT2V }
@@ -27,6 +38,11 @@ func (v VideoOptions) RGBFloatBytes(width, height int) int64 {
 }
 
 func (v VideoOptions) Validate() error {
+	switch v.AttentionPreference() {
+	case WanAttentionCuTe, WanAttentionSageFP8:
+	default:
+		return errors.New("unknown Wan attention backend")
+	}
 	if v.Frames < 5 || v.Frames > 241 || (v.Frames-1)%4 != 0 {
 		return errors.New("Wan requires 4n+1 frames between 5 and 241")
 	}
