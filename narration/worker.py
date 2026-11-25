@@ -146,17 +146,8 @@ def make_voice(root, index):
     return IndexVoice(root) if index else QwenVoice(root, load_model)
 
 
-def synth(root, cfg, work, preview=False, engine=None, reading=None):
-    progress(1, "Iniciando o motor de voz")
+def spoken_chunks(chunks, engine, index, cfg, work):
     import numpy as np
-    import soundfile as sf
-    index = cfg.get("engine") == "index"
-    progress(2, ("Reutilizando " if engine is not None else "Carregando ") + (INDEX if index else QWEN))
-    chunks = [preview_chunk(cfg)] if preview else speech_plan(cfg)
-    if engine is None:
-        engine = make_voice(root, index)
-    if index:
-        engine.references.clear()  # Normalized files live in the current job directory.
     for i, chunk in enumerate(chunks):
         settings = cfg.get("directions", {}).get(str(chunk["paragraph"]), cfg.get("directions", {}).get("default", {}))
         if not index and cfg.get("voiceProfile") and not settings.get("reference"):
@@ -173,33 +164,66 @@ def synth(root, cfg, work, preview=False, engine=None, reading=None):
         pcm = np.asarray(audio, dtype=np.float32).reshape(-1)
         if not pcm.size or not np.isfinite(pcm).all():
             raise RuntimeError("A síntese produziu áudio inválido.")
-        if preview:
-            # Twelve seconds at up to 2x speed, plus filter latency.
-            source = work / "source.wav"
-            sf.write(source, pcm[:rate * 26], rate)
-            finish_audio(source, work / "preview.wav", cfg, rate, preview=True)
-        else:
-            dry = io.BytesIO()
-            sf.write(dry, pcm, rate, format="WAV", subtype="PCM_16")
-            proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "wav",
-                                   "-i", "pipe:0", "-af", voice_filter(cfg, rate, apply_volume=reading is not None, frames=len(pcm)), "-ac", "1",
-                                   "-f", "s16le", "pipe:1"], input=dry.getvalue(), capture_output=True)
-            if proc.returncode or not proc.stdout:
-                raise RuntimeError(proc.stderr.decode("utf8", "replace")[-1200:] or "Leitura sem áudio.")
-            if reading is None:
-                with wave.open(str(work / f"{i}.wav"), "wb") as segment:
-                    segment.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
-                    segment.writeframes(proc.stdout)
-            else:
-                reading.writeframesraw(proc.stdout)
-                if chunk["paragraph_end"]:
-                    reading.writeframesraw(bytes(2 * round(24000 * cfg.get("pauseMs", 350) / 1000)))
+        yield i, pcm, rate, chunk["paragraph_end"]
+
+
+def finish_segment(i, pcm, rate, paragraph_end, cfg, reading, work):
+    import soundfile as sf
+    dry = io.BytesIO()
+    sf.write(dry, pcm, rate, format="WAV", subtype="PCM_16")
+    proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "wav",
+                           "-i", "pipe:0", "-af", voice_filter(cfg, rate, apply_volume=reading is not None,
+                                                               frames=len(pcm)),
+                           "-ac", "1", "-f", "s16le", "pipe:1"], input=dry.getvalue(), capture_output=True)
+    if proc.returncode or not proc.stdout:
+        raise RuntimeError(proc.stderr.decode("utf8", "replace")[-1200:] or "Leitura sem áudio.")
+    if reading is None:
+        with wave.open(str(work / f"{i}.wav"), "wb") as segment:
+            segment.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+            segment.writeframes(proc.stdout)
+    else:
+        reading.writeframesraw(proc.stdout)
+        if paragraph_end:
+            reading.writeframesraw(bytes(2 * round(24000 * cfg.get("pauseMs", 350) / 1000)))
+
+
+def synth(root, cfg, work, preview=False, engine=None, reading=None):
+    progress(1, "Iniciando o motor de voz")
+    index = cfg.get("engine") == "index"
+    progress(2, ("Reutilizando " if engine is not None else "Carregando ") + (INDEX if index else QWEN))
+    chunks = [preview_chunk(cfg)] if preview else speech_plan(cfg)
+    if engine is None:
+        engine = make_voice(root, index)
+    if index:
+        engine.references.clear()  # Normalized files live in the current job directory.
+    spoken = spoken_chunks(chunks, engine, index, cfg, work)
+    if preview:
+        import soundfile as sf
+        _, pcm, rate, _ = next(spoken)
+        # Twelve seconds at up to 2x speed, plus filter latency.
+        source = work / "source.wav"
+        sf.write(source, pcm[:rate * 26], rate)
+        finish_audio(source, work / "preview.wav", cfg, rate, preview=True)
+    elif len(chunks) == 1 or not str(getattr(engine.model, "device", "")).startswith("cuda"):
+        for chunk in spoken:
+            finish_segment(*chunk, cfg, reading, work)
+    else:
+        # Overlap the previous CPU audio filter with synthesis of the next chunk.
+        # One writer owns the WAV; at most one filtered chunk can be outstanding.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as writer:
+            pending = None
+            for chunk in spoken:
+                if pending is not None:
+                    pending.result()
+                pending = writer.submit(finish_segment, *chunk, cfg, reading, work)
+            pending.result()
     progress(66, "Narração pronta")
 
 
 def align(root, cfg, work):
     progress(67, "Iniciando o motor de alinhamento")
-    import soundfile as sf
+    import numpy as np
     from qwen_asr import Qwen3ForcedAligner
     progress(68, "Carregando o alinhador")
     model = load_model(Qwen3ForcedAligner, root / ALIGN)
@@ -210,17 +234,20 @@ def align(root, cfg, work):
         for i, chunk in enumerate(chunks):
             progress(69 + int(13 * i / len(chunks)), f"Sincronizando trecho {i + 1} de {len(chunks)}")
             p = work / f"{i}.wav"
-            samples, sr = sf.read(p, dtype="float32")
+            # Synthesis writes mono PCM16. Read once for both alignment and the master WAV.
+            with wave.open(str(p), "rb") as part:
+                sr = part.getframerate()
+                pcm = part.readframes(part.getnframes())
+            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
             marks = list(model.align(audio=(samples, sr), text=chunk["spoken"], language="English")[0])
             if not marks:
                 raise RuntimeError(f"Sem alinhamento para o trecho {i + 1}.")
             captions.extend(caption_times(chunk["units"], marks, len(samples)/sr, offset/sr))
-            with wave.open(str(p), "rb") as part:
-                combined.writeframes(part.readframes(part.getnframes()))
+            combined.writeframesraw(pcm)
             offset += len(samples)
             if chunk["paragraph_end"]:
                 silence = round(sr * cfg.get("pauseMs", 350) / 1000)
-                combined.writeframes(bytes(2 * silence))
+                combined.writeframesraw(bytes(2 * silence))
                 offset += silence
             p.unlink()
     save_json(work / "words.json", captions)

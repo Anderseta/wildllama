@@ -45,7 +45,9 @@ class QwenVoice:
         from qwen_tts import Qwen3TTSModel
         self.model = load_model(Qwen3TTSModel, root / QWEN)
         from qwen_codec import optimize_codec
+        from qwen_talker import optimize_talker
         optimize_codec(self.model.model.talker)
+        optimize_talker(self.model.model.talker)
         self.root = root
         self.prompt = lru_cache(maxsize=4)(self._prompt)
         self.saved_prompt = lru_cache(maxsize=1)(self._saved_prompt)
