@@ -245,7 +245,7 @@ def main():
     if opts.stage == "transcribe":
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as folder:
-            text = transcribe(opts.models, str(job), Path(folder), read_reference, load_model)
+            text = transcribe(opts.models, str(job), Path(folder), read_reference, load_model, progress)
             print("@transcript " + json.dumps(text), flush=True)
         return
     cfg = json.loads((job / "request.json").read_text("utf-8-sig"))

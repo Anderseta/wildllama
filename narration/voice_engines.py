@@ -8,11 +8,30 @@ ASR = "Qwen3-ASR-0.6B"
 EMOTIONS = {"happy": 1.5, "sad": 2.5, "angry": 2.5}
 
 
-def transcribe(root, reference, work, read_reference, load_model):
+def transcribe(root, reference, work, read_reference, load_model, progress):
+    progress(5, "Iniciando o reconhecedor de fala")
     from qwen_asr import Qwen3ASRModel
+    progress(18, "Lendo e convertendo a amostra para áudio mono")
     samples = read_reference(reference, work)
+    duration = len(samples[0]) / samples[1]
+    progress(30, f"Carregando os pesos do Qwen3-ASR · amostra de {duration:.1f} s")
     asr = load_model(Qwen3ASRModel, root / ASR)
-    result = asr.transcribe(audio=samples, language=None)
+    progress(62, "Extraindo as características da fala e codificando o áudio")
+    # Transformers does not know the output length before the stop token. Count
+    # actual decoder iterations without copying CUDA tensors back to the host.
+    steps = 0
+    def decoded(_module, _inputs, _outputs):
+        nonlocal steps
+        steps += 1
+        if steps == 1 or steps % 8 == 0:
+            percent = 66 + int(29 * steps / (steps + max(1, duration * 3)))
+            progress(percent, f"Reconhecendo a fala · {steps} passos de decodificação")
+    hook = asr.model.thinker.register_forward_hook(decoded)
+    try:
+        result = asr.transcribe(audio=samples, language=None)
+    finally:
+        hook.remove()
+    progress(97, "Conferindo o texto reconhecido")
     text = result[0].text.strip() if result else ""
     if not text:
         raise ValueError("O ASR não reconheceu fala na amostra.")
