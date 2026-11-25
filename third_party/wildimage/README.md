@@ -157,10 +157,9 @@ groups are split to limit temporary projection storage. From 16,384 key tokens, 
 key means and value scales share a tiled reduction in the existing key scratch
 buffer. Text/vision encoders and VAE run at their usual precision. This mode
 requires a compatible CUDA device even when weights are offloaded to RAM. An
-unsupported attention operator triggers one retry on CUDA with CuTe, using the
-same seed, memory settings and any completed sampler step. A GPU memory failure
-still follows the normal memory policy. The gallery records observed kernels
-separately from the profile preference.
+unsupported attention operator reports the rejected constraint and tensor
+layouts. SageAttention FP8 stays selected through GPU memory recovery. The
+gallery records observed kernels separately from the profile preference.
 
 The CUDA reference encoder carries the stationary early-layer activation between
 eight-group graphs within a single spatial tile. Reuse requires the validated

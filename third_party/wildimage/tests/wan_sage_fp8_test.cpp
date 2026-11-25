@@ -100,6 +100,22 @@ static bool compare_cross(ggml_backend_t gpu, int d, int queries, int text_len, 
     return compare_outputs(baseline, candidate, image_len ? "reference+text" : "text", queries, .08);
 }
 
+// Check support without allocating a full long-video attention graph. Wan groups
+// the 40 heads into four-head operations at 1024x768x109 (86,016 query positions).
+static bool check_long_attention(ggml_backend_t gpu, int queries, int keys, int heads, bool expected) {
+    BackendProbeGraph graph(gpu, 32);
+    GGMLRunnerContext ctx{};
+    ctx.backend = gpu;
+    ctx.ggml_ctx = graph.ctx;
+    auto q = ggml_new_tensor_3d(graph.ctx, GGML_TYPE_F32, 128, queries, heads);
+    auto k = ggml_new_tensor_3d(graph.ctx, GGML_TYPE_F32, 128, keys, heads);
+    auto v = ggml_new_tensor_3d(graph.ctx, GGML_TYPE_F16, 128, keys, heads);
+    auto out = ggml_ext_sage_attn(&ctx, q, k, v, 1.f / std::sqrt(128.f), GGML_SAGE_ATTN_2);
+    const bool supported = out && ggml_backend_supports_op(gpu, out);
+    std::printf("SageAttention query=%d keys=%d heads=%d support=%d\n", queries, keys, heads, int(supported));
+    return supported == expected;
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     ggml_backend_load_all_from_path(argv[1]);
@@ -112,6 +128,10 @@ int main(int argc, char** argv) {
     ok &= compare_cross(gpu, 128, 129, 77, 0);
     ok &= compare_cross(gpu, 128, 257, 77, 37);
     ok &= compare_cross(gpu, 64, 127, 16385, 61);
+    ok &= check_long_attention(gpu, 65536, 65536, 4, true);
+    ok &= check_long_attention(gpu, 86016, 86016, 4, true);
+    ok &= check_long_attention(gpu, 86016, 257, 4, true);
+    ok &= check_long_attention(gpu, 1, 1, 65536, false);
     ggml_backend_free(gpu);
     return ok ? 0 : 1;
 }

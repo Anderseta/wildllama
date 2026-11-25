@@ -695,7 +695,6 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	}
 	var runErr error
 	var decoded image.Image
-	requestedVideo := r.Video
 	eagerCUDA := false
 	retriedStep := false
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
@@ -715,13 +714,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		}
 		retryCUDA := allowCUDARetry && !eagerCUDA && cudaload.IsSharedObjectInitFailure(log.tail())
 		retryMemory := p.OffloadToCPU && exit.ExitCode() == GPUOutOfMemoryExitCode
-		retryAttention := r.Video != nil && r.Video.AttentionPreference() == WanAttentionSageFP8 &&
-			exit.ExitCode() == wanAttentionUnsupportedExit
 		// Retry a terminated native process once with the last published step.
 		// Host-budget exits, validation errors and user cancellations stay final.
 		nativeCrash := exit.ExitCode() < 0 || runtime.GOOS == "windows" && uint64(exit.ExitCode()) >= 0x80000000
 		resume := !retriedStep && checkpoint.name != "" && log.wan.savedStep > 0 && (nativeCrash || retryMemory && mode == imageRAMGPU)
-		if !retryCUDA && !retryMemory && !resume && !retryAttention {
+		if !retryCUDA && !retryMemory && !resume {
 			break
 		}
 		if r.Video != nil {
@@ -740,15 +737,6 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		if removeErr := os.Remove(output); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			return Result{}, fmt.Errorf("remove incomplete GPU attempt: %w", removeErr)
 		}
-		if retryAttention {
-			// Keep the requested profile intact. The next child uses CuTe with
-			// the same backend placement, seed and last published sampler step.
-			fallback := *r.Video
-			fallback.AttentionBackend = WanAttentionCuTe
-			r.Video = &fallback
-			log.emit(Progress{Phase: "attention_fallback", Message: "O SageAttention FP8 recusou uma operação. Tentando novamente na GPU com CuTe e a mesma seed."}, true)
-			continue
-		}
 		if retryCUDA {
 			eagerCUDA = true
 			log.emit(Progress{Phase: "cuda_module_retry", Message: "O CUDA falhou ao inicializar um kernel. Tentando novamente na GPU com carregamento antecipado e a mesma seed."}, true)
@@ -765,7 +753,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			mode = imageRAMGPU
 			log.emit(Progress{Phase: "ram_offload", Message: "Os pesos e buffers não couberam na GPU; usando RAM dentro do orçamento e mantendo o cálculo na GPU."}, true)
 		} else {
-			if cpuErr := requestedVideo.CPUFallbackError(); cpuErr != nil {
+			if cpuErr := r.Video.CPUFallbackError(); cpuErr != nil {
 				log.emit(Progress{Phase: "gpu_memory_limit", Message: cpuErr.Error()}, true)
 				err = errors.Join(cpuErr, err)
 				break

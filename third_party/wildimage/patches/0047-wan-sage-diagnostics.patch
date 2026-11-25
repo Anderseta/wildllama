@@ -1,0 +1,93 @@
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -111,10 +111,19 @@
+         return enabled;
+     }
+ 
+-    // This setting belongs to the isolated video worker. Stop with a regular
+-    // exit code so the parent can report an incompatible device without retrying.
+-    [[noreturn]] inline void wan_sage_unavailable() {
+-        std::fprintf(stderr, "SageAttention FP8 requires supported CUDA attention for every Wan diffusion block. Select CuTe or update the media runtime.\n");
++    [[noreturn]] inline void wan_sage_unavailable(GGMLRunnerContext* ctx, const char* reason,
++                                                   ggml_tensor* q, ggml_tensor* k, ggml_tensor* v) {
++        std::fprintf(stderr, "SageAttention FP8: %s (backend %s)\n", reason,
++                     ctx->backend ? ggml_backend_name(ctx->backend) : "none");
++        const ggml_tensor* inputs[] = {q, k, v};
++        const char* labels[] = {"Q", "K", "V"};
++        for (int i = 0; i < 3; ++i) {
++            const auto* t = inputs[i];
++            if (!t) continue;
++            std::fprintf(stderr, "  %s %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] contiguous=%d\n",
++                         labels[i], ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
++                         int(ggml_is_contiguous(t)));
++        }
+         std::fflush(stderr);
+         std::_Exit(77);
+     }
+@@ -149,9 +158,13 @@
+                         auto half = ggml_cast(c, value, GGML_TYPE_F16);
+                         if (!ggml_backend_supports_op(ctx->backend, half))
+                             half = ggml_cast(c, ggml_ext_cont(ctx, value), GGML_TYPE_F16);
+-                        auto out = ggml_ext_sage_attn(ctx, query, ordered(key), half,
++                        auto ordered_key = ordered(key);
++                        auto out = ggml_ext_sage_attn(ctx, query, ordered_key, half,
+                                                       1.f / std::sqrt(float(q->ne[0])), GGML_SAGE_ATTN_2);
+-                        if (!out || !ggml_backend_supports_op(ctx->backend, out)) wan_sage_unavailable();
++                        if (!out) wan_sage_unavailable(ctx, "invalid Q/K/V layout", query, ordered_key, half);
++                        if (!ggml_backend_supports_op(ctx->backend, out)) {
++                            wan_sage_unavailable(ctx, "CUDA rejected the attention operator", query, ordered_key, half);
++                        }
+                         ggml_set_name(out, "wan.sage_fp8");
+                         return out;
+                     };
+@@ -258,9 +271,15 @@
+ 
+ #ifndef SD_USE_UPSTREAM_GGML
+             if (wan_sage_requested()) {
+-                if (N != 1 || mask || (head_dim != 64 && head_dim != 128) || x->type != GGML_TYPE_F32 ||
+-                    k->type != GGML_TYPE_F32 || pe->ne[3] != n_token || (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) ||
+-                    !sd_backend_is(ctx->backend, "CUDA")) wan_sage_unavailable();
++                const char* reason =
++                    !sd_backend_is(ctx->backend, "CUDA") ? "self-attention requires CUDA" :
++                    N != 1 ? "self-attention requires a single batch" :
++                    mask ? "self-attention mask unsupported" :
++                    (head_dim != 64 && head_dim != 128) ? "unsupported self-attention head dimension" :
++                    (x->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32) ? "unsupported self-attention input type" :
++                    pe->ne[3] != n_token ? "self-attention position count does not match token count" :
++                    (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) ? "custom self-attention scale unsupported" : nullptr;
++                if (reason) wan_sage_unavailable(ctx, reason, x, k, v);
+                 auto query = norm_q->forward(ctx, q_proj->forward(ctx, x));
+                 query = ggml_reshape_4d(ctx->ggml_ctx, query, head_dim, num_heads, n_token, 1);
+                 auto out = attention_by_head(ctx, query, k, v, pe, wan_head_group(head_dim, n_token), true);
+@@ -307,8 +326,12 @@
+     inline ggml_tensor* wan_sage_cross(GGMLRunnerContext* ctx, int64_t heads, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
+                                        ggml_tensor* image_k = nullptr, ggml_tensor* image_v = nullptr) {
+         const int64_t d = q->ne[0] / heads;
+-        if (q->ne[2] != 1 || (d != 64 && d != 128) || (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) ||
+-            !sd_backend_is(ctx->backend, "CUDA")) wan_sage_unavailable();
++        const char* reason =
++            !sd_backend_is(ctx->backend, "CUDA") ? "cross-attention requires CUDA" :
++            q->ne[2] != 1 ? "cross-attention requires a single batch" :
++            (d != 64 && d != 128) ? "unsupported cross-attention head dimension" :
++            (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) ? "custom cross-attention scale unsupported" : nullptr;
++        if (reason) wan_sage_unavailable(ctx, reason, q, k, v);
+         auto split = [&](ggml_tensor* t) { return ggml_reshape_4d(ctx->ggml_ctx, t, d, heads, t->ne[1], 1); };
+         return attention_by_head(ctx, split(q), split(k), split(v), nullptr, wan_head_group(d, q->ne[1]), true,
+                                  image_k ? split(image_k) : nullptr, image_v ? split(image_v) : nullptr);
+--- a/src/core/cuda/sage_attention.cu
++++ b/src/core/cuda/sage_attention.cu
+@@ -371,9 +371,12 @@
+         const auto* v = op->src[2];
+         if (q->ne[0] != 64 && q->ne[0] != 128)
+             return false;
++        // Q/K/V are [D, sequence, heads, batch]; the result is [D, heads, sequence, batch].
++        // CUDA's y-grid spans input head/batch groups. The result copy uses a linear x-grid.
++        if (q->ne[2] * q->ne[3] > 65535 || k->ne[2] * k->ne[3] > 65535)
++            return false;
+         for (const auto* t : {q, k, v, op}) {
+-            if (ggml_nelements(t) > INT_MAX || t->ne[2] * t->ne[3] > 65535 ||
+-                (reinterpret_cast<uintptr_t>(t->data) & 15))
++            if (ggml_nelements(t) > INT_MAX || (reinterpret_cast<uintptr_t>(t->data) & 15))
+                 return false;
+         }
+         return k->ne[0] * GGML_PAD(k->ne[1], 64) * k->ne[2] * k->ne[3] <= INT_MAX;
