@@ -129,6 +129,42 @@ func TestWanVideoCPUFallbackRequiresOptIn(t *testing.T) {
 	}
 }
 
+func TestWanVideoRetriesUnsupportedAttentionOnCUDA(t *testing.T) {
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	config := Config{RunnerPath: exe, WorkDir: filepath.Join(dir, "work"), ModelsDir: filepath.Join(dir, "models"), OutputDir: filepath.Join(dir, "outputs")}
+	engine, err := NewEngine(config)
+	require.NoError(t, err)
+	defer engine.Close()
+	p := testProfile(t, dir)
+	p.ModelID, p.Sampler, p.Scheduler, p.Sigmas = WanRapidT2V, "euler_a", "beta", ""
+	p.OffloadToCPU = false // Attention recovery is independent of memory retries.
+	fixture, err := filepath.Abs(filepath.Join("testdata", "wan-five-frames.webm"))
+	require.NoError(t, err)
+	attemptFile := filepath.Join(dir, "attempts.jsonl")
+	t.Setenv("WILDIMAGE_FAKE_CHILD", "wan-attention-fallback")
+	t.Setenv("WILDIMAGE_FAKE_WEBM", fixture)
+	t.Setenv("WILDIMAGE_FAKE_ATTEMPTS", attemptFile)
+	video := &VideoOptions{Frames: 5, FPS: 16, AttentionBackend: WanAttentionSageFP8}
+	r := Request{Prompt: "literal --prompt ; &", Seed: 1234, OutputPath: filepath.Join(config.OutputDir, "clip.webm"), Video: video}
+	var notice string
+	result, err := engine.Run(t.Context(), p, r, func(progress Progress) {
+		if progress.Phase == "attention_fallback" {
+			notice = progress.Message
+		}
+	})
+	require.NoError(t, err)
+	require.Contains(t, notice, "CuTe")
+	require.Equal(t, WanAttentionSageFP8, video.AttentionBackend)
+	require.Equal(t, WanAttentionCuTe, result.VideoAttentionUsed)
+	require.NoError(t, checkWebM(result.Path, 5, 64, 64))
+	attempts := imageAttempts(t, attemptFile)
+	require.Len(t, attempts, 2)
+	require.Equal(t, attempts[0], attempts[1], "only the attention environment should change")
+	require.Equal(t, "1234", imageArgument(t, attempts[1], "--seed"))
+}
+
 func TestWanVideoAttentionTracksExecution(t *testing.T) {
 	var w wanProgress
 	w.observe("selected sage_fp8", 4)

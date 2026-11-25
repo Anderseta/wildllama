@@ -153,6 +153,20 @@ func fakeChild(mode string) {
 		fmt.Fprintln(os.Stderr, "managed RAM budget exhausted")
 		os.Exit(RAMBudgetExitCode)
 	}
+	if mode == "wan-attention-fallback" {
+		if os.Getenv("WILDLLAMA_WAN_ATTENTION") == WanAttentionSageFP8 {
+			os.Exit(wanAttentionUnsupportedExit)
+		}
+		if values["--backend"] != "cuda0" {
+			os.Exit(8)
+		}
+		video, err := os.ReadFile(os.Getenv("WILDIMAGE_FAKE_WEBM"))
+		if err != nil || os.WriteFile(values["--output"], video, 0600) != nil {
+			os.Exit(4)
+		}
+		fmt.Fprintln(os.Stderr, "wildvideo attention cute")
+		return
+	}
 	if mode == "saved-video-oom" {
 		video, err := os.ReadFile(os.Getenv("WILDIMAGE_FAKE_WEBM"))
 		if err != nil || os.WriteFile(values["--output"], video, 0600) != nil {

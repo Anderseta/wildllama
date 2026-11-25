@@ -18,9 +18,10 @@ const (
 	MiniMaxH3RecipeID = "minimax-h3-image-q5-abliterated-12.5g"
 	MiniMaxH3Sigmas   = "1.0,0.9675236940383911,0.8875485062599182,0.75,0.5327739119529724,0.23200887441635132,0.0"
 	// Only the managed native runner emits this code for a retryable GPU failure.
-	GPUOutOfMemoryExitCode = 75
-	RAMBudgetExitCode      = 76
-	DefaultVRAMReserveMiB  = 256
+	GPUOutOfMemoryExitCode      = 75
+	RAMBudgetExitCode           = 76
+	wanAttentionUnsupportedExit = 77
+	DefaultVRAMReserveMiB       = 256
 )
 
 type Config struct {
