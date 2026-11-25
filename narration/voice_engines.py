@@ -25,6 +25,7 @@ class QwenVoice:
         self.model = load_model(Qwen3TTSModel, root / QWEN)
         self.root = root
         self.prompt = lru_cache(maxsize=4)(self._prompt)
+        self.saved_prompt = lru_cache(maxsize=1)(self._saved_prompt)
         self.vectors = {}
 
     def _prompt(self, reference, transcript, work, read_reference):
@@ -32,9 +33,32 @@ class QwenVoice:
         return self.model.create_voice_clone_prompt(ref_audio=samples, ref_text=transcript or None,
                                                    x_vector_only_mode=not transcript)
 
+    def save_voice(self, target, reference, transcript, work, read_reference):
+        from safetensors.torch import save_file
+        item, = self.prompt(reference, transcript, work, read_reference)
+        tensors = {"speaker": item.ref_spk_embedding.detach().cpu().contiguous()}
+        if item.icl_mode:
+            tensors["codes"] = item.ref_code.detach().cpu().contiguous()
+        save_file(tensors, str(target), metadata={"format": "wildllama-qwen-voice-v1", "model": QWEN,
+                  "mode": "icl" if item.icl_mode else "speaker", "text": item.ref_text or ""})
+
+    def _saved_prompt(self, file):
+        from safetensors import safe_open
+        from qwen_tts import VoiceClonePromptItem
+        with safe_open(str(file), framework="pt", device="cpu") as voice:
+            meta = voice.metadata() or {}
+            if (meta.get("format") != "wildllama-qwen-voice-v1" or meta.get("model") != QWEN
+                    or meta.get("mode") not in ("icl", "speaker")):
+                raise ValueError("A voz salva é incompatível com este Qwen.")
+            icl = meta["mode"] == "icl"
+            return [VoiceClonePromptItem(ref_spk_embedding=voice.get_tensor("speaker"),
+                    ref_code=voice.get_tensor("codes") if icl else None, x_vector_only_mode=not icl,
+                    icl_mode=icl, ref_text=meta["text"] if icl else None)]
+
     def speak(self, text, reference, transcript, settings, work, read_reference, on_blocks):
         import torch
-        prompt = self.prompt(reference, transcript, work, read_reference)
+        profile = settings.get("voiceProfile")
+        prompt = self.saved_prompt(profile) if profile else self.prompt(reference, transcript, work, read_reference)
         emotion, strength = settings.get("emotion"), settings.get("strength", 0)
         if emotion in EMOTIONS and strength > 0:
             if emotion not in self.vectors:

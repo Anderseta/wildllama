@@ -85,6 +85,8 @@ def synth(root, cfg, work, preview=False):
     engine = IndexVoice(root) if index else QwenVoice(root, load_model)
     for i, chunk in enumerate(chunks):
         settings = cfg.get("directions", {}).get(str(chunk["paragraph"]), cfg.get("directions", {}).get("default", {}))
+        if not index and cfg.get("voiceProfile") and not settings.get("reference"):
+            settings = {**settings, "voiceProfile": cfg["voiceProfile"]}
         reference = cfg["reference"] if index else settings.get("reference") or cfg["reference"]
         transcript = settings.get("transcript","") if settings.get("reference") else cfg.get("transcript","")
         pct = 8 + int(58 * i / len(chunks))
@@ -234,7 +236,7 @@ def save_json(path, data):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=["run", "synth", "align", "transcribe", "preview", "preview-remix"])
+    parser.add_argument("stage", choices=["run", "synth", "align", "transcribe", "preview", "preview-remix", "save-voice", "read"])
     parser.add_argument("job", type=Path)
     parser.add_argument("models", type=Path)
     parser.add_argument("runtime", type=Path)
@@ -248,6 +250,28 @@ def main():
         return
     cfg = json.loads((job / "request.json").read_text("utf-8-sig"))
     work = job / "working"
+    if opts.stage == "save-voice":
+        voice = QwenVoice(opts.models, load_model)
+        return voice.save_voice(job / "voice.safetensors", cfg["reference"], cfg.get("transcript", ""),
+                                job, read_reference)
+    if opts.stage == "read":
+        work.mkdir()
+        try:
+            synth(opts.models, cfg, work)
+            progress(90, "Montando o áudio da leitura")
+            with wave.open(str(job / "speech.wav"), "wb") as result:
+                result.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+                for i, chunk in enumerate(speech_plan(cfg)):
+                    part = work / f"{i}.wav"
+                    with wave.open(str(part), "rb") as src:
+                        while data := src.readframes(65536):
+                            result.writeframesraw(data)
+                    part.unlink()
+                    if chunk["paragraph_end"]:
+                        result.writeframesraw(bytes(2 * round(24000 * cfg.get("pauseMs", 350) / 1000)))
+            return
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
     if opts.stage == "preview-remix":
         source = job / "source.wav"
         with wave.open(str(source), "rb") as audio:
@@ -276,7 +300,7 @@ def main():
                                                "reference":Path(d.get("reference","")).name} for k,d in cfg.get("directions",{}).items()}, width=cfg["width"], height=cfg["height"],
                                speed=cfg["speed"], pitch=cfg["pitch"], body=cfg.get("body", 0),
                                brightness=cfg.get("brightness", 0), captions=cfg["captions"],
-                               reference=Path(cfg["reference"]).name, background=Path(cfg["background"]).name)))
+                               reference=cfg.get("voiceName") or Path(cfg["reference"]).name, background=Path(cfg["background"]).name)))
         progress(100, "Vídeo salvo")
     finally:
         shutil.rmtree(work, ignore_errors=True)
