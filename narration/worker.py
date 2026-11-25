@@ -1,6 +1,7 @@
 """Local Wildllama narration worker. Each neural stage owns its CUDA context."""
 import argparse
 import json
+import io
 import math
 import os
 from pathlib import Path
@@ -54,8 +55,14 @@ def read_reference(path, work):
 
 def voice_filter(cfg, rate):
     pitch = 2 ** (cfg["pitch"] / 12)
-    filters = [f"asetrate={round(rate * pitch)}", "aresample=24000",
-               f"atempo={cfg['speed'] / pitch:.8f}"]
+    tempo = cfg["speed"] / pitch
+    filters = [f"asetrate={round(rate * pitch)}", "aresample=24000"]
+    # Keep each time-stretch in the high-quality 0.5–2 range.
+    while tempo < 0.5 or tempo > 2:
+        step = 0.5 if tempo < 0.5 else 2
+        filters.append(f"atempo={step}")
+        tempo /= step
+    filters.append(f"atempo={tempo:.8f}")
     body, brightness = cfg.get("body", 0), cfg.get("brightness", 0)
     if body or brightness:
         filters.append("aformat=sample_fmts=fltp")
@@ -68,10 +75,30 @@ def voice_filter(cfg, rate):
     return ",".join(filters)
 
 
+def preview_filter(cfg, rate):
+    return voice_filter(cfg, rate) + ",atrim=duration=12,afade=t=out:st=11.94:d=0.06"
+
+
+def remix_stream():
+    """Remix the retained dry WAV through pipes, without loading a voice model."""
+    cfg = json.loads(sys.stdin.buffer.readline(512))
+    source = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
+    if len(source) > 2 * 1024 * 1024:
+        raise ValueError("Amostra de prévia inválida.")
+    with wave.open(io.BytesIO(source), "rb") as audio:
+        rate = audio.getframerate()
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "wav", "-i", "pipe:0",
+           "-af", preview_filter(cfg, rate), "-ac", "1", "-f", "s16le", "pipe:1"]
+    run = subprocess.run(cmd, input=source, capture_output=True, timeout=15)
+    if run.returncode or not run.stdout:
+        raise RuntimeError(run.stderr.decode("utf8", "replace")[-1200:] or "Prévia sem áudio.")
+    with wave.open(sys.stdout.buffer, "wb") as result:
+        result.setparams((1, 2, 24000, len(run.stdout)//2, "NONE", "not compressed"))
+        result.writeframes(run.stdout)
+
+
 def finish_audio(source, target, cfg, rate, preview=False):
-    filters = voice_filter(cfg, rate)
-    if preview:
-        filters += ",atrim=duration=12,afade=t=out:st=11.94:d=0.06"
+    filters = preview_filter(cfg, rate) if preview else voice_filter(cfg, rate)
     ff("-i", source, "-af", filters, "-ac", "1", "-c:a", "pcm_s16le", target)
 
 
@@ -92,15 +119,17 @@ def synth(root, cfg, work, preview=False):
         pct = 8 + int(58 * i / len(chunks))
         message = f"Narrando trecho {i+1} de {len(chunks)}"
         progress(pct, message)
-        audio, rate = engine.speak(chunk["spoken"], reference, transcript, settings, work, read_reference,
-                                   lambda n: progress(pct, f"{message} · {n} blocos de áudio"))
+        def report(fraction, detail):
+            progress(pct + int(52 * fraction / len(chunks)), f"{message} · {detail}")
+        audio, rate = engine.speak(chunk["spoken"], reference, transcript, settings, work, read_reference, report)
+        report(1, "aplicando os ajustes de voz")
         pcm = np.asarray(audio, dtype=np.float32).reshape(-1)
         if not pcm.size or not np.isfinite(pcm).all():
             raise RuntimeError("A síntese produziu áudio inválido.")
         if preview:
-            # Enough source audio for 12 s at the fastest supported playback rate (1.5x).
+            # Twelve seconds at up to 2x speed, plus filter latency.
             source = work / "source.wav"
-            sf.write(source, pcm[:rate * 20], rate)
+            sf.write(source, pcm[:rate * 26], rate)
             finish_audio(source, work / "preview.wav", cfg, rate, preview=True)
         else:
             sf.write(work / "segment.wav", pcm, rate)
@@ -251,9 +280,12 @@ def main():
     cfg = json.loads((job / "request.json").read_text("utf-8-sig"))
     work = job / "working"
     if opts.stage == "save-voice":
+        progress(8, "Carregando o Qwen3-TTS")
         voice = QwenVoice(opts.models, load_model)
-        return voice.save_voice(job / "voice.safetensors", cfg["reference"], cfg.get("transcript", ""),
-                                job, read_reference)
+        voice.save_voice(job / "voice.safetensors", cfg["reference"], cfg.get("transcript", ""),
+                         job, read_reference, progress)
+        progress(95, "Dados da voz preparados")
+        return
     if opts.stage == "read":
         work.mkdir()
         try:
@@ -308,8 +340,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if sys.argv[1:] == ["preview-pipe"]:
+            remix_stream()
+        else:
+            main()
     except Exception as error:
-        if not isinstance(error, subprocess.CalledProcessError):
+        if sys.argv[1:] != ["preview-pipe"] and not isinstance(error, subprocess.CalledProcessError):
             print("@failure " + str(error).replace("\n", " ")[:1500], flush=True)
         raise

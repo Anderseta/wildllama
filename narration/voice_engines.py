@@ -52,9 +52,14 @@ class QwenVoice:
         return self.model.create_voice_clone_prompt(ref_audio=samples, ref_text=transcript or None,
                                                    x_vector_only_mode=not transcript)
 
-    def save_voice(self, target, reference, transcript, work, read_reference):
+    def save_voice(self, target, reference, transcript, work, read_reference, progress):
         from safetensors.torch import save_file
-        item, = self.prompt(reference, transcript, work, read_reference)
+        progress(41, "Lendo e convertendo a amostra")
+        samples = read_reference(reference, work)
+        progress(58, "Extraindo a identidade e as características da voz")
+        item, = self.model.create_voice_clone_prompt(ref_audio=samples, ref_text=transcript or None,
+                                                     x_vector_only_mode=not transcript)
+        progress(84, "Gravando a voz preparada")
         tensors = {"speaker": item.ref_spk_embedding.detach().cpu().contiguous()}
         if item.icl_mode:
             tensors["codes"] = item.ref_code.detach().cpu().contiguous()
@@ -74,7 +79,7 @@ class QwenVoice:
                     ref_code=voice.get_tensor("codes") if icl else None, x_vector_only_mode=not icl,
                     icl_mode=icl, ref_text=meta["text"] if icl else None)]
 
-    def speak(self, text, reference, transcript, settings, work, read_reference, on_blocks):
+    def speak(self, text, reference, transcript, settings, work, read_reference, report):
         import torch
         profile = settings.get("voiceProfile")
         prompt = self.saved_prompt(profile) if profile else self.prompt(reference, transcript, work, read_reference)
@@ -93,7 +98,7 @@ class QwenVoice:
             nonlocal blocks
             blocks += 1
             if blocks % 24 == 0:
-                on_blocks(blocks)
+                report(blocks / (blocks + max(16, len(text.split()) * 5)), f"{blocks} blocos de áudio")
         hook = self.model.model.talker.register_forward_hook(count)
         try:
             audios, rate = self.model.generate_voice_clone(text=text, language="English", voice_clone_prompt=prompt)
@@ -123,7 +128,7 @@ class IndexVoice:
             self.references[path] = str(file)
         return self.references[path]
 
-    def speak(self, text, reference, transcript, settings, work, read_reference, on_blocks):
+    def speak(self, text, reference, transcript, settings, work, read_reference, report):
         import soundfile as sf
         base = self.wav(reference, work, read_reference)
         style = settings.get("reference")
@@ -137,5 +142,13 @@ class IndexVoice:
             vector[{"happy": 0, "angry": 1, "sad": 2}[emotion]] = 1.
             options = {"emo_vector": vector, "emo_alpha": strength}
         output = str(work / "index-output.wav")
-        self.model.infer(spk_audio_prompt=base, text=text, output_path=output, verbose=False, **options)
+        def on_progress(value, desc=""):
+            label = "preparando a interpretação" if value < 0.1 else (
+                "processando o texto" if value < 0.2 else "sintetizando a fala" if value < 0.9 else "finalizando o áudio")
+            report(float(value), label)
+        self.model.gr_progress = on_progress
+        try:
+            self.model.infer(spk_audio_prompt=base, text=text, output_path=output, verbose=False, **options)
+        finally:
+            self.model.gr_progress = None
         return sf.read(output, dtype="float32")
