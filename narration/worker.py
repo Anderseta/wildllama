@@ -55,7 +55,19 @@ def read_reference(path, _work):
     return samples, sr
 
 
-def voice_filter(cfg, rate):
+def volume_filters(cfg):
+    volume = cfg.get("volume", 100)
+    if type(volume) not in (float, int) or not 0 <= volume <= 300:
+        raise ValueError("Use um volume entre 0% e 300%.")
+    if volume == 100:
+        return []
+    filters = [f"volume={volume / 100:.8f}"]
+    if volume > 100:
+        filters.append("alimiter=limit=0.98:level=0:latency=1")
+    return filters
+
+
+def voice_filter(cfg, rate, *, apply_volume=True):
     pitch = 2 ** (cfg["pitch"] / 12)
     tempo = cfg["speed"] / pitch
     filters = [f"asetrate={round(rate * pitch)}", "aresample=24000"]
@@ -74,6 +86,8 @@ def voice_filter(cfg, rate):
             filters.append(f"treble=f=3200:g={brightness}")
         if max(body, brightness) > 0:
             filters.append("alimiter=limit=0.98:level=0:latency=1")
+    if apply_volume:
+        filters.extend(volume_filters(cfg))
     return ",".join(filters)
 
 
@@ -144,7 +158,7 @@ def synth(root, cfg, work, preview=False, engine=None, reading=None):
             dry = io.BytesIO()
             sf.write(dry, pcm, rate, format="WAV", subtype="PCM_16")
             proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "wav",
-                                   "-i", "pipe:0", "-af", voice_filter(cfg, rate), "-ac", "1",
+                                   "-i", "pipe:0", "-af", voice_filter(cfg, rate, apply_volume=reading is not None), "-ac", "1",
                                    "-f", "s16le", "pipe:1"], input=dry.getvalue(), capture_output=True)
             if proc.returncode or not proc.stdout:
                 raise RuntimeError(proc.stderr.decode("utf8", "replace")[-1200:] or "Leitura sem áudio.")
@@ -270,12 +284,15 @@ def render(cfg, work):
         # Repeat the scaled frame. Animated captions still render at each output timestamp.
         filt += ",loop=loop=-1:size=1:start=0,setpts=N"
     filt += ",ass=captions.ass"
+    # Align with audible speech even when the user mutes the finished video.
+    gain = volume_filters(cfg)
+    audio_args = ["-af", ",".join(gain)] if gain else []
     progress(83, "Montando o vídeo com legendas")
     high = 83
     for encoder in ("h264_nvenc", "libx264"):
         frames = 0
         args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *source, *audio_input(bg),
-                "-i", "speech.wav", "-map", "0:v:0", "-map", "1:a:0", "-vf", filt, "-t", f"{duration:.8f}",
+                "-i", "speech.wav", "-map", "0:v:0", "-map", "1:a:0", "-vf", filt, *audio_args, "-t", f"{duration:.8f}",
                 "-c:v", encoder, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
                 "-progress", "pipe:1", "video.mp4"]
         with (work / "ffmpeg.log").open("wb") as log, subprocess.Popen(args, cwd=work, stdout=subprocess.PIPE,
@@ -408,7 +425,7 @@ def main():
                                directions={k: {**{a:v for a,v in d.items() if a in ("emotion","strength")},
                                                "reference":Path(d.get("reference","")).name} for k,d in cfg.get("directions",{}).items()}, width=cfg["width"], height=cfg["height"],
                                speed=cfg["speed"], pitch=cfg["pitch"], body=cfg.get("body", 0),
-                               brightness=cfg.get("brightness", 0), captions=cfg["captions"],
+                               brightness=cfg.get("brightness", 0), volume=cfg.get("volume", 100), captions=cfg["captions"],
                                reference=cfg.get("voiceName") or Path(cfg["reference"]).name, background=Path(cfg["background"]).name)))
         progress(100, "Vídeo salvo")
     finally:
