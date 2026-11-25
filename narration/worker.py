@@ -2,7 +2,6 @@
 import argparse
 import json
 import io
-import math
 import os
 from pathlib import Path
 import re
@@ -274,6 +273,7 @@ def render(cfg, work):
     progress(83, "Montando o vídeo com legendas")
     high = 83
     for encoder in ("h264_nvenc", "libx264"):
+        frames = 0
         args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *source, *audio_input(bg),
                 "-i", "speech.wav", "-map", "0:v:0", "-map", "1:a:0", "-vf", filt, "-t", f"{duration:.8f}",
                 "-c:v", encoder, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
@@ -281,7 +281,9 @@ def render(cfg, work):
         with (work / "ffmpeg.log").open("wb") as log, subprocess.Popen(args, cwd=work, stdout=subprocess.PIPE,
                                                                         stderr=log, text=True) as proc:
             for line in proc.stdout:
-                if line.startswith("out_time_us="):
+                if line.startswith("frame="):
+                    frames = int(line.partition("=")[2])
+                elif line.startswith("out_time_us="):
                     try:
                         current = min(97, 83 + int(14 * int(line.split("=")[1]) / 1e6 / duration))
                     except ValueError:
@@ -294,9 +296,11 @@ def render(cfg, work):
         if encoder == "libx264":
             raise RuntimeError((work / "ffmpeg.log").read_text("utf8", errors="replace")[-1500:])
     progress(98, "Salvando vídeo e miniatura")
-    ff("-ss", f"{math.floor(duration * fps / 2) / fps:.8f}", "-i", work / "video.mp4", "-frames:v", "1",
+    if frames < 1:
+        raise RuntimeError("O codificador não produziu quadros.")
+    ff("-ss", f"{(frames // 2) / fps:.8f}", "-i", work / "video.mp4", "-frames:v", "1",
        "-vf", "scale=320:-2", work / "poster.jpg")
-    return duration
+    return frames
 
 
 def save_json(path, data):
@@ -394,10 +398,10 @@ def main():
         for stage, env in stages:
             py = opts.runtime / env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
             subprocess.run([str(py), "-u", __file__, stage, str(job), str(opts.models), str(opts.runtime)], check=True)
-        duration = render(cfg, work)
+        frames = render(cfg, work)
         for name in ("video.mp4", "poster.jpg"):
             os.replace(work / name, job / name)
-        save_json(job / "record.json", dict(id=cfg["id"], created_at=cfg["created_at"], frames=math.ceil(duration * cfg["fps"]),
+        save_json(job / "record.json", dict(id=cfg["id"], created_at=cfg["created_at"], frames=frames,
                   fps=cfg["fps"], generation_seconds=round(time.monotonic()-start, 2), path=str(job.parent / cfg["id"] / "video.mp4"),
                   details=dict(prompt=cfg["text"], model=INDEX if cfg.get("engine") == "index" else QWEN, pause_ms=cfg.get("pauseMs",350),
                                pronunciations=cfg.get("pronunciations",[]),
