@@ -67,16 +67,33 @@ def volume_filters(cfg):
     return filters
 
 
-def voice_filter(cfg, rate, *, apply_volume=True):
+def voice_filter(cfg, rate, *, apply_volume=True, frames=None):
     pitch = 2 ** (cfg["pitch"] / 12)
     tempo = cfg["speed"] / pitch
-    filters = [f"asetrate={round(rate * pitch)}", "aresample=24000"]
-    # Keep each time-stretch in the high-quality 0.5–2 range.
-    while tempo < 0.5 or tempo > 2:
-        step = 0.5 if tempo < 0.5 else 2
-        filters.append(f"atempo={step}")
-        tempo /= step
-    filters.append(f"atempo={tempo:.8f}")
+    resonance = cfg.get("resonance", 0)
+    preserve = cfg.get("preserveFormants", False)
+    de_ess, compression = cfg.get("deEss", 0), cfg.get("compression", 0)
+    if (type(preserve) is not bool or any(type(v) not in (int, float) or not low <= v <= high
+            for v, low, high in ((resonance, -5, 5), (de_ess, 0, 100), (compression, 0, 100)))):
+        raise ValueError("Ajustes de timbre inválidos.")
+    if resonance or (preserve and pitch != 1):
+        # Resampling shifts the spectral envelope. Rubber Band then sets the requested
+        # pitch and tempo independently, preserving that new envelope.
+        shift = 2 ** (resonance / 12) * (1 if preserve else pitch)
+        source_rate = round(rate * shift)
+        shift = source_rate / rate
+        filters = ["apad=pad_dur=0.25", f"asetrate={source_rate}", "aresample=24000",
+                   f"rubberband=pitch={pitch/shift:.8f}:tempo={cfg['speed']/shift:.8f}:formant=preserved:pitchq=quality"]
+        if frames is not None:
+            length = max(1, round(frames * 24000 / (rate * cfg["speed"])))
+            filters.extend([f"apad=whole_len={length}", f"atrim=end_sample={length}"])
+    else:
+        filters = [f"asetrate={round(rate * pitch)}", "aresample=24000"]
+        while tempo < 0.5 or tempo > 2:
+            step = 0.5 if tempo < 0.5 else 2
+            filters.append(f"atempo={step}")
+            tempo /= step
+        filters.append(f"atempo={tempo:.8f}")
     body, brightness = cfg.get("body", 0), cfg.get("brightness", 0)
     if body or brightness:
         filters.append("aformat=sample_fmts=fltp")
@@ -84,15 +101,20 @@ def voice_filter(cfg, rate, *, apply_volume=True):
             filters.append(f"bass=f=300:g={body}")
         if brightness:
             filters.append(f"treble=f=3200:g={brightness}")
-        if max(body, brightness) > 0:
-            filters.append("alimiter=limit=0.98:level=0:latency=1")
+    if de_ess:
+        filters.append(f"deesser=i={de_ess * .007:.5f}:m=0.5:s=o")
+    if compression:
+        filters.append(f"acompressor=threshold=0.16:ratio={1 + compression * .035:.5f}"
+                       f":attack=12:release=140:makeup={1 + compression * .0035:.5f}")
+    if max(body, brightness) > 0 or compression or resonance or (preserve and pitch != 1):
+        filters.append("alimiter=limit=0.98:level=0:latency=1")
     if apply_volume:
         filters.extend(volume_filters(cfg))
     return ",".join(filters)
 
 
-def preview_filter(cfg, rate):
-    return voice_filter(cfg, rate) + ",atrim=duration=12,afade=t=out:st=11.94:d=0.06"
+def preview_filter(cfg, rate, frames):
+    return voice_filter(cfg, rate, frames=frames) + ",atrim=duration=12,afade=t=out:st=11.94:d=0.06"
 
 
 def remix_stream():
@@ -102,9 +124,9 @@ def remix_stream():
     if len(source) > 2 * 1024 * 1024:
         raise ValueError("Amostra de prévia inválida.")
     with wave.open(io.BytesIO(source), "rb") as audio:
-        rate = audio.getframerate()
+        rate, frames = audio.getframerate(), audio.getnframes()
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "wav", "-i", "pipe:0",
-           "-af", preview_filter(cfg, rate), "-ac", "1", "-f", "s16le", "pipe:1"]
+           "-af", preview_filter(cfg, rate, frames), "-ac", "1", "-f", "s16le", "pipe:1"]
     run = subprocess.run(cmd, input=source, capture_output=True, timeout=15)
     if run.returncode or not run.stdout:
         raise RuntimeError(run.stderr.decode("utf8", "replace")[-1200:] or "Prévia sem áudio.")
@@ -114,7 +136,9 @@ def remix_stream():
 
 
 def finish_audio(source, target, cfg, rate, preview=False):
-    filters = preview_filter(cfg, rate) if preview else voice_filter(cfg, rate)
+    with wave.open(str(source), "rb") as audio:
+        frames = audio.getnframes()
+    filters = preview_filter(cfg, rate, frames) if preview else voice_filter(cfg, rate, frames=frames)
     ff("-i", source, "-af", filters, "-ac", "1", "-c:a", "pcm_s16le", target)
 
 
@@ -158,7 +182,7 @@ def synth(root, cfg, work, preview=False, engine=None, reading=None):
             dry = io.BytesIO()
             sf.write(dry, pcm, rate, format="WAV", subtype="PCM_16")
             proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "wav",
-                                   "-i", "pipe:0", "-af", voice_filter(cfg, rate, apply_volume=reading is not None), "-ac", "1",
+                                   "-i", "pipe:0", "-af", voice_filter(cfg, rate, apply_volume=reading is not None, frames=len(pcm)), "-ac", "1",
                                    "-f", "s16le", "pipe:1"], input=dry.getvalue(), capture_output=True)
             if proc.returncode or not proc.stdout:
                 raise RuntimeError(proc.stderr.decode("utf8", "replace")[-1200:] or "Leitura sem áudio.")
@@ -425,7 +449,9 @@ def main():
                                directions={k: {**{a:v for a,v in d.items() if a in ("emotion","strength")},
                                                "reference":Path(d.get("reference","")).name} for k,d in cfg.get("directions",{}).items()}, width=cfg["width"], height=cfg["height"],
                                speed=cfg["speed"], pitch=cfg["pitch"], body=cfg.get("body", 0),
-                               brightness=cfg.get("brightness", 0), volume=cfg.get("volume", 100), captions=cfg["captions"],
+                               brightness=cfg.get("brightness", 0), volume=cfg.get("volume", 100),
+                               resonance=cfg.get("resonance", 0), preserveFormants=cfg.get("preserveFormants", False),
+                               deEss=cfg.get("deEss", 0), compression=cfg.get("compression", 0), captions=cfg["captions"],
                                reference=cfg.get("voiceName") or Path(cfg["reference"]).name, background=Path(cfg["background"]).name)))
         progress(100, "Vídeo salvo")
     finally:

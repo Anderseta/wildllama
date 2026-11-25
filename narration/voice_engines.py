@@ -7,6 +7,7 @@ QWEN = "Qwen3-TTS-12Hz-1.7B-Base"
 INDEX = "IndexTTS-2"
 ASR = "Qwen3-ASR-0.6B"
 EMOTIONS = {"happy": 1.5, "sad": 2.5, "angry": 2.5}
+INDEX_EMOTIONS = ("happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm")
 
 
 def transcribe(root, reference, work, read_reference, load_model, progress):
@@ -145,9 +146,8 @@ class IndexVoice:
         options = {}
         if style:
             options = {"emo_audio_prompt": self.wav(style, work, read_reference), "emo_alpha": strength}
-        elif emotion in EMOTIONS and strength > 0:
-            vector = [0.] * 8
-            vector[{"happy": 0, "angry": 1, "sad": 2}[emotion]] = 1.
+        elif emotion in INDEX_EMOTIONS and strength > 0:
+            vector = [float(label == emotion) for label in INDEX_EMOTIONS]
             options = {"emo_vector": vector, "emo_alpha": strength}
         output = str(work / "index-output.wav")
         def on_progress(value, desc=""):
