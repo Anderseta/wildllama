@@ -11,7 +11,7 @@ import sys
 import time
 import wave
 
-from speech_plan import speech_plan, caption_times
+from speech_plan import speech_plan, caption_times, preview_chunk
 from voice_engines import QWEN, INDEX, QwenVoice, IndexVoice, transcribe
 
 ALIGN = "Qwen3-ForcedAligner-0.6B"
@@ -52,14 +52,37 @@ def read_reference(path, work):
     return samples, sr
 
 
-def synth(root, cfg, work):
+def voice_filter(cfg, rate):
+    pitch = 2 ** (cfg["pitch"] / 12)
+    filters = [f"asetrate={round(rate * pitch)}", "aresample=24000",
+               f"atempo={cfg['speed'] / pitch:.8f}"]
+    body, brightness = cfg.get("body", 0), cfg.get("brightness", 0)
+    if body or brightness:
+        filters.append("aformat=sample_fmts=fltp")
+        if body:
+            filters.append(f"bass=f=300:g={body}")
+        if brightness:
+            filters.append(f"treble=f=3200:g={brightness}")
+        if max(body, brightness) > 0:
+            filters.append("alimiter=limit=0.98:level=0:latency=1")
+    return ",".join(filters)
+
+
+def finish_audio(source, target, cfg, rate, preview=False):
+    filters = voice_filter(cfg, rate)
+    if preview:
+        filters += ",atrim=duration=12,afade=t=out:st=11.94:d=0.06"
+    ff("-i", source, "-af", filters, "-ac", "1", "-c:a", "pcm_s16le", target)
+
+
+def synth(root, cfg, work, preview=False):
     progress(1, "Iniciando o motor de voz")
     import numpy as np
     import soundfile as sf
     index = cfg.get("engine") == "index"
     progress(2, "Carregando " + (INDEX if index else QWEN))
+    chunks = [preview_chunk(cfg)] if preview else speech_plan(cfg)
     engine = IndexVoice(root) if index else QwenVoice(root, load_model)
-    chunks = speech_plan(cfg)
     for i, chunk in enumerate(chunks):
         settings = cfg.get("directions", {}).get(str(chunk["paragraph"]), cfg.get("directions", {}).get("default", {}))
         reference = cfg["reference"] if index else settings.get("reference") or cfg["reference"]
@@ -72,12 +95,16 @@ def synth(root, cfg, work):
         pcm = np.asarray(audio, dtype=np.float32).reshape(-1)
         if not pcm.size or not np.isfinite(pcm).all():
             raise RuntimeError("A síntese produziu áudio inválido.")
-        sf.write(work / "segment.wav", pcm, rate)
-        pitch = 2 ** (cfg["pitch"] / 12)
-        ff("-i", work / "segment.wav", "-af",
-           f"asetrate={round(rate * pitch)},aresample=24000,atempo={cfg['speed'] / pitch:.8f}",
-           "-ac", "1", "-c:a", "pcm_s16le", work / f"{i}.wav")
-    (work / "segment.wav").unlink()
+        if preview:
+            # Enough source audio for 12 s at the fastest supported playback rate (1.5x).
+            source = work / "source.wav"
+            sf.write(source, pcm[:rate * 20], rate)
+            finish_audio(source, work / "preview.wav", cfg, rate, preview=True)
+        else:
+            sf.write(work / "segment.wav", pcm, rate)
+            finish_audio(work / "segment.wav", work / f"{i}.wav", cfg, rate)
+    if not preview:
+        (work / "segment.wav").unlink()
     progress(66, "Narração pronta")
 
 
@@ -207,7 +234,7 @@ def save_json(path, data):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=["run", "synth", "align", "transcribe"])
+    parser.add_argument("stage", choices=["run", "synth", "align", "transcribe", "preview", "preview-remix"])
     parser.add_argument("job", type=Path)
     parser.add_argument("models", type=Path)
     parser.add_argument("runtime", type=Path)
@@ -221,6 +248,13 @@ def main():
         return
     cfg = json.loads((job / "request.json").read_text("utf-8-sig"))
     work = job / "working"
+    if opts.stage == "preview-remix":
+        source = job / "source.wav"
+        with wave.open(str(source), "rb") as audio:
+            rate = audio.getframerate()
+        return finish_audio(source, job / "preview.wav", cfg, rate, preview=True)
+    if opts.stage == "preview":
+        return synth(opts.models, cfg, job, preview=True)
     if opts.stage == "synth":
         return synth(opts.models, cfg, work)
     if opts.stage == "align":
@@ -240,7 +274,8 @@ def main():
                                pronunciations=cfg.get("pronunciations",[]),
                                directions={k: {**{a:v for a,v in d.items() if a in ("emotion","strength")},
                                                "reference":Path(d.get("reference","")).name} for k,d in cfg.get("directions",{}).items()}, width=cfg["width"], height=cfg["height"],
-                               speed=cfg["speed"], pitch=cfg["pitch"], captions=cfg["captions"],
+                               speed=cfg["speed"], pitch=cfg["pitch"], body=cfg.get("body", 0),
+                               brightness=cfg.get("brightness", 0), captions=cfg["captions"],
                                reference=Path(cfg["reference"]).name, background=Path(cfg["background"]).name)))
         progress(100, "Vídeo salvo")
     finally:

@@ -57,6 +57,22 @@ def speech_plan(cfg, limit=340):
     return chunks
 
 
+def preview_chunk(cfg):
+    """Take one short passage, keeping its original paragraph's voice direction."""
+    paragraph = cfg.get("previewParagraph", 0)
+    paragraphs = [p for p in re.split(r"\r?\n+", cfg["text"]) if p.strip()]
+    if type(paragraph) is not int or not 0 <= paragraph < len(paragraphs):
+        raise ValueError("Escolha um parágrafo do roteiro para ouvir.")
+    chunk = speech_plan({**cfg, "text": paragraphs[paragraph]}, limit=150)[0]
+    words = []
+    for _, spoken in chunk["units"]:
+        words.extend(spoken.split()[:24 - len(words)])
+        token = spoken.rstrip("\"'”’)")
+        if len(words) >= 24 or (token.endswith((".", "!", "?", "…")) and token.lower() not in ABBREVIATIONS):
+            break
+    return {**chunk, "paragraph": paragraph, "spoken": " ".join(words), "paragraph_end": False}
+
+
 def caption_times(units, marks, duration, offset):
     """Associate spoken spans with their original labels, including one-to-many aliases."""
     def weight(s):
