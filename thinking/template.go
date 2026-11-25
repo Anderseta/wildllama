@@ -11,6 +11,10 @@ import (
 // templates that strip prior tagged reasoning; templates using a separate
 // reasoning_content field are not treated as tagged-thinking templates.
 func TemplateSupportsThinking(chatTemplate string) bool {
+	if strings.Contains(chatTemplate, "<|content_thinking|>") && strings.Contains(chatTemplate, "message.reasoning_content") &&
+		strings.Contains(chatTemplate, "<|end_message|>") {
+		return true
+	}
 	if strings.Contains(chatTemplate, "<think>") && strings.Contains(chatTemplate, "</think>") {
 		return true
 	}

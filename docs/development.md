@@ -162,6 +162,27 @@ Additional prerequisites:
 > [!IMPORTANT]
 > Ensure prerequisites are in `PATH` before running CMake.
 
+## Inkling 2 Mini (optional)
+
+GGUFs declaring `inkling2_loop` use an architecture-specific llama.cpp engine
+beside the primary runner, in `lib/ollama/inkling2/`. Selection uses model
+metadata, including for renamed models. Keep the engine's GGML libraries in
+that directory. The CUDA 13.5 dependencies can be shared with the main install.
+
+On Windows x64 with CUDA 13, install the pinned, checksum-verified release:
+
+```powershell
+./scripts/install-inkling-engine.ps1 -InstallRoot F:/WildLlama
+```
+
+For a matching CPU, Metal or Linux build, install the server and its backend
+libraries from [llama.cpp b12728](https://github.com/ggml-org/llama.cpp/releases/tag/b12728)
+into the same directory relative to the primary runner. The verified Windows
+path supports text, native chat tools and the external BF16 vision projector.
+The engine accounts for the vision graph during GPU fitting. Leave the custom
+WildLlama MoE SSD weight budget unset for this engine. An explicit positive
+budget prevents loading because upstream cannot enforce it.
+
 ## MLX Engine (Optional)
 
 The MLX engine enables running safetensor based models. On macOS arm64, MLX is enabled by default. On other platforms, MLX backends are selected with `OLLAMA_MLX_BACKENDS`.

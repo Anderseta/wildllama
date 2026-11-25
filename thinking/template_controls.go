@@ -36,6 +36,14 @@ func TemplateControls(source string) *model.Thinking {
 	if !TemplateSupportsThinking(source) {
 		return nil
 	}
+	// Inkling encodes effort in a dedicated message using its published
+	// numeric lookup table. The minimum is an effort level, not a true off switch.
+	if strings.Contains(source, `set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99}`) &&
+		strings.Contains(source, "reasoning_effort is not none else 0.9") &&
+		strings.Contains(source, "set num = effort_map[key]") &&
+		strings.Contains(source, "<|message_system|><|content_text|>Thinking effort level:") {
+		return &model.Thinking{Values: []any{"none", "minimal", "low", "medium", "high", "xhigh", "max"}, Default: "high"}
+	}
 	statements := jinjaStatement.FindAllStringSubmatch(source, -1)
 	toggle := false
 	for _, statement := range statements {

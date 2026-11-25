@@ -9,6 +9,20 @@ import (
 	"github.com/ollama/ollama/types/model"
 )
 
+func TestInklingEffortControls(t *testing.T) {
+	source := `{%- set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}
+{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}
+{%- set num = effort_map[key] -%}{{ "<|message_system|><|content_text|>Thinking effort level:" ~ num }}
+{{ "<|content_thinking|>" ~ message.reasoning_content ~ "<|end_message|>" }}`
+	controls := TemplateControls(source)
+	if !controls.Valid() || controls.Default != "high" || !controls.Supports("xhigh") || !controls.Supports("none") || controls.Supports(false) {
+		t.Fatalf("unexpected Inkling effort controls: %#v", controls)
+	}
+	if TemplateControls(strings.ReplaceAll(source, "set num = effort_map[key]", "set num = 0.9")) != nil {
+		t.Fatal("advertised effort on a fixed-effort template")
+	}
+}
+
 func TestTemplateControlsPublishedQwenTemplates(t *testing.T) {
 	for _, tc := range []struct {
 		file string

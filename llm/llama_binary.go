@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,22 @@ import (
 
 	"github.com/ollama/ollama/ml"
 )
+
+const inkling2Architecture = "inkling2_loop"
+
+func (launch llamaServerLaunchConfig) nativeExecutable() (string, error) {
+	primary, err := FindLlamaServer()
+	if err != nil || launch.modelArch != inkling2Architecture {
+		return primary, err
+	}
+	// The main patched engine predates looped Inkling. Its GGML ABI is
+	// different; the optional engine has its own executable and libraries.
+	exe := filepath.Join(filepath.Dir(primary), "inkling2", filepath.Base(primary))
+	if info, err := os.Stat(exe); err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("Inkling 2 engine missing at %s (see docs/development.md)", exe)
+	}
+	return exe, nil
+}
 
 type llamaCppBinarySearch struct {
 	libOllamaPath string

@@ -393,7 +393,7 @@ func FindLlamaServer() (string, error) {
 
 // startLlamaServer spawns the upstream llama-server process with appropriate CLI flags.
 func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.Cmd, port int, err error) {
-	exe, err := FindLlamaServer()
+	exe, err := launch.nativeExecutable()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -429,9 +429,17 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	} else {
 		params = append(params, "-np", strconv.Itoa(launch.numParallel))
 	}
-	params, err = appendMoeRAMLimitArgs(params, launch.opts, launch.modelExperts)
+	moeArgs, err := appendMoeRAMLimitArgs(nil, launch.opts, launch.modelExperts)
 	if err != nil {
 		return nil, 0, err
+	}
+	if launch.modelArch == inkling2Architecture {
+		// Upstream's runner cannot enforce the WildLlama SSD expert-weight limit.
+		if len(moeArgs) != 0 && moeArgs[1] != "0" {
+			return nil, 0, fmt.Errorf("Inkling's native runner cannot enforce moe_ram_limit_mib; clear the MoE weight limit in this model's profile")
+		}
+	} else {
+		params = append(params, moeArgs...)
 	}
 	params, err = appendRunnerWarmupArgs(params, launch.opts)
 	if err != nil {
@@ -453,8 +461,12 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	params = appendLoadModeArgs(params, launch.opts, launch.gpus)
 
 	// KV cache type
-	if launch.kvCacheType != "" {
-		params = append(params, "--cache-type-k", launch.kvCacheType, "--cache-type-v", launch.kvCacheType)
+	kType, vType := launch.cacheStorageTypes()
+	if kType != "" {
+		params = append(params, "--cache-type-k", kType)
+	}
+	if vType != "" {
+		params = append(params, "--cache-type-v", vType)
 	}
 
 	mode := "auto"
@@ -506,6 +518,11 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	}
 	cmd.SysProcAttr = LlamaServerSysProcAttr
 	childEnvs := cloneStringMap(launch.extraEnvsForStart())
+	if launch.modelArch == inkling2Architecture {
+		// CUDA runtime dependencies may be shared; ggml backend plugins must match
+		// the engine that loads them. Empty means native discovery beside the exe.
+		childEnvs["GGML_BACKEND_PATH"] = ""
+	}
 	if launch.handoff != nil {
 		childEnvs["WILDLLAMA_IMAGE_HANDOFF_AUTH"] = launch.handoff.auth
 	}
@@ -536,6 +553,29 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		return nil, 0, fmt.Errorf("assign llama-server to runner job: %w", err)
 	}
 	return cmd, port, nil
+}
+
+func (launch llamaServerLaunchConfig) cacheStorageTypes() (string, string) {
+	base := launch.kvCacheType
+	if launch.modelArch != inkling2Architecture {
+		return base, base
+	}
+	// This engine selects its storage at launch. The scheduler still budgets
+	// for Q8 and explicit K/V choices take precedence independently.
+	if base == "q8_0" && launch.opts.NumGPU != 0 && len(launch.gpus) == 1 &&
+		strings.EqualFold(launch.gpus[0].Library, "cuda") && launch.gpus[0].ComputeMajor == 12 &&
+		gpuNativeEnvironment(launch.opts, "WILDLLAMA_FP8_KV") != "0" &&
+		LlamaServerFlashAttentionForOptions(launch.gpus, launch.opts) == ml.FlashAttentionEnabled {
+		base = "f8_e4m3"
+	}
+	k, v := gpuNativeEnvironment(launch.opts, "LLAMA_ARG_CACHE_TYPE_K"), gpuNativeEnvironment(launch.opts, "LLAMA_ARG_CACHE_TYPE_V")
+	if k == "" {
+		k = base
+	}
+	if v == "" {
+		v = base
+	}
+	return k, v
 }
 
 // The backend checks the actual weight, cache and graph layouts for these SM120 kernels.
@@ -659,7 +699,7 @@ func llamaServerLibraryPaths(exe string, gpuLibs []string, envUpdates map[string
 		if dir == ml.LibOllamaPath || dir == llamaDir {
 			continue
 		}
-		if envUpdates["GGML_BACKEND_PATH"] == "" {
+		if _, specified := envUpdates["GGML_BACKEND_PATH"]; !specified {
 			if backend := findLlamaServerGPUBackend(dir); backend != "" {
 				envUpdates["GGML_BACKEND_PATH"] = backend
 			}
@@ -926,6 +966,11 @@ func (launch llamaServerLaunchConfig) extraEnvsForStart() map[string]string {
 }
 
 func (launch llamaServerLaunchConfig) mmprojFitTargetMiB() (uint64, bool) {
+	// Inkling's separate engine measures the projector graph and includes it
+	// in fit automatically. Padding twice can spill otherwise resident experts.
+	if launch.modelArch == inkling2Architecture {
+		return 0, false
+	}
 	if len(launch.projectors) == 0 || launch.mmprojMemory == 0 {
 		return 0, false
 	}
@@ -2825,6 +2870,13 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 		body["top_logprobs"] = max(req.TopLogprobs, 1)
 	}
 	if kwargs := llamaServerChatTemplateKwargs(req.Think); kwargs != nil {
+		if s.launch.modelArch == inkling2Architecture && req.Think.IsBool() {
+			if req.Think.Bool() {
+				kwargs["reasoning_effort"] = "high"
+			} else {
+				kwargs["reasoning_effort"] = "none"
+			}
+		}
 		body["chat_template_kwargs"] = kwargs
 	}
 	if format, err := llamaServerChatResponseFormat(req.Format); err != nil {

@@ -44,7 +44,7 @@ func newImageHandoff(launch llamaServerLaunchConfig, split bool) *imageHandoffCo
 		}
 		mib = n
 	}
-	exe, err := FindLlamaServer()
+	exe, err := launch.nativeExecutable()
 	if err != nil || !NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, handoffBudgetEnv) {
 		return nil
 	}
