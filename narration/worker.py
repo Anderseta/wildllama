@@ -248,8 +248,12 @@ def render(cfg, work):
     with wave.open(str(work / "speech.wav"), "rb") as audio:
         duration = audio.getnframes() / audio.getframerate()
     static = bg.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")
-    source = ["-loop", "1", "-framerate", str(fps)] if static else ["-stream_loop", "-1"]
-    filt = f"fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,ass=captions.ass"
+    source = ["-framerate", str(fps)] if static else ["-stream_loop", "-1"]
+    filt = f"fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    if static:
+        # Repeat the scaled frame. Animated captions still render at each output timestamp.
+        filt += ",loop=loop=-1:size=1:start=0,setpts=N"
+    filt += ",ass=captions.ass"
     progress(83, "Montando o vídeo com legendas")
     high = 83
     for encoder in ("h264_nvenc", "libx264"):
