@@ -1,6 +1,7 @@
 """Qwen voice prompts, expression vectors and optional IndexTTS2 synthesis."""
 from dataclasses import replace
 from functools import lru_cache
+from pathlib import Path
 
 QWEN = "Qwen3-TTS-12Hz-1.7B-Base"
 INDEX = "IndexTTS-2"
@@ -42,23 +43,28 @@ class QwenVoice:
     def __init__(self, root, load_model):
         from qwen_tts import Qwen3TTSModel
         self.model = load_model(Qwen3TTSModel, root / QWEN)
+        from qwen_codec import optimize_codec
+        optimize_codec(self.model.model.talker)
         self.root = root
         self.prompt = lru_cache(maxsize=4)(self._prompt)
         self.saved_prompt = lru_cache(maxsize=1)(self._saved_prompt)
         self.vectors = {}
 
-    def _prompt(self, reference, transcript, work, read_reference):
-        samples = read_reference(reference, work)
+    @staticmethod
+    def identity(file):
+        stat = Path(file).stat()
+        return file, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    def _prompt(self, identity, transcript, read_reference):
+        samples = read_reference(identity[0], None)
         return self.model.create_voice_clone_prompt(ref_audio=samples, ref_text=transcript or None,
                                                    x_vector_only_mode=not transcript)
 
     def save_voice(self, target, reference, transcript, work, read_reference, progress):
         from safetensors.torch import save_file
         progress(41, "Lendo e convertendo a amostra")
-        samples = read_reference(reference, work)
-        progress(58, "Extraindo a identidade e as características da voz")
-        item, = self.model.create_voice_clone_prompt(ref_audio=samples, ref_text=transcript or None,
-                                                     x_vector_only_mode=not transcript)
+        progress(58, "Preparando a identidade e as características da voz")
+        item, = self.prompt(self.identity(reference), transcript, read_reference)
         progress(84, "Gravando a voz preparada")
         tensors = {"speaker": item.ref_spk_embedding.detach().cpu().contiguous()}
         if item.icl_mode:
@@ -66,7 +72,8 @@ class QwenVoice:
         save_file(tensors, str(target), metadata={"format": "wildllama-qwen-voice-v1", "model": QWEN,
                   "mode": "icl" if item.icl_mode else "speaker", "text": item.ref_text or ""})
 
-    def _saved_prompt(self, file):
+    def _saved_prompt(self, identity):
+        file = identity[0]
         from safetensors import safe_open
         from qwen_tts import VoiceClonePromptItem
         with safe_open(str(file), framework="pt", device="cpu") as voice:
@@ -82,7 +89,7 @@ class QwenVoice:
     def speak(self, text, reference, transcript, settings, work, read_reference, report):
         import torch
         profile = settings.get("voiceProfile")
-        prompt = self.saved_prompt(profile) if profile else self.prompt(reference, transcript, work, read_reference)
+        prompt = self.saved_prompt(self.identity(profile)) if profile else self.prompt(self.identity(reference), transcript, read_reference)
         emotion, strength = settings.get("emotion"), settings.get("strength", 0)
         if emotion in EMOTIONS and strength > 0:
             if emotion not in self.vectors:
@@ -101,7 +108,8 @@ class QwenVoice:
                 report(blocks / (blocks + max(16, len(text.split()) * 5)), f"{blocks} blocos de áudio")
         hook = self.model.model.talker.register_forward_hook(count)
         try:
-            audios, rate = self.model.generate_voice_clone(text=text, language="English", voice_clone_prompt=prompt)
+            with torch.inference_mode():
+                audios, rate = self.model.generate_voice_clone(text=text, language="English", voice_clone_prompt=prompt)
             return audios[0], rate
         finally:
             hook.remove()

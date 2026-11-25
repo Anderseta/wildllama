@@ -1,4 +1,4 @@
-"""Local Wildllama narration worker. Each neural stage owns its CUDA context."""
+"""Local narration worker and session-scoped voice synthesis."""
 import argparse
 import json
 import io
@@ -42,12 +42,15 @@ def load_model(cls, directory):
                                local_files_only=True)
 
 
-def read_reference(path, work):
-    import soundfile as sf
-    ref = work / "reference.wav"
-    ff(*audio_input(path), "-vn", "-t", "61", "-ac", "1", "-ar", "24000", ref)
-    samples, sr = sf.read(ref, dtype="float32")
-    ref.unlink()
+def read_reference(path, _work):
+    import numpy as np
+    sr = 24000
+    proc = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *audio_input(path),
+                           "-vn", "-t", "61", "-ac", "1", "-ar", str(sr), "-f", "s16le", "pipe:1"],
+                          capture_output=True, timeout=60)
+    if proc.returncode:
+        raise ValueError(proc.stderr.decode("utf8", "replace")[-1200:])
+    samples = np.frombuffer(proc.stdout, dtype="<i2").astype(np.float32) / 32768
     if not sr <= len(samples) <= sr * 60:
         raise ValueError("Use uma amostra de voz de 1 a 60 segundos.")
     return samples, sr
@@ -102,14 +105,21 @@ def finish_audio(source, target, cfg, rate, preview=False):
     ff("-i", source, "-af", filters, "-ac", "1", "-c:a", "pcm_s16le", target)
 
 
-def synth(root, cfg, work, preview=False):
+def make_voice(root, index):
+    return IndexVoice(root) if index else QwenVoice(root, load_model)
+
+
+def synth(root, cfg, work, preview=False, engine=None, reading=None):
     progress(1, "Iniciando o motor de voz")
     import numpy as np
     import soundfile as sf
     index = cfg.get("engine") == "index"
-    progress(2, "Carregando " + (INDEX if index else QWEN))
+    progress(2, ("Reutilizando " if engine is not None else "Carregando ") + (INDEX if index else QWEN))
     chunks = [preview_chunk(cfg)] if preview else speech_plan(cfg)
-    engine = IndexVoice(root) if index else QwenVoice(root, load_model)
+    if engine is None:
+        engine = make_voice(root, index)
+    if index:
+        engine.references.clear()  # Normalized files live in the current job directory.
     for i, chunk in enumerate(chunks):
         settings = cfg.get("directions", {}).get(str(chunk["paragraph"]), cfg.get("directions", {}).get("default", {}))
         if not index and cfg.get("voiceProfile") and not settings.get("reference"):
@@ -132,10 +142,21 @@ def synth(root, cfg, work, preview=False):
             sf.write(source, pcm[:rate * 26], rate)
             finish_audio(source, work / "preview.wav", cfg, rate, preview=True)
         else:
-            sf.write(work / "segment.wav", pcm, rate)
-            finish_audio(work / "segment.wav", work / f"{i}.wav", cfg, rate)
-    if not preview:
-        (work / "segment.wav").unlink()
+            dry = io.BytesIO()
+            sf.write(dry, pcm, rate, format="WAV", subtype="PCM_16")
+            proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "wav",
+                                   "-i", "pipe:0", "-af", voice_filter(cfg, rate), "-ac", "1",
+                                   "-f", "s16le", "pipe:1"], input=dry.getvalue(), capture_output=True)
+            if proc.returncode or not proc.stdout:
+                raise RuntimeError(proc.stderr.decode("utf8", "replace")[-1200:] or "Leitura sem áudio.")
+            if reading is None:
+                with wave.open(str(work / f"{i}.wav"), "wb") as segment:
+                    segment.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+                    segment.writeframes(proc.stdout)
+            else:
+                reading.writeframesraw(proc.stdout)
+                if chunk["paragraph_end"]:
+                    reading.writeframesraw(bytes(2 * round(24000 * cfg.get("pauseMs", 350) / 1000)))
     progress(66, "Narração pronta")
 
 
@@ -263,12 +284,56 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
+def read_aloud(root, cfg, job, engine=None):
+    work = job / "working"
+    work.mkdir()
+    try:
+        with wave.open(str(job / "speech.wav"), "wb") as result:
+            result.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+            synth(root, cfg, work, engine=engine, reading=result)
+        progress(90, "Leitura pronta")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def voice_session(root, kind):
+    if kind not in ("tts", "index"):
+        raise ValueError("Motor de voz inválido.")
+    engine = None
+    # The parent owns stdin. An idle worker exits on EOF even if the app crashes.
+    for line in sys.stdin:
+        request = json.loads(line)
+        stage = request["stage"]
+        job = Path(request["dir"])
+        cfg = json.loads((job / "request.json").read_text("utf-8-sig"))
+        if (cfg.get("engine") == "index") != (kind == "index"):
+            raise ValueError("O motor carregado é diferente do solicitado.")
+        if engine is None:
+            progress(2, "Carregando " + (INDEX if kind == "index" else QWEN))
+            engine = make_voice(root, kind == "index")
+        if stage == "preview":
+            synth(root, cfg, job, preview=True, engine=engine)
+        elif stage == "read":
+            read_aloud(root, cfg, job, engine)
+        elif stage == "synth":
+            work = job / "working"
+            work.mkdir()
+            synth(root, cfg, work, engine=engine)
+        elif stage == "save-voice" and kind == "tts":
+            engine.save_voice(job / "voice.safetensors", cfg["reference"], cfg.get("transcript", ""),
+                              job, read_reference, progress)
+        else:
+            raise ValueError("Operação de voz inválida.")
+        print("@voice-done " + json.dumps({"device": str(engine.model.device)}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=["run", "synth", "align", "transcribe", "preview", "preview-remix", "save-voice", "read"])
+    parser.add_argument("stage", choices=["run", "synth", "align", "transcribe", "preview", "preview-remix", "save-voice", "read", "finish-video"])
     parser.add_argument("job", type=Path)
     parser.add_argument("models", type=Path)
     parser.add_argument("runtime", type=Path)
+    parser.add_argument("--elapsed", type=float, default=0)
     opts = parser.parse_args()
     job = opts.job.resolve()
     if opts.stage == "transcribe":
@@ -287,23 +352,7 @@ def main():
         progress(95, "Dados da voz preparados")
         return
     if opts.stage == "read":
-        work.mkdir()
-        try:
-            synth(opts.models, cfg, work)
-            progress(90, "Montando o áudio da leitura")
-            with wave.open(str(job / "speech.wav"), "wb") as result:
-                result.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
-                for i, chunk in enumerate(speech_plan(cfg)):
-                    part = work / f"{i}.wav"
-                    with wave.open(str(part), "rb") as src:
-                        while data := src.readframes(65536):
-                            result.writeframesraw(data)
-                    part.unlink()
-                    if chunk["paragraph_end"]:
-                        result.writeframesraw(bytes(2 * round(24000 * cfg.get("pauseMs", 350) / 1000)))
-            return
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
+        return read_aloud(opts.models, cfg, job)
     if opts.stage == "preview-remix":
         source = job / "source.wav"
         with wave.open(str(source), "rb") as audio:
@@ -315,10 +364,13 @@ def main():
         return synth(opts.models, cfg, work)
     if opts.stage == "align":
         return align(opts.models, cfg, work)
-    start = time.monotonic()
-    work.mkdir(exist_ok=False)
+    start = time.monotonic() - opts.elapsed
+    stages = [("align", "aligner")]
+    if opts.stage != "finish-video":
+        work.mkdir(exist_ok=False)
+        stages.insert(0, ("synth", "index" if cfg.get("engine") == "index" else "tts"))
     try:
-        for stage, env in (("synth", "index" if cfg.get("engine") == "index" else "tts"), ("align", "aligner")):
+        for stage, env in stages:
             py = opts.runtime / env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
             subprocess.run([str(py), "-u", __file__, stage, str(job), str(opts.models), str(opts.runtime)], check=True)
         duration = render(cfg, work)
@@ -342,6 +394,8 @@ if __name__ == "__main__":
     try:
         if sys.argv[1:] == ["preview-pipe"]:
             remix_stream()
+        elif len(sys.argv) == 4 and sys.argv[1] == "voice-session":
+            voice_session(Path(sys.argv[2]), sys.argv[3])
         else:
             main()
     except Exception as error:

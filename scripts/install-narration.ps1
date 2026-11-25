@@ -59,7 +59,7 @@ if ($WithIndexTTS) {
 & (Join-Path $runtime 'aligner/Scripts/python.exe') @assetArgs
 if ($LASTEXITCODE) {throw 'Falha ao instalar os recursos de narração.'}
 [void][IO.Directory]::CreateDirectory($library)
-foreach ($file in 'worker.py','voice_engines.py','speech_plan.py') {
+foreach ($file in 'worker.py','voice_engines.py','speech_plan.py','qwen_codec.py') {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "../narration/$file") -Destination (Join-Path $library $file)
 }
 Write-Output "Narração instalada. Modelos em $voice."
