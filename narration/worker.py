@@ -241,13 +241,30 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     (work / "captions.ass").write_text("".join(lines), encoding="utf-8-sig")
 
 
+def still_background(bg):
+    if bg.suffix.lower() != ".png":
+        return bg.suffix.lower() in (".jpg", ".jpeg", ".bmp")
+    # APNG declares its animation before the first IDAT. Skip metadata without decoding it.
+    with bg.open("rb") as stream:
+        if stream.read(8) != b"\x89PNG\r\n\x1a\n":
+            return False
+        while len(header := stream.read(8)) == 8:
+            kind = header[4:]
+            if kind == b"acTL":
+                return False
+            if kind == b"IDAT":
+                return True
+            stream.seek(int.from_bytes(header[:4], "big") + 4, 1)
+    return False
+
+
 def render(cfg, work):
     write_captions(work, cfg)
     bg = Path(cfg["background"])
     w, h, fps = cfg["width"], cfg["height"], cfg["fps"]
     with wave.open(str(work / "speech.wav"), "rb") as audio:
         duration = audio.getnframes() / audio.getframerate()
-    static = bg.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")
+    static = still_background(bg)
     source = ["-framerate", str(fps)] if static else ["-stream_loop", "-1"]
     filt = f"fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
     if static:
