@@ -25,7 +25,7 @@ def transcribe(root, reference, work, read_reference, load_model, progress):
         steps += 1
         if steps == 1 or steps % 8 == 0:
             percent = 66 + int(29 * steps / (steps + max(1, duration * 3)))
-            progress(percent, f"Reconhecendo a fala · {steps} passos de decodificação")
+            progress(percent, f"Reconhecendo a fala · passo {steps} de decodificação")
     hook = asr.model.thinker.register_forward_hook(decoded)
     try:
         result = asr.transcribe(audio=samples, language=None)
