@@ -156,6 +156,9 @@ two independent text and reference softmaxes and sums their outputs. Both use
 the same quantized queries and reuse one K/V workspace in stream order. The
 Sage FP8 kernel widens its FP16-rounded output to FP32 as it writes, so it can
 add the reference contribution without allocating a separate output tensor.
+On compatible CUDA graphs, the FP8 packer reads the projected values using their
+original strides and rounds to FP16 on load. This avoids a separate FP16 value
+tensor while preserving the existing rounding and FP8 output.
 Larger head groups are split to limit temporary projection storage. From
 16,384 key tokens, the
 key means and value scales share a tiled reduction in the existing key scratch
@@ -180,8 +183,9 @@ The Wildllama process environment also controls decode tiling and Windows read-a
   Spatial context changes at tile boundaries can change the decoded pixels.
 * Windows Wan video generation with weight tiering enabled uses bounded file
   read-ahead by default. One low-priority worker maps small windows of the next
-  segment's weights, up to 32 MiB per request, even when auto-fit selects buffered
-  reads. Physical memory, system commit and the host budget bound each request.
+  GPU segment's weights and submits up to eight ranges together, with up to 32 MiB
+  total per request, even when auto-fit selects buffered reads. Physical memory,
+  system commit and the host budget bound each request.
   Set `WILDLLAMA_WAN_FILE_HINT=0` to disable it. With timing diagnostics enabled
   the runner reports the first accepted hint.
 

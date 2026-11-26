@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -62,6 +63,43 @@ func (j *imageJob) dropVideoCheckpoint() error {
 		j.diskStep = 0
 	}
 	return nil
+}
+
+// Only the GPU worker loads saved steps, so queued or duplicate requests do not
+// allocate checkpoint RAM or hold up unrelated media operations.
+func (v *imageService) prepareVideoCheckpoint(job *imageJob) (*imagegen.VideoCheckpoint, error) {
+	v.mu.Lock()
+	if err := job.ctx.Err(); err != nil {
+		v.mu.Unlock()
+		return nil, err
+	}
+	if !job.isResume || job.diskStep <= job.checkpoint.Step() {
+		if job.checkpoint == nil {
+			job.checkpoint = &imagegen.VideoCheckpoint{}
+		}
+		checkpoint := job.checkpoint
+		v.mu.Unlock()
+		return checkpoint, nil
+	}
+	path, size, steps := job.videoCheckpointPath(), job.latentSize(), job.Generation.Profile.Steps
+	v.mu.Unlock()
+
+	loaded, loadErr := imagegen.LoadVideoCheckpoint(path, size, steps)
+	v.mu.Lock()
+	if err := job.ctx.Err(); err != nil {
+		v.mu.Unlock()
+		loaded.Close()
+		return nil, err
+	}
+	if loadErr != nil {
+		v.mu.Unlock()
+		return nil, fmt.Errorf("não foi possível carregar o passo salvo para retomar o vídeo: %w", loadErr)
+	}
+	previous := job.checkpoint
+	job.checkpoint = loaded
+	v.mu.Unlock()
+	previous.Close()
+	return loaded, nil
 }
 
 // Called exclusively on shutdown, after all workers have joined. A checkpoint
@@ -131,14 +169,6 @@ func (s *Server) videoResumeHandler(c *gin.Context) {
 			return
 		}
 		next := *job
-		if next.checkpoint.Step() == 0 || next.diskStep > next.checkpoint.Step() {
-			loaded, err := imagegen.LoadVideoCheckpoint(job.videoCheckpointPath(), job.latentSize(), job.Generation.Profile.Steps)
-			if err != nil {
-				c.JSON(409, gin.H{"error": err.Error()})
-				return
-			}
-			next.checkpoint = loaded
-		}
 		next.Config = cloneImageConfig(v.config)
 		next.Config.WorkDir = job.VideoWorkDir
 		next.Config.OutputDir = filepath.Join(next.Config.OutputDir, "videos")
@@ -161,9 +191,6 @@ func (s *Server) videoResumeHandler(c *gin.Context) {
 		if err := v.persistJobsLocked(); err != nil {
 			next.cancel()
 			v.jobs[i] = job
-			if next.checkpoint != job.checkpoint {
-				next.checkpoint.Close()
-			}
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}

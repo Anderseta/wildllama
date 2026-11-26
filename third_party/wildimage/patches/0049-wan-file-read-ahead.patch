@@ -1,0 +1,77 @@
+--- a/src/core/segment_weight_pipeline.cpp
++++ b/src/core/segment_weight_pipeline.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <utility>
+ 
++#include "core/ggml_extend_backend.h"
+ #include "core/ggml_graph_cut.h"
+ #include "device_residency_manager.h"
+ #include "core/wildimage_ram_budget.h"
+@@ -119,13 +120,14 @@
+ #ifdef _WIN32
+             const auto* value = std::getenv("WILDLLAMA_WAN_FILE_HINT");
+             if (value) return std::strcmp(value, "1") == 0;
+             return std::getenv("WILDLLAMA_VIDEO_PROGRESS") != nullptr &&
+                    std::getenv("WILDLLAMA_WAN_WEIGHT_CACHE") != nullptr;
+ #else
+             return false;
+ #endif
+         }();
+-        if (hint_files && opportunistic_only_ && manager->prefetch_enabled()) {
++        if (hint_files && opportunistic_only_ && manager->prefetch_enabled() &&
++            compute_backend_ && !sd_backend_is_cpu(compute_backend_)) {
+             const auto next = next_parameter_segment(segment_index);
+             if (next != SIZE_MAX) {
+                 try {
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1,6 +1,7 @@
+ #include "model_manager.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstdint>
+ #include <iterator>
+ #include <fstream>
+@@ -2185,9 +2186,12 @@
+             if (!alignment) return;
+             const auto size = static_cast<size_t>(file_size.QuadPart);
+             std::sort(spans.begin(), spans.end());
+-            size_t previous_end = 0, accepted = 0, windows = 0;
++            // One hint lets Windows overlap reads for disjoint ranges. The total
++            // mapped/read-ahead window remains limited by the caller's budget.
++            std::array<Range, 8> ranges{};
++            size_t previous_end = 0, requested = 0, windows = 0;
+             for (const auto& span : spans) {
+-                if (!left || windows == 8) break;
++                if (!left || windows == ranges.size()) break;
+                 if (span.first >= size) continue;
+                 const auto end = span.first + std::min(span.second, size - span.first);
+                 if (end <= previous_end) continue;
+@@ -2198,19 +2202,17 @@
+                 auto* view = MapViewOfFile(mapping.get(), FILE_MAP_READ, DWORD(uint64_t(offset) >> 32),
+                                            DWORD(offset), length);
+                 if (!view) break;
+-                Range range{view, length};
+-                const bool ok = hint(GetCurrentProcess(), 1, &range, 0);
+-                UnmapViewOfFile(view);
+-                if (!ok) break;
+-                accepted += length;
++                ranges[windows++] = {view, length};
++                requested += length;
+                 left -= length;
+                 previous_end = offset + length;
+-                ++windows;
+-            }
++            }
++            const bool accepted = windows && hint(GetCurrentProcess(), windows, ranges.data(), 0);
++            for (size_t i = 0; i < windows; ++i) UnmapViewOfFile(ranges[i].address);
+             if (trace && accepted) {
+                 static std::atomic<bool> reported{false};
+                 if (!reported.exchange(true))
+-                    std::fprintf(stderr, "Wan read-ahead: first accepted file-page hint %.1f MiB\n", accepted / 1048576.);
++                    std::fprintf(stderr, "Wan read-ahead: first accepted file-page hint %.1f MiB\n", requested / 1048576.);
+             }
+         });
+     } catch (const std::system_error&) {

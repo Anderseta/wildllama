@@ -24,6 +24,7 @@ type videoTestRunner struct {
 func (r *videoTestRunner) Status() imagegen.RunnerStatus {
 	status := r.imageTestRunner.Status()
 	status.WanVideoStagingSupported = true
+	status.WanSageFP8Supported = true
 	return status
 }
 
@@ -179,4 +180,51 @@ func TestWanVideoReferenceToStream(t *testing.T) {
 	require.Equal(t, 206, res.Code)
 	require.True(t, bytes.Equal(data[:16], res.Body.Bytes()))
 	require.Equal(t, "video/webm", res.Header().Get("Content-Type"))
+}
+
+func TestWanVideoUnavailableSagePreservesText(t *testing.T) {
+	_, service, _, events, runner := newImageTestService(t)
+	runner.status = &imagegen.RunnerStatus{Ready: true, WanVideoStagingSupported: true}
+	profile := defaultVideoProfile()
+	profile.Diffusion = service.config.Profiles[0].DiffusionModel
+	profile.Encoder, profile.VAE = profile.Diffusion, profile.Diffusion
+	profile.Width, profile.Height, profile.Frames = 64, 64, 5
+	profile.AttentionBackend = imagegen.WanAttentionSageFP8
+	job := &imageJob{
+		ID: "missing-sage", Config: cloneImageConfig(service.config), Profile: profile.runtimeProfile("t2v"),
+		Request: imageJobRequest{Prompt: "a forest"}, Video: &profile.VideoOptions, ctx: service.ctx,
+	}
+	require.ErrorContains(t, service.generate(job), "SageAttention FP8")
+	require.Equal(t, []string{"close_image"}, events.snapshot())
+}
+
+func TestWanVideoQueuedResumeDoesNotLoadSavedStep(t *testing.T) {
+	_, service, router, _, _ := newImageTestService(t)
+	profile := defaultVideoProfile()
+	job := &imageJob{
+		ID: "resume-from-disk", RequestID: "resume-from-disk", Kind: "video", Status: "failed",
+		Video: &profile.VideoOptions, VideoWorkDir: service.root, ParentAssetID: "fixture/image.png",
+		Generation: &imageGenerationSummary{Profile: profile.runtimeProfile("i2v")},
+	}
+	service.jobs = []*imageJob{job}
+	service.assets[job.ParentAssetID] = imageAssetRecord{}
+	service.workerStarted = true // Leave the job queued so no disk read can run yet.
+	base := "/api/videos/jobs/" + job.ID
+	resume := func() *httptest.ResponseRecorder {
+		return imageTestHTTP(router, "POST", base+"/resume", nil, "")
+	}
+	require.Equal(t, 409, resume().Code)
+	job.diskStep = 1
+	// The checkpoint was discovered at startup but has since become unavailable.
+	response := resume()
+	require.Equal(t, 202, response.Code, response.Body.String())
+	require.Equal(t, 202, resume().Code)
+	require.Len(t, service.queue, 1)
+	queued := service.jobs[0]
+	require.Nil(t, queued.checkpoint)
+	cancelled := imageTestHTTP(router, "POST", base+"/cancel", nil, "")
+	require.Equal(t, 200, cancelled.Code)
+	require.Equal(t, "cancelled", queued.Status)
+	require.Empty(t, service.queue)
+	require.Nil(t, queued.checkpoint)
 }

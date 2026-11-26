@@ -501,12 +501,6 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		return err
 	}
 	v.mu.Lock()
-	if job.Video != nil && profile.ModelID == imagegen.WanRapidI2V {
-		if job.checkpoint == nil {
-			job.checkpoint = &imagegen.VideoCheckpoint{}
-		}
-		input.VideoCheckpoint = job.checkpoint
-	}
 	job.Generation = generation
 	job.ParentAssetID = parent
 	job.Progress.BatchCount = generation.Count
@@ -596,14 +590,25 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		}
 	}()
 	status := engine.Status()
-	if job.Video != nil && status.Ready && job.Profile.Tokenizer != "" && !status.WanExtendedUMT5Supported {
-		return errors.New("atualize o motor de mídia do Wildllama para usar o vocabulário estendido do UMT5")
-	}
-	if job.Video != nil && status.Ready && !status.WanVideoStagingSupported {
-		return errors.New("atualize o motor de mídia do Wildllama para habilitar a geração Wan por etapas")
-	}
 	if !status.Ready {
 		return fmt.Errorf("image runtime is not ready: %s", status.Error)
+	}
+	if job.Video != nil {
+		if profile.Tokenizer != "" && !status.WanExtendedUMT5Supported {
+			return errors.New("atualize o motor de mídia do Wildllama para usar o vocabulário estendido do UMT5")
+		}
+		if !status.WanVideoStagingSupported {
+			return errors.New("atualize o motor de mídia do Wildllama para habilitar a geração Wan por etapas")
+		}
+		if job.Video.AttentionPreference() == imagegen.WanAttentionSageFP8 && !status.WanSageFP8Supported {
+			return errors.New("atualize o runtime de vídeo do WildLlama para usar SageAttention FP8, ou selecione CuTe")
+		}
+		if profile.ModelID == imagegen.WanRapidI2V {
+			input.VideoCheckpoint, err = v.prepareVideoCheckpoint(job)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	v.mu.Lock()
 	job.EffectiveMode = mode

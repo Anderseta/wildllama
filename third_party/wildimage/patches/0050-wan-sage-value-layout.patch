@@ -1,0 +1,223 @@
+--- a/src/core/ggml_extensions.cpp
++++ b/src/core/ggml_extensions.cpp
+@@ -364,14 +364,29 @@
+         return false;
+     for (int i = 0; i < count; ++i) {
+         const auto* t = inputs[i];
+-        const auto type = i == 2 || i == 4 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+-        if (!t || !ggml_is_contiguous(t) || t->type != type)
++        const bool value = i == 2 || i == 4;
++        const bool direct_value = t && value && t->type == GGML_TYPE_F32 && params.mode == GGML_SAGE_ATTN_2;
++        if (!t || (!direct_value && (!ggml_is_contiguous(t) || t->type != (value ? GGML_TYPE_F16 : GGML_TYPE_F32))))
+             return false;
+         int64_t elements = 1;
+         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+             if (t->ne[d] <= 0 || t->ne[d] > INT64_MAX / int64_t(sizeof(float)) / elements)
+                 return false;
+             elements *= t->ne[d];
++        }
++        if (direct_value) {
++            // Sage rounds the projected float values to half on load. The
++            // channel axis is contiguous; tokens/heads can be interleaved.
++            if (t->nb[0] != sizeof(float)) return false;
++            const size_t row_bytes = size_t(t->ne[0]) * sizeof(float);
++            size_t span = row_bytes;
++            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
++                const size_t stride = t->nb[d];
++                if (stride < row_bytes || stride % sizeof(float) ||
++                    uint64_t(t->ne[d] - 1) > (SIZE_MAX - span) / stride)
++                    return false;
++                span += size_t(t->ne[d] - 1) * stride;
++            }
+         }
+     }
+     const auto* q = inputs[0];
+--- a/src/core/cuda/sage_attention.cu
++++ b/src/core/cuda/sage_attention.cu
+@@ -193,14 +193,50 @@
+         }
+     }
+ 
+-    template <int D>
+-    static __global__ void sage_value_scale(const half* v, float* scales, int length, float scale_max) {
++    template <typename T>
++    struct SageValueView {
++        using Element = T;
++        const T* data;
++        size_t token_stride;
++        size_t head_stride;
++        size_t batch_stride;
++        unsigned int heads;
++
++        template <int D>
++        __device__ __forceinline__ const T* head(unsigned int index, int length) const {
++            if constexpr (std::is_same<T, half>::value) {
++                return data + size_t(index) * length * D;
++            } else {
++                return data + size_t(index % heads) * head_stride + size_t(index / heads) * batch_stride;
++            }
++        }
++
++        template <int D>
++        __device__ __forceinline__ float load(const T* head_base, int token, int channel) const {
++            if constexpr (std::is_same<T, half>::value) {
++                return __half2float(head_base[size_t(token) * D + channel]);
++            } else {
++                // Match the previous ggml F32 -> F16 cast before each FP8
++                // value operation, without storing the intermediate tensor.
++                return __half2float(__float2half_rn(head_base[size_t(token) * token_stride + channel]));
++            }
++        }
++    };
++
++    template <typename T>
++    static SageValueView<T> sage_value_view(const ggml_tensor* v) {
++        return {static_cast<const T*>(v->data), v->nb[1] / sizeof(T), v->nb[2] / sizeof(T),
++                v->nb[3] / sizeof(T), static_cast<unsigned int>(v->ne[2])};
++    }
++
++    template <int D, typename T>
++    static __global__ void sage_value_scale(SageValueView<T> v, float* scales, int length, float scale_max) {
+         const int channel = blockIdx.x * 32 + threadIdx.x % 32;
+         const int row     = threadIdx.x / 32;
+-        const size_t base = size_t(blockIdx.y) * length * D;
+-        float amax        = 1e-7f;
++        const T* head_base = v.template head<D>(blockIdx.y, length);
++        float amax = 1e-7f;
+         for (int token = row; token < length; token += 8) {
+-            amax = fmaxf(amax, fabsf(__half2float(v[base + size_t(token) * D + channel])));
++            amax = fmaxf(amax, fabsf(v.template load<D>(head_base, token, channel)));
+         }
+         __shared__ float maxima[256];
+         maxima[threadIdx.x] = amax;
+@@ -213,16 +249,16 @@
+         }
+     }
+ 
+-    template <int D>
+-    static __global__ void sage_quantize_value(const half* v, const float* scales, int8_t* output, int length, int padded) {
++    template <int D, typename T>
++    static __global__ void sage_quantize_value(SageValueView<T> v, const float* scales, int8_t* output, int length, int padded) {
+         __shared__ uint8_t tile[32][D + 4];
+         const int head    = blockIdx.y;
+         const int first   = blockIdx.x * 32;
+-        const size_t base = size_t(head) * length * D;
++        const T* head_base = v.template head<D>(blockIdx.y, length);
+         for (int i = threadIdx.x; i < 32 * D; i += 256) {
+             const int token   = first + i / D;
+             const int channel = i % D;
+-            const float value = token < length ? __half2float(v[base + size_t(token) * D + channel]) / scales[size_t(head) * D + channel] : 0.0f;
++            const float value = token < length ? v.template load<D>(head_base, token, channel) / scales[size_t(head) * D + channel] : 0.0f;
+             // FP8 MMA consumes pairs of tokens in a permuted, transposed V tile.
+             const int row           = i / D;
+             const int permuted      = row / 16 * 16 + row % 16 / 8 * 2 + row % 8 / 2 * 4 + row % 2;
+@@ -237,17 +273,18 @@
+     // Coalesced, tiled first pass for long sequences. Store both partials in
+     // the not-yet-written INT8 key buffer. The second pass runs on the same stream.
+     static constexpr int sage_rows_per_tile = 256;
+-    template <int D>
+-    static __global__ void sage_partial_stats(const float* keys, const half* values, float2* partials, int length) {
++    template <int D, typename T>
++    static __global__ void sage_partial_stats(const float* keys, SageValueView<T> values, float2* partials, int length) {
+         const int channel = blockIdx.x * 32 + threadIdx.x % 32;
+         const int row = threadIdx.x / 32;
+         const int start = blockIdx.z * sage_rows_per_tile;
+         const int end = min(length, start + sage_rows_per_tile);
+         const size_t base = size_t(blockIdx.y) * length * D + channel;
++        const T* head_base = values.template head<D>(blockIdx.y, length);
+         float sum = 0.f, peak = 1e-7f;
+         for (int t = start + row; t < end; t += 8) {
+             sum += keys[base + size_t(t) * D];
+-            peak = fmaxf(peak, fabsf(__half2float(values[base + size_t(t) * D])));
++            peak = fmaxf(peak, fabsf(values.template load<D>(head_base, t, channel)));
+         }
+         __shared__ float sums[256], peaks[256];
+         sums[threadIdx.x] = sum;
+@@ -297,24 +334,39 @@
+         auto* km  = reinterpret_cast<float*>(data + work.k_mean);
+         auto* out = DIRECT ? static_cast<Output*>(dst->data) : reinterpret_cast<Output*>(data + work.output);
+         const bool parallel = !PLUS_PLUS && lk >= 16384 && lk <= 65535 * sage_rows_per_tile && std::strcmp(dst->name, "wan.sage_fp8") == 0;
+-        if (parallel) {
+-            const int tiles = (lk + sage_rows_per_tile - 1) / sage_rows_per_tile;
+-            auto* partials = reinterpret_cast<float2*>(ki);
+-            sage_partial_stats<D><<<dim3(D / 32, hk * batch, tiles), 256, 0, stream>>>(
+-                static_cast<const float*>(k->data), static_cast<const half*>(v->data), partials, lk);
+-            sage_finish_stats<D><<<dim3(1, hk * batch), D, 0, stream>>>(partials, km, vs, tiles, lk);
++        auto stage_inputs = [&](auto values) {
++            using T = typename decltype(values)::Element;
++            if (parallel) {
++                const int tiles = (lk + sage_rows_per_tile - 1) / sage_rows_per_tile;
++                auto* partials = reinterpret_cast<float2*>(ki);
++                sage_partial_stats<D, T><<<dim3(D / 32, hk * batch, tiles), 256, 0, stream>>>(
++                    static_cast<const float*>(k->data), values, partials, lk);
++                sage_finish_stats<D><<<dim3(1, hk * batch), D, 0, stream>>>(partials, km, vs, tiles, lk);
++            } else {
++                sage_key_mean<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const float*>(k->data), km, lk);
++            }
++            if constexpr (!ACCUMULATE) {
++                sage_quantize_per_thread<D, false><<<dim3(GGML_PAD(lq, 128) / 32, hq * batch), 256, 0, stream>>>(
++                    static_cast<const float*>(q->data), nullptr, qi, qs, lq);
++            }
++            sage_quantize_per_thread<D, true><<<dim3(padded / 64, hk * batch), 128, 0, stream>>>(
++                static_cast<const float*>(k->data), km, ki, ks, lk);
++            // The smaller V range keeps the FP16 instruction accumulator finite in SageAttention2++.
++            if (!parallel) {
++                sage_value_scale<D, T><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(
++                    values, vs, lk, PLUS_PLUS ? 2.25f : 448.0f);
++            }
++            sage_quantize_value<D, T><<<dim3(padded / 32, hk * batch), 256, 0, stream>>>(values, vs, vi, lk, padded);
++        };
++        if constexpr (!PLUS_PLUS) {
++            if (v->type == GGML_TYPE_F32) {
++                stage_inputs(sage_value_view<float>(v));
++            } else {
++                stage_inputs(sage_value_view<half>(v));
++            }
+         } else {
+-            sage_key_mean<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const float*>(k->data), km, lk);
+-        }
+-        if constexpr (!ACCUMULATE) {
+-            sage_quantize_per_thread<D, false><<<dim3(GGML_PAD(lq, 128) / 32, hq * batch), 256, 0, stream>>>(
+-                static_cast<const float*>(q->data), nullptr, qi, qs, lq);
+-        }
+-        sage_quantize_per_thread<D, true><<<dim3(padded / 64, hk * batch), 128, 0, stream>>>(
+-            static_cast<const float*>(k->data), km, ki, ks, lk);
+-        // The smaller V range keeps the FP16 instruction accumulator finite in SageAttention2++.
+-        if (!parallel) sage_value_scale<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const half*>(v->data), vs, lk, PLUS_PLUS ? 2.25f : 448.0f);
+-        sage_quantize_value<D><<<dim3(padded / 32, hk * batch), 256, 0, stream>>>(static_cast<const half*>(v->data), vs, vi, lk, padded);
++            stage_inputs(sage_value_view<half>(v));
++        }
+         auto kernel = sageattention::qk_int_sv_f8_attn_kernel<128, 64, 32, 64, D,
+                                                               sageattention::DataType::kInt8, sageattention::QuantGranularity::kPerThread,
+                                                               sageattention::QuantGranularity::kPerThread, float, true, Output,
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -161,12 +161,15 @@
+                         t = heads(t);
+                         return ggml_ext_cont(ctx, pe ? Rope::apply_rope(ctx, t, pe) : ggml_permute(c, t, 0, 2, 1, 3));
+                     };
+-                    auto prepare_value = [&](ggml_tensor* values) {
+-                        auto value = ggml_permute(c, heads(values), 0, 2, 1, 3);
++                    auto legacy_value = [&](ggml_tensor* value) {
+                         auto half = ggml_cast(c, value, GGML_TYPE_F16);
+                         if (!ggml_backend_supports_op(ctx->backend, half))
+                             half = ggml_cast(c, ggml_ext_cont(ctx, value), GGML_TYPE_F16);
+                         return half;
++                    };
++                    auto prepare_value = [&](ggml_tensor* values) {
++                        auto view = ggml_permute(c, heads(values), 0, 2, 1, 3);
++                        return view->type == GGML_TYPE_F32 ? view : legacy_value(view);
+                     };
+                     const float scale = 1.f / std::sqrt(float(q->ne[0]));
+                     auto query = ordered(q);
+@@ -174,6 +177,10 @@
+                     auto value = prepare_value(v);
+                     auto attend = [&](ggml_tensor* keys, ggml_tensor* values) {
+                         auto out = ggml_ext_sage_attn(ctx, query, keys, values, scale, GGML_SAGE_ATTN_2);
++                        if (values->type == GGML_TYPE_F32 && (!out || !ggml_backend_supports_op(ctx->backend, out))) {
++                            values = legacy_value(values);
++                            out = ggml_ext_sage_attn(ctx, query, keys, values, scale, GGML_SAGE_ATTN_2);
++                        }
+                         if (!out) wan_sage_unavailable(ctx, "invalid Q/K/V layout", query, keys, values);
+                         if (!ggml_backend_supports_op(ctx->backend, out)) {
+                             wan_sage_unavailable(ctx, "CUDA rejected the attention operator", query, keys, values);

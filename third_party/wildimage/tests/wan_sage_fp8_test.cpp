@@ -121,7 +121,7 @@ static bool check_long_attention(ggml_backend_t gpu, int queries, int keys, int 
 // Compare direct output with the original FP16 round-trip and FP32 addition.
 // For I2V, key counts can differ and the second softmax must recompute its K/V scales.
 static bool compare_sage_output(ggml_backend_t gpu, int d, int queries, int text_len, int image_len,
-                              int query_heads, int kv_heads, int rounds = 0) {
+                              int query_heads, int kv_heads, int rounds = 0, bool strided_values = false) {
     BackendProbeGraph reference(gpu, 128), candidate(gpu, 128);
     for (auto* graph : {&reference, &candidate}) {
         GGMLRunnerContext ctx{};
@@ -132,13 +132,27 @@ static bool compare_sage_output(ggml_backend_t gpu, int d, int queries, int text
             graph->inputs.push_back(tensor);
             return tensor;
         };
+        auto value = [&](int tokens) {
+            if (!strided_values) return ggml_cast(graph->ctx, input(tokens, kv_heads), GGML_TYPE_F16);
+            // Values start at a nonzero head offset. Padding between heads
+            // makes both the head stride and token stride larger than D.
+            auto* base = ggml_new_tensor_2d(graph->ctx, GGML_TYPE_F32, d * (kv_heads * 2 + 1), tokens);
+            graph->inputs.push_back(base);
+            auto* view = ggml_view_4d(graph->ctx, base, d, tokens, kv_heads, 1, base->nb[1],
+                                      2 * d * sizeof(float), base->nb[2], d * sizeof(float));
+            if (graph == &candidate) return view;
+            auto* converted = ggml_cast(graph->ctx, view, GGML_TYPE_F16);
+            if (!ggml_backend_supports_op(gpu, converted))
+                converted = ggml_cast(graph->ctx, ggml_cont(graph->ctx, view), GGML_TYPE_F16);
+            return converted;
+        };
         auto* q = input(queries, query_heads);
         auto* k = input(text_len, kv_heads);
-        auto* v = ggml_cast(graph->ctx, input(text_len, kv_heads), GGML_TYPE_F16);
+        auto* v = value(text_len);
         auto* ik = image_len ? input(image_len, kv_heads) : nullptr;
-        auto* iv = image_len ? ggml_cast(graph->ctx, input(image_len, kv_heads), GGML_TYPE_F16) : nullptr;
+        auto* iv = image_len ? value(image_len) : nullptr;
         const float scale = 1.f / std::sqrt(float(d));
-        if (graph == &reference) {
+        if (graph == &reference && !strided_values) {
             graph->output = ggml_ext_sage_attn(&ctx, q, k, v, scale, GGML_SAGE_ATTN_2);
             if (image_len) {
                 auto* image = ggml_ext_sage_attn(&ctx, q, ik, iv, scale, GGML_SAGE_ATTN_2);
@@ -160,7 +174,7 @@ static bool compare_sage_output(ggml_backend_t gpu, int d, int queries, int text
     ggml_backend_tensor_get(candidate.output, actual.data(), 0, ggml_nbytes(candidate.output));
     const bool exact = std::all_of(actual.begin(), actual.end(), [](float v) { return std::isfinite(v); }) &&
                        std::memcmp(expected.data(), actual.data(), elements * sizeof(float)) == 0;
-    const char* kind = image_len ? "pair" : "self";
+    const char* kind = strided_values ? "strided" : image_len ? "pair" : "self";
     std::printf("Sage %s D=%d Q=%d keys=%d image=%d heads=%d/%d exact=%d\n",
                 kind, d, queries, text_len, image_len, query_heads, kv_heads, int(exact));
     if (!exact || !rounds) return exact;
@@ -204,10 +218,16 @@ int main(int argc, char** argv) {
     ok &= compare_sage_output(gpu, 128, 257, 257, 0, 4, 4);
     ok &= compare_sage_output(gpu, 64, 133, 129, 33, 3, 3);
     ok &= compare_sage_output(gpu, 128, 257, 77, 259, 4, 2);
+    ok &= compare_sage_output(gpu, 64, 137, 131, 0, 3, 3, 0, true);
+    ok &= compare_sage_output(gpu, 128, 129, 16385, 0, 2, 2, 0, true);
+    ok &= compare_sage_output(gpu, 64, 129, 67, 73, 4, 2, 0, true);
+    ok &= compare_sage_output(gpu, 128, 257, 77, 259, 4, 2, 0, true);
     if (benchmark) {
         ok &= compare_sage_output(gpu, 128, 4096, 4096, 0, 4, 4, 9);
         ok &= compare_sage_output(gpu, 128, 8192, 129, 257, 4, 4, 9);
         ok &= compare_sage_output(gpu, 128, 32768, 129, 257, 4, 4, 9);
+        ok &= compare_sage_output(gpu, 128, 4097, 4097, 0, 4, 4, 9, true);
+        ok &= compare_sage_output(gpu, 128, 32768, 129, 257, 4, 4, 9, true);
     }
     ggml_backend_free(gpu);
     return ok ? 0 : 1;
