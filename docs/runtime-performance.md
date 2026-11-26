@@ -165,6 +165,13 @@ admission, not a hard process RAM limit. Unknown OS memory information preserves
 the existing admission fallback. Explicit restoration of checkpoint appendices
 from manually saved slot files retains its existing parser and allocation policy.
 
+With adaptive admission and checkpoint spacing above 32 tokens, the server can
+replay a plain-text prefix of up to 32 tokens when copying its recurrent state
+would take at least 64 MiB. Media prefixes keep their normal checkpoints. For a
+cacheable text prompt of at least 136 tokens that fits before the usual first
+checkpoint, the server also keeps an anchor 68 tokens before the end. Editing
+the ending can then reuse the earlier tokens even with a large physical batch.
+
 ## Optional experiments
 
 Additional MTP verifier, proposal-head and compact recurrent-state controls are
