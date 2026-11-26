@@ -1,0 +1,108 @@
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -58,6 +58,23 @@
+ 
+     void unmap_fragment(size_t first, size_t last);
+ 
++#ifdef _WIN32
++    // Read-only source for synchronous uploads. Only one view is held across shards.
++    class upload_window {
++    public:
++        upload_window() = default;
++        upload_window(const upload_window &) = delete;
++        upload_window & operator=(const upload_window &) = delete;
++        ~upload_window();
++        const void * read(const llama_mmap & mapping, size_t offset, size_t bytes);
++    private:
++        const llama_mmap * owner = nullptr;
++        void * view = nullptr;
++        size_t first = 0;
++        size_t length = 0;
++    };
++#endif
++
+     static const bool SUPPORTED;
+ 
+ private:
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -698,6 +698,49 @@
+ 
+ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+ 
++#if defined(_WIN32) && !defined(_POSIX_MAPPED_FILES)
++llama_mmap::upload_window::~upload_window() {
++    if (view) { UnmapViewOfFile(view); }
++}
++
++const void * llama_mmap::upload_window::read(const llama_mmap & mapping, size_t offset, size_t bytes) {
++    GGML_ASSERT(offset <= mapping.size() && bytes <= mapping.size() - offset);
++    if (view && owner == &mapping && offset >= first && offset - first <= length &&
++            bytes <= length - (offset - first)) {
++        return static_cast<const char *>(view) + (offset - first);
++    }
++    if (view) {
++        UnmapViewOfFile(view);
++        view = nullptr;
++    }
++    if (bytes) {
++        static const DWORD granularity = [] {
++            SYSTEM_INFO info;
++            GetSystemInfo(&info);
++            return info.dwAllocationGranularity;
++        }();
++        first = offset - offset % granularity;
++        const size_t required = (offset - first) + bytes;
++        length = std::min(mapping.size() - first, std::max<size_t>(64u << 20, required));
++        const uint64_t start = first;
++        view = MapViewOfFile(mapping.pimpl->hMapping, FILE_MAP_READ,
++                             DWORD(start >> 32), DWORD(start), length);
++        if (view) {
++            owner = &mapping;
++            return static_cast<const char *>(view) + (offset - first);
++        }
++    }
++    // Address space can be exhausted even when the existing primary view is usable.
++    return static_cast<const char *>(mapping.addr()) + offset;
++}
++#elif defined(_WIN32)
++llama_mmap::upload_window::~upload_window() = default;
++
++const void * llama_mmap::upload_window::read(const llama_mmap & mapping, size_t offset, size_t) {
++    return static_cast<const char *>(mapping.addr()) + offset;
++}
++#endif
++
+ #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+ const bool llama_mmap::SUPPORTED  = true;
+ #else
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1705,6 +1705,9 @@
+         });
+     }
+ 
++#if defined(_WIN32) && !defined(_POSIX_MAPPED_FILES)
++    llama_mmap::upload_window upload_window;
++#endif
+     for (struct ggml_tensor * cur : tensors) {
+         const auto * weight = get_weight(ggml_get_name(cur));
+         if (weight == nullptr) {
+@@ -1781,7 +1784,16 @@
+                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+             } else {
+-                ggml_backend_tensor_set(cur, data, 0, n_size);
++                const void * source = data;
++#if defined(_WIN32) && !defined(_POSIX_MAPPED_FILES)
++                // The long-lived mapping backs CPU tensors. Reading GPU-only weights
++                // through it would retain both models in the process working set.
++                if (!check_tensors && !lmlocks && !lazy.has(cur) && cur->buffer &&
++                        !ggml_backend_buffer_is_host(cur->buffer)) {
++                    source = upload_window.read(*mapping, weight->offs, n_size);
++                }
++#endif
++                ggml_backend_tensor_set(cur, source, 0, n_size);
+             }
+         } else {
+             const auto & file = files.at(weight->idx);

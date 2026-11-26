@@ -94,6 +94,17 @@ the affected model. Sampling-only changes keep its weights resident. Truly globa
 settings such as maximum loaded models and keep-alive can still require a daemon
 restart; official Ollama retains the legacy profile behavior.
 
+## RAM during GPU weight uploads on Windows
+
+With memory-mapped GGUFs, the Windows loader reads device-bound weights through
+a temporary file view. It reuses a 64 MiB window across nearby tensors and
+expands it when one tensor is larger. Closing the view removes those source
+pages from the process working set. CPU weights keep their original mapping.
+The window is limited to synchronous uploads and is released on cancellation.
+Locked mappings, lazy weights and asynchronous weight validation keep their
+existing read paths. This affects physical RAM during loading and inference.
+The driver can still report separate committed memory.
+
 ## On-demand visual projectors
 
 The launcher enables `WILDLLAMA_MMPROJ_ON_DEMAND=1` only when a runner advertises
