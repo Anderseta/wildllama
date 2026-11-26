@@ -517,7 +517,8 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		cmd.Stderr = out
 	}
 	cmd.SysProcAttr = LlamaServerSysProcAttr
-	childEnvs := cloneStringMap(launch.extraEnvsForStart())
+	projectorLifecycleSupported := len(launch.projectors) > 0 && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, projectorOnDemandEnvironment)
+	childEnvs := cloneStringMap(launch.extraEnvsForStart(projectorLifecycleSupported))
 	if launch.modelArch == inkling2Architecture {
 		// CUDA runtime dependencies may be shared; ggml backend plugins must match
 		// the engine that loads them. Empty means native discovery beside the exe.
@@ -526,7 +527,6 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	if launch.handoff != nil {
 		childEnvs["WILDLLAMA_IMAGE_HANDOFF_AUTH"] = launch.handoff.auth
 	}
-	projectorLifecycleSupported := len(launch.projectors) > 0 && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, projectorOnDemandEnvironment)
 	setProjectorLifecycleEnvironment(childEnvs, launch.projectors, projectorLifecycleSupported)
 	adaptivePrefixRequested := adaptivePrefixCacheRequested(launch.opts, launch.decision)
 	adaptivePrefixSupported := adaptivePrefixRequested && NativeRuntimeSupportsEnvironment(exe, launch.gpuLibs, adaptivePrefixCacheEnvironment)
@@ -935,7 +935,12 @@ func shouldDisableMMProjOffload(opts api.Options, gpus []ml.DeviceInfo, modelLay
 	return false, ""
 }
 
-func (launch llamaServerLaunchConfig) extraEnvsForStart() map[string]string {
+func (launch llamaServerLaunchConfig) extraEnvsForStart(nativeProjectorFit bool) map[string]string {
+	// Runners with our projector lifecycle measure placement by device during fit.
+	// Adding the historical weight and scratch allowance here counts vision twice.
+	if nativeProjectorFit {
+		return launch.extraEnvs
+	}
 	pad, ok := launch.mmprojFitTargetMiB()
 	if !ok {
 		return launch.extraEnvs

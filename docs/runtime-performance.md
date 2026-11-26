@@ -113,6 +113,16 @@ resetting the text model. In-flight encoding retains ownership until it finishes
 including cancellation. Audio and mixed audio/vision projectors retain their
 conventional lifecycle; older payloads retain their original loading behavior.
 
+With automatic layer placement on a single GPU, the text runner first checks
+whether all layers, the KV cache, the draft context and the compute buffers fit
+within the configured budget. It measures projector memory on the device that
+will run it. For causal text generation it can reduce the physical microbatch
+to keep the KV on the GPU. With a Qwen3.5 vision projector it can instead run
+the encoder on demand on the CPU when there is enough host RAM. If needed, it
+also tries host-side target KV and attention before moving model layers to RAM.
+These alternatives are estimated from metadata before loading the weights.
+Explicit layer placement and GPU-exclusive execution retain their restrictions.
+
 ## Live KV allocation measurements
 
 Compatible native contexts publish `runtime_memory.kv_committed` with physical

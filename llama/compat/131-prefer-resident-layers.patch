@@ -1,0 +1,353 @@
+--- a/common/common.h
++++ b/common/common.h
+@@ -1001,7 +1001,9 @@
+ common_gguf_info common_get_gguf_info(const std::string & fname);
+ 
+ // note: defines the model, context, samplers, ets. lifetimes
++struct common_fit_projector;
+ struct common_init_result {
++    common_init_result(common_params & params, bool model_only, common_fit_projector * vision);
+     common_init_result(common_params & params, bool model_only = false);
+     ~common_init_result();
+ 
+@@ -1021,6 +1023,7 @@
+ using common_init_result_ptr = std::unique_ptr<common_init_result>;
+ 
+ common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
++common_init_result_ptr common_init_from_params(common_params & params, bool model_only, common_fit_projector * vision);
+ 
+ struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+ struct llama_context_params common_context_params_to_llama(const common_params & params);
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -4,6 +4,8 @@
+ #include "llama.h"
+ 
+ #include <vector>
++#include <map>
++#include <functional>
+ 
+ enum common_params_fit_status {
+     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
+@@ -37,6 +39,24 @@
+       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
+                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+ 
++// The media backend measures the projector separately from the text graph.
++struct common_fit_projector {
++    std::map<ggml_backend_dev_t, size_t> device_bytes;
++    std::function<size_t()> measure_host;
++    bool on_host = false;
++
++    size_t bytes_on(ggml_backend_dev_t dev) const {
++        const auto it = device_bytes.find(dev);
++        return it == device_bytes.end() ? 0 : it->second;
++    }
++};
++
++common_params_fit_status common_fit_generation(
++        const char * path_model, llama_model_params * mparams, llama_context_params * cparams,
++        float * tensor_split, llama_model_tensor_buft_override * tensor_buft_overrides,
++        size_t * margins, uint32_t n_ctx_min, const common_fit_extra_model * extra,
++        ggml_log_level log_level, bool generation, bool allow_smaller_ubatch, common_fit_projector * vision);
++
+ // print estimated memory to stdout
+ void common_fit_print(
+                          const char * path_model,
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1242,6 +1242,9 @@
+ }
+ 
+ common_init_result::common_init_result(common_params & params, bool model_only) :
++    common_init_result(params, model_only, nullptr) {}
++
++common_init_result::common_init_result(common_params & params, bool model_only, common_fit_projector * vision) :
+     pimpl(new impl{}) {
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+@@ -1271,13 +1274,14 @@
+             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+         };
+ 
+-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
++        common_fit_generation(params.model.path.c_str(), &mparams, &cparams,
+             params.tensor_split,
+             params.tensor_buft_overrides.data(),
+             params.fit_params_target.data(),
+             params.fit_params_min_ctx,
+             has_draft || spec_mtp ? &extra : nullptr,
+-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
++            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
++            !model_only && !params.embedding, params.mmproj.path.empty(), vision);
+     }
+ 
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+@@ -1420,7 +1424,11 @@
+ }
+ 
+ common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+-    common_init_result_ptr res(new common_init_result(params, model_only));
++    return common_init_from_params(params, model_only, nullptr);
++}
++
++common_init_result_ptr common_init_from_params(common_params & params, bool model_only, common_fit_projector * vision) {
++    common_init_result_ptr res(new common_init_result(params, model_only, vision));
+ 
+     llama_model * model = res->model();
+     if (model == NULL) {
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -1,4 +1,5 @@
+ #include "fit.h"
++#include "common.h"
+ 
+ #include "json.h"
+ #include "log.h"
+@@ -35,7 +36,7 @@
+         uint32_t & hp_ngl,
+         uint32_t & hp_n_ctx_train,
+         uint32_t & hp_n_expert,
+-        ggml_log_level log_level) {
++        ggml_log_level log_level, bool * causal_generation = nullptr, bool * cpu_vision_supported = nullptr) {
+     constexpr size_t staging_bytes = 4*1024*1024 + 8192;
+     if (mparams->moe_ram_limit > (size_t) INT64_MAX - staging_bytes) {
+         throw std::runtime_error("MoE RAM allowance overflows host memory accounting");
+@@ -74,6 +75,16 @@
+         throw std::runtime_error("failed to create llama_context from model");
+     }
+ 
++    if (causal_generation) {
++        *causal_generation = llama_get_causal_attn(ctx) && !llama_model_has_encoder(model) &&
++            llama_get_memory(ctx) && common_get_decision_type(model) == COMMON_DECISION_TYPE_NONE;
++    }
++    if (cpu_vision_supported) {
++        // Only move projectors validated on CPU. Some other encoders produce incorrect features there.
++        char arch[64] = {};
++        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
++        *cpu_vision_supported = std::string(arch) == "qwen35";
++    }
+     const size_t nd = llama_model_n_devices(model);
+     std::vector<llama_device_memory_data> ret(nd + 1);
+ 
+@@ -189,7 +200,8 @@
+ static void common_params_fit_impl(
+         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
++        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level,
++        bool generation, bool allow_smaller_ubatch, common_fit_projector * vision) {
+     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+     }
+@@ -271,7 +283,9 @@
+     // step 1: get data for default parameters and check whether any changes are necessary in the first place
+ 
+     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
+-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++    bool causal_generation = false, cpu_vision_supported = false;
++    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex,
++        log_level, generation ? &causal_generation : nullptr, vision ? &cpu_vision_supported : nullptr);
+ 
+     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
+     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+@@ -296,7 +310,12 @@
+         margins.push_back(margins_s[0]);
+     } else {
+         for (size_t id = 0; id < nd; id++) {
+-            margins.push_back(margins_s[id]);
++            int64_t margin = margins_s[id];
++            if (nd == 1 && mparams->gpu_vram_limit_mib && mparams->gpu_vram_limit_mib < uint64_t(INT64_MAX / MiB)) {
++                margin = std::max(margin, dmds_full[id].free - int64_t(mparams->gpu_vram_limit_mib) * MiB);
++            }
++            if (vision) { margin += vision->bytes_on(devs[id]); }
++            margins.push_back(margin);
+         }
+     }
+ 
+@@ -376,6 +395,85 @@
+             if (!changes_needed) {
+                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+                 return;
++            }
++        }
++    }
++
++    // Compare full-layer layouts using allocation-free graphs before considering partial weights.
++    // The speculative context is separate and retains its originally measured placement.
++    if (causal_generation && nd == 1 && mparams->n_gpu_layers == default_mparams.n_gpu_layers &&
++        !mparams->moe_ram_limit && (!mparams->tensor_buft_overrides || !mparams->tensor_buft_overrides[0].pattern)) {
++        const auto & device = dmds_full.front();
++        const auto & host = dmds_full.back();
++        const auto within_cap = [&](const llama_device_memory_data & gpu) {
++            return !mparams->gpu_vram_limit_mib || (gpu.mb.total() + MiB - 1) / MiB <= mparams->gpu_vram_limit_mib;
++        };
++        const int64_t base_margin = margins[0] - (vision ? int64_t(vision->bytes_on(devs[0])) : 0);
++        if (int64_t(device.mb.model) < device.free - base_margin) {
++            int64_t margin = margins[0];
++            size_t host_vision = 0;
++            auto fits_host = [&](const llama_device_memory_data & cpu, size_t extra_bytes) {
++                const auto free = cpu.free - 512 * MiB;
++                return free > 0 && uint64_t(free) >= cpu.mb.total() &&
++                    extra_bytes <= uint64_t(free) - cpu.mb.total();
++            };
++            auto fits = [&](uint32_t ubatch, bool gpu_kv) {
++                auto candidate = *cparams;
++                candidate.n_ubatch = ubatch;
++                candidate.offload_kqv = gpu_kv;
++                std::vector<ggml_backend_dev_t> devices;
++                uint32_t layers, context_train, experts;
++                try {
++                    auto usage = common_get_device_memory_data_impl(path_model, mparams, &candidate,
++                        devices, layers, context_train, experts, log_level);
++                    if (devices != devs) { return false; }
++                    add_extra_memory(usage);
++                    const auto & gpu = usage.front();
++                    if (int64_t(gpu.mb.total()) > std::min(device.free, gpu.free) - margin || !within_cap(gpu) ||
++                        ((!gpu_kv || host_vision) && !fits_host(usage.back(), host_vision))) {
++                        return false;
++                    }
++                    *cparams = candidate;
++                    if (host_vision) { vision->on_host = true; }
++                    LOG_INF("%s: all GPU layers fit with microbatch %u, target KV %s, projected GPU %zu MiB\n",
++                        __func__, ubatch, gpu_kv ? "on device" : "in host RAM", size_t(gpu.mb.total() / MiB));
++                    return true;
++                } catch (const std::runtime_error & e) {
++                    LOG_TRC("%s: skipping unsupported context layout: %s\n", __func__, e.what());
++                    return false;
++                }
++            };
++            const auto original = cparams->n_ubatch;
++            const auto compact = allow_smaller_ubatch ? std::min(original, 64u) : original;
++            if (compact < original && int64_t(device.mb.model + device.mb.context) < device.free - margin &&
++                ((original > 256 && fits(256, cparams->offload_kqv)) || fits(compact, cparams->offload_kqv))) {
++                return;
++            }
++            if (vision && vision->measure_host && cpu_vision_supported && !mparams->gpu_exclusive && margin > base_margin) {
++                host_vision = vision->measure_host();
++                if (host_vision && fits_host(host, host_vision)) {
++                    margin = base_margin;
++                    if (int64_t(device.mb.total()) <= device.free - margin && within_cap(device)) {
++                        vision->on_host = true;
++                        return;
++                    }
++                } else {
++                    host_vision = 0;
++                }
++            }
++            if (cparams->offload_kqv && !mparams->gpu_exclusive) {
++                const auto cpu_vision_bytes = host_vision;
++                host_vision = 0;
++                margin = margins[0];
++                auto fits_host_kv = [&]() {
++                    return fits(original, false) || (compact < original && fits(compact, false));
++                };
++                if (fits_host_kv()) { return; }
++                if (cpu_vision_bytes) {
++                    host_vision = cpu_vision_bytes;
++                    margin = base_margin;
++                    if (fits_host_kv()) { return; }
++                }
+             }
+         }
+     }
+@@ -923,10 +1021,24 @@
+         uint32_t n_ctx_min,
+         const common_fit_extra_model * extra,
+         ggml_log_level log_level) {
++    return common_fit_generation(path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
++            margins, n_ctx_min, extra, log_level, false, false, nullptr);
++}
++
++enum common_params_fit_status common_fit_generation(
++        const char * path_model,
++        llama_model_params * mparams,
++        llama_context_params * cparams,
++        float * tensor_split,
++        llama_model_tensor_buft_override * tensor_buft_overrides,
++        size_t * margins,
++        uint32_t n_ctx_min,
++        const common_fit_extra_model * extra,
++        ggml_log_level log_level, bool generation, bool allow_smaller_ubatch, common_fit_projector * vision) {
+     const int64_t t0_us = llama_time_us();
+     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+     try {
+-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
++        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level, generation, allow_smaller_ubatch, vision);
+         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+     } catch (const common_params_fit_exception & e) {
+         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1438,38 +1438,29 @@
+ 
+         // get the memory usage of mmproj, also used to check image_max_tokens against n_ubatch
+         mtmd_memory_usage mmproj_usage = {{}, -1, false};
+-        int64_t mmproj_usage_t_us = 0;
+         if (has_mmproj) {
+-            int64_t t_start = ggml_time_us();
+             mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+-            mmproj_usage_t_us = ggml_time_us() - t_start;
+-        }
+-
+-        // optionally fit mmproj memory usage
+-        // on resume params_base already holds the margin from the first load
+-        if (has_mmproj && params_base.fit_params && !is_resume) {
+-            const auto & mmproj_mem = mmproj_usage.backend_mem_usage;
+-            const int64_t t_elapsed = mmproj_usage_t_us;
+-            if (!mmproj_mem.empty()) {
+-                size_t total = 0;
+-                for (auto & [dev, size] : mmproj_mem) {
+-                    total += size;
+-                }
+-                SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
+-                GGML_ASSERT(!params_base.fit_params_target.empty());
+-                for (auto & [dev, size] : mmproj_mem) {
+-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+-                        if (ggml_backend_dev_get(i) == dev) {
+-                            if (i < params_base.fit_params_target.size()) {
+-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+-                                params_base.fit_params_target[i] += size;
+-                            }
+-                            break;
+-                        }
++        }
++
++        common_fit_projector vision_fit;
++        if (has_mmproj && params_base.fit_params) {
++            vision_fit.device_bytes = mmproj_usage.backend_mem_usage;
++            if (vision_fit.device_bytes.empty()) {
++                SRV_WRN("%s", "could not estimate projector memory\n");
++            }
++            const char * on_demand = std::getenv("WILDLLAMA_MMPROJ_ON_DEMAND");
++            if (on_demand && std::strcmp(on_demand, "1") == 0 && mparams.use_gpu && !mparams.device && !mparams.gpu_exclusive) {
++                vision_fit.measure_host = [&]() -> size_t {
++                    auto cpu_params = mparams;
++                    cpu_params.use_gpu = false;
++                    auto usage = mtmd_get_memory_usage(mmproj_path.c_str(), cpu_params);
++                    size_t total = 0;
++                    for (const auto & entry : usage.backend_mem_usage) {
++                        if (!entry.first || ggml_backend_dev_type(entry.first) != GGML_BACKEND_DEVICE_TYPE_CPU) { return 0; }
++                        total += entry.second;
+                     }
+-                }
+-            } else {
+-                SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
++                    return total;
++                };
+             }
+         }
+ 
+@@ -1481,7 +1472,11 @@
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
+-        llama_init = common_init_from_params(params_base);
++        llama_init = common_init_from_params(params_base, false, has_mmproj ? &vision_fit : nullptr);
++        if (vision_fit.on_host) {
++            mparams.use_gpu = params_base.mmproj_use_gpu = false;
++            SRV_INF("%s", "keeping all text layers on GPU; the on-demand vision projector will use CPU\n");
++        }
+ 
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();

@@ -2529,10 +2529,19 @@ func TestMMProjFitTargetExtraEnvs(t *testing.T) {
 		}
 	}
 
+	t.Run("native projector planner preserves per-device margins", func(t *testing.T) {
+		for _, target := range []string{"", "64", "256,512"} {
+			launch := newLaunch(map[string]string{llamaArgFitTargetEnv: target})
+			if got := launch.extraEnvsForStart(true)[llamaArgFitTargetEnv]; got != target {
+				t.Fatalf("native projector margin %q, want %q", got, target)
+			}
+		}
+	})
+
 	t.Run("sets projector pad when no fit target exists", func(t *testing.T) {
 		launch := newLaunch(map[string]string{"KEEP": "1"})
 
-		got := launch.extraEnvsForStart()
+		got := launch.extraEnvsForStart(false)
 		assertFitTarget(t, got, projectorPadMiB)
 		if _, ok := launch.extraEnvs[llamaArgFitTargetEnv]; ok {
 			t.Fatal("extraEnvsForStart mutated launch.extraEnvs")
@@ -2551,7 +2560,7 @@ func TestMMProjFitTargetExtraEnvs(t *testing.T) {
 				llamaArgFitTargetEnv: fitTargetValue(tt.launchFitTargetMiB),
 			})
 
-			got := launch.extraEnvsForStart()
+			got := launch.extraEnvsForStart(false)
 			assertFitTarget(t, got, tt.launchFitTargetMiB+projectorPadMiB)
 		})
 	}
@@ -2560,7 +2569,7 @@ func TestMMProjFitTargetExtraEnvs(t *testing.T) {
 		t.Setenv(llamaArgFitTargetEnv, fitTargetValue(256))
 		launch := newLaunch(map[string]string{})
 
-		got := launch.extraEnvsForStart()
+		got := launch.extraEnvsForStart(false)
 		if _, ok := got[llamaArgFitTargetEnv]; ok {
 			t.Fatalf("user env should not be overridden, got extra env %q", got[llamaArgFitTargetEnv])
 		}
@@ -3403,7 +3412,7 @@ func TestMemoryParsingPerDevice(t *testing.T) {
 	tests := []struct {
 		name       string
 		lines      []string
-		wantDevice map[string]uint64 // device name → expected MiB
+		wantDevice map[string]uint64 // device name â†’ expected MiB
 	}{
 		{
 			name: "CUDA multi-GPU all buffer types",
