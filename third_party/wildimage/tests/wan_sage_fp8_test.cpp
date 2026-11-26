@@ -1,5 +1,7 @@
 // Link to the same native objects as wan_backend_benchmark. No model or video is needed.
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <vector>
 #include "core/probe/backend_probe.h"
@@ -116,8 +118,74 @@ static bool check_long_attention(ggml_backend_t gpu, int queries, int keys, int 
     return supported == expected;
 }
 
+// Compare direct output with the original FP16 round-trip and FP32 addition.
+// For I2V, key counts can differ and the second softmax must recompute its K/V scales.
+static bool compare_sage_output(ggml_backend_t gpu, int d, int queries, int text_len, int image_len,
+                              int query_heads, int kv_heads, int rounds = 0) {
+    BackendProbeGraph reference(gpu, 128), candidate(gpu, 128);
+    for (auto* graph : {&reference, &candidate}) {
+        GGMLRunnerContext ctx{};
+        ctx.backend = gpu;
+        ctx.ggml_ctx = graph->ctx;
+        auto input = [&](int tokens, int heads) {
+            auto* tensor = ggml_new_tensor_3d(graph->ctx, GGML_TYPE_F32, d, tokens, heads);
+            graph->inputs.push_back(tensor);
+            return tensor;
+        };
+        auto* q = input(queries, query_heads);
+        auto* k = input(text_len, kv_heads);
+        auto* v = ggml_cast(graph->ctx, input(text_len, kv_heads), GGML_TYPE_F16);
+        auto* ik = image_len ? input(image_len, kv_heads) : nullptr;
+        auto* iv = image_len ? ggml_cast(graph->ctx, input(image_len, kv_heads), GGML_TYPE_F16) : nullptr;
+        const float scale = 1.f / std::sqrt(float(d));
+        if (graph == &reference) {
+            graph->output = ggml_ext_sage_attn(&ctx, q, k, v, scale, GGML_SAGE_ATTN_2);
+            if (image_len) {
+                auto* image = ggml_ext_sage_attn(&ctx, q, ik, iv, scale, GGML_SAGE_ATTN_2);
+                if (!graph->output || !image) return false;
+                graph->output = ggml_add(graph->ctx, graph->output, image);
+            }
+        } else {
+            graph->output = image_len ? WAN::wan_sage_attention_pair(&ctx, q, k, v, ik, iv, scale)
+                                      : ggml_ext_sage_attn(&ctx, q, k, v, scale, GGML_SAGE_ATTN_2);
+            if (graph->output) ggml_set_name(graph->output, "wan.sage_fp8");
+        }
+        if (!graph->output) return false;
+        if (!graph->supported() || !graph->allocate() || !graph->initialize_f32_inputs() ||
+            graph->run() < 0. || graph->run() < 0.) return false;
+    }
+    const size_t elements = static_cast<size_t>(ggml_nelements(reference.output));
+    std::vector<float> expected(elements), actual(elements);
+    ggml_backend_tensor_get(reference.output, expected.data(), 0, ggml_nbytes(reference.output));
+    ggml_backend_tensor_get(candidate.output, actual.data(), 0, ggml_nbytes(candidate.output));
+    const bool exact = std::all_of(actual.begin(), actual.end(), [](float v) { return std::isfinite(v); }) &&
+                       std::memcmp(expected.data(), actual.data(), elements * sizeof(float)) == 0;
+    const char* kind = image_len ? "pair" : "self";
+    std::printf("Sage %s D=%d Q=%d keys=%d image=%d heads=%d/%d exact=%d\n",
+                kind, d, queries, text_len, image_len, query_heads, kv_heads, int(exact));
+    if (!exact || !rounds) return exact;
+
+    std::vector<double> old_times(rounds), new_times(rounds);
+    for (int i = 0; i < rounds; ++i) {
+        if (i % 2 == 0) {
+            old_times[i] = reference.run();
+            new_times[i] = candidate.run();
+        } else {
+            new_times[i] = candidate.run();
+            old_times[i] = reference.run();
+        }
+        if (old_times[i] < 0. || new_times[i] < 0.) return false;
+    }
+    std::sort(old_times.begin(), old_times.end());
+    std::sort(new_times.begin(), new_times.end());
+    std::printf("Sage %s Q=%d timed rounds=%d original=%.3f ms optimized=%.3f ms\n",
+                kind, queries, rounds, old_times[rounds / 2], new_times[rounds / 2]);
+    return true;
+}
+
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    const bool benchmark = argc == 3 && std::strcmp(argv[2], "--benchmark-pair") == 0;
+    if (argc != 2 && !benchmark) return 2;
     ggml_backend_load_all_from_path(argv[1]);
     auto gpu = ggml_backend_init_by_name("CUDA0", nullptr);
     if (!gpu) return 3;
@@ -132,6 +200,15 @@ int main(int argc, char** argv) {
     ok &= check_long_attention(gpu, 86016, 86016, 4, true);
     ok &= check_long_attention(gpu, 86016, 257, 4, true);
     ok &= check_long_attention(gpu, 1, 1, 65536, false);
+    ok &= compare_sage_output(gpu, 64, 137, 137, 0, 3, 3);
+    ok &= compare_sage_output(gpu, 128, 257, 257, 0, 4, 4);
+    ok &= compare_sage_output(gpu, 64, 133, 129, 33, 3, 3);
+    ok &= compare_sage_output(gpu, 128, 257, 77, 259, 4, 2);
+    if (benchmark) {
+        ok &= compare_sage_output(gpu, 128, 4096, 4096, 0, 4, 4, 9);
+        ok &= compare_sage_output(gpu, 128, 8192, 129, 257, 4, 4, 9);
+        ok &= compare_sage_output(gpu, 128, 32768, 129, 257, 4, 4, 9);
+    }
     ggml_backend_free(gpu);
     return ok ? 0 : 1;
 }

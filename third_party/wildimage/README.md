@@ -152,8 +152,12 @@ Video profiles accept `attention_backend` values `cute` (default) and `sage_fp8`
 Wan RAPID uses SageAttention2 for every diffusion self-attention and cross-attention
 block when selected. Queries and keys use INT8, probability/value products use FP8,
 and accumulation uses FP32. Each head sees every key. Image-to-video retains the
-two independent text and reference softmaxes and sums their outputs. Larger head
-groups are split to limit temporary projection storage. From 16,384 key tokens, the
+two independent text and reference softmaxes and sums their outputs. Both use
+the same quantized queries and reuse one K/V workspace in stream order. The
+Sage FP8 kernel widens its FP16-rounded output to FP32 as it writes, so it can
+add the reference contribution without allocating a separate output tensor.
+Larger head groups are split to limit temporary projection storage. From
+16,384 key tokens, the
 key means and value scales share a tiled reduction in the existing key scratch
 buffer. Text/vision encoders and VAE run at their usual precision. This mode
 requires a compatible CUDA device even when weights are offloaded to RAM. An

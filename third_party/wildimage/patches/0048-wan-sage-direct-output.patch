@@ -1,0 +1,400 @@
+--- a/src/core/ggml_extensions.cpp
++++ b/src/core/ggml_extensions.cpp
+@@ -354,15 +354,18 @@
+ }
+ 
+ static bool sage_attn_infer(ggml_tensor* const* inputs, int count, const void* attributes, ggml_ext_tensor_desc* out) {
+-    if (count != 3 || !attributes)
+-        return false;
++    if ((count != 3 && count != 5) || !attributes)
++        return false;
++    const bool paired = count == 5;
+     SDSageAttentionParams params;
+     std::memcpy(&params, attributes, sizeof(params));
+-    if (!std::isfinite(params.scale) || params.scale <= 0.f || params.mode < GGML_SAGE_ATTN_AUTO || params.mode > GGML_SAGE_ATTN_2_PLUS_PLUS)
++    if (!std::isfinite(params.scale) || params.scale <= 0.f || params.mode < GGML_SAGE_ATTN_AUTO ||
++        params.mode > GGML_SAGE_ATTN_2_PLUS_PLUS || (paired && params.mode != GGML_SAGE_ATTN_2))
+         return false;
+     for (int i = 0; i < count; ++i) {
+         const auto* t = inputs[i];
+-        if (!t || !ggml_is_contiguous(t) || t->type != (i == 2 ? GGML_TYPE_F16 : GGML_TYPE_F32))
++        const auto type = i == 2 || i == 4 ? GGML_TYPE_F16 : GGML_TYPE_F32;
++        if (!t || !ggml_is_contiguous(t) || t->type != type)
+             return false;
+         int64_t elements = 1;
+         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+@@ -375,6 +378,12 @@
+     const auto* k = inputs[1];
+     if (q->ne[0] != k->ne[0] || !ggml_are_same_shape(k, inputs[2]) || q->ne[2] % k->ne[2] != 0 || q->ne[3] != k->ne[3])
+         return false;
++    if (paired) {
++        const auto* image_k = inputs[3];
++        if (!ggml_are_same_shape(image_k, inputs[4]) || image_k->ne[0] != k->ne[0] ||
++            image_k->ne[2] != k->ne[2] || image_k->ne[3] != k->ne[3])
++            return false;
++    }
+     *out = {GGML_TYPE_F32, {q->ne[0], q->ne[2], q->ne[1], q->ne[3]}};
+     return true;
+ }
+@@ -390,11 +399,14 @@
+ }
+ 
+ bool sd_ggml_sage_attn_describe(const ggml_tensor* node, SDSageAttentionParams* params) {
+-    if (!node || ggml_ext_op_get(node) != sd_ggml_sage_attn_op() || node->src[3] || !ggml_is_contiguous(node))
+-        return false;
++    if (!node || ggml_ext_op_get(node) != sd_ggml_sage_attn_op() || !ggml_is_contiguous(node))
++        return false;
++    const int count = node->src[3] || node->src[4] ? 5 : 3;
++    for (int i = count; i < GGML_MAX_SRC; ++i)
++        if (node->src[i]) return false;
+     ggml_ext_tensor_desc output;
+     const auto* attributes = ggml_ext_op_attributes(node);
+-    if (!sage_attn_infer(node->src, 3, attributes, &output) || node->type != output.type || std::memcmp(node->ne, output.ne, sizeof(output.ne)))
++    if (!sage_attn_infer(node->src, count, attributes, &output) || node->type != output.type || std::memcmp(node->ne, output.ne, sizeof(output.ne)))
+         return false;
+     std::memcpy(params, attributes, sizeof(*params));
+     return true;
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -132,6 +132,15 @@
+         return std::max<int64_t>(1, (192LL << 20) / (width * tokens * sizeof(float)));
+     }
+ 
++#ifndef SD_USE_UPSTREAM_GGML
++    inline ggml_tensor* wan_sage_attention_pair(GGMLRunnerContext* ctx, ggml_tensor* q, ggml_tensor* k,
++                                               ggml_tensor* v, ggml_tensor* image_k, ggml_tensor* image_v, float scale) {
++        ggml_tensor* inputs[] = {q, k, v, image_k, image_v};
++        const SDSageAttentionParams params = {scale, GGML_SAGE_ATTN_2};
++        return ggml_ext_op_create(ctx->ggml_ctx, sd_ggml_sage_attn_op(), inputs, 5, &params);
++    }
++#endif
++
+     // Independent attention heads share positions but never mix before the
+     // output projection. Keep every key and value for the whole sequence.
+     inline ggml_tensor* attention_by_head(GGMLRunnerContext* ctx, ggml_tensor* q, ggml_tensor* k,
+@@ -152,25 +161,40 @@
+                         t = heads(t);
+                         return ggml_ext_cont(ctx, pe ? Rope::apply_rope(ctx, t, pe) : ggml_permute(c, t, 0, 2, 1, 3));
+                     };
+-                    auto query = ordered(q);
+-                    auto attend = [&](ggml_tensor* key, ggml_tensor* values) {
++                    auto prepare_value = [&](ggml_tensor* values) {
+                         auto value = ggml_permute(c, heads(values), 0, 2, 1, 3);
+                         auto half = ggml_cast(c, value, GGML_TYPE_F16);
+                         if (!ggml_backend_supports_op(ctx->backend, half))
+                             half = ggml_cast(c, ggml_ext_cont(ctx, value), GGML_TYPE_F16);
+-                        auto ordered_key = ordered(key);
+-                        auto out = ggml_ext_sage_attn(ctx, query, ordered_key, half,
+-                                                      1.f / std::sqrt(float(q->ne[0])), GGML_SAGE_ATTN_2);
+-                        if (!out) wan_sage_unavailable(ctx, "invalid Q/K/V layout", query, ordered_key, half);
++                        return half;
++                    };
++                    const float scale = 1.f / std::sqrt(float(q->ne[0]));
++                    auto query = ordered(q);
++                    auto key = ordered(k);
++                    auto value = prepare_value(v);
++                    auto attend = [&](ggml_tensor* keys, ggml_tensor* values) {
++                        auto out = ggml_ext_sage_attn(ctx, query, keys, values, scale, GGML_SAGE_ATTN_2);
++                        if (!out) wan_sage_unavailable(ctx, "invalid Q/K/V layout", query, keys, values);
+                         if (!ggml_backend_supports_op(ctx->backend, out)) {
+-                            wan_sage_unavailable(ctx, "CUDA rejected the attention operator", query, ordered_key, half);
++                            wan_sage_unavailable(ctx, "CUDA rejected the attention operator", query, keys, values);
+                         }
+                         ggml_set_name(out, "wan.sage_fp8");
+                         return out;
+                     };
+-                    auto out = attend(k, v);
+-                    if (image_k) out = ggml_add(c, out, attend(image_k, image_v));
+-                    return ggml_reshape_3d(c, out, q->ne[0] * count, q->ne[2], 1);
++                    auto reshape = [&](ggml_tensor* out) {
++                        return ggml_reshape_3d(c, out, q->ne[0] * count, q->ne[2], 1);
++                    };
++                    if (!image_k) return reshape(attend(key, value));
++
++                    // Both contexts share the query but have independent softmax denominators.
++                    auto reference_key = ordered(image_k);
++                    auto reference_value = prepare_value(image_v);
++                    auto out = wan_sage_attention_pair(ctx, query, key, value, reference_key, reference_value, scale);
++                    if (out && ggml_backend_supports_op(ctx->backend, out)) {
++                        ggml_set_name(out, "wan.sage_fp8");
++                        return reshape(out);
++                    }
++                    return reshape(ggml_add(c, attend(key, value), attend(reference_key, reference_value)));
+                 }
+ #endif
+                 return Rope::attention(ctx, heads(q), heads(k), heads(v), pe, nullptr);
+--- a/src/core/cuda/sageattention/attn_fp8.cuh
++++ b/src/core/cuda/sageattention/attn_fp8.cuh
+@@ -36,7 +36,7 @@
+ #define MMA_SV_N 16
+ #define MMA_SV_K 32
+ 
+-    template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale = false, bool fuse_v_mean = false, bool use_pv_fp16_accu = false>
++    template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale = false, bool fuse_v_mean = false, bool use_pv_fp16_accu = false, bool ACCUMULATE = false>
+     __global__ void qk_int_sv_f8_attn_kernel(int8_t* __restrict__ Q, int8_t* __restrict__ K, int8_t* __restrict__ V, DTypeOut* __restrict__ O, float* __restrict__ Lse, float* __restrict__ Q_scale, float* __restrict__ K_scale, float* __restrict__ V_scale, float* __restrict__ V_mean, const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups, const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q, const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k, const uint32_t stride_bz_v, const uint32_t stride_h_v, const uint32_t stride_d_v, const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale) {
+         // Keep unsupported device passes from parsing architecture-specific intrinsics.
+ #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
+@@ -46,7 +46,12 @@
+         static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
+         static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
+         static_assert(std::is_same<DTypeSVAccum, float>::value, "DTypeSVAccum must be float, half is WIP");
+-        static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
++        constexpr bool direct_f32_output = std::is_same<DTypeOut, float>::value;
++        static_assert(direct_f32_output || std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value,
++                      "DTypeOut must be float, half or nv_bfloat16");
++        static_assert(!ACCUMULATE || direct_f32_output, "Accumulation requires FP32 output");
++        static_assert(!direct_f32_output || ((head_dim == 64 || head_dim == 128) && WARP_K == CTA_K),
++                      "Direct FP32 output requires a 64/128-wide head and one warp per key tile");
+         static_assert(CTA_K % 64 == 0);
+         static_assert(CTA_Q / CTA_K <= 2);  // for efficient causal implementation
+ 
+@@ -548,7 +553,7 @@
+                     uint32_t RO_f16[4];
+ #pragma unroll
+                     for (uint32_t k = 0; k < 4; k++) {
+-                        if constexpr (std::is_same<DTypeOut, half>::value) {
++                        if constexpr (direct_f32_output || std::is_same<DTypeOut, half>::value) {
+                             ((half2*)RO_f16)[k] = __float22half2_rn(((float2*)RO[fq][fv])[k]);
+                         } else {
+                             ((nv_bfloat162*)RO_f16)[k] = __float22bfloat162_rn(((float2*)RO[fq][fv])[k]);
+@@ -570,25 +575,58 @@
+         // ! do we need to sync here?
+         __syncwarp();
+ 
+-        // shared memory to global memory
+-        DTypeOut* O_lane_ptr          = O + batch_id * stride_bz_o + head_id * stride_h_o + (bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() + lane_id / global_to_shared_line_lanes_O) * stride_seq_o + lane_id % global_to_shared_line_lanes_O * PACK_SIZE_O;
+-        uint32_t offset_O             = smem_O.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / global_to_shared_line_lanes_O, lane_id % global_to_shared_line_lanes_O);
+-        uint32_t O_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_O;
+-
+-#pragma unroll
+-        for (uint32_t i = 0; i < O_smem_iters_col; i++) {
+-#pragma unroll
+-            for (uint32_t j = 0; j < O_smem_iters_row; j++) {
+-                if (O_load_idx_lane_base < qo_len) {
+-                    smem_O.store_128b(offset_O, O_lane_ptr);
+-                }
+-                O_lane_ptr += (global_to_shared_line_lanes_O * PACK_SIZE_O);
+-                offset_O = smem_O.advance_offset_by_column<global_to_shared_line_lanes_O>(offset_O);
+-            }
+-
+-            offset_O = smem_O.advance_offset_by_row<global_to_shared_copy_lines_per_warp_O>(offset_O - (O_smem_iters_row * global_to_shared_line_lanes_O));
+-            O_lane_ptr += ((global_to_shared_copy_lines_per_warp_O * stride_seq_o) - (O_smem_iters_row * global_to_shared_line_lanes_O * PACK_SIZE_O));
+-            O_load_idx_lane_base += global_to_shared_copy_lines_per_warp_O;
++        if constexpr (direct_f32_output) {
++            // Match the original FP16 epilogue before widening into the FP32
++            // destination. Each lane reads four adjacent halves from the
++            // swizzled tile and writes one aligned, coalesced 16-byte vector.
++            constexpr uint32_t width = 4;
++            constexpr uint32_t lanes_per_row = head_dim / width;
++            constexpr uint32_t rows_per_copy = 32 / lanes_per_row;
++            const uint32_t column = lane_id % lanes_per_row;
++            const uint32_t first_row = get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / lanes_per_row;
++            const auto* packed_half = reinterpret_cast<const uint2*>(smem_O.base);
++            auto* dst = O + batch_id * stride_bz_o + head_id * stride_h_o;
++#pragma unroll
++            for (uint32_t i = 0; i < WARP_Q; i += rows_per_copy) {
++                const uint32_t row = bx * CTA_Q + first_row + i;
++                if (row < qo_len) {
++                    const uint32_t slot = smem_O.get_permuted_offset(first_row + i, column / 2) * 2 + column % 2;
++                    const uint2 bits = packed_half[slot];
++                    float4 value = make_float4(
++                        __half2float(__ushort_as_half(static_cast<unsigned short>(bits.x))),
++                        __half2float(__ushort_as_half(static_cast<unsigned short>(bits.x >> 16))),
++                        __half2float(__ushort_as_half(static_cast<unsigned short>(bits.y))),
++                        __half2float(__ushort_as_half(static_cast<unsigned short>(bits.y >> 16))));
++                    auto* vector = reinterpret_cast<float4*>(dst + row * stride_seq_o + column * width);
++                    if constexpr (ACCUMULATE) {
++                        const float4 prior = *vector;
++                        value = make_float4(__fadd_rn(prior.x, value.x), __fadd_rn(prior.y, value.y),
++                                            __fadd_rn(prior.z, value.z), __fadd_rn(prior.w, value.w));
++                    }
++                    *vector = value;
++                }
++            }
++        } else {
++            // shared memory to global memory
++            DTypeOut* O_lane_ptr          = O + batch_id * stride_bz_o + head_id * stride_h_o + (bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() + lane_id / global_to_shared_line_lanes_O) * stride_seq_o + lane_id % global_to_shared_line_lanes_O * PACK_SIZE_O;
++            uint32_t offset_O             = smem_O.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / global_to_shared_line_lanes_O, lane_id % global_to_shared_line_lanes_O);
++            uint32_t O_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_O;
++
++#pragma unroll
++            for (uint32_t i = 0; i < O_smem_iters_col; i++) {
++#pragma unroll
++                for (uint32_t j = 0; j < O_smem_iters_row; j++) {
++                    if (O_load_idx_lane_base < qo_len) {
++                        smem_O.store_128b(offset_O, O_lane_ptr);
++                    }
++                    O_lane_ptr += (global_to_shared_line_lanes_O * PACK_SIZE_O);
++                    offset_O = smem_O.advance_offset_by_column<global_to_shared_line_lanes_O>(offset_O);
++                }
++
++                offset_O = smem_O.advance_offset_by_row<global_to_shared_copy_lines_per_warp_O>(offset_O - (O_smem_iters_row * global_to_shared_line_lanes_O));
++                O_lane_ptr += ((global_to_shared_copy_lines_per_warp_O * stride_seq_o) - (O_smem_iters_row * global_to_shared_line_lanes_O * PACK_SIZE_O));
++                O_load_idx_lane_base += global_to_shared_copy_lines_per_warp_O;
++            }
+         }
+ 
+         if constexpr (return_lse) {
+--- a/src/core/cuda/sage_attention.cu
++++ b/src/core/cuda/sage_attention.cu
+@@ -8,6 +8,7 @@
+ #include <cstring>
+ #include <cstdio>
+ #include <map>
++#include <type_traits>
+ #include "sageattention/attn.cuh"
+ #include "sageattention/attn_fp8.cuh"
+ 
+@@ -42,6 +43,13 @@
+         const int i = blockIdx.x * blockDim.x + threadIdx.x;
+         if (i < count)
+             output[i] = __half2float(input[i]);
++    }
++
++    static bool sage_direct_fp32(const ggml_tensor* dst, ggml_sage_attn_mode mode) {
++        // Keep the existing generic Sage paths isolated. Paired Wan I2V uses
++        // the explicit FP32-accumulating FP8 mode for both softmaxes.
++        return mode == GGML_SAGE_ATTN_2 &&
++               (dst->src[3] || std::strcmp(dst->name, "wan.sage_fp8") == 0);
+     }
+ 
+     struct SageWorkspace {
+@@ -55,9 +63,12 @@
+         size_t output;
+         size_t size;
+ 
+-        explicit SageWorkspace(const ggml_tensor* dst) {
++        SageWorkspace(const ggml_tensor* dst, bool direct_output) {
+             const ggml_tensor* qt = dst->src[0];
+             const ggml_tensor* kt = dst->src[1];
++            // Paired inputs have the same head/batch shape. The two
++            // launches reuse K/V scratch in stream order, sized for the longer context.
++            if (dst->src[3] && dst->src[3]->ne[1] > kt->ne[1]) kt = dst->src[3];
+             size                  = 0;
+             q                     = reserve(ggml_nelements(qt));
+             k                     = reserve(ggml_nelements(kt));
+@@ -66,7 +77,7 @@
+             k_mean                = reserve(kt->ne[0] * kt->ne[2] * kt->ne[3] * sizeof(float));
+             v                     = reserve(kt->ne[0] * GGML_PAD(kt->ne[1], 64) * kt->ne[2] * kt->ne[3]);
+             v_scale               = reserve(kt->ne[0] * kt->ne[2] * kt->ne[3] * sizeof(float));
+-            output                = reserve(ggml_nelements(dst) * sizeof(half));
++            output                = direct_output ? 0 : reserve(ggml_nelements(dst) * sizeof(half));
+         }
+ 
+         size_t reserve(size_t bytes) {
+@@ -268,11 +279,13 @@
+         scales[index] = peak / 448.f;
+     }
+ 
+-    template <int D, bool PLUS_PLUS>
++    template <int D, bool PLUS_PLUS, bool DIRECT = false, bool ACCUMULATE = false>
+     static void sage_attn_fp8(cudaStream_t stream, ggml_tensor* dst, char* data, const SageWorkspace& work, float scale) {
++        static_assert(!ACCUMULATE || DIRECT);
++        using Output = std::conditional_t<DIRECT, float, half>;
+         const ggml_tensor* q = dst->src[0];
+-        const ggml_tensor* k = dst->src[1];
+-        const ggml_tensor* v = dst->src[2];
++        const ggml_tensor* k = dst->src[ACCUMULATE ? 3 : 1];
++        const ggml_tensor* v = dst->src[ACCUMULATE ? 4 : 2];
+         const int lq = q->ne[1], lk = k->ne[1], padded = GGML_PAD(lk, 64);
+         const int hq = q->ne[2], hk = k->ne[2], batch = q->ne[3];
+         auto* qi  = reinterpret_cast<int8_t*>(data + work.q);
+@@ -282,7 +295,7 @@
+         auto* ks  = reinterpret_cast<float*>(data + work.k_scale);
+         auto* vs  = reinterpret_cast<float*>(data + work.v_scale);
+         auto* km  = reinterpret_cast<float*>(data + work.k_mean);
+-        auto* out = reinterpret_cast<half*>(data + work.output);
++        auto* out = DIRECT ? static_cast<Output*>(dst->data) : reinterpret_cast<Output*>(data + work.output);
+         const bool parallel = !PLUS_PLUS && lk >= 16384 && lk <= 65535 * sage_rows_per_tile && std::strcmp(dst->name, "wan.sage_fp8") == 0;
+         if (parallel) {
+             const int tiles = (lk + sage_rows_per_tile - 1) / sage_rows_per_tile;
+@@ -293,8 +306,10 @@
+         } else {
+             sage_key_mean<D><<<dim3(D / 32, hk * batch), 256, 0, stream>>>(static_cast<const float*>(k->data), km, lk);
+         }
+-        sage_quantize_per_thread<D, false><<<dim3(GGML_PAD(lq, 128) / 32, hq * batch), 256, 0, stream>>>(
+-            static_cast<const float*>(q->data), nullptr, qi, qs, lq);
++        if constexpr (!ACCUMULATE) {
++            sage_quantize_per_thread<D, false><<<dim3(GGML_PAD(lq, 128) / 32, hq * batch), 256, 0, stream>>>(
++                static_cast<const float*>(q->data), nullptr, qi, qs, lq);
++        }
+         sage_quantize_per_thread<D, true><<<dim3(padded / 64, hk * batch), 128, 0, stream>>>(
+             static_cast<const float*>(k->data), km, ki, ks, lk);
+         // The smaller V range keeps the FP16 instruction accumulator finite in SageAttention2++.
+@@ -302,13 +317,16 @@
+         sage_quantize_value<D><<<dim3(padded / 32, hk * batch), 256, 0, stream>>>(static_cast<const half*>(v->data), vs, vi, lk, padded);
+         auto kernel = sageattention::qk_int_sv_f8_attn_kernel<128, 64, 32, 64, D,
+                                                               sageattention::DataType::kInt8, sageattention::QuantGranularity::kPerThread,
+-                                                              sageattention::QuantGranularity::kPerThread, float, true, half,
+-                                                              sageattention::ComputeUnit::kCudaCore, sageattention::MaskMode::kNone, false, true, false, PLUS_PLUS>;
++                                                              sageattention::QuantGranularity::kPerThread, float, true, Output,
++                                                              sageattention::ComputeUnit::kCudaCore, sageattention::MaskMode::kNone,
++                                                              false, true, false, PLUS_PLUS, ACCUMULATE>;
+         kernel<<<dim3(GGML_PAD(lq, 128) / 128, hq, batch), dim3(32, 4), 256 * D, stream>>>(
+             qi, ki, vi, out, nullptr, qs, ks, vs, nullptr, lq, lk, hq / hk,
+             D * lq * hq, D, D * lq, D * lk * hk, D, D * lk,
+             D * padded * hk, D * padded, padded, D * lq * hq, D * hq, D, scale);
+-        sage_output<<<(ggml_nelements(dst) + 255) / 256, 256, 0, stream>>>(out, static_cast<float*>(dst->data), ggml_nelements(dst));
++        if constexpr (!DIRECT) {
++            sage_output<<<(ggml_nelements(dst) + 255) / 256, 256, 0, stream>>>(out, static_cast<float*>(dst->data), ggml_nelements(dst));
++        }
+     }
+ 
+     template <int D>
+@@ -318,13 +336,21 @@
+         const ggml_tensor* v = dst->src[2];
+         const int lq = q->ne[1], lk = k->ne[1];
+         const int hq = q->ne[2], hk = k->ne[2], batch = q->ne[3];
+-        const SageWorkspace work(dst);
++        const bool direct = sage_direct_fp32(dst, mode);
++        const SageWorkspace work(dst, direct);
+         if (mode == GGML_SAGE_ATTN_2_PLUS_PLUS) {
+             sage_attn_fp8<D, true>(stream, dst, data, work, scale);
+             return;
+         }
+         if (mode == GGML_SAGE_ATTN_2) {
+-            sage_attn_fp8<D, false>(stream, dst, data, work, scale);
++            if (direct) {
++                sage_attn_fp8<D, false, true>(stream, dst, data, work, scale);
++                if (dst->src[3]) {
++                    sage_attn_fp8<D, false, true, true>(stream, dst, data, work, scale);
++                }
++            } else {
++                sage_attn_fp8<D, false>(stream, dst, data, work, scale);
++            }
+             return;
+         }
+         auto* qi  = reinterpret_cast<int8_t*>(data + work.q);
+@@ -375,15 +401,25 @@
+         // CUDA's y-grid spans input head/batch groups. The result copy uses a linear x-grid.
+         if (q->ne[2] * q->ne[3] > 65535 || k->ne[2] * k->ne[3] > 65535)
+             return false;
+-        for (const auto* t : {q, k, v, op}) {
+-            if (ggml_nelements(t) > INT_MAX || (reinterpret_cast<uintptr_t>(t->data) & 15))
++        const auto* image_k = op->src[3];
++        const auto* image_v = op->src[4];
++        for (const auto* t : {q, k, v, op, image_k, image_v}) {
++            if (t && (ggml_nelements(t) > INT_MAX || (reinterpret_cast<uintptr_t>(t->data) & 15)))
+                 return false;
+         }
+-        return k->ne[0] * GGML_PAD(k->ne[1], 64) * k->ne[2] * k->ne[3] <= INT_MAX;
+-    }
+-
+-    static ggml_status sage_prepare(ggml_backend_t, ggml_tensor* const* nodes, int, void**, size_t* workspace, void*) {
+-        *workspace = SageWorkspace(nodes[0]).size;
++        for (const auto* keys : {k, image_k}) {
++            if (keys && keys->ne[0] * GGML_PAD(keys->ne[1], 64) * keys->ne[2] * keys->ne[3] > INT_MAX)
++                return false;
++        }
++        return true;
++    }
++
++    static ggml_status sage_prepare(ggml_backend_t, ggml_tensor* const* nodes, int, void**, size_t* workspace, void* user_data) {
++        SDSageAttentionParams params;
++        if (!sd_ggml_sage_attn_describe(nodes[0], &params))
++            return GGML_STATUS_FAILED;
++        const auto mode = sage_mode(*static_cast<const SageDevice*>(user_data), params.mode);
++        *workspace = SageWorkspace(nodes[0], sage_direct_fp32(nodes[0], mode)).size;
+         return GGML_STATUS_SUCCESS;
+     }
+ 
