@@ -1,0 +1,121 @@
+--- a/common/mtp-round-policy.h
++++ b/common/mtp-round-policy.h
+@@ -9,6 +9,7 @@
+ // collisions and rewinds are harmless because each match is verified in full.
+ class common_mtp_response_lookup {
+     static constexpr size_t anchor = 6, buckets = 4096, window = 16384;
++    const bool require_agreement;
+     std::vector<uint32_t> offsets;
+     size_t start = 0, next = 0, last_size = 0;
+     template <class At> static size_t bucket(At at) {
+@@ -20,6 +21,8 @@
+     }
+ 
+   public:
++    explicit common_mtp_response_lookup(bool require_agreement = false) : require_agreement(require_agreement) {}
++
+     void begin(size_t prompt) {
+         start = last_size = prompt;
+         next = prompt;
+@@ -30,28 +33,42 @@
+             begin(h.size());
+         }
+         last_size = h.size();
+-        if (max < 2 || !out.empty() || h.size() > UINT32_MAX || h.size() - start < anchor + 2) {
++        if (max < 2 || !out.empty() || h.size() > UINT32_MAX || h.size() - start < (require_agreement ? 3 * anchor + 4 : anchor + 2)) {
+             return false;
+         }
+         if (offsets.empty()) {
+-            offsets.resize(buckets);
++            offsets.resize(require_agreement ? 2 * buckets : buckets);
+         }
+         const size_t oldest = std::max(start, h.size() > window ? h.size() - window : 0);
+         next = std::max(next, oldest + anchor);
+         for (; next <= h.size() - 2; ++next) {
+-            offsets[bucket([&](size_t i) { return h[next - anchor + i]; })] = uint32_t(next);
++            const size_t key = bucket([&](size_t i) { return h[next - anchor + i]; });
++            if (require_agreement) { offsets[buckets + key] = offsets[key]; }
++            offsets[key] = uint32_t(next);
+         }
+         const auto at = [&](size_t i) { return i + 1 == anchor ? last : h[h.size() - (anchor - 1) + i]; };
+-        const size_t pos = offsets[bucket(at)];
+-        if (pos < oldest + anchor || pos > h.size() - 2) {
+-            return false;
+-        }
+-        for (size_t i = 0; i < anchor; ++i) {
+-            if (at(i) != h[pos - anchor + i]) {
++        const size_t key = bucket(at);
++        const size_t pos = offsets[key];
++        const auto matches = [&](size_t end) {
++            if (end < oldest + anchor || end > h.size() - 2) { return false; }
++            for (size_t i = 0; i < anchor; ++i) {
++                if (at(i) != h[end - anchor + i]) { return false; }
++            }
++            return true;
++        };
++        if (!matches(pos)) { return false; }
++        size_t count = std::min(max, h.size() - pos);
++        if (require_agreement) {
++            const size_t previous = offsets[buckets + key];
++            const size_t current = h.size() - (anchor - 1); // start of the live anchor
++            // Two independent occurrences must predict the same next tokens.
++            // Do not cross another anchor or copy past the first disagreement.
++            if (!matches(previous) || pos - previous < anchor + 2 || current < pos + 2) { return false; }
++            if (count != max || pos - previous - anchor < max || current - pos < max ||
++                    !std::equal(h.begin() + previous, h.begin() + previous + max, h.begin() + pos)) {
+                 return false;
+             }
+         }
+-        const size_t count = std::min(max, h.size() - pos);
+         out.assign(h.begin() + pos, h.begin() + pos + count);
+         return true;
+     }
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1756,8 +1756,10 @@
+             return value && std::strcmp(value, "1") == 0;
+         };
+         const bool single = n_seq == 1 && !chain_heads && !is_mem_shared && this->params.n_min <= 1;
+-        if (single && enabled("WILDLLAMA_MTP_RESPONSE_LOOKUP") && !tune_proposals && !draft_vocab_active) {
+-            response_lookup = std::make_unique<common_mtp_response_lookup>();
++        const char * response_mode = std::getenv("WILDLLAMA_MTP_RESPONSE_LOOKUP");
++        const bool consensus = edit_lookup && (!response_mode || !*response_mode) && !enabled("WILDLLAMA_MTP_AUTO_STRATEGY");
++        if (single && (consensus || enabled("WILDLLAMA_MTP_RESPONSE_LOOKUP")) && !tune_proposals && !draft_vocab_active) {
++            response_lookup = std::make_unique<common_mtp_response_lookup>(consensus);
+         }
+         // Automatic mode may probe normally-off features. A forced strategy or fixed shortlist wins.
+         auto_strategy = single && this->params.block_verification && (!shortlist || !*shortlist) && !tune_proposals && !contextual &&
+--- a/tests/test-server-mtp-depth.cpp
++++ b/tests/test-server-mtp-depth.cpp
+@@ -175,6 +175,31 @@
+     output.begin(history.size());
+     check(!output.propose(history,6,2,result), "lookup crossed requests");
+ 
++    common_mtp_response_lookup consensus(true);
++    const std::vector<int32_t> phrase{11,12,13,14,15,16};
++    const auto response_draft = [&](int first, int second, int third) {
++        consensus.begin(3);
++        history = {91,92,93};
++        for (int variable : {first, second}) {
++            history.insert(history.end(), phrase.begin(), phrase.end());
++            history.insert(history.end(), {21,variable,third + variable,33,34});
++        }
++        history.insert(history.end(), phrase.begin(), phrase.end() - 1);
++        result.clear();
++        return consensus.propose(history, phrase.back(), 4, result);
++    };
++    check(response_draft(22,22,10) && result == std::vector<int32_t>({21,22,32,33}), "missed two agreeing spans");
++    check(!response_draft(22,24,10), "draft crossed disagreement in the second token");
++    history[10] = 24; // now both spans agree for two tokens but differ at the third
++    consensus.begin(3);
++    result.clear();
++    check(!consensus.propose(history, phrase.back(), 4, result), "short response draft displaced a full neural block");
++    check(consensus.propose(history, phrase.back(), 2, result) && result == std::vector<int32_t>({21,24}),
++          "two agreeing tokens should satisfy a two-token request");
++    consensus.begin(history.size());
++    result.clear();
++    check(!consensus.propose(history, phrase.back(), 4, result), "response draft crossed request boundary");
++
+     common_mtp_round_policy policy;
+     int used[3]{};
+     for (int i=0;i<400;++i) {

@@ -1,0 +1,119 @@
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1615,8 +1615,9 @@
+     return common_chat_peg_parse(params.parser, input, is_partial, params);
+ }
+ 
++// input includes the generation prompt; streaming sessions keep it between feeds.
+ static common_chat_msg common_chat_peg_parse_impl(
+-        const common_peg_arena & src_parser, const common_chat_input & input,
++        const common_peg_arena & src_parser, common_chat_input & input,
+         bool is_partial, const common_chat_parser_params & params,
+         std::vector<common_peg_stream_scan> * stream_scans) {
+     // both branches must be lvalues, a temporary here would copy the arena on every call
+@@ -1628,17 +1629,22 @@
+         LOG_DBG("No parser definition detected, assuming pure content parser.");
+     }
+ 
+-    common_chat_input effective_input = input;
+-    effective_input.prepend(params.generation_prompt);
+-
+-    //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.text.c_str());
+-
+     common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
+     if (params.debug) {
+         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
+     }
+ 
+-    common_peg_parse_context ctx(std::move(effective_input.text), std::move(effective_input.tokens), flags);
++    common_peg_parse_context ctx(std::move(input.text), std::move(input.tokens), flags);
++    // The PEG context owns the buffers while its AST has views into the text.
++    // Return their capacity to the caller even if parsing or mapping throws.
++    struct restore_input {
++        common_chat_input & input;
++        common_peg_parse_context & ctx;
++        ~restore_input() {
++            input.text.swap(ctx.input);
++            input.tokens.swap(ctx.tokens);
++        }
++    } restore{input, ctx};
+     ctx.stream_scans = params.debug ? nullptr : stream_scans;
+     auto result = parser.parse(ctx);
+ 
+@@ -1696,7 +1702,9 @@
+ 
+ common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const common_chat_input & input,
+                                       bool is_partial, const common_chat_parser_params & params) {
+-    return common_chat_peg_parse_impl(src_parser, input, is_partial, params, nullptr);
++    common_chat_input combined = params.generation_prompt;
++    combined.append(input);
++    return common_chat_peg_parse_impl(src_parser, combined, is_partial, params, nullptr);
+ }
+ 
+ common_chat_session::common_chat_session(const common_chat_templates *        tmpls,
+@@ -1717,8 +1725,8 @@
+     thinking_ends          = std::move(applied.thinking_end_tags);
+ 
+     parser_params.format            = applied.format;
+-    parser_params.generation_prompt = vocab ? common_chat_input_tokenize(vocab, applied.generation_prompt)
+-                                            : common_chat_input(applied.generation_prompt);
++    input = vocab ? common_chat_input_tokenize(vocab, applied.generation_prompt)
++                  : common_chat_input(applied.generation_prompt);
+     parser_params.debug             = params.debug;
+     parser_params.parser            = std::move(applied.parser);
+ 
+@@ -1739,7 +1747,7 @@
+ 
+     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !params.echo) {
+         // start from the prefill so it is not emitted as part of the first delta
+-        result = common_chat_parse(input, true, parser_params);
++        result = common_chat_peg_parse_impl(parser_params.parser, input, true, parser_params, nullptr);
+     }
+ }
+ 
+@@ -1770,7 +1778,7 @@
+     GGML_ASSERT(!finished && "finish() called twice");
+     finished = true;
+     input.append(chunk);
+-    auto msg = common_chat_parse(input, false, parser_params);
++    auto msg = common_chat_peg_parse_impl(parser_params.parser, input, false, parser_params, nullptr);
+     if (!msg.empty()) {
+         result = std::move(msg);
+     }
+--- a/tests/test-stream-scan.cpp
++++ b/tests/test-stream-scan.cpp
+@@ -1,3 +1,4 @@
++#include "chat.h"
+ #include "chat-peg-parser.h"
+ #include "peg-parser.h"
+ 
+@@ -37,6 +38,21 @@
+     }
+ }
+ 
++static void verify_session_buffers() {
++    common_chat_session session;
++    common_chat_input prefix;
++    prefix.append(std::string(2048, 'x'), 17);
++    prefix.append("\xc3", 18);
++    session.feed(prefix);
++    common_chat_session copy = session;
++    common_chat_input next;
++    next.append("\xa7", 19);
++    const auto & finished = session.finish(next);
++    require(finished.content == std::string(2048, 'x') + "\xc3\xa7", "split UTF-8 lost after finish");
++    copy.feed(next);
++    require(copy.finish(common_chat_input("!")).content == finished.content + "!", "copied session shares input");
++}
++
+ static double replay(bool incremental) {
+     const auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+         return p.until("</think>");
+@@ -56,6 +72,7 @@
+ 
+ int main() {
+     verify_fragments();
++    verify_session_buffers();
+     const double reference = replay(false);
+     const double resumed = replay(true);
+     std::printf("PASS stream scan parity (reference %.2f ms, resumed %.2f ms)\n", reference, resumed);

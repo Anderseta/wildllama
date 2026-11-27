@@ -154,9 +154,19 @@ with the intended model and sampling settings before enabling the option.
 
 ## Experimental per-request MTP controls
 
-Single-sequence MTP can opt into three independent runner environment settings.
-All default to 0. The target sampler still verifies proposals with their actual
-distribution. Changing a proposal may change a seeded output.
+Single-sequence MTP supports the following runner settings. The target sampler
+verifies each proposal with its actual distribution. Changing a proposal can
+change a seeded output.
+
+With prompt edit lookup active and the response setting unset, the runner can
+also draft from the current response. Two separate earlier occurrences of the
+same six tokens must agree on the entire requested block. Otherwise the MTP
+head supplies the draft. The two-position index uses up to 32 KiB of host
+memory per eligible slot and reads the existing confirmed tokens. Prompt
+matches have priority. Explicitly setting the response lookup to 0 disables
+it. Setting it to 1 selects the single-match mode described below. Automatic
+strategy trials keep their original proposals when this setting is unset.
+Automatic strategy and early stopping default to 0.
 
 | Runner environment setting | Effect of setting it to 1 |
 | --- | --- |
