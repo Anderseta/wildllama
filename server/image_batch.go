@@ -131,13 +131,6 @@ func (v *imageService) resolveImageGenerationDimensions(generation *imageGenerat
 	return nil
 }
 
-func imageBatchFilename(index int) string {
-	if index == 1 {
-		return "image.png"
-	}
-	return fmt.Sprintf("image-%d.png", index)
-}
-
 func (v *imageService) setImageBatchProgress(job *imageJob, index, count int) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -148,10 +141,13 @@ func (v *imageService) setImageBatchProgress(job *imageJob, index, count int) {
 	job.Progress.BatchCount = count
 }
 
-func (v *imageService) registerImageResult(job *imageJob, result imagegen.Result, filename string, index, count int) error {
+func (v *imageService) registerImageResult(job *imageJob, result imagegen.Result, filename string, seed int64, index, count int) error {
 	expected := filepath.Join(job.Config.OutputDir, job.ID, filename)
 	if filepath.Clean(result.Path) != filepath.Clean(expected) {
 		return errors.New("image runner returned an unexpected output path")
+	}
+	if result.Seed != seed {
+		return errors.New("image runner returned an unexpected output seed")
 	}
 	asset := imageAssetRecord{imageAsset: imageAsset{AssetID: job.ID + "/" + filename, RequestID: job.RequestID, SessionID: job.SessionID, JobID: job.ID, Filename: filename, MIMEType: "image/png", Path: expected,
 		Width: result.Width, Height: result.Height, Seed: result.Seed, DurationSeconds: result.DurationSeconds, GeneratedAtMS: time.Now().UnixMilli(), BatchIndex: index, BatchCount: count, ParentAssetID: job.ParentAssetID}, OutputRoot: job.Config.OutputDir}

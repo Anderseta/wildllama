@@ -20,8 +20,7 @@ var (
 )
 
 func validImageDeletionAsset(asset imageAssetRecord) bool {
-	name := asset.Filename == "image.png" || !asset.Input && imageBatchOutputName(asset.Filename) ||
-		asset.Input && (asset.Filename == "image.jpg" || asset.Filename == "image.webp")
+	name := validImageAssetFilename(asset.Filename, asset.Input)
 	return imageSafeID(asset.JobID) && (asset.RequestID == "" || imageSafeID(asset.RequestID)) && name && asset.AssetID == asset.JobID+"/"+asset.Filename &&
 		filepath.IsAbs(asset.OutputRoot) && filepath.Clean(asset.Path) == filepath.Clean(filepath.Join(asset.OutputRoot, asset.relativePath()))
 }

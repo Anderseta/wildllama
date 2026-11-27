@@ -259,6 +259,16 @@ func ValidateProfile(p Profile) error {
 	return nil
 }
 
+// ResolveSeed selects a random nonnegative seed when the request uses a sentinel.
+func ResolveSeed(seed int64) int64 {
+	if seed >= 0 {
+		return seed
+	}
+	var data [8]byte
+	rand.Read(data[:])
+	return int64(binary.LittleEndian.Uint64(data[:]) & math.MaxInt64)
+}
+
 func ValidateRequest(p Profile, r Request) error {
 	_, _, err := prepareImageRequest(p, r)
 	return err
@@ -627,13 +637,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		}
 		seed = r.VideoCheckpoint.seed
 	}
-	if seed < 0 {
-		var data [8]byte
-		if _, err := rand.Read(data[:]); err != nil {
-			return Result{}, err
-		}
-		seed = int64(binary.LittleEndian.Uint64(data[:]) & math.MaxInt64)
-	}
+	seed = ResolveSeed(seed)
 	start := time.Now()
 	log := &progressLog{callback: progress, start: start, expectedSteps: p.Steps, video: r.Video != nil}
 	if !r.crop.Empty() {

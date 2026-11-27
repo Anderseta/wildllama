@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -131,7 +132,9 @@ func TestImageBatchSequentialResultsUseOneTextTransition(t *testing.T) {
 		require.Equal(t, int64(41+i), asset.Seed)
 		require.Equal(t, i+1, asset.BatchIndex)
 		require.Equal(t, 3, asset.BatchCount)
-		require.Equal(t, imageBatchFilename(i+1), asset.Filename)
+		require.Regexp(t, `^qwen_[a-f0-9]{16}_`+strconv.Itoa(41+i)+`[.]png$`, asset.Filename)
+		require.Equal(t, asset.Filename, filepath.Base(asset.Path))
+		require.FileExists(t, asset.Path)
 		response := imageTestHTTP(router, "GET", "/api/images/assets/"+asset.AssetID, nil, "")
 		require.Equal(t, 200, response.Code)
 	}
@@ -182,7 +185,11 @@ func TestImageBatchResultsPersistWhileLaterImageIsRunningAndSurviveRestart(t *te
 	require.Len(t, recovered.jobs[0].Results, 1)
 	response := imageTestHTTP(mustImageRouter(t, restarted), "GET", "/api/images/jobs?session_id=session-a", nil, "")
 	require.Equal(t, 200, response.Code)
-	require.Contains(t, response.Body.String(), "image.png")
+	asset := recovered.jobs[0].Results[0]
+	require.Regexp(t, `^qwen_[a-f0-9]{16}_[0-9]+[.]png$`, asset.Filename)
+	require.GreaterOrEqual(t, asset.Seed, int64(0))
+	require.Contains(t, response.Body.String(), asset.Filename)
+	require.Equal(t, 200, imageTestHTTP(mustImageRouter(t, restarted), "GET", "/api/images/assets/"+asset.AssetID, nil, "").Code)
 	response = imageTestHTTP(router, "POST", "/api/images/jobs/"+job.ID+"/cancel", nil, "")
 	require.Equal(t, 200, response.Code)
 	waitImageBatchTerminal(t, service, job)

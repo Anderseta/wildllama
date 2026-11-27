@@ -469,7 +469,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 	if err != nil {
 		return err
 	}
-	input := imagegen.Request{Video: job.Video, Inpaint: request.Inpaint, Prompt: generation.Prompt, NegativePrompt: generation.NegativePrompt, Width: profile.Width, Height: profile.Height, Seed: seed, OutputPath: filepath.Join(job.Config.OutputDir, job.ID, "image.png")}
+	input := imagegen.Request{Video: job.Video, Inpaint: request.Inpaint, Prompt: generation.Prompt, NegativePrompt: generation.NegativePrompt, Width: profile.Width, Height: profile.Height, Seed: seed}
 	refs := generation.ReferenceAssetIDs
 	parent := request.ParentAssetID
 	if parent == "" && len(refs) > 0 {
@@ -648,15 +648,16 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		if err := job.ctx.Err(); err != nil {
 			return err
 		}
-		filename := imageBatchFilename(index)
-		if job.Video != nil {
-			filename = "video.webm"
-		}
-		input.OutputPath = filepath.Join(job.Config.OutputDir, job.ID, filename)
 		input.Seed = seed
 		if seed >= 0 {
 			input.Seed += int64(index - 1)
 		}
+		filename := "video.webm"
+		if job.Video == nil {
+			input.Seed = imagegen.ResolveSeed(input.Seed)
+			filename = imageOutputFilename(profile, input.Seed)
+		}
+		input.OutputPath = filepath.Join(job.Config.OutputDir, job.ID, filename)
 		v.setImageBatchProgress(job, index, generation.Count)
 		if index > 1 {
 			v.update(job, "checking_memory", "Checking free CUDA memory for the next batch image", 0, 0)
@@ -685,7 +686,7 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 			if job.Video != nil {
 				saveErr = v.registerVideoResult(job, result)
 			} else {
-				saveErr = v.registerImageResult(job, result, filename, index, generation.Count)
+				saveErr = v.registerImageResult(job, result, filename, input.Seed, index, generation.Count)
 			}
 			if err := saveErr; err != nil {
 				return errors.Join(generationErr, err)

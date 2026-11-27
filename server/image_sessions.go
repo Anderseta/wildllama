@@ -393,7 +393,7 @@ func (v *imageService) deleteImageSessionFilesLocked(id string, legacy []string)
 			retained++
 			continue
 		}
-		validName := asset.Filename == "image.png" || !asset.Input && imageBatchOutputName(asset.Filename) || asset.Input && (asset.Filename == "image.jpg" || asset.Filename == "image.webp")
+		validName := validImageAssetFilename(asset.Filename, asset.Input)
 		if !imageSafeID(asset.JobID) || !validName || key != asset.JobID+"/"+asset.Filename || filepath.Clean(asset.Path) != filepath.Clean(filepath.Join(asset.OutputRoot, asset.relativePath())) {
 			return 0, removed, retained, errors.New("invalid managed image asset identity during deletion")
 		}

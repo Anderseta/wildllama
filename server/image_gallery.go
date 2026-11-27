@@ -100,7 +100,7 @@ func splitGalleryCursor(cursor string) (int64, string, bool) {
 	raw, id, _ := strings.Cut(cursor, ":")
 	job, filename, _ := strings.Cut(id, "/")
 	stamp, err := strconv.ParseInt(raw, 10, 64)
-	return stamp, id, err == nil && imageSafeID(job) && (filename == "image.png" || imageBatchOutputName(filename))
+	return stamp, id, err == nil && imageSafeID(job) && validImageOutputFilename(filename)
 }
 
 // A local midnight can be skipped on a daylight-saving transition. Search

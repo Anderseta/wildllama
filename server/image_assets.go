@@ -77,8 +77,7 @@ func imageDecode(reader io.Reader, kind string) (image.Image, error) {
 }
 
 func openImageAsset(asset imageAssetRecord) (*os.File, error) {
-	validName := asset.Filename == "image.png" || !asset.Input && imageBatchOutputName(asset.Filename) || asset.Input && (asset.Filename == "image.jpg" || asset.Filename == "image.webp")
-	if !imageSafeID(asset.JobID) || !validName {
+	if !imageSafeID(asset.JobID) || !validImageAssetFilename(asset.Filename, asset.Input) {
 		return nil, errors.New("invalid image asset identity")
 	}
 	root, err := os.OpenRoot(asset.OutputRoot)
