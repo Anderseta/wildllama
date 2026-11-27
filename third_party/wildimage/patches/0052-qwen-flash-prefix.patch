@@ -1,0 +1,66 @@
+--- a/src/model/diffusion/qwen_image_2_1.hpp
++++ b/src/model/diffusion/qwen_image_2_1.hpp
+@@ -237,6 +237,31 @@
+             for (const auto* name : {"add_q_proj", "add_k_proj", "add_v_proj", "norm_added_q", "norm_added_k", "to_add_out"}) {
+                 blocks.erase(name);
+             }
++        }
++
++        // The generic flash path concatenates in F32 and then rounds both inputs to
++        // half. A prefix already stored in F16 can stay in the final attention layout.
++        static ggml_tensor* cached_flash(GGMLRunnerContext* ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
++                                         ggml_tensor* prefix_k, ggml_tensor* prefix_v) {
++            if (prefix_k->type != GGML_TYPE_F16 || prefix_v->type != GGML_TYPE_F16 ||
++                q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
++                !ctx->flash_attn_enabled || ctx->sage_attn_enabled || (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) ||
++                q->ne[0] != 128 || v->ne[3] != 1 || !sd_backend_is(ctx->backend, "CUDA")) return nullptr;
++
++            auto arena = ctx->ggml_ctx;
++            auto target_k = ggml_cast(arena, k, GGML_TYPE_F16);
++            auto target_v = ggml_cast(arena, ggml_permute(arena, v, 0, 2, 1, 3), GGML_TYPE_F16);
++            if (!ggml_backend_supports_op(ctx->backend, target_k) || !ggml_backend_supports_op(ctx->backend, target_v)) return nullptr;
++            const auto width = q->ne[0], heads = q->ne[2], prefix = prefix_k->ne[1];
++            auto pk = ggml_reshape_3d(arena, prefix_k, width, prefix, heads);
++            auto pv = ggml_permute(arena, ggml_reshape_3d(arena, prefix_v, width, heads, prefix), 0, 2, 1, 3);
++            auto keys = ggml_concat(arena, pk, target_k, 1);
++            auto values = ggml_concat(arena, ggml_ext_cont(ctx, pv), target_v, 1);
++            if (!ggml_backend_supports_op(ctx->backend, keys) || !ggml_backend_supports_op(ctx->backend, values)) return nullptr;
++            auto attn = ggml_flash_attn_ext(arena, q, keys, values, nullptr, 1.f / std::sqrt(float(width)), 0, 0);
++            if (!ggml_backend_supports_op(ctx->backend, attn)) return nullptr;
++            ggml_prec_set_acc(attn, GGML_PREC_F32);
++            return ggml_reshape_3d(arena, attn, width * heads, q->ne[1], 1);
+         }
+ 
+         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
+@@ -283,17 +308,20 @@
+                 auto prefix_k = ctx->load_cache_tensor(cache.name + ".k");
+                 auto prefix_v = ctx->load_cache_tensor(cache.name + ".v");
+                 GGML_ASSERT(prefix_k != nullptr && prefix_v != nullptr);
+-                if (prefix_k->type != k->type) {
+-                    prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, k->type);
+-                }
+-                if (prefix_v->type != v->type) {
+-                    prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
+-                }
+-                prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
+-                prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
+-                k        = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
+-                v        = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
+-                result   = attend(q, k, v, nullptr);
++                result = cached_flash(ctx, q, k, v, prefix_k, prefix_v);
++                if (result == nullptr) {
++                    if (prefix_k->type != k->type) {
++                        prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, k->type);
++                    }
++                    if (prefix_v->type != v->type) {
++                        prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
++                    }
++                    prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
++                    prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
++                    k        = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
++                    v        = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
++                    result   = attend(q, k, v, nullptr);
++                }
+             } else {
+                 for (size_t i = 0; i < segments.size(); ++i) {
+                     const auto& segment = segments[i];

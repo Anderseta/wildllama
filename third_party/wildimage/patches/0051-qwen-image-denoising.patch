@@ -1,0 +1,295 @@
+--- a/src/model/diffusion/qwen_image_2_1.hpp
++++ b/src/model/diffusion/qwen_image_2_1.hpp
+@@ -1,5 +1,7 @@
+ #ifndef __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
+ #define __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
++
++#include <array>
+ 
+ #include "core/pe_cache.h"
+ #include "model/diffusion/qwen_image.hpp"
+@@ -63,13 +65,82 @@
+         int64_t end;
+         int64_t context_start;
+         int image_index;
++        int64_t position;
++        int64_t height;
++        int64_t width;
+     };
+ 
+     struct QwenImage21Layout {
+         std::vector<QwenImage21Segment> segments;
+-        std::vector<std::vector<float>> positions;
+         int64_t prefix_length = 0;
+-        Rope::PositionLayout rope_layout;
++        int64_t token_count = 0;
++
++        sd::PECacheKey position_key(bool target_only, const std::vector<int>& axes, int64_t head_dim,
++                                    bool circular_x, bool circular_y) const {
++            sd::PECacheKey key("qwen_image_2_1.pe");
++            key.add(axes).add(head_dim).add(circular_x).add(circular_y);
++            for (const auto& segment : segments) {
++                if (target_only && segment.start < prefix_length) continue;
++                key.add(segment.position).add(segment.end - segment.start).add(segment.height).add(segment.width);
++            }
++            return key;
++        }
++
++        // The temporal coordinate is constant across an image. Each row and column
++        // also shares a rotation. Write each distinct axis rotation once in the final
++        // tensor, including the periodic coordinate convention for seamless images.
++        sd::Tensor<float> position_tensor(bool target_only, const std::vector<int>& axes, int64_t head_dim,
++                                          bool circular_x, bool circular_y) const {
++            GGML_ASSERT(axes.size() == 3 && axes[0] + axes[1] + axes[2] == head_dim);
++            const int64_t offset = target_only ? prefix_length : 0;
++            sd::Tensor<float> output({2, 2, head_dim / 2, token_count - offset});
++            const std::array<std::vector<float>, 3> omega = {Rope::rope_frequencies(axes[0], 10000.f),
++                                                             Rope::rope_frequencies(axes[1], 10000.f),
++                                                             Rope::rope_frequencies(axes[2], 10000.f)};
++            const int64_t stride = 2 * head_dim, y_offset = 2 * axes[0], x_offset = y_offset + 2 * axes[1];
++            auto write_axis = [&](float* dst, int axis, float pos, float period = 0.f) {
++                constexpr float two_pi = 6.28318530717958647692f;
++                for (float frequency : omega[axis]) {
++                    const float angle = period > 0.f ? pos * two_pi * std::round(frequency * period / two_pi) / period
++                                                     : pos * frequency;
++                    const float c = std::cos(angle), sn = std::sin(angle);
++                    dst[0] = c; dst[1] = -sn; dst[2] = sn; dst[3] = c;
++                    dst += 4;
++                }
++            };
++            for (const auto& segment : segments) {
++                if (segment.start < offset) continue;
++                float* first = output.data() + (segment.start - offset) * stride;
++                if (segment.image_index < 0) {
++                    for (int64_t j = 0; j < segment.end - segment.start; ++j) {
++                        float* dst = first + j * stride;
++                        const float pos = static_cast<float>(segment.position + j);
++                        write_axis(dst, 0, pos);
++                        write_axis(dst + y_offset, 1, pos);
++                        write_axis(dst + x_offset, 2, pos);
++                    }
++                    continue;
++                }
++                write_axis(first, 0, static_cast<float>(segment.position));
++                for (int64_t y = 0; y < segment.height; ++y) {
++                    float* row = first + y * segment.width * stride;
++                    write_axis(row + y_offset, 1, static_cast<float>(y - (segment.height - segment.height / 2)),
++                               circular_y ? static_cast<float>(segment.height) : 0.f);
++                    for (int64_t x = 0; x < segment.width; ++x) {
++                        float* dst = row + x * stride;
++                        if (x || y) std::copy_n(first, y_offset, dst);
++                        if (x) std::copy_n(row + y_offset, x_offset - y_offset, dst + y_offset);
++                        if (y) {
++                            std::copy_n(first + x * stride + x_offset, stride - x_offset, dst + x_offset);
++                        } else {
++                            write_axis(dst + x_offset, 2, static_cast<float>(x - (segment.width - segment.width / 2)),
++                                       circular_x ? static_cast<float>(segment.width) : 0.f);
++                        }
++                    }
++                }
++            }
++            return output;
++        }
+ 
+         static QwenImage21Layout build(int64_t text_length,
+                                        const sd::Tensor<int32_t>& image_slots,
+@@ -82,16 +153,9 @@
+             int next_image    = 0;
+             auto append_image = [&](int index, int64_t context_start) {
+                 auto [height, width] = image_shapes[index];
+-                int64_t start        = static_cast<int64_t>(layout.positions.size());
+-                layout.segments.push_back({start, start + height * width, context_start, index});
+-                layout.rope_layout.append_image(static_cast<int>(height), static_cast<int>(width));
+-                for (int64_t h = 0; h < height; ++h) {
+-                    for (int64_t w = 0; w < width; ++w) {
+-                        layout.positions.push_back({static_cast<float>(position),
+-                                                    static_cast<float>(h - (height - height / 2)),
+-                                                    static_cast<float>(w - (width - width / 2))});
+-                    }
+-                }
++                const int64_t start = layout.token_count;
++                layout.token_count += height * width;
++                layout.segments.push_back({start, layout.token_count, context_start, index, position, height, width});
+                 position += std::max(height, width);
+             };
+             for (int64_t i = 0; i < text_length;) {
+@@ -107,19 +171,16 @@
+                     }
+                     append_image(next_image++, begin);
+                 } else {
+-                    int64_t start = static_cast<int64_t>(layout.positions.size());
+-                    layout.segments.push_back({start, start + i - begin, begin, -1});
+-                    layout.rope_layout.append_tokens(i - begin);
+-                    for (int64_t j = begin; j < i; ++j, ++position) {
+-                        float p = static_cast<float>(position);
+-                        layout.positions.push_back({p, p, p});
+-                    }
++                    const int64_t start = layout.token_count;
++                    layout.token_count += i - begin;
++                    layout.segments.push_back({start, layout.token_count, begin, -1, position, 0, 0});
++                    position += i - begin;
+                 }
+             }
+             if (next_image + 1 != static_cast<int>(image_shapes.size())) {
+                 throw std::runtime_error("Qwen Image 2.1: missing reference image slots");
+             }
+-            layout.prefix_length = static_cast<int64_t>(layout.positions.size());
++            layout.prefix_length = layout.token_count;
+             append_image(next_image, text_length);
+             return layout;
+         }
+@@ -264,28 +325,35 @@
+             blocks["img_mlp.out"] = std::make_shared<Linear>(config.intermediate_size, config.hidden_size, false);
+         }
+ 
+-        static ggml_tensor* modulate(GGMLRunnerContext* runner_ctx, ggml_tensor* x, ggml_tensor* params, int64_t prefix_length, bool gate = false) {
+-            auto ctx   = runner_ctx->ggml_ctx;
+-            auto rows  = ggml_ext_chunk(runner_ctx, params, 2, 1);
+-            auto apply = [&](ggml_tensor* part, ggml_tensor* row) {
+-                row = gate ? ggml_tanh(ctx, row) : ggml_scale_bias(ctx, row, 1.f, 1.f);
+-                runner_ctx->expand_graph(row);
+-                return ggml_mul(ctx, part, row);
+-            };
+-            if (prefix_length == 0) {
+-                return apply(x, rows[0]);
+-            }
+-            auto target = apply(ggml_ext_slice(runner_ctx, x, 1, prefix_length, x->ne[1]), rows[0]);
+-            auto prefix = apply(ggml_ext_slice(runner_ctx, x, 1, 0, prefix_length), rows[1]);
+-            return ggml_concat(ctx, prefix, target, 1);
+-        }
+-
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
++        using Modulation = std::array<std::array<ggml_tensor*, 2>, 4>;
++
++        static Modulation prepare_modulation(GGMLRunnerContext* ctx, ggml_tensor* modulation, bool include_prefix) {
++            const auto parts = ggml_ext_chunk(ctx, modulation, 4, 0);
++            Modulation factors{};
++            for (size_t i = 0; i < factors.size(); ++i) {
++                const auto rows = ggml_ext_chunk(ctx, parts[i], 2, 1);
++                for (size_t j = 0; j < (include_prefix ? 2u : 1u); ++j) {
++                    factors[i][j] = i % 2 ? ggml_tanh(ctx->ggml_ctx, rows[j])
++                                          : ggml_scale_bias(ctx->ggml_ctx, rows[j], 1.f, 1.f);
++                    ctx->expand_graph(factors[i][j]);
++                }
++            }
++            return factors;
++        }
++
++        static ggml_tensor* modulate(GGMLRunnerContext* ctx, ggml_tensor* x, const std::array<ggml_tensor*, 2>& rows, int64_t prefix_length) {
++            if (prefix_length == 0) return ggml_mul(ctx->ggml_ctx, x, rows[0]);
++            auto target = ggml_mul(ctx->ggml_ctx, ggml_ext_slice(ctx, x, 1, prefix_length, x->ne[1]), rows[0]);
++            auto prefix = ggml_mul(ctx->ggml_ctx, ggml_ext_slice(ctx, x, 1, 0, prefix_length), rows[1]);
++            return ggml_concat(ctx->ggml_ctx, prefix, target, 1);
++        }
++
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const Modulation& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
+             const int64_t prefix_length = cache.mode == QwenImage21PrefixCache::Mode::REUSE ? 0 : layout.prefix_length;
+             auto h                      = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"])->forward(ctx, x);
+             h                           = modulate(ctx, h, modulation[0], prefix_length);
+             h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, pe, layout.segments, masks, cache);
+-            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[1], prefix_length, true));
++            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[1], prefix_length));
+             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
+             h                           = modulate(ctx, h, modulation[2], prefix_length);
+             auto fused                  = blocks.find("img_mlp.gate_up");
+@@ -298,7 +366,7 @@
+                 h         = ggml_swiglu_split(ctx->ggml_ctx, gate, h);
+             }
+             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
+-            return ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[3], prefix_length, true));
++            return ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[3], prefix_length));
+         }
+     };
+ 
+@@ -327,7 +395,7 @@
+             time               = std::dynamic_pointer_cast<TimestepEmbedding>(blocks["time_text_embed.timestep_embedder"])->forward(ctx, time);
+             time               = ggml_silu(ctx->ggml_ctx, time);
+             auto modulation    = std::dynamic_pointer_cast<Linear>(blocks["modulation.1"])->forward(ctx, time);
+-            auto mod           = ggml_ext_chunk(ctx, modulation, 4, 0);
++            auto mod           = QwenImage21TransformerBlock::prepare_modulation(ctx, modulation, cache.mode != QwenImage21PrefixCache::Mode::REUSE && layout.prefix_length > 0);
+             auto img_in        = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
+             ggml_tensor* joint = nullptr;
+             if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
+@@ -520,31 +588,9 @@
+                 }
+                 auto build = [&]() {
+                     auto graph = new_graph_custom(QWEN_IMAGE_GRAPH_SIZE * 2);
+-                    sd::PECacheKey pe_key("qwen_image_2_1.pe");
+-                    pe_key.add(layout.positions).add(cached).add(layout.prefix_length).add(config.axes_dim).add(config.head_dim);
+-                    pe_key.add(circular_x_enabled).add(circular_y_enabled);
+-                    for (const auto& region : layout.rope_layout.images) {
+-                        pe_key.add(region.begin).add(region.count).add(region.height_period).add(region.width_period);
+-                        pe_key.add(region.height_axis).add(region.width_axis);
+-                    }
++                    const auto pe_key = layout.position_key(cached, config.axes_dim, config.head_dim, circular_x_enabled, circular_y_enabled);
+                     auto pe = make_input(pe_cache_.get_or_create(pe_key, [&]() {
+-                        const int64_t tokens=static_cast<int64_t>(layout.positions.size())-(cached ? layout.prefix_length : 0);
+-                        const auto pe_bytes=wildimage_ram::tensor_bytes(static_cast<uint64_t>(tokens),sizeof(float)*2*config.head_dim);
+-                        wildimage_ram::Reservation pe_memory(pe_bytes), pe_scratch(wildimage_ram::tensor_bytes(pe_bytes,2));
+-                        const auto first_position = layout.positions.begin() + (cached ? layout.prefix_length : 0);
+-                        Rope::Embedding embedding;
+-                        embedding.ids.assign(first_position, layout.positions.end());
+-                        const size_t offset             = cached ? static_cast<size_t>(layout.prefix_length) : 0;
+-                        embedding.positions.token_count = embedding.ids.size();
+-                        for (auto region : layout.rope_layout.images) {
+-                            if (region.begin >= offset) {
+-                                region.begin -= offset;
+-                                embedding.positions.images.push_back(region);
+-                            }
+-                        }
+-                        embedding.values     = Rope::embed_nd(embedding.ids, 1, 10000.f, config.axes_dim, embedding.layout, &embedding.frequencies);
+-                        auto values          = finish_rope_pe(std::move(embedding));
+-                        return sd::Tensor<float>({2, 2, config.head_dim / 2, tokens}, std::move(values),std::move(pe_memory));
++                        return layout.position_tensor(cached, config.axes_dim, config.head_dim, circular_x_enabled, circular_y_enabled);
+                     }));
+                     std::vector<ggml_tensor*> masks, ref_inputs;
+                     for (const auto& mask : mask_data) {
+--- a/src/runtime/denoiser.hpp
++++ b/src/runtime/denoiser.hpp
+@@ -2583,8 +2583,8 @@
+         er_lambdas[i] = sigma_to_er_sde_lambda(sigmas[i], is_flow_denoiser);
+     }
+ 
+-    sd::Tensor<float> old_denoised   = x;
+-    sd::Tensor<float> old_denoised_d = x;
++    sd::Tensor<float> old_denoised;
++    sd::Tensor<float> old_denoised_d;
+     bool have_old_denoised           = false;
+     bool have_old_denoised_d         = false;
+ 
+@@ -2599,6 +2599,7 @@
+         int stage_used = std::min(max_stage, i + 1);
+ 
+         if (sigmas[i + 1] == 0.0f) {
++            if (i + 1 == steps) return denoised;
+             x = denoised;
+         } else {
+             float er_lambda_s = er_lambdas[i];
+@@ -2610,7 +2611,8 @@
+             float r_alpha     = alpha_s > 0.0f ? alpha_t / alpha_s : 0.0f;
+             float r           = scaled_s > 0.0f ? scaled_t / scaled_s : 0.0f;
+ 
+-            x = r_alpha * r * x + alpha_t * (1.0f - r) * denoised;
++            x *= r_alpha * r;
++            x += alpha_t * (1.0f - r) * denoised;
+ 
+             if (stage_used >= 2 && have_old_denoised) {
+                 float dt               = er_lambda_t - er_lambda_s;
+@@ -2649,7 +2651,7 @@
+                         }
+                     }
+ 
+-                    old_denoised_d      = denoised_d;
++                    old_denoised_d      = std::move(denoised_d);
+                     have_old_denoised_d = true;
+                 }
+             }
+@@ -2661,7 +2663,7 @@
+             }
+         }
+ 
+-        old_denoised      = denoised;
++        old_denoised      = std::move(denoised);
+         have_old_denoised = true;
+     }
+     return x;

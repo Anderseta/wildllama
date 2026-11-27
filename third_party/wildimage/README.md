@@ -198,3 +198,18 @@ Saved input and output tensors are FP32 in GGML order. One optional dispatch
 override, `WILDLLAMA_WAN_NATIVE_SHAPE`, applies only to tiled Wan D128
 self-attention on an exact `GPU name/CUDA driver API version/Q/K/heads` match.
 Benchmark a new backend and compare generated frames before selecting an override.
+
+## Qwen Image 2.1
+
+The denoiser computes timestep modulation once per forward pass and shares it
+across transformer blocks. Its rotary cache key describes the text segments and
+image grids. On a miss the runner writes rotations into the final tensor,
+reusing the entries shared by each row and column. ER-SDE moves completed
+predictions into its history buffers.
+
+When CUDA Flash Attention accepts a 128-channel head and a cached FP16 prefix,
+the runner assembles keys and values at the same precision used by the original
+attention operation. Other configurations use the existing attention path.
+`tests/qwen_image_positions_test.cpp` checks edit layouts, circular coordinates
+and the host allocation limit. `tests/qwen_cached_flash_test.cpp` compares GPU
+outputs byte for byte against the original graph.
