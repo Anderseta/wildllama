@@ -32,6 +32,15 @@ func Recipes() []Recipe {
 		result = append(result, Recipe{ID: id, Name: "Qwen Image 2.1 Turbo · " + strings.ToUpper(q.tag) + " + Uncensored encoder Q4", Family: "qwen-image-2.1-turbo", Capabilities: []string{"generate", "edit"}, Components: []Component{diffusion, encoder, vae, vision}, DefaultProfile: DefaultProfile(id)})
 	}
 	result = append(result, Recipe{
+		ID: OmniFP8RecipeID, Name: "Qwen Image 2.1 Uncensored Omni · FP8 (ChatR Labs)", Family: "qwen-image-2.1",
+		Capabilities: []string{"generate", "edit"}, DefaultProfile: DefaultProfile(OmniFP8RecipeID),
+		Components: []Component{
+			{Role: "diffusion_model", Repo: "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized", Revision: "af0343c259513913de8056af85819c70f627d681", Filename: "qwen-image-2.1-step90000-FP8-comfy.safetensors", SHA256: "ff341f9485d8f8e57ea4dbb4817eac5f8fddfd3c95299b20b66e691732cd698e", Size: 7116789419, Required: true},
+			{Role: "text_encoder", Repo: vae.Repo, Revision: vae.Revision, Filename: "text_encoders/qwen3vl_8b_int8_convrot.safetensors", SHA256: "8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f", Size: 9350798360, Required: true},
+			vae,
+		},
+	})
+	result = append(result, Recipe{
 		ID: MiniMaxH3RecipeID, Name: "MiniMax H3 Image · Q5_K_M + encoder 12.5G com visão", Family: "minimax-h3-image",
 		Capabilities: []string{"generate", "edit"}, DefaultProfile: DefaultProfile(MiniMaxH3RecipeID),
 		Components: []Component{
@@ -166,7 +175,7 @@ func bindProfile(b *Bundle) {
 		}
 	}
 	// This pinned encoder contains its vision tower; never download or load it twice.
-	if b.RecipeID == MiniMaxH3RecipeID && b.Profile.VisionEncoder == "" {
+	if (b.RecipeID == MiniMaxH3RecipeID || b.RecipeID == OmniFP8RecipeID) && b.Profile.VisionEncoder == "" {
 		b.Profile.VisionEncoder = b.Profile.TextEncoder
 	}
 }

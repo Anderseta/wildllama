@@ -14,6 +14,7 @@ const (
 	DefaultRecipeID   = "qwen-image-2.1-turbo-uncensored-q5"
 	ManifestName      = "wildimage-model.json"
 	MOSSRecipeID      = "moss-image-sft-q8-heretic-nsfw"
+	OmniFP8RecipeID   = "qwen-image-2.1-uncensored-omni-fp8"
 	TurboSigmas       = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
 	MiniMaxH3RecipeID = "minimax-h3-image-q5-abliterated-12.5g"
 	MiniMaxH3Sigmas   = "1.0,0.9675236940383911,0.8875485062599182,0.75,0.5327739119529724,0.23200887441635132,0.0"
@@ -218,6 +219,12 @@ func DefaultProfile(modelID string) Profile {
 		StageComponents: true, OffloadToCPU: true, FlashAttention: true, VAETiling: true}
 	if modelID == MiniMaxH3RecipeID {
 		p.ID, p.Steps, p.Sigmas = "minimax-h3-image", 6, MiniMaxH3Sigmas
+	}
+	if modelID == OmniFP8RecipeID {
+		p.ID = OmniFP8RecipeID
+		p.Steps, p.CFGScale = 35, 5
+		p.Sigmas, p.Scheduler = "", "simple"
+		p.VAETiling = false
 	}
 	if modelID == MOSSRecipeID {
 		p.ID = MOSSRecipeID
