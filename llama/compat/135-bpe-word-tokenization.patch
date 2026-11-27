@@ -1,0 +1,170 @@
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -246,21 +246,6 @@
+ 
+ // TODO: there are a lot of common parts between spm and bpe tokenizers, should be refactored and reused
+ 
+-template<typename T, typename Container = std::vector<T>, typename Compare = std::less<typename Container::value_type>>
+-class llama_priority_queue : public std::priority_queue<T, Container, Compare> {
+-public:
+-    using std::priority_queue<T, Container, Compare>::priority_queue;
+-
+-    T pop_move() {
+-        T item = std::move(this->c.front());
+-        std::pop_heap(this->c.begin(), this->c.end(), this->comp);
+-        this->c.pop_back();
+-        return item;
+-    }
+-
+-    void pop() =  delete;
+-};
+-
+ struct llm_bigram_bpe {
+     struct comparator {
+         bool operator()(const llm_bigram_bpe & l, const llm_bigram_bpe & r) const {
+@@ -269,10 +254,9 @@
+     };
+ 
+     using queue_storage = std::vector<llm_bigram_bpe>;
+-    using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
++    using queue = std::priority_queue<llm_bigram_bpe, queue_storage, comparator>;
+     llm_symbol::index left;
+     llm_symbol::index right;
+-    std::string text;
+     int rank;
+     size_t size;
+ };
+@@ -651,10 +635,6 @@
+             word_collection = unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
+         }
+ 
+-        int final_prev_index = -1;
+-
+-        symbols_final.clear();
+-
+         if (tok_pre == LLAMA_VOCAB_PRE_TYPE_MMBERT) {
+             // Metaspace pre-tokenizer: a text starts with an escaped space, and each escaped space starts a new word
+             static const std::string space = "\xe2\x96\x81";
+@@ -678,8 +658,31 @@
+             word_collection = std::move(words);
+         }
+ 
++        // Word bytes are immutable for this split. Output offsets remain valid
++        // even when appending tokens reallocates the destination.
++        struct word_entry {
++            const std::string * word = nullptr;
++            size_t first = 0;
++            size_t count = 0;
++        };
++        constexpr size_t slots = 256;
++        std::vector<word_entry> recent(word_collection.size() >= 64 ? slots : 0);
+         for (const auto & word : word_collection) {
+-            work_queue = llm_bigram_bpe::queue();
++            word_entry * entry = nullptr;
++            if (!recent.empty() && word.size() <= 64) {
++                entry = &recent[std::hash<std::string>{}(word) % slots];
++                if (entry->word && *entry->word == word) {
++                    if (entry->count == 1) {
++                        output.push_back(output[entry->first]);
++                    } else {
++                        const size_t end = output.size();
++                        output.resize(end + entry->count);
++                        std::copy_n(output.begin() + entry->first, entry->count, output.begin() + end);
++                    }
++                    continue;
++                }
++            }
++            const size_t first = output.size();
+             symbols.clear();
+ 
+             int index = 0;
+@@ -715,7 +718,8 @@
+ 
+             // build token(s)
+             while (!work_queue.empty()) {
+-                auto bigram = work_queue.pop_move();
++                const auto bigram = work_queue.top();
++                work_queue.pop();
+ 
+                 auto & left_symbol = symbols[bigram.left];
+                 auto & right_symbol = symbols[bigram.right];
+@@ -723,10 +727,10 @@
+                 if (left_symbol.n == 0 || right_symbol.n == 0) {
+                     continue;
+                 }
+-                std::string left_token = std::string(left_symbol.text, left_symbol.n);
+-                std::string right_token = std::string(right_symbol.text, right_symbol.n);
+-                if (left_token + right_token != bigram.text) {
+-                    continue;  // Skip this bigram if it's outdated
++                // Live symbols only grow to the right. The same adjacent indices
++                // with the same combined length still span the original bytes.
++                if (left_symbol.next != bigram.right || left_symbol.n + right_symbol.n != bigram.size) {
++                    continue;
+                 }
+ 
+                 // merge the right sym into the left one
+@@ -743,25 +747,8 @@
+                 add_new_bigram(bigram.left, left_symbol.next);  // right side of current symbol
+             }
+ 
+-            // add the finished tokens to the final list keeping correct order for next and prev
+-            for (auto & sym : symbols) {
+-                if (sym.n > 0) {
+-                    sym.prev = final_prev_index;
+-                    sym.next = -1;
+-                    if (final_prev_index != -1) {
+-                        symbols_final[final_prev_index].next = symbols_final.size();
+-                    }
+-                    symbols_final.emplace_back(sym);
+-                    final_prev_index = symbols_final.size() - 1;
+-                }
+-            }
+-        }
+-
+-        symbols = symbols_final;
+-
+-        if (!symbols.empty()) {
+-            for (int i = 0; i != -1; i = symbols[i].next) {
+-                auto & symbol = symbols[i];
++            // Merging never changes the order of the surviving symbols.
++            for (const auto & symbol : symbols) {
+                 if (symbol.n == 0) {
+                     continue;
+                 }
+@@ -790,6 +777,9 @@
+                     output.push_back(token);
+                 }
+             }
++            if (entry) {
++                *entry = {&word, first, output.size() - first};
++            }
+         }
+     }
+ 
+@@ -813,7 +803,6 @@
+ 
+         bigram.left  = left;
+         bigram.right = right;
+-        bigram.text  = left_token + right_token;
+         bigram.size  = left_token.size() + right_token.size();
+         bigram.rank  = rank_found;
+ 
+@@ -824,7 +813,6 @@
+     const llm_tokenizer_bpe & tokenizer;
+ 
+     std::vector<llm_symbol> symbols;
+-    std::vector<llm_symbol> symbols_final;
+     llm_bigram_bpe::queue work_queue;
+ };
+ 
+--- a/models/ggml-vocab-qwen35.gguf.inp
++++ b/models/ggml-vocab-qwen35.gguf.inp
+@@ -120 +120,3 @@
+ __ggml_vocab_test__
++ obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey; obj_multikey += obj_multikey;
++__ggml_vocab_test__
+--- a/models/ggml-vocab-qwen35.gguf.out
++++ b/models/ggml-vocab-qwen35.gguf.out
+@@ -50 +50,2 @@
+ 53 645 51580 29974
++2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26 2839 25133 792 1421 2839 25133 792 26
