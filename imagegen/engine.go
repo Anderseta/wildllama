@@ -184,8 +184,9 @@ func ValidateProfile(p Profile) error {
 	if math.IsNaN(p.CFGScale) || math.IsInf(p.CFGScale, 0) || p.CFGScale < 0 || p.CFGScale > 30 {
 		return errors.New("image CFG must be finite and between 0 and 30")
 	}
-	if p.Sampler != "euler" && !(p.IsWanRapid() && p.Sampler == "euler_a") {
-		return errors.New("this image pipeline currently supports the verified Euler sampler")
+	if p.Sampler != "euler" && !(p.ModelID == OmniFP8RecipeID && p.Sampler == "er_sde") &&
+		!(p.IsWanRapid() && p.Sampler == "euler_a") {
+		return errors.New("unsupported sampler for this image pipeline")
 	}
 	if p.Scheduler != "" && p.Scheduler != "simple" && p.Scheduler != "discrete" && p.Scheduler != "karras" && !(p.IsWanRapid() && p.Scheduler == "beta") {
 		return errors.New("unsupported image scheduler")

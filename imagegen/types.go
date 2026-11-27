@@ -223,6 +223,7 @@ func DefaultProfile(modelID string) Profile {
 	if modelID == OmniFP8RecipeID {
 		p.ID = OmniFP8RecipeID
 		p.Steps, p.CFGScale = 35, 5
+		p.Sampler = "er_sde"
 		p.Sigmas, p.Scheduler = "", "simple"
 		p.VAETiling = false
 	}

@@ -30,6 +30,26 @@ type imageBatchTestRunner struct {
 	closeOnce         sync.Once
 }
 
+func TestImageOmniNegativeConditioning(t *testing.T) {
+	profile := imageProfile{Profile: imagegen.DefaultProfile(imagegen.OmniFP8RecipeID)}
+	request := imageJobRequest{Prompt: "A blue ceramic mug"}
+	summary, err := imageGenerationFor(request, profile)
+	require.NoError(t, err)
+	require.Equal(t, " ", summary.NegativePrompt)
+	require.Equal(t, "er_sde", summary.Profile.Sampler)
+
+	request.NegativePrompt = "no lettering"
+	summary, err = imageGenerationFor(request, profile)
+	require.NoError(t, err)
+	require.Equal(t, "no lettering", summary.NegativePrompt)
+
+	request.NegativePrompt = ""
+	profile.CFGScale = 1
+	summary, err = imageGenerationFor(request, profile)
+	require.NoError(t, err)
+	require.Empty(t, summary.NegativePrompt)
+}
+
 func (b *imageBatchTestRunner) Status() imagegen.RunnerStatus { return b.base.Status() }
 func (b *imageBatchTestRunner) Close() error {
 	if b.closeEntered != nil {

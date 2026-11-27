@@ -93,8 +93,13 @@ func imageGenerationFor(request imageJobRequest, profile imageProfile) (*imageGe
 	if err := imagegen.ValidateProfile(profile.Profile); err != nil {
 		return nil, err
 	}
+	negativePrompt := strings.TrimSpace(strings.TrimSpace(profile.NegativePrompt) + "\n" + request.NegativePrompt)
+	if profile.ModelID == imagegen.OmniFP8RecipeID && profile.CFGScale > 1 && negativePrompt == "" {
+		// Match the author's empty negative conditioning for the Omni preset.
+		negativePrompt = " "
+	}
 	return &imageGenerationSummary{UserPrompt: request.Prompt, UserNegativePrompt: request.NegativePrompt,
-		Prompt: strings.TrimSpace(strings.TrimSpace(profile.PromptPrefix) + "\n" + request.Prompt), NegativePrompt: strings.TrimSpace(strings.TrimSpace(profile.NegativePrompt) + "\n" + request.NegativePrompt),
+		Prompt: strings.TrimSpace(strings.TrimSpace(profile.PromptPrefix) + "\n" + request.Prompt), NegativePrompt: negativePrompt,
 		ProfileID: profile.ID, Profile: profile, ReferenceAssetIDs: refs, Count: count}, nil
 }
 

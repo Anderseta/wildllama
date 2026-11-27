@@ -59,11 +59,14 @@ func TestOmniFP8InstallUsesExistingComponentsAndBindsVision(t *testing.T) {
 	if p.ModelID != OmniFP8RecipeID || p.VisionEncoder == "" || p.VisionEncoder != p.TextEncoder {
 		t.Fatalf("Omni edit must use the integrated vision encoder: %+v", p)
 	}
-	if p.Sigmas != "" || p.Steps != 35 || p.CFGScale != 5 || p.VAETiling || !p.StageComponents {
+	if p.Sigmas != "" || p.Steps != 35 || p.CFGScale != 5 || p.Sampler != "er_sde" || p.VAETiling || !p.StageComponents {
 		t.Fatalf("wrong non-distilled Omni profile: %+v", p)
 	}
 	args := buildArguments(p, Request{ReferenceImages: []string{"reference.png"}}, dir, "out.png", 42)
 	if slices.Contains(args, "--llm_vision") || !slices.Contains(args, "reference.png") {
 		t.Fatalf("incorrect Omni edit arguments: %v", args)
+	}
+	if index := slices.Index(args, "--sampling-method"); index < 0 || args[index+1] != "er_sde" {
+		t.Fatalf("missing recommended Omni sampler: %v", args)
 	}
 }
