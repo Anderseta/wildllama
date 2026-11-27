@@ -213,3 +213,10 @@ attention operation. Other configurations use the existing attention path.
 `tests/qwen_image_positions_test.cpp` checks edit layouts, circular coordinates
 and the host allocation limit. `tests/qwen_cached_flash_test.cpp` compares GPU
 outputs byte for byte against the original graph.
+
+On supported CUDA devices, Qwen Image 2.1 combines a scalar projection scale
+with the SwiGLU activation or the gated residual addition. Each kernel reads
+the projected values once and preserves the original FP32 operation order.
+Reference and target tokens can use separate residual gates during editing.
+`tests/qwen_scaled_projection_test.cpp` compares these kernels with the
+original GPU graph, including unaligned views and graph reuse.

@@ -1,4 +1,5 @@
 #include "core/wildimage_fp8.h"
+#include "core/wildimage_scaled_projection.h"
 #include "core/cuda/runtime.h"
 #include <cuda_fp8.h>
 #include <cublasLt.h>
@@ -110,6 +111,81 @@ static ggml_status execute(const ggml_ext_execution_context* e, ggml_tensor* con
         status == CUBLAS_STATUS_ALLOC_FAILED ? GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
 }
 }
+namespace wildimage_projection {
+template <bool residual>
+__device__ __forceinline__ float finish(float a, float b, float c, float scale) {
+    const float value = __fmul_rn(a, scale);
+    if constexpr (residual) return __fadd_rn(c, __fmul_rn(value, b));
+    const float up = __fmul_rn(b, scale);
+    return __fmul_rn(value / (1.f + expf(-value)), up);
+}
+
+template <bool residual, class T>
+__global__ void scaled_projection(const T* projection, const float* weight_scale, const T* skip,
+                                  const T* target_gate, const T* prefix_gate, T* out,
+                                  int64_t width, int64_t rows, int64_t prefix) {
+    const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col >= width) return;
+    const float scale = *weight_scale;
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const int64_t idx = row * width + col;
+        T a, b, c{};
+        if constexpr (residual) {
+            a = projection[idx];
+            b = (row < prefix ? prefix_gate : target_gate)[col];
+            c = skip[idx];
+        } else {
+            a = projection[2 * row * width + col];
+            b = projection[(2 * row + 1) * width + col];
+        }
+        if constexpr (sizeof(T) == sizeof(float)) {
+            out[idx] = finish<residual>(a, b, c, scale);
+        } else {
+            out[idx] = make_float4(finish<residual>(a.x, b.x, c.x, scale), finish<residual>(a.y, b.y, c.y, scale),
+                                   finish<residual>(a.z, b.z, c.z, scale), finish<residual>(a.w, b.w, c.w, scale));
+        }
+    }
+}
+
+static bool supports(ggml_backend_dev_t, const ggml_tensor* node, void*) {
+    const bool add = ggml_ext_op_get(node) == operation(true);
+    const int count = add ? (node->src[4] ? 5 : 4) : 2;
+    ggml_ext_tensor_desc shape;
+    return infer(node->src, count, add ? ggml_ext_op_attributes(node) : nullptr, &shape) && matrix(node) &&
+           node->ne[0] <= INT32_MAX && !std::memcmp(node->ne, shape.ne, sizeof(shape.ne));
+}
+
+template <bool add, class T>
+static void launch(ggml_tensor* node, int64_t prefix, cudaStream_t stream) {
+    const int64_t width = node->ne[0] / (sizeof(T) / sizeof(float));
+    auto input = [&](int i) { return node->src[i] ? static_cast<const T*>(node->src[i]->data) : nullptr; };
+    const dim3 grid(unsigned((width + 255) / 256), unsigned(std::min<int64_t>(node->ne[1], 65535)));
+    scaled_projection<add><<<grid, 256, 0, stream>>>(input(0), static_cast<const float*>(node->src[1]->data),
+        input(2), input(3), input(4), static_cast<T*>(node->data), width, node->ne[1], prefix);
+}
+
+static ggml_status execute(const ggml_ext_execution_context* execution, ggml_tensor* const* nodes, int, void*, void*) {
+    ggml_ext_gpu_context context;
+    if (!sd_cuda::cuda_context(execution->backend, &context)) return GGML_STATUS_FAILED;
+    auto* node = nodes[0];
+    auto stream = static_cast<cudaStream_t>(context.stream);
+    uintptr_t alignment = reinterpret_cast<uintptr_t>(node->data);
+    for (int i : {0, 2, 3, 4}) {
+        if (node->src[i]) alignment |= reinterpret_cast<uintptr_t>(node->src[i]->data);
+    }
+    const bool vectorized = !(alignment % alignof(float4)) && node->ne[0] % 4 == 0;
+    if (ggml_ext_op_get(node) == operation(true)) {
+        int64_t prefix;
+        std::memcpy(&prefix, ggml_ext_op_attributes(node), sizeof(prefix));
+        if (vectorized) launch<true, float4>(node, prefix, stream);
+        else launch<true, float>(node, prefix, stream);
+    } else {
+        if (vectorized) launch<false, float4>(node, 0, stream);
+        else launch<false, float>(node, 0, stream);
+    }
+    return cudaGetLastError() == cudaSuccess ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+}
+}
 void wildimage_register_fp8(ggml_backend_dev_t device) {
     const auto info = sd_cuda::cuda_device_info(device);
     int major = 0, minor = 0;
@@ -125,5 +201,16 @@ void wildimage_register_fp8(ggml_backend_dev_t device) {
         desc.custom_op = op;
         desc.name = op == wildimage_fp8::pack_op() ? "wildimage.fp8.pack.cuda.v1" : "wildimage.fp8.matmul.cuda.v1";
         GGML_ASSERT(ggml_ext_register_kernel_ex(device, &desc, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
+    }
+    ggml_ext_kernel_desc epilogue{};
+    epilogue.abi_version = GGML_EXT_ABI_VERSION;
+    epilogue.op = GGML_OP_CUSTOM;
+    epilogue.priority = 100;
+    epilogue.supports = wildimage_projection::supports;
+    epilogue.execute = wildimage_projection::execute;
+    for (bool residual : {false, true}) {
+        epilogue.custom_op = wildimage_projection::operation(residual);
+        epilogue.name = residual ? "wildimage.scaled_gated_residual.cuda.v1" : "wildimage.scaled_swiglu.cuda.v1";
+        GGML_ASSERT(ggml_ext_register_kernel_ex(device, &epilogue, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
     }
 }
