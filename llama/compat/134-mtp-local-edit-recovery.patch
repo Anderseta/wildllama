@@ -1,0 +1,181 @@
+--- a/common/mtp-edit-lookup.h
++++ b/common/mtp-edit-lookup.h
+@@ -21,6 +21,89 @@
+     size_t last_history_size = 0;
+     size_t last_source_end = 0;
+     size_t last_draft_size = 0;
++    size_t matched_suffix = anchor;
++
++    // Learn at most one aligned substitution from confirmed output in this request.
++    int32_t replace_from = -1, replace_to = -1;
++    unsigned observations = 0;
++
++    int32_t project(int32_t id) const {
++        return observations >= 2 && id == replace_from ? replace_to : id;
++    }
++
++    void observe(int32_t from, int32_t to) {
++        if (from == to) {
++            if (from == replace_from) { observations = 0; }
++        } else if (observations && from == replace_from && to == replace_to) {
++            observations = 2;
++        } else {
++            replace_from = from;
++            replace_to = to;
++            observations = 1;
++        }
++    }
++
++    size_t resume(const tokens & history, int32_t last, size_t & matched) {
++        constexpr size_t max_gap = 16;
++        if (!last_source_end) { return 0; }
++        if (history.size() <= last_history_size || history.size() - last_history_size > max_gap) {
++            last_source_end = 0;
++            observations = 0;
++            return 0;
++        }
++        const size_t advance = history.size() - last_history_size;
++        const size_t next = last_source_end + advance;
++        const auto * after = history.data() + last_history_size + 1;
++        const auto * prior = source.data() + last_source_end;
++        // Ordinary copying stays a single contiguous comparison. Check both
++        // the earlier anchor and the newly accepted tokens before advancing.
++        if (observations < 2 && advance <= last_draft_size + 1 && next + 2 <= source.size() &&
++                source[next - 1] == last &&
++                std::equal(prior - matched_suffix, prior + advance - 1, after - matched_suffix)) {
++            matched = std::min(anchor, matched_suffix + advance);
++            return next;
++        }
++        for (size_t i = 1; i <= matched_suffix; ++i) {
++            if (*(after - i) != *(prior - i) && *(after - i) != project(*(prior - i))) {
++                last_source_end = 0;
++                observations = 0;
++                return 0;
++            }
++        }
++        const auto accepted = [&](size_t i) { return i + 1 == advance ? last : after[i]; };
++        if (next + 2 <= source.size()) {
++            size_t mismatches = 0, trailing = 0, changed = 0;
++            for (size_t i = 0; i < advance; ++i) {
++                if (project(prior[i]) == accepted(i)) { ++trailing; }
++                else { ++mismatches; trailing = 0; changed = i; }
++            }
++            if (!mismatches && advance <= last_draft_size + 1) {
++                matched = std::min(anchor, matched_suffix + advance);
++                return next;
++            }
++            if (mismatches == 1 && trailing >= 2) {
++                observe(prior[changed], accepted(changed));
++                matched = std::min(anchor, trailing);
++                return next;
++            }
++        }
++
++        // A small insertion or deletion shifts the source. Only accept a unique
++        // three-token suffix in the immediate neighborhood of the prior span.
++        constexpr size_t suffix = 3, drift = 3;
++        if (advance < suffix + 1) { return 0; }
++        size_t found = 0;
++        const size_t first = std::max(last_source_end + suffix, next - drift);
++        const size_t final = std::min(source.size() - 2, next + drift);
++        for (size_t end = first; end <= final; ++end) {
++            if (project(source[end - 1]) != last || project(source[end - 2]) != history.back() ||
++                    project(source[end - 3]) != history[history.size() - 2]) { continue; }
++            if (found) { return 0; }
++            found = end;
++        }
++        if (found) { matched = suffix; }
++        return found;
++    }
+ 
+     template<class At> static size_t bucket(At at) {
+         uint32_t hash = 2166136261u;
+@@ -31,6 +114,7 @@
+ public:
+     void begin(const tokens & prompt) {
+         last_source_end = 0;
++        observations = 0;
+         offsets.clear();
+         source.clear();
+         if (prompt.size() < anchor + 2) { return; }
+@@ -46,25 +130,14 @@
+     bool propose(const tokens & history, int32_t last, size_t maximum, tokens & result) {
+         if (maximum < 2 || offsets.empty() || history.size() < anchor - 1 || !result.empty()) {
+             last_source_end = 0;
++            observations = 0;
+             return false;
+         }
+ 
+-        size_t end = 0;
+-        if (last_source_end && history.size() > last_history_size) {
+-            const size_t advance = history.size() - last_history_size;
+-            // The target may also commit one token beyond the previous draft.
+-            if (advance - 1 <= last_draft_size && advance <= source.size() - last_source_end) {
+-                const size_t next = last_source_end + advance;
+-                const size_t known = anchor + advance - 1;
+-                if (source.size() - next >= 2 && source[next - 1] == last &&
+-                        std::equal(source.begin() + last_source_end - anchor, source.begin() + next - 1,
+-                                   history.end() - known)) {
+-                    end = next;
+-                }
+-            }
+-        }
++        size_t matched = anchor;
++        size_t end = resume(history, last, matched);
++        const bool resumed = end != 0;
+         if (!end) {
+-            last_source_end = 0;
+             const auto at = [&](size_t i) {
+                 return i == anchor - 1 ? last : history[history.size() - (anchor - 1) + i];
+             };
+@@ -92,6 +165,10 @@
+         }
+         const size_t count = std::min(maximum, source.size() - end);
+         result.assign(source.begin() + end, source.begin() + end + count);
++        if (resumed && observations >= 2) {
++            std::replace(result.begin(), result.end(), replace_from, replace_to);
++        }
++        matched_suffix = matched;
+         last_source_end = end;
+         last_history_size = history.size();
+         last_draft_size = count;
+--- a/tests/test-server-mtp-depth.cpp
++++ b/tests/test-server-mtp-depth.cpp
+@@ -131,6 +131,37 @@
+     history = {1,2,3,4,5};
+     result.clear();
+     check(lookup.propose(history, 6, 2, result) && result.front() == 91, "hash collision hid verified older anchor");
++
++    source = {10,11,12,13,14,15,41,20,21,22,41,23,24,25,41,26,27,28,41,29,30};
++    const auto ask = [&](const std::vector<int32_t> & confirmed) {
++        history.assign(confirmed.begin(), confirmed.end() - 1);
++        result.clear();
++        return lookup.propose(history, confirmed.back(), 4, result);
++    };
++    lookup.begin(source);
++    std::vector<int32_t> edited(source.begin(), source.begin() + 6);
++    check(ask(edited) && result.front() == 41, "no initial edit anchor");
++    edited.push_back(91);
++    check(!ask(edited), "guessed from an isolated change");
++    edited.insert(edited.end(), {20,21});
++    check(ask(edited) && result[1] == 41, "first change should resume without predicting a rename");
++    edited.insert(edited.end(), {22,91,23,24});
++    check(ask(edited) && result[1] == 91, "two confirmed substitutions did not predict the next rename");
++    edited.insert(edited.end(), {25,41,26,27});
++    check(ask(edited) && result[1] == 41, "contradicted substitution was kept");
++    lookup.begin(source);
++    edited.assign(source.begin(), source.begin() + 6);
++    check(ask(edited) && result.front() == 41, "substitution leaked into another request");
++    edited.insert(edited.end(), {80,81,41,20,21});
++    check(ask(edited) && result.front() == 22, "could not resume after an insertion");
++    edited.insert(edited.end(), {41,23,24,25});
++    check(ask(edited) && result.front() == 41, "could not resume after a deletion");
++    lookup.begin({1,2,3,4,5,6,7,8,9,7,8,9,12,13});
++    check(ask({1,2,3,4,5,6}), "missing anchor for ambiguity check");
++    check(!ask({1,2,3,4,5,6,90,91,7,8,9}), "chose an ambiguous local realignment");
++    lookup.begin({1,2,3,4,5,6,7,8});
++    check(ask({1,2,3,4,5,6}) && result.size() == 2, "lost final complete draft");
++    check(!ask({1,2,3,4,5,6,90,91,92,93}), "realigned past the end of the source");
+     common_mtp_response_lookup output;
+     output.begin(3);
+     history = {50,51,52,1,2,3,4,5,6,77,88,99,1,2,3,4,5};

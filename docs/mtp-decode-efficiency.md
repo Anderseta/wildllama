@@ -116,9 +116,17 @@ also depends on the configured maximum rollback depth.
 During a code edit, the lookup keeps its position in the source while the
 target continues to confirm the same tokens. Before reusing the position,
 it checks the anchor and every newly committed token, including a possible
-bonus token. A mismatch or a rewind sends the lookup back to the index.
-This keeps repeated function bodies and route definitions aligned with the
-occurrence being edited. The cursor uses three machine words per lookup.
+bonus token. For a gap of up to 16 tokens, the lookup can recover its place
+after a substitution followed by two confirmed matches. For an insertion or
+deletion it checks a three-token suffix within three positions of the expected
+source offset and requires a unique match. Otherwise it uses the full anchor
+index. A rewind invalidates the local alignment.
+
+After observing the same single-token substitution in two aligned spans, the
+lookup can propose it again while copying that span. The target still verifies
+every token. Contradictory aligned evidence can invalidate the substitution.
+The cursor and the substitution occupy a fixed number of CPU words per lookup
+and reset for each request. They allocate no GPU buffers.
 
 For vocabularies of at least 4,096 tokens, CPU sampling and MTP block verification
 can select candidates directly from the raw scores when the first effective
