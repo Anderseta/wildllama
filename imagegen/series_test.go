@@ -64,7 +64,7 @@ func TestImageSeriesPublicationAndResume(t *testing.T) {
 }
 
 func TestImageSeriesBudgetsAndDestinations(t *testing.T) {
-	p := Profile{Width: 1024, Height: 1024}
+	p := Profile{Width: 1536, Height: 1024}
 	if group := seriesGroupSize(p, Request{}); group < 5 || group > 32 {
 		t.Fatal(group)
 	}

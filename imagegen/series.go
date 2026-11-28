@@ -55,7 +55,7 @@ func seriesGroupSize(p Profile, r Request) int {
 	if len(r.ReferenceImages) != 0 || r.Inpaint != nil {
 		return 1
 	}
-	budget := int64(144 << 20)
+	budget := int64(192 << 20)
 	if p.MaxRAMMiB > 0 {
 		budget = min(budget, (int64(p.MaxRAMMiB)<<20)/16)
 	}
