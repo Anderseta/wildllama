@@ -208,6 +208,7 @@ func conditioningCacheEnvironment(ctx context.Context, config Config, profile Pr
 	conditioningProfile.LoRAs = slices.Clone(profile.LoRAs)
 	for i := range conditioningProfile.LoRAs {
 		conditioningProfile.LoRAs[i].Description = ""
+		conditioningProfile.LoRAs[i].Preset = ""
 	}
 	if len(request.ReferenceImages) == 0 {
 		conditioningProfile.MOSSEditLoRA = nil

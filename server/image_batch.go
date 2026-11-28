@@ -90,6 +90,7 @@ func imageGenerationFor(request imageJobRequest, profile imageProfile) (*imageGe
 	if request.Sampler != "" {
 		profile.Sampler = request.Sampler
 	}
+	profile.Profile = profile.Profile.WithLoRASampling()
 	if err := imagegen.ValidateProfile(profile.Profile); err != nil {
 		return nil, err
 	}
@@ -127,7 +128,7 @@ func (v *imageService) resolveImageGenerationDimensions(generation *imageGenerat
 	if err != nil {
 		return err
 	}
-	generation.Profile.Profile = profile
+	generation.Profile.Profile = profile.WithLoRASampling()
 	return nil
 }
 

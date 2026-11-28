@@ -966,19 +966,6 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "image profile was not found"})
 		return
 	}
-	if request.Steps != 0 {
-		profile.Steps = request.Steps
-	}
-	if request.CFGScale != nil {
-		profile.CFGScale = *request.CFGScale
-	}
-	if request.Sampler != "" {
-		profile.Sampler = request.Sampler
-	}
-	if err := imagegen.ValidateProfile(profile.Profile); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
 	generation, err := imageGenerationFor(request, profile)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})

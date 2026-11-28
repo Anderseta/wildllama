@@ -85,6 +85,7 @@ type LoRA struct {
 	Path        string  `json:"path"`
 	Scale       float64 `json:"scale"`
 	Description string  `json:"description,omitempty"`
+	Preset      string  `json:"preset,omitempty"`
 }
 type LocalInspection struct {
 	Path            string         `json:"path"`
@@ -157,6 +158,7 @@ type RunnerStatus struct {
 	WanSageFP8Supported        bool   `json:"wan_sage_fp8_supported,omitempty"`
 	MOSSEditSupported          bool   `json:"moss_edit_supported,omitempty"`
 	InpaintCropSupported       bool   `json:"inpaint_crop_supported,omitempty"`
+	LoRASamplingPresets        bool   `json:"lora_sampling_presets,omitempty"`
 }
 
 type Component struct {

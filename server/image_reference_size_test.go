@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ollama/ollama/imagegen"
 	"github.com/stretchr/testify/require"
 )
 
@@ -67,6 +68,40 @@ func TestImageReferenceSizeConfigAndSnapshotPersist(t *testing.T) {
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, original.Bytes(), after)
+}
+
+func TestImageReferenceSizeResolvesOmniTurboSampling(t *testing.T) {
+	_, service, router, _, _ := newImageBatchTestService(t)
+	service.workerStarted = true
+	config := cloneImageConfig(service.config)
+	profile := imagegen.DefaultProfile(imagegen.OmniFP8RecipeID)
+	profile.PreserveReferenceSize = true
+	profile.LoRAs = []imagegen.LoRA{{Path: filepath.Join(t.TempDir(), "omni.safetensors"), Scale: 1, Preset: "omni-turbo"}}
+	config.Profiles = []imageProfile{{Profile: profile, Name: "Omni test"}}
+	config.DefaultProfileID = profile.ID
+	encoded, err := json.Marshal(config)
+	require.NoError(t, err)
+	response := imageTestHTTP(router, "PATCH", "/api/images/config", encoded, "application/json")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	path := filepath.Join(config.OutputDir, "inputs", "reference", "image.png")
+	var original bytes.Buffer
+	require.NoError(t, png.Encode(&original, image.NewRGBA(image.Rect(0, 0, 480, 256))))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+	require.NoError(t, os.WriteFile(path, original.Bytes(), 0600))
+	asset := imageAssetRecord{imageAsset: imageAsset{AssetID: "reference/image.png", JobID: "reference", Filename: "image.png", MIMEType: "image/png", Width: 480, Height: 256}, OutputRoot: config.OutputDir, Input: true}
+	service.assets[asset.AssetID] = asset
+
+	response = imageTestHTTP(router, "POST", "/api/images/jobs", []byte(`{"request_id":"omni-turbo-ref","prompt":"fixture","input_asset_id":"reference/image.png","steps":35,"cfg_scale":5,"sampler":"er_sde"}`), "application/json")
+	require.Equal(t, 202, response.Code, response.Body.String())
+	require.Len(t, service.jobs, 1)
+	generated := service.jobs[0].Generation.Profile.Profile
+	require.Equal(t, 480, generated.Width)
+	require.Equal(t, 256, generated.Height)
+	require.Equal(t, 8, generated.Steps)
+	require.Equal(t, 1.0, generated.CFGScale)
+	require.Equal(t, "euler", generated.Sampler)
+	require.NotEqual(t, profile.WithLoRASampling().Sigmas, generated.Sigmas)
+	require.Equal(t, profile, service.config.Profiles[0].Profile)
 }
 
 func TestImageReferenceSizeNoReferenceAndDisabledKeepOverrides(t *testing.T) {

@@ -167,7 +167,7 @@ func TestImageExclusiveRestoresExactProfileAfterChildClose(t *testing.T) {
 	require.Empty(t, job.RestoreErrors)
 	require.Equal(t, int64(0), runner.request.Seed)
 	require.NotNil(t, job.Result)
-	response := imageTestHTTP(mustImageRouter(t, service.server), "GET", "/api/images/assets/fixture/image.png", nil, "")
+	response := imageTestHTTP(mustImageRouter(t, service.server), "GET", "/api/images/assets/fixture/"+job.Result.Filename, nil, "")
 	require.Equal(t, 200, response.Code)
 	_, err := png.Decode(response.Body)
 	require.NoError(t, err)

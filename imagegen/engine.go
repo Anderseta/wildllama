@@ -67,7 +67,7 @@ func NewEngine(config Config) (*Engine, error) {
 func (e *Engine) Status() RunnerStatus {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	status := RunnerStatus{RunnerPath: e.config.RunnerPath, Revision: "unknown", Running: e.done != nil, PID: e.pid}
+	status := RunnerStatus{RunnerPath: e.config.RunnerPath, Revision: "unknown", Running: e.done != nil, PID: e.pid, LoRASamplingPresets: true}
 	if e.closed {
 		status.Error = "image engine is closed"
 		return status
@@ -216,7 +216,14 @@ func ValidateProfile(p Profile) error {
 			}
 		}
 	}
+	samplingPreset := false
 	for _, lora := range p.LoRAs {
+		if lora.Preset != "" {
+			if samplingPreset || lora.Preset != omniTurboPreset || p.ModelID != OmniFP8RecipeID || lora.Scale != 1 {
+				return errors.New("the Omni Turbo sampling preset requires one LoRA at strength 1 on the Omni FP8 model")
+			}
+			samplingPreset = true
+		}
 		if utf8.RuneCountInString(lora.Description) > 500 {
 			return errors.New("LoRA descriptions must be at most 500 characters")
 		}
@@ -296,6 +303,7 @@ func prepareImageRequest(p Profile, r Request) (Profile, *image.Gray, error) {
 	if err != nil {
 		return p, nil, err
 	}
+	p = p.WithLoRASampling()
 	return p, mask, validateImageInputs(p, r)
 }
 
@@ -938,6 +946,7 @@ func buildArguments(p Profile, r Request, jobDir, output string, seed int64) []s
 }
 
 func buildArgumentsForMode(p Profile, r Request, jobDir, output string, seed int64, mode imageMemoryMode) []string {
+	p = p.WithLoRASampling()
 	encoderFlag := "--llm"
 	if r.Video != nil {
 		encoderFlag = "--t5xxl"
