@@ -747,6 +747,10 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	retriedSeries := false
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
+		firstPending := 0
+		if s := r.seriesRun; s != nil {
+			firstPending = s.next
+		}
 		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log, reference, checkpoint)
 		if s := r.seriesRun; s != nil {
 			// The process can exit after a rename and before its stdout notification.
@@ -775,6 +779,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		var exit *exec.ExitError
 		if runErr != nil || ctx.Err() != nil || !errors.As(err, &exit) {
 			break
+		}
+		if s := r.seriesRun; s != nil && exit.ExitCode() == seriesReopenExitCode && s.next > firstPending && runtime.GOOS == "windows" && len(r.ReferenceImages) > 0 {
+			log.emit(Progress{Phase: "preparing", BatchIndex: s.next + 1,
+				Message: fmt.Sprintf("Liberando a memória do gerador antes da imagem %d de %d.", s.next+1, len(s.plan.Outputs))}, true)
+			continue
 		}
 		if s := r.seriesRun; s != nil && !retriedSeries && runtime.GOOS == "windows" && uint32(exit.ExitCode()) == 0xc0000005 {
 			// The previous child has exited. Restart once with the original
@@ -931,6 +940,9 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	}
 	cmd.Dir = jobDir
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
+	if runtime.GOOS == "windows" && r.seriesRun != nil && len(r.ReferenceImages) > 0 {
+		cmd.Env = append(cmd.Env, "WILDIMAGE_SERIES_REOPEN=1")
+	}
 	if s := r.seriesRun; s != nil && s.group > s.legacyGroup {
 		cmd.Env = append(cmd.Env, "WILDIMAGE_QWEN_SERIES_GROUP="+strconv.Itoa(s.group))
 	}
@@ -1252,7 +1264,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	if runtime.GOOS == "windows" && strings.TrimSpace(os.Getenv("WILDIMAGE_CUDA_WAIT")) == "" {
 		set("WILDIMAGE_CUDA_WAIT", "blocking")
 	}
-	for _, key := range []string{"WILDIMAGE_QWEN_SERIES_GROUP", "WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_STEP", "WILDLLAMA_WAN_WEIGHT_CACHE", "WILDLLAMA_WAN_ATTENTION"} {
+	for _, key := range []string{"WILDIMAGE_SERIES_REOPEN", "WILDIMAGE_QWEN_SERIES_GROUP", "WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_STEP", "WILDLLAMA_WAN_WEIGHT_CACHE", "WILDLLAMA_WAN_ATTENTION"} {
 		set(key, "")
 	}
 	set("PATH", filepath.Dir(config.RunnerPath)+string(os.PathListSeparator)+os.Getenv("PATH"))

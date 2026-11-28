@@ -14,6 +14,10 @@ import (
 
 const MaxImageSeries = 1000
 
+// The native process has published complete images and requests a fresh
+// address space before the next edit. This is a clean, negotiated handoff.
+const seriesReopenExitCode = 79
+
 type SeriesOutput struct {
 	Filename string
 	Seed     int64

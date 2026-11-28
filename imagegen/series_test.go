@@ -18,8 +18,15 @@ import (
 func fakeSeriesExit(mode string, args map[string]string) {
 	code := uint32(0xc0000005)
 	var first, count, group int
-	if _, err := fmt.Fscan(os.Stdin, &first, &count, &group); err != nil || count != 10-first || (first > 0 && group != 1) {
+	total := 10
+	if mode == "series-exit-handoff" {
+		total = 1000
+	}
+	if _, err := fmt.Fscan(os.Stdin, &first, &count, &group); err != nil || count != total-first || (first > 0 && group != 1) {
 		os.Exit(8)
+	}
+	if mode == "series-exit-no-progress" {
+		os.Exit(seriesReopenExitCode)
 	}
 	for i := first; i < first+count; i++ {
 		var seed int64
@@ -36,6 +43,12 @@ func fakeSeriesExit(mode string, args map[string]string) {
 		if (mode == "series-exit-once" && i == 0) || (mode == "series-exit-at-end" && i == 9) {
 			os.Exit(int(code))
 		}
+		if mode == "series-exit-handoff" && i+1 < total && (i+1)%250 == 0 {
+			if os.Getenv("WILDIMAGE_SERIES_REOPEN") != "1" {
+				os.Exit(8)
+			}
+			os.Exit(seriesReopenExitCode)
+		}
 	}
 }
 
@@ -50,6 +63,8 @@ func TestWindowsSeriesRecovery(t *testing.T) {
 		{"series-exit-once", 10, 2},
 		{"series-exit-twice", 1, 2},
 		{"series-exit-at-end", 10, 1},
+		{"series-exit-handoff", 1000, 4},
+		{"series-exit-no-progress", 0, 1},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			dir := t.TempDir()
@@ -75,11 +90,30 @@ func TestWindowsSeriesRecovery(t *testing.T) {
 				seen++
 				return nil
 			}}
-			for i := 0; i < 10; i++ {
+			count := max(10, tc.wantImages)
+			for i := 0; i < count; i++ {
 				series.Outputs = append(series.Outputs, SeriesOutput{fmt.Sprintf("img%d.png", i), int64(57 + i)})
 			}
-			_, err = e.Run(t.Context(), p, Request{Prompt: "literal --prompt ; &", OutputPath: filepath.Join(cfg.OutputDir, "img0.png"), Seed: 57, Series: series}, nil)
-			if (err == nil) != (tc.wantImages == 10) || seen != tc.wantImages || len(imageAttempts(t, trace)) != tc.wantAttempts {
+			request := Request{Prompt: "literal --prompt ; &", OutputPath: filepath.Join(cfg.OutputDir, "img0.png"), Seed: 57, Series: series}
+			if tc.mode == "series-exit-handoff" || tc.mode == "series-exit-no-progress" {
+				p.VisionEncoder = filepath.Join(dir, "vision.gguf")
+				putModel(t, p.VisionEncoder, modelBytes())
+				ref := filepath.Join(dir, "reference.png")
+				file, err := os.Create(ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = png.Encode(file, image.NewGray(image.Rect(0, 0, 64, 64))); err != nil {
+					file.Close()
+					t.Fatal(err)
+				}
+				if err = file.Close(); err != nil {
+					t.Fatal(err)
+				}
+				request.ReferenceImages = []string{ref}
+			}
+			_, err = e.Run(t.Context(), p, request, nil)
+			if (err == nil) != (tc.wantImages == count) || seen != tc.wantImages || len(imageAttempts(t, trace)) != tc.wantAttempts {
 				t.Fatalf("%d images, expected %d in %d attempts: %v", seen, tc.wantImages, tc.wantAttempts, err)
 			}
 		})

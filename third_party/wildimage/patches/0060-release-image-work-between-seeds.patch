@@ -1,0 +1,140 @@
+--- a/src/runtime/image_preprocess.h
++++ b/src/runtime/image_preprocess.h
+@@ -76,6 +76,7 @@
+     public:
+         explicit ImagePreprocessor(const char* rules = nullptr);
+         ~ImagePreprocessor();
++        void release_images();
+         ImagePreprocessor(const ImagePreprocessor&)            = delete;
+         ImagePreprocessor& operator=(const ImagePreprocessor&) = delete;
+         bool prepare_inputs(sd_img_gen_params_t& params, int width, int height);
+--- a/src/runtime/image_preprocess.cpp
++++ b/src/runtime/image_preprocess.cpp
+@@ -415,8 +415,13 @@
+     }
+ 
+     ImagePreprocessor::~ImagePreprocessor() {
++        release_images();
++    }
++
++    void ImagePreprocessor::release_images() {
+         for (const auto& image : owned_images_)
+             sd_host_free(image.data);
++        owned_images_.clear();
+     }
+ 
+     bool ImagePreprocessor::prepare_image(sd_image_t& image, ImageTarget target, int index, int width, int height) {
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -1053,11 +1053,9 @@
+             return false;
+         }
+         ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+-        if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
+-            // The denoiser consumes the encoded latents. The VLM input rasters
+-            // are no longer used, including on the subsequent high-res pass.
+-            latents.ref_images.clear();
+-        }
++        // Conditioning is the last reader of the full-size reference rasters.
++        // Denoising and the high-res pass use their encoded latents.
++        latents.ref_images.clear();
+         std::vector<sd::Tensor<float>> final_latents;
+         int64_t denoise_start = ggml_time_ms();
+         for (int b = 0; b < request.batch_count; b++) {
+@@ -1276,6 +1274,11 @@
+             final_latents = std::move(hires_final_latents);
+         }
+ 
++        // The decoder only needs final_latents. Drop per-seed pixel copies,
++        // embeddings and denoising inputs before allocating its workspace.
++        preprocessing.release_images();
++        latents = {};
++        embeds = {};
+         if (wildimage_ram::budget().stage_components) {
+             sd->end_runners();
+             sd->model_manager->evict_inactive_components({
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -25,6 +25,9 @@
+ #include "common/resource_owners.hpp"
+ #include "image_metadata.h"
+ #include "core/wildimage_ram_budget.h"
++#ifdef _WIN32
++#include <psapi.h>
++#endif
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -515,11 +518,35 @@
+     }
+ };
+ 
++// Test Windows commit at the same boundary, after the PNG's last owner
++// has released it. Reuse a stable session without retaining unbounded
++// driver/heap allocations across a long series of reference edits.
++struct SeriesMemory {
++#ifdef _WIN32
++    uint64_t lowest_private = UINT64_MAX;
++    bool should_reopen() {
++        MEMORYSTATUSEX system{};
++        system.dwLength = sizeof(system);
++        PROCESS_MEMORY_COUNTERS_EX process{};
++        if (!GlobalMemoryStatusEx(&system) ||
++            !K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&process), sizeof(process)))
++            return false;
++        const uint64_t current = process.PrivateUsage;
++        lowest_private = std::min(lowest_private, current);
++        const uint64_t transient = process.PeakPagefileUsage > current ? process.PeakPagefileUsage - current : 0;
++        constexpr uint64_t margin = 512ULL << 20;
++        return current - lowest_private > margin || system.ullAvailPageFile < transient + margin;
++    }
++#else
++    bool should_reopen() const { return false; }
++#endif
++};
++
+ // Keep one context across bounded groups. Each group conditions once, samples
+ // one latent at a time, and decodes while the VAE is resident. A rename marks
+ // a complete PNG even if the parent cancels before reading the notification.
+ static bool generate_series(sd_ctx_t* ctx, sd_img_gen_params_t params, const SDCliParams& cli,
+-                            const SDContextParams& settings, const SDGenerationParams& gen) {
++                            const SDContextParams& settings, const SDGenerationParams& gen, bool& reopen) {
+     int first, count, group;
+     if (!(std::cin >> first >> count >> group) || first < 0 || count < 1 || count > 1000 ||
+         first > 1000 - count || group < 1 || group > 32) return false;
+@@ -532,6 +559,9 @@
+             if (*extended && !*end && size > group && size <= 32) group = static_cast<int>(size);
+         }
+     }
++    SeriesMemory memory;
++    const bool allow_reopen = (params.ref_images_count || params.init_image.data) &&
++                              std::getenv("WILDIMAGE_SERIES_REOPEN") != nullptr;
+     for (int i = first; i < first + count;) {
+         params.batch_count = std::min(group, first + count - i);
+         std::vector<int64_t> seeds(params.batch_count);
+@@ -565,6 +595,11 @@
+             std::cout << "WILDIMAGE_SAVED " << i + j << std::endl;
+         }
+         i += params.batch_count;
++        results.clear();
++        if (allow_reopen && i < first + count && memory.should_reopen()) {
++            reopen = true;
++            return true;
++        }
+     }
+     return true;
+ }
+@@ -1129,8 +1164,11 @@
+         }
+ 
+         if (cli_params.mode == IMG_GEN) {
+-            if (cli_params.image_series)
+-                return generate_series(sd_ctx.get(), img_gen_params, cli_params, ctx_params, gen_params) ? 0 : 1;
++            if (cli_params.image_series) {
++                bool reopen = false;
++                if (!generate_series(sd_ctx.get(), img_gen_params, cli_params, ctx_params, gen_params, reopen)) return 1;
++                return reopen ? 79 : 0;
++            }
+             sd_image_generation_result_t* generated = nullptr;
+             generate_image(sd_ctx.get(), &img_gen_params, &generated);
+             results.adopt(generated, ctx_params.lora_model_dir);
