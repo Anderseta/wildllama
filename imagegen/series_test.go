@@ -83,3 +83,32 @@ func TestImageSeriesBudgetsAndDestinations(t *testing.T) {
 		}
 	}
 }
+
+func TestQwenStreamGroupBudget(t *testing.T) {
+	p := Profile{ModelID: OmniFP8RecipeID, Width: 1536, Height: 1024}
+	legacy := seriesGroupSize(p, Request{})
+	if legacy != 5 || qwenStreamGroupSize(p, Request{}, legacy) != 12 {
+		t.Fatal("unexpected landscape group size")
+	}
+	if qwenStreamGroupSize(p, Request{ReferenceImages: []string{"ref.png"}}, 1) != 1 {
+		t.Fatal("seed-dependent references grouped")
+	}
+	p.MaxRAMMiB = 256
+	if qwenStreamGroupSize(p, Request{}, 1) != 1 {
+		t.Fatal("tight RAM budget ignored")
+	}
+	p.ModelID = "other"
+	if qwenStreamGroupSize(p, Request{}, 2) != 2 {
+		t.Fatal("unknown model group changed")
+	}
+	s := imageSeriesRun{plan: &ImageSeries{Outputs: make([]SeriesOutput, 8)}, group: 12, legacyGroup: 5}
+	b, err := io.ReadAll(s.seedInput())
+	if err != nil || !strings.HasPrefix(string(b), "0 8 5\n") {
+		t.Fatal(string(b), err)
+	}
+	s.group = 2
+	b, err = io.ReadAll(s.seedInput())
+	if err != nil || !strings.HasPrefix(string(b), "0 8 2\n") {
+		t.Fatal(string(b), err)
+	}
+}

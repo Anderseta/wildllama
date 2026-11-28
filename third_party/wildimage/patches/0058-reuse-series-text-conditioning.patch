@@ -1,0 +1,166 @@
+--- a/src/conditioning/conditioning_cache.h
++++ b/src/conditioning/conditioning_cache.h
+@@ -33,6 +33,29 @@
+     };
+ 
+     size_t capacity_ = 4;
++    bool series_text_ = false;
++
++    void remember_series_text(const ConditionerParams& params, const SDCondition& c) {
++        // This cache serves plain Qwen 2.1 text only. Keep up to two prompt
++        // encodings (positive and negative) and skip other tensor layouts.
++        if (c.empty() || !c.c_concat.empty() || !c.c_t5_ids.empty() || !c.c_t5_weights.empty() ||
++            !c.c_input_ids.empty() || !c.c_position_ids.empty() || !c.c_vinput_mask.empty() ||
++            !c.c_image_embeds.empty() || !c.c_ref_images.empty() || !c.c_ref_audios.empty() ||
++            !c.c_reference_blocks.empty() || params.text.size() > 32768) return;
++        uint64_t bytes = (c.c_crossattn.numel() + c.c_vector.numel() + c.c_token_types.numel()) * 4ULL;
++        for (const auto& t : c.extra_c_crossattns) bytes += t.numel() * 4ULL;
++        if (bytes > (8ULL << 20) || bytes > wildimage_ram::budget().remaining() / 64) return;
++        wildimage_ram::OptionalWork optional;
++        try {
++            if (entries_.size() >= 2) entries_.pop_back();
++            entries_.emplace_front(params, c);
++        } catch (const wildimage_ram::Exceeded&) {
++            entries_.clear();
++        } catch (const std::bad_alloc&) {
++            entries_.clear();
++        }
++    }
++
+     std::list<Entry> entries_;
+ 
+     static bool same_images(const std::vector<sd::Tensor<float>>& a,
+@@ -72,6 +95,8 @@
+     }
+ 
+ public:
++    void enable_series_text() { series_text_ = capacity_ == 0; }
++
+     void set_capacity(size_t capacity) {
+         capacity_ = capacity;
+         while (entries_.size() > capacity_) {
+@@ -84,11 +109,33 @@
+     }
+ 
+     SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& params) {
++        const bool series = series_text_ && (!params.ref_images || params.ref_images->empty()) &&
++                            (!params.minimax_h3_references || params.minimax_h3_references->empty());
++        if (series) {
++            for (auto it = entries_.begin(); it != entries_.end(); ++it) {
++                if (!same_params(it->params, params)) continue;
++                // Cache copies are optional under memory pressure.
++                try {
++                    wildimage_ram::OptionalWork optional;
++                    SDCondition hit = it->condition;
++                    entries_.splice(entries_.begin(), entries_, it);
++                    LOG_INFO("reusing image series prompt encoding");
++                    return hit;
++                } catch (const wildimage_ram::Exceeded&) {
++                    entries_.clear();
++                    break;
++                } catch (const std::bad_alloc&) {
++                    entries_.clear();
++                    break;
++                }
++            }
++        }
+         wildimage_conditioning::Cache<SDCondition, ConditionerParams> disk_cache;
+         const auto disk_key = disk_cache.key(params, conditioner.resolve_clip_skip(params.clip_skip));
+         SDCondition cached;
+         if (disk_cache.load(disk_key, cached)) {
+             LOG_INFO("conditioning disk cache hit");
++            if (series) remember_series_text(params, cached);
+             return cached;
+         }
+         if (!disk_key.empty()) {
+@@ -99,6 +146,7 @@
+             if (disk_cache.save(disk_key, condition)) {
+                 LOG_VERBOSE("conditioning disk cache stored");
+             }
++            if (series) remember_series_text(params, condition);
+             return condition;
+         }
+         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+--- a/src/pipeline/diffusion_engine.h
++++ b/src/pipeline/diffusion_engine.h
+@@ -388,6 +388,7 @@
+ 
+     bool apply_loras(const sd_lora_t* loras, uint32_t lora_count);
+ 
++    void enable_qwen_series_text_cache();
+     SDCondition get_learned_condition(const ConditionerParams& params);
+ 
+     void reset_generation_extensions();
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -1873,6 +1873,10 @@
+     }
+     conditioning_loras_ = std::move(all_loras);
+     return true;
++}
++
++void StableDiffusionGGML::enable_qwen_series_text_cache() {
++    conditioning_cache_->enable_series_text();
+ }
+ 
+ SDCondition StableDiffusionGGML::get_learned_condition(const ConditionerParams& params) {
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -880,11 +880,13 @@
+ }
+ 
+ extern "C" SD_API bool wildimage_stream_qwen_series(sd_ctx_t* ctx, const sd_img_gen_params_t* params,
+-                                                     const int64_t* seeds, sd::pipeline::SeriesSink sink, void* user) {
++                                                     const int64_t* seeds, sd::pipeline::SeriesSink sink, void* user, bool repeated) {
+     if (!wildimage_has_qwen_series(ctx) || !params || !seeds || !sink) return false;
+     StableDiffusionGGML::ExecutionScope execution(*ctx->sd);
+     if (!execution.ready) return false;
+     try {
++        if (repeated && !params->init_image.data && params->ref_images_count == 0)
++            ctx->sd->enable_qwen_series_text_cache();
+         return sd::pipeline::generate_image(ctx->sd, params, nullptr, nullptr, nullptr, seeds, sink, user);
+     } catch (const std::exception& e) {
+         if (dynamic_cast<const wildimage_ram::Exceeded*>(&e) || dynamic_cast<const std::bad_alloc*>(&e))
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -461,7 +461,7 @@
+ 
+ using SeriesSink = bool (*)(void*, int, sd_image_t*, const char*);
+ extern "C" SD_API bool wildimage_has_qwen_series(sd_ctx_t*);
+-extern "C" SD_API bool wildimage_stream_qwen_series(sd_ctx_t*, const sd_img_gen_params_t*, const int64_t*, SeriesSink, void*);
++extern "C" SD_API bool wildimage_stream_qwen_series(sd_ctx_t*, const sd_img_gen_params_t*, const int64_t*, SeriesSink, void*, bool);
+ 
+ // Encode and rename one PNG while the GPU decodes the next latent. Back
+ // pressure bounds raster memory. Emit notifications on the inference thread
+@@ -476,7 +476,12 @@
+ 
+     bool finish() {
+         if (!pending.valid()) return true;
+-        if (!pending.get()) return false;
++        try {
++            if (!pending.get()) return false;
++        } catch (const std::exception& e) {
++            std::cerr << "image series PNG failed: " << e.what() << std::endl;
++            return false;
++        }
+         std::cout << "WILDIMAGE_SAVED " << pending_index << std::endl;
+         return true;
+     }
+@@ -501,7 +506,7 @@
+                 return true;
+             };
+             self.pending_index = index;
+-            self.pending = std::async(std::launch::async, std::move(save));
++            self.pending = std::async(std::launch::async | std::launch::deferred, std::move(save));
+             return true;
+         } catch (const std::exception& e) {
+             std::cerr << "image series PNG: " << e.what() << std::endl;
+@@ -537,7 +542,7 @@
+         std::cout << "WILDIMAGE_GROUP " << i << ' ' << params.batch_count << std::endl;
+         if (streaming) {
+             SeriesPNGWriter writer{directory, settings, gen, cli.compression_quality, i};
+-            const bool ok = wildimage_stream_qwen_series(ctx, &params, seeds.data(), SeriesPNGWriter::submit, &writer);
++            const bool ok = wildimage_stream_qwen_series(ctx, &params, seeds.data(), SeriesPNGWriter::submit, &writer, count > group);
+             if (!writer.finish() || !ok) return false;
+             i += params.batch_count;
+             continue;

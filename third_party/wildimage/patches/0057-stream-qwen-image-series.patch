@@ -1,0 +1,285 @@
+--- a/src/pipeline/generation.h
++++ b/src/pipeline/generation.h
+@@ -51,13 +51,16 @@
+         }
+     };
+ 
++    // The receiver may take ownership of pixels by clearing image->data.
++    using SeriesSink = bool (*)(void*, int, sd_image_t*, const char*);
++
+     // Callers hold ExecutionScope; AnimateDiff reuses the image path within the same scope.
+     bool generate_image(StableDiffusionGGML* sd,
+                         const sd_img_gen_params_t* sd_img_gen_params,
+                         sd_image_t** images_out,
+                         int* num_images_out,
+                         std::vector<nlohmann::json>* infos_out = nullptr,
+-                        const int64_t* seeds = nullptr);
++                        const int64_t* seeds = nullptr, SeriesSink sink = nullptr, void* sink_context = nullptr);
+ 
+     bool generate_video(StableDiffusionGGML* sd,
+                         const sd_vid_gen_params_t* sd_vid_gen_params,
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -705,17 +705,18 @@
+         return embeds;
+     }
+ 
+-    static sd_image_t* decode_image_outputs(StableDiffusionGGML* sd,
++    static bool decode_image_outputs(StableDiffusionGGML* sd,
+                                             const GenerationRequest& request,
+                                             const std::vector<sd::Tensor<float>>& final_latents,
+-                                            int* num_images_out) {
++                                            int* num_images_out, sd_image_t** images_out,
++                                            SeriesSink sink, void* sink_context, const nlohmann::json& info) {
+         if (final_latents.empty()) {
+             LOG_ERROR("no latent images to decode");
+-            return nullptr;
++            return false;
+         }
+         if (final_latents.size() > static_cast<size_t>(request.batch_count)) {
+             LOG_ERROR("expected at most %d latents, got %zu", request.batch_count, final_latents.size());
+-            return nullptr;
++            return false;
+         }
+         if (final_latents.size() < static_cast<size_t>(request.batch_count)) {
+             LOG_INFO("decoding %zu/%d latents", final_latents.size(), request.batch_count);
+@@ -753,7 +754,7 @@
+                     LOG_ERROR("qwen image layered expected at least %d latent layers, got shape dim=%d",
+                               qwen_image_latent_layers,
+                               final_latents[i].dim());
+-                    return nullptr;
++                    return false;
+                 }
+                 for (int layer_index = 0; layer_index < qwen_image_latent_layers; layer_index++) {
+                     if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+@@ -766,7 +767,7 @@
+                     sd::Tensor<float> image = sd->decode_first_stage(layer_latent);
+                     if (image.empty()) {
+                         LOG_ERROR("decode_first_stage failed for latent %zu layer %d", i + 1, layer_index + 1);
+-                        return nullptr;
++                        return false;
+                     }
+                     decoded_images.push_back(std::move(image));
+                 }
+@@ -787,7 +788,7 @@
+                     sd::Tensor<float> image        = sd->decode_first_stage(frame_latent);
+                     if (image.empty()) {
+                         LOG_ERROR("decode_first_stage failed for AnimateDiff frame %d/%d", f + 1, n_frames);
+-                        return nullptr;
++                        return false;
+                     }
+                     decoded_images.push_back(std::move(image));
+                 }
+@@ -795,9 +796,20 @@
+                 sd::Tensor<float> image = sd->decode_first_stage(final_latents[i]);
+                 if (image.empty()) {
+                     LOG_ERROR("decode_first_stage failed for latent %" PRId64, i + 1);
+-                    return nullptr;
+-                }
+-                decoded_images.push_back(std::move(image));
++                    return false;
++                }
++                if (sink) {
++                    auto metadata = info;
++                    metadata["seed"] = std::to_string(request.seed_for_batch(static_cast<int>(i)));
++                    const auto text = metadata.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
++                    auto packed = tensor_to_sd_image(image);
++                    // The receiver is noexcept and takes or borrows this allocation.
++                    const bool ok = sink(sink_context, static_cast<int>(i), &packed, text.c_str());
++                    sd_host_free(packed.data);
++                    if (!ok) return false;
++                } else {
++                    decoded_images.push_back(std::move(image));
++                }
+             }
+             int64_t t2 = ggml_time_ms();
+             LOG_INFO("latent %zu decoded, taking %.2fs", i + 1, (t2 - t1) * 1.0f / 1000);
+@@ -805,25 +817,30 @@
+ 
+         int64_t t4 = ggml_time_ms();
+         LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t0) * 1.0f / 1000);
++        if (sink) {
++            *num_images_out = static_cast<int>(final_latents.size());
++            return !cancelled && final_latents.size() == static_cast<size_t>(request.batch_count);
++        }
+         if (decoded_images.empty() || cancelled) {
+             LOG_ERROR(cancelled ? "cancelled before any latent images were decoded" : "no decoded images");
+-            return nullptr;
++            return false;
+         }
+ 
+         int image_count           = static_cast<int>(decoded_images.size());
+         sd_image_t* result_images = (sd_image_t*)calloc(image_count, sizeof(sd_image_t));
+         if (result_images == nullptr) {
+-            return nullptr;
++            return false;
+         }
+         if (num_images_out != nullptr) {
+             *num_images_out = image_count;
+         }
+ 
++        *images_out = result_images;
+         for (size_t i = 0; i < decoded_images.size(); i++) {
+             result_images[i] = tensor_to_sd_image(decoded_images[i]);
+         }
+ 
+-        return result_images;
++        return true;
+     }
+ 
+     static sd::Tensor<float> upscale_hires_latent(StableDiffusionGGML* sd,
+@@ -969,7 +986,7 @@
+                         sd_image_t** images_out,
+                         int* num_images_out,
+                         std::vector<nlohmann::json>* infos_out,
+-                        const int64_t* seeds) {
++                        const int64_t* seeds, SeriesSink sink, void* sink_context) {
+         if (infos_out)
+             infos_out->clear();
+         if (images_out != nullptr) {
+@@ -1267,9 +1284,15 @@
+                 ModelComponent::ControlNet, ModelComponent::PhotoMaker, ModelComponent::PuLID, ModelComponent::LoRA});
+         }
+         int num_images = 0;
+-        auto result    = decode_image_outputs(sd, request, final_latents, &num_images);
+-        if (result == nullptr) {
+-            return false;
++        sd_image_t* result = nullptr;
++        try {
++            if (!decode_image_outputs(sd, request, final_latents, &num_images, &result, sink, sink_context, info)) {
++                free_sd_images(result, num_images);
++                return false;
++            }
++        } catch (...) {
++            free_sd_images(result, num_images);
++            throw;
+         }
+ 
+         if (infos_out) {
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -873,6 +873,27 @@
+     return sd::make_image_generation_result(images, count, infos, result_out);
+ }
+ 
++// Qwen Image 2.1 produces one RGB image per latent. Other formats keep
++// their existing output layout, including multi-layer and animated images.
++extern "C" SD_API bool wildimage_has_qwen_series(sd_ctx_t* ctx) {
++    return ctx && ctx->sd && ctx->sd->version == VERSION_QWEN_IMAGE_2_1;
++}
++
++extern "C" SD_API bool wildimage_stream_qwen_series(sd_ctx_t* ctx, const sd_img_gen_params_t* params,
++                                                     const int64_t* seeds, sd::pipeline::SeriesSink sink, void* user) {
++    if (!wildimage_has_qwen_series(ctx) || !params || !seeds || !sink) return false;
++    StableDiffusionGGML::ExecutionScope execution(*ctx->sd);
++    if (!execution.ready) return false;
++    try {
++        return sd::pipeline::generate_image(ctx->sd, params, nullptr, nullptr, nullptr, seeds, sink, user);
++    } catch (const std::exception& e) {
++        if (dynamic_cast<const wildimage_ram::Exceeded*>(&e) || dynamic_cast<const std::bad_alloc*>(&e))
++            wildimage_ram::budget().fail();
++        LOG_ERROR("image series failed: %s", e.what());
++        return false;
++    }
++}
++
+ SD_API bool generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params, sd_image_generation_result_t** result_out) {
+     return wildimage_generate_seeded(sd_ctx, params, nullptr, result_out);
+ }
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -8,6 +8,7 @@
+ #include <climits>
+ #include <filesystem>
+ #include <functional>
++#include <future>
+ #include <iostream>
+ #include <map>
+ #include <random>
+@@ -458,6 +459,57 @@
+ 
+ extern "C" SD_API bool wildimage_generate_seeded(sd_ctx_t*, const sd_img_gen_params_t*, const int64_t*, sd_image_generation_result_t**);
+ 
++using SeriesSink = bool (*)(void*, int, sd_image_t*, const char*);
++extern "C" SD_API bool wildimage_has_qwen_series(sd_ctx_t*);
++extern "C" SD_API bool wildimage_stream_qwen_series(sd_ctx_t*, const sd_img_gen_params_t*, const int64_t*, SeriesSink, void*);
++
++// Encode and rename one PNG while the GPU decodes the next latent. Back
++// pressure bounds raster memory. Emit notifications on the inference thread
++// so CUDA progress cannot interrupt a marker on stdout.
++struct SeriesPNGWriter {
++    fs::path directory;
++    const SDContextParams& settings;
++    const SDGenerationParams& gen;
++    int quality, first;
++    int pending_index = -1;
++    std::future<bool> pending;
++
++    bool finish() {
++        if (!pending.valid()) return true;
++        if (!pending.get()) return false;
++        std::cout << "WILDIMAGE_SAVED " << pending_index << std::endl;
++        return true;
++    }
++
++    static bool submit(void* user, int offset, sd_image_t* img, const char* info) noexcept {
++        auto& self = *static_cast<SeriesPNGWriter*>(user);
++        try {
++            if (!self.finish()) return false;
++            SDImageOwner owner(*img);
++            img->data = nullptr;
++            const int index = self.first + offset;
++            const auto metadata = self.gen.embed_image_metadata
++                                      ? generation_info_with_relative_lora_paths(info, self.settings.lora_model_dir)
++                                      : std::string{};
++            auto save = [owner = std::move(owner), directory = self.directory, index,
++                         metadata, quality = self.quality]() {
++                const auto& image = owner.get();
++                const auto tmp = directory / "writing.png";
++                if (!write_image_to_file(tmp.u8string(), image.data, image.width, image.height,
++                                         image.channel, metadata, quality)) return false;
++                fs::rename(tmp, directory / (std::to_string(index) + ".png"));
++                return true;
++            };
++            self.pending_index = index;
++            self.pending = std::async(std::launch::async, std::move(save));
++            return true;
++        } catch (const std::exception& e) {
++            std::cerr << "image series PNG: " << e.what() << std::endl;
++            return false;
++        }
++    }
++};
++
+ // Keep one context across bounded groups. Each group conditions once, samples
+ // one latent at a time, and decodes while the VAE is resident. A rename marks
+ // a complete PNG even if the parent cancels before reading the notification.
+@@ -467,6 +519,14 @@
+     if (!(std::cin >> first >> count >> group) || first < 0 || count < 1 || count > 1000 ||
+         first > 1000 - count || group < 1 || group > 32) return false;
+     const auto directory = fs::u8path(cli.output_path).parent_path();
++    const bool streaming = wildimage_has_qwen_series(ctx);
++    if (streaming) {
++        if (const char* extended = std::getenv("WILDIMAGE_QWEN_SERIES_GROUP")) {
++            char* end = nullptr;
++            const long size = std::strtol(extended, &end, 10);
++            if (*extended && !*end && size > group && size <= 32) group = static_cast<int>(size);
++        }
++    }
+     for (int i = first; i < first + count;) {
+         params.batch_count = std::min(group, first + count - i);
+         std::vector<int64_t> seeds(params.batch_count);
+@@ -475,6 +535,13 @@
+         }
+         params.seed = seeds.front();
+         std::cout << "WILDIMAGE_GROUP " << i << ' ' << params.batch_count << std::endl;
++        if (streaming) {
++            SeriesPNGWriter writer{directory, settings, gen, cli.compression_quality, i};
++            const bool ok = wildimage_stream_qwen_series(ctx, &params, seeds.data(), SeriesPNGWriter::submit, &writer);
++            if (!writer.finish() || !ok) return false;
++            i += params.batch_count;
++            continue;
++        }
+         sd_image_generation_result_t* generated = nullptr;
+         const bool ok = wildimage_generate_seeded(ctx, &params, seeds.data(), &generated);
+         SDImageVec results;

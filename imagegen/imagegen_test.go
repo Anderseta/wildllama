@@ -85,6 +85,7 @@ func TestProgressNativeCounterPhases(t *testing.T) {
 		{"iterations per second", "|====>     | 1/25 - 5.00it/s\x1b[K", "sampling", 1, 25},
 		{"unlabelled count", "1/25", "sampling", 1, 25},
 		{"conditioning cache hit", "conditioning disk cache hit", "conditioning_cache_hit", 0, 0},
+		{"series conditioning cache hit", "reusing image series prompt encoding", "conditioning_cache_hit", 0, 0},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -256,7 +257,7 @@ func testProfile(t *testing.T, dir string) Profile {
 }
 func TestRecipesAndArguments(t *testing.T) {
 	list := Recipes()
-	if len(list) != 4 || list[0].ID != DefaultRecipeID {
+	if len(list) < 2 || list[0].ID != DefaultRecipeID || list[1].ID != "qwen-image-2.1-turbo-uncensored-q4" {
 		t.Fatal("Q5 default/Q4 fallback missing")
 	}
 	for _, r := range list {

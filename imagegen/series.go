@@ -55,27 +55,47 @@ func seriesGroupSize(p Profile, r Request) int {
 	if len(r.ReferenceImages) != 0 || r.Inpaint != nil {
 		return 1
 	}
+	budget := seriesRasterBudget(p)
+	return int(max(1, min(32, budget/(int64(p.Width)*int64(p.Height)*24))))
+}
+
+func seriesRasterBudget(p Profile) int64 {
 	budget := int64(192 << 20)
 	if p.MaxRAMMiB > 0 {
 		budget = min(budget, (int64(p.MaxRAMMiB)<<20)/16)
 	}
-	return int(max(1, min(32, budget/(int64(p.Width)*int64(p.Height)*24))))
+	return budget
+}
+
+// Streamed groups hold one active decoder and PNG writer. Only the final
+// latents accumulate. Limit the time until the first gallery image as well.
+func qwenStreamGroupSize(p Profile, r Request, legacy int) int {
+	if p.ModelID != OmniFP8RecipeID || len(r.ReferenceImages) != 0 || r.Inpaint != nil {
+		return legacy
+	}
+	pixels := int64(p.Width) * int64(p.Height)
+	room := seriesRasterBudget(p) - 48*pixels
+	return max(legacy, int(min(12, room/(2*pixels))))
 }
 
 type imageSeriesRun struct {
-	plan                                           *ImageSeries
-	staging, destination, revision                 string
-	width, height, group, first, activeCount, next int
-	started                                        time.Time
-	stop                                           func()
-	compose                                        func(image.Image, string) (image.Point, error)
-	last                                           Result
-	err                                            error
+	plan                                                        *ImageSeries
+	staging, destination, revision                              string
+	width, height, group, legacyGroup, first, activeCount, next int
+	started                                                     time.Time
+	stop                                                        func()
+	compose                                                     func(image.Image, string) (image.Point, error)
+	last                                                        Result
+	err                                                         error
 }
 
 func (s *imageSeriesRun) seedInput() io.Reader {
 	var input strings.Builder
-	fmt.Fprintf(&input, "%d %d %d\n", s.next, len(s.plan.Outputs)-s.next, s.group)
+	group := s.group
+	if s.legacyGroup > 0 {
+		group = min(group, s.legacyGroup)
+	}
+	fmt.Fprintf(&input, "%d %d %d\n", s.next, len(s.plan.Outputs)-s.next, group)
 	for _, item := range s.plan.Outputs[s.next:] {
 		fmt.Fprintln(&input, item.Seed)
 	}

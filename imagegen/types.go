@@ -148,6 +148,7 @@ type Result struct {
 }
 
 type RunnerStatus struct {
+	QwenStreamSeriesSupported  bool   `json:"qwen_stream_series_supported,omitempty"`
 	ImageSeriesSupported       bool   `json:"image_series_supported,omitempty"`
 	Ready                      bool   `json:"ready"`
 	Running                    bool   `json:"running"`

@@ -86,6 +86,7 @@ func (e *Engine) Status() RunnerStatus {
 		var manifest struct {
 			Revision string `json:"revision"`
 			Features struct {
+				QwenStreamSeries  bool `json:"qwen_stream_series"`
 				ImageSeries       bool `json:"image_series"`
 				ConditioningCache bool `json:"conditioning_cache"`
 				RAMBudget         bool `json:"ram_budget"`
@@ -142,6 +143,7 @@ func (e *Engine) Status() RunnerStatus {
 		}
 		status.Revision = manifest.Revision
 		status.ImageSeriesSupported = manifest.Features.ImageSeries
+		status.QwenStreamSeriesSupported = manifest.Features.QwenStreamSeries
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 		status.RAMBudgetSupported = manifest.Features.RAMBudget
 		status.MOSSEditSupported = manifest.Features.MOSSEdit
@@ -666,6 +668,10 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		defer os.RemoveAll(staging)
 		series := &imageSeriesRun{plan: r.Series, staging: staging, destination: filepath.Dir(finalPath), started: start,
 			width: p.Width, height: p.Height, group: seriesGroupSize(p, r), revision: runnerStatus.Revision}
+		series.legacyGroup = series.group
+		if runnerStatus.QwenStreamSeriesSupported {
+			series.group = qwenStreamGroupSize(p, r, series.legacyGroup)
+		}
 		if r.Inpaint != nil {
 			series.compose = func(img image.Image, dest string) (image.Point, error) {
 				return composeInpaint(ctx, mask, r.ReferenceImages[0], img, dest, r.crop)
@@ -893,13 +899,25 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 	}
 	cmd := exec.CommandContext(ctx, e.config.RunnerPath, args...)
 	if s := r.seriesRun; s != nil {
-		if err := CheckDiskSpace(ctx, output, int64(min(s.group, len(s.plan.Outputs)-s.next))*OutputSpaceBudget(p.Width, p.Height, nil)); err != nil {
-			return err
+		spaceForGroup := func(group int) error {
+			return CheckDiskSpace(ctx, output, int64(min(group, len(s.plan.Outputs)-s.next))*OutputSpaceBudget(p.Width, p.Height, nil))
+		}
+		if err := spaceForGroup(s.group); err != nil {
+			if s.group <= s.legacyGroup || !IsDiskSpaceError(err) {
+				return err
+			}
+			s.group = s.legacyGroup
+			if err := spaceForGroup(s.group); err != nil {
+				return err
+			}
 		}
 		cmd.Stdin = s.seedInput()
 	}
 	cmd.Dir = jobDir
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
+	if s := r.seriesRun; s != nil && s.group > s.legacyGroup {
+		cmd.Env = append(cmd.Env, "WILDIMAGE_QWEN_SERIES_GROUP="+strconv.Itoa(s.group))
+	}
 	if r.Video != nil {
 		cmd.Env = append(cmd.Env, "WILDLLAMA_VIDEO_PROGRESS=1")
 		if mode != imageRAMCPU && r.Video.AttentionPreference() == WanAttentionSageFP8 {
@@ -1218,7 +1236,7 @@ func isolatedEnvironment(config Config, jobDir string) []string {
 	if runtime.GOOS == "windows" && strings.TrimSpace(os.Getenv("WILDIMAGE_CUDA_WAIT")) == "" {
 		set("WILDIMAGE_CUDA_WAIT", "blocking")
 	}
-	for _, key := range []string{"WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_STEP", "WILDLLAMA_WAN_WEIGHT_CACHE", "WILDLLAMA_WAN_ATTENTION"} {
+	for _, key := range []string{"WILDIMAGE_QWEN_SERIES_GROUP", "WILDIMAGE_CONDITION_CACHE_DIR", "WILDIMAGE_CONDITION_NAMESPACE", "WILDIMAGE_CONDITION_CACHE_BYTES", "WILDLLAMA_VIDEO_PROGRESS", "WILDLLAMA_WAN_REFERENCE", "WILDLLAMA_WAN_STEP", "WILDLLAMA_WAN_WEIGHT_CACHE", "WILDLLAMA_WAN_ATTENTION"} {
 		set(key, "")
 	}
 	set("PATH", filepath.Dir(config.RunnerPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1301,7 +1319,7 @@ func (p *progressLog) line(line string) {
 	samplerSelected := strings.Contains(lower, "sampling using ") || strings.Contains(lower, "sampling(high noise) using ")
 	update := Progress{}
 	switch {
-	case strings.Contains(lower, "conditioning disk cache hit"):
+	case strings.Contains(lower, "conditioning disk cache hit"), strings.Contains(lower, "reusing image series prompt encoding"):
 		update.Phase = "conditioning_cache_hit"
 		update.Message = "Reusing cached prompt encoding"
 	case imageBatchHeader:
