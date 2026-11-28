@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	manifest, err := json.Marshal(map[string]any{
-		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true, "wan_video_staging": true, "wan_diffusion_sage_fp8": true},
+		"revision": "isolated-test", "features": map[string]bool{"ram_budget": true, "wan_video_staging": true, "wan_diffusion_sage_fp8": true, "image_series": true},
 		"files": []map[string]any{{"name": filepath.Base(exe), "size": len(data), "sha256": digest(data)}},
 	})
 	if err != nil {
@@ -153,6 +153,10 @@ func fakeChild(mode string) {
 	if mode == "ram-budget" {
 		fmt.Fprintln(os.Stderr, "managed RAM budget exhausted")
 		os.Exit(RAMBudgetExitCode)
+	}
+	if strings.HasPrefix(mode, "series-exit-") {
+		fakeSeriesExit(mode, values)
+		return
 	}
 	if mode == "wan-attention-unsupported" {
 		fmt.Fprintln(os.Stderr, "SageAttention FP8: unsupported tensor layout")

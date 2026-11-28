@@ -744,6 +744,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	var decoded image.Image
 	eagerCUDA := false
 	retriedStep := false
+	retriedSeries := false
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
 		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log, reference, checkpoint)
@@ -754,6 +755,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 				return s.last, s.err
 			}
 			if s.next == len(s.plan.Outputs) {
+				// Each requested PNG was validated and published, including
+				// any output renamed just before a native teardown failure.
+				err = nil
 				break
 			}
 			if err == nil {
@@ -769,7 +773,19 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		default:
 		}
 		var exit *exec.ExitError
-		if runErr != nil || ctx.Err() != nil || mode == imageRAMCPU || !errors.As(err, &exit) {
+		if runErr != nil || ctx.Err() != nil || !errors.As(err, &exit) {
+			break
+		}
+		if s := r.seriesRun; s != nil && !retriedSeries && runtime.GOOS == "windows" && uint32(exit.ExitCode()) == 0xc0000005 {
+			// The previous child has exited. Restart once with the original
+			// remaining seeds and a single latent per group.
+			retriedSeries = true
+			s.group = 1
+			log.emit(Progress{Phase: "preparing", BatchIndex: s.next + 1,
+				Message: fmt.Sprintf("Reabrindo o gerador para continuar na imagem %d de %d.", s.next+1, len(s.plan.Outputs))}, true)
+			continue
+		}
+		if mode == imageRAMCPU {
 			break
 		}
 		if s := r.seriesRun; s != nil && min(s.group, len(s.plan.Outputs)-s.next) > 1 && (exit.ExitCode() == RAMBudgetExitCode || exit.ExitCode() == GPUOutOfMemoryExitCode && log.lastPhase == "decoding") {

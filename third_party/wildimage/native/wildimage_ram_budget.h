@@ -233,7 +233,17 @@ inline void* raw_malloc(size_t bytes) noexcept {
     if(!budget().try_acquire(bytes)) { budget().fail(); return nullptr; }
     void* ptr=std::malloc(bytes);
     if(!ptr) { budget().release(bytes); budget().fail(); return nullptr; }
-    try { auto& registry=raw_registry(); std::lock_guard<std::mutex> lock(registry.mutex); registry.sizes.emplace(ptr,bytes); }
+    try {
+        auto& registry=raw_registry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto entry=registry.sizes.emplace(ptr,bytes);
+        if (!entry.second) {
+            // A legacy consumer may have released the old image via the C
+            // runtime. malloc has reused its address for a new allocation.
+            budget().release(entry.first->second);
+            entry.first->second=bytes;
+        }
+    }
     catch(...) { std::free(ptr); budget().release(bytes); return nullptr; }
     return ptr;
 }

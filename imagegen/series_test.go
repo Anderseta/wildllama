@@ -1,16 +1,90 @@
 package imagegen
 
 import (
+	"fmt"
 	"image"
 	"image/png"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+// Model a child that dies after rename but before notifying the parent.
+func fakeSeriesExit(mode string, args map[string]string) {
+	code := uint32(0xc0000005)
+	var first, count, group int
+	if _, err := fmt.Fscan(os.Stdin, &first, &count, &group); err != nil || count != 10-first || (first > 0 && group != 1) {
+		os.Exit(8)
+	}
+	for i := first; i < first+count; i++ {
+		var seed int64
+		if _, err := fmt.Fscan(os.Stdin, &seed); err != nil || seed != 57+int64(i) {
+			os.Exit(8)
+		}
+		if mode == "series-exit-twice" && i == 1 {
+			os.Exit(int(code))
+		}
+		file, err := os.Create(filepath.Join(filepath.Dir(args["--output"]), fmt.Sprintf("%d.png", i)))
+		if err != nil || png.Encode(file, image.NewGray(image.Rect(0, 0, 64, 64))) != nil || file.Close() != nil {
+			os.Exit(8)
+		}
+		if (mode == "series-exit-once" && i == 0) || (mode == "series-exit-at-end" && i == 9) {
+			os.Exit(int(code))
+		}
+	}
+}
+
+func TestWindowsSeriesRecovery(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows native exit status")
+	}
+	for _, tc := range []struct {
+		mode                     string
+		wantImages, wantAttempts int
+	}{
+		{"series-exit-once", 10, 2},
+		{"series-exit-twice", 1, 2},
+		{"series-exit-at-end", 10, 1},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			dir := t.TempDir()
+			p := testProfile(t, dir)
+			exe, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := Config{RunnerPath: exe, WorkDir: filepath.Join(dir, "work"), OutputDir: filepath.Join(dir, "outputs"), ModelsDir: filepath.Join(dir, "models")}
+			e, err := NewEngine(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			trace := filepath.Join(dir, "attempts.jsonl")
+			t.Setenv("WILDIMAGE_FAKE_ATTEMPTS", trace)
+			t.Setenv("WILDIMAGE_FAKE_CHILD", tc.mode)
+			seen := 0
+			series := &ImageSeries{Publish: func(index int, result Result) error {
+				if index != seen || result.Seed != int64(57+index) {
+					return fmt.Errorf("unexpected index or seed: %d, %d", index, result.Seed)
+				}
+				seen++
+				return nil
+			}}
+			for i := 0; i < 10; i++ {
+				series.Outputs = append(series.Outputs, SeriesOutput{fmt.Sprintf("img%d.png", i), int64(57 + i)})
+			}
+			_, err = e.Run(t.Context(), p, Request{Prompt: "literal --prompt ; &", OutputPath: filepath.Join(cfg.OutputDir, "img0.png"), Seed: 57, Series: series}, nil)
+			if (err == nil) != (tc.wantImages == 10) || seen != tc.wantImages || len(imageAttempts(t, trace)) != tc.wantAttempts {
+				t.Fatalf("%d images, expected %d in %d attempts: %v", seen, tc.wantImages, tc.wantAttempts, err)
+			}
+		})
+	}
+}
 
 func TestImageSeriesPublicationAndResume(t *testing.T) {
 	dst, staging := t.TempDir(), t.TempDir()
