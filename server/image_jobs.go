@@ -76,6 +76,10 @@ func (v *imageService) recordProgress(job *imageJob, report imagegen.Progress, c
 	job.trackImagePhase(phase, time.Now())
 	job.Phase = phase
 	previous := job.Progress
+	if report.BatchIndex > 0 && report.BatchIndex != previous.BatchIndex {
+		previous.BatchIndex = report.BatchIndex
+		previous.SamplingCurrent, previous.SamplingTotal = 0, 0
+	}
 	if job.Kind == "video" && (phase == "ram_offload" || phase == "cpu_fallback" || phase == "gpu_memory_limit") {
 		job.VideoMemoryIssue = message
 		if previous.VideoAttempt > 0 && previous.Message != "" {
@@ -680,6 +684,35 @@ func (v *imageService) generate(job *imageJob) (runErr error) {
 		}
 		v.update(job, "loading_image", "Preparing the isolated image runner", 0, 0)
 		imageStarted = true
+		if generation.Count > 1 && job.Video == nil && status.ImageSeriesSupported {
+			items := make([]imagegen.SeriesOutput, generation.Count)
+			items[0] = imagegen.SeriesOutput{Filename: filename, Seed: input.Seed}
+			for offset := 1; offset < generation.Count; offset++ {
+				itemSeed := seed
+				if seed >= 0 {
+					itemSeed += int64(offset)
+				}
+				itemSeed = imagegen.ResolveSeed(itemSeed)
+				items[offset] = imagegen.SeriesOutput{Filename: imageOutputFilename(profile, itemSeed), Seed: itemSeed}
+			}
+			published := 0
+			input.Series = &imagegen.ImageSeries{Outputs: items, Publish: func(offset int, result imagegen.Result) error {
+				if offset != published || offset >= len(items) {
+					return errors.New("unexpected native image series order")
+				}
+				item := items[offset]
+				if err := v.registerImageResult(job, result, item.Filename, item.Seed, offset+1, generation.Count); err != nil {
+					return err
+				}
+				published++
+				return nil
+			}}
+			_, err := v.runMedia(job, engine, runtimeProfile, input)
+			if err == nil && published != len(items) {
+				return errors.New("image series did not publish all requested outputs")
+			}
+			return err
+		}
 		result, generationErr := v.runMedia(job, engine, runtimeProfile, input)
 		if result.Path != "" {
 			var saveErr error
@@ -923,7 +956,7 @@ func (s *Server) imageJobsHandler(c *gin.Context) {
 	if !imageBind(c, &request) {
 		return
 	}
-	if strings.TrimSpace(request.Prompt) == "" || len(request.Prompt) > 32768 || len(request.NegativePrompt) > 32768 || len(request.SessionID) > 256 || len(request.ReferenceImages) > 4 || !validImageMode(request.ExecutionMode, true) || request.Seed != nil && *request.Seed < -1 || request.Count < 0 || request.Count > 8 || len(request.ParentAssetID) > 512 {
+	if strings.TrimSpace(request.Prompt) == "" || len(request.Prompt) > 32768 || len(request.NegativePrompt) > 32768 || len(request.SessionID) > 256 || len(request.ReferenceImages) > 4 || !validImageMode(request.ExecutionMode, true) || request.Seed != nil && *request.Seed < -1 || request.Count < 0 || request.Count > imagegen.MaxImageSeries || len(request.ParentAssetID) > 512 {
 		c.JSON(400, gin.H{"error": "invalid image job request"})
 		return
 	}

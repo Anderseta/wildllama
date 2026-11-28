@@ -1,0 +1,159 @@
+--- a/src/pipeline/request.h
++++ b/src/pipeline/request.h
+@@ -42,6 +42,7 @@
+         bool use_high_noise                         = false;
+         bool use_vace                               = false;
+         const sd_cache_params_t* cache_params       = nullptr;
++        const int64_t* explicit_image_seeds = nullptr;
+         int batch_count                             = 1;
+         int qwen_image_layers                       = 3;
+         int shifted_timestep                        = 0;
+--- a/src/pipeline/request.cpp
++++ b/src/pipeline/request.cpp
+@@ -230,6 +230,7 @@
+     }
+ 
+     int64_t GenerationRequest::seed_for_batch(int index) const {
++        if (explicit_image_seeds) return explicit_image_seeds[index];
+         return static_cast<int64_t>((static_cast<uint64_t>(seed) + index) & INT64_MAX);
+     }
+ 
+--- a/src/pipeline/generation.h
++++ b/src/pipeline/generation.h
+@@ -56,7 +56,8 @@
+                         const sd_img_gen_params_t* sd_img_gen_params,
+                         sd_image_t** images_out,
+                         int* num_images_out,
+-                        std::vector<nlohmann::json>* infos_out = nullptr);
++                        std::vector<nlohmann::json>* infos_out = nullptr,
++                        const int64_t* seeds = nullptr);
+ 
+     bool generate_video(StableDiffusionGGML* sd,
+                         const sd_vid_gen_params_t* sd_vid_gen_params,
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -954,7 +954,8 @@
+                         const sd_img_gen_params_t* sd_img_gen_params,
+                         sd_image_t** images_out,
+                         int* num_images_out,
+-                        std::vector<nlohmann::json>* infos_out) {
++                        std::vector<nlohmann::json>* infos_out,
++                        const int64_t* seeds) {
+         if (infos_out)
+             infos_out->clear();
+         if (images_out != nullptr) {
+@@ -978,6 +979,7 @@
+         int64_t t0            = ggml_time_ms();
+         sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
+         GenerationRequest request(sd, sd_img_gen_params);
++        request.explicit_image_seeds = seeds;
+         const auto info = sd::generation_info(request, *sd_img_gen_params);
+         sd::ImagePreprocessor preprocessing(sd_img_gen_params->image_preprocess.rules);
+         sd_img_gen_params_t processed_params = *sd_img_gen_params;
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -847,9 +847,8 @@
+     return sd::pipeline::default_scheduler(sd_ctx != nullptr ? sd_ctx->sd : nullptr, sample_method);
+ }
+ 
+-SD_API bool generate_image(sd_ctx_t* sd_ctx,
+-                           const sd_img_gen_params_t* params,
+-                           sd_image_generation_result_t** result_out) {
++extern "C" SD_API bool wildimage_generate_seeded(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params,
++                                                 const int64_t* seeds, sd_image_generation_result_t** result_out) {
+     if (result_out)
+         *result_out = nullptr;
+     if (!result_out || !sd_ctx || !sd_ctx->sd || !params)
+@@ -861,7 +860,7 @@
+     int count          = 0;
+     std::vector<nlohmann::json> infos;
+     try {
+-        if (!sd::pipeline::generate_image(sd_ctx->sd, params, &images, &count, &infos)) {
++        if (!sd::pipeline::generate_image(sd_ctx->sd, params, &images, &count, &infos, seeds)) {
+             free_sd_images(images, count);
+             return false;
+         }
+@@ -872,6 +871,10 @@
+         return false;
+     }
+     return sd::make_image_generation_result(images, count, infos, result_out);
++}
++
++SD_API bool generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params, sd_image_generation_result_t** result_out) {
++    return wildimage_generate_seeded(sd_ctx, params, nullptr, result_out);
+ }
+ 
+ SD_API bool generate_video(sd_ctx_t* sd_ctx,
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -64,6 +64,7 @@
+     std::string imatrix_out;
+     std::vector<std::string> imatrix_in;
+ 
++    bool image_series = false;
+     bool normal_exit = false;
+ 
+     ArgOptions get_options() {
+@@ -117,6 +118,7 @@
+         };
+ 
+         options.bool_options = {
++            {"", "--wildimage-series", "generate seeded PNG groups from the WildLlama stdin protocol", true, &image_series},
+             {"",
+              "--convert-name",
+              "convert tensor name (for convert mode)",
+@@ -454,6 +456,45 @@
+     return base_path;
+ }
+ 
++extern "C" SD_API bool wildimage_generate_seeded(sd_ctx_t*, const sd_img_gen_params_t*, const int64_t*, sd_image_generation_result_t**);
++
++// Keep one context across bounded groups. Each group conditions once, samples
++// one latent at a time, and decodes while the VAE is resident. A rename marks
++// a complete PNG even if the parent cancels before reading the notification.
++static bool generate_series(sd_ctx_t* ctx, sd_img_gen_params_t params, const SDCliParams& cli,
++                            const SDContextParams& settings, const SDGenerationParams& gen) {
++    int first, count, group;
++    if (!(std::cin >> first >> count >> group) || first < 0 || count < 1 || count > 1000 ||
++        first > 1000 - count || group < 1 || group > 32) return false;
++    const auto directory = fs::u8path(cli.output_path).parent_path();
++    for (int i = first; i < first + count;) {
++        params.batch_count = std::min(group, first + count - i);
++        std::vector<int64_t> seeds(params.batch_count);
++        for (auto& seed : seeds) {
++            if (!(std::cin >> seed) || seed < 0) return false;
++        }
++        params.seed = seeds.front();
++        std::cout << "WILDIMAGE_GROUP " << i << ' ' << params.batch_count << std::endl;
++        sd_image_generation_result_t* generated = nullptr;
++        const bool ok = wildimage_generate_seeded(ctx, &params, seeds.data(), &generated);
++        SDImageVec results;
++        results.adopt(generated, settings.lora_model_dir);
++        if (!ok || results.count() != params.batch_count) return false;
++        for (int j = 0; j < params.batch_count; ++j) {
++            const auto& img = results[j];
++            auto path = directory / (std::to_string(i + j) + ".png");
++            auto tmp = directory / "writing.png";
++            const auto info = gen.embed_image_metadata ? results.generation_info(j) : "";
++            if (!img.data || !write_image_to_file(tmp.u8string(), img.data, img.width, img.height,
++                                                   img.channel, info, cli.compression_quality)) return false;
++            fs::rename(tmp, path);
++            std::cout << "WILDIMAGE_SAVED " << i + j << std::endl;
++        }
++        i += params.batch_count;
++    }
++    return true;
++}
++
+ bool save_results(const SDCliParams& cli_params,
+                   const SDContextParams& ctx_params,
+                   const SDGenerationParams& gen_params,
+@@ -1014,6 +1055,8 @@
+         }
+ 
+         if (cli_params.mode == IMG_GEN) {
++            if (cli_params.image_series)
++                return generate_series(sd_ctx.get(), img_gen_params, cli_params, ctx_params, gen_params) ? 0 : 1;
+             sd_image_generation_result_t* generated = nullptr;
+             generate_image(sd_ctx.get(), &img_gen_params, &generated);
+             results.adopt(generated, ctx_params.lora_model_dir);

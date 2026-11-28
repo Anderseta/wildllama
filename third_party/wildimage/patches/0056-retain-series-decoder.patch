@@ -1,0 +1,42 @@
+--- a/src/model/vae/vae.hpp
++++ b/src/model/vae/vae.hpp
+@@ -177,6 +177,7 @@
+     }
+ 
+ public:
++    bool keep_series_decoder = false;
+     VAE(SDVersion version,
+         ggml_backend_t backend,
+         const std::string& weight_prefix                    = "",
+@@ -387,7 +388,7 @@
+                                                   tiling_params);
+         }
+ 
+-        if (auto_end) {
++        if (auto_end && !keep_series_decoder) {
+             runner_end();
+         }
+ 
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -722,6 +722,20 @@
+         } else {
+             LOG_INFO("decoding %zu latents", final_latents.size());
+         }
++        // The staged denoiser has already been released. Reuse the decoder
++        // session only until the last latent in this bounded group is decoded.
++        struct DecoderScope {
++            VAE* vae;
++            explicit DecoderScope(VAE* model) : vae(model) {
++                if (vae) vae->keep_series_decoder = true;
++            }
++            ~DecoderScope() {
++                if (vae) {
++                    vae->keep_series_decoder = false;
++                    vae->runner_end();
++                }
++            }
++        } decoder(request.explicit_image_seeds && final_latents.size() > 1 ? sd->first_stage_model.get() : nullptr);
+         std::vector<sd::Tensor<float>> decoded_images;
+         int64_t t0     = ggml_time_ms();
+         bool cancelled = false;

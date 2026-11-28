@@ -26,8 +26,8 @@ func imageBatchCount(request imageJobRequest) (int, error) {
 	if count == 0 {
 		count = 1
 	}
-	if count < 1 || count > 8 {
-		return 0, errors.New("image batch count must be between 1 and 8")
+	if count < 1 || count > imagegen.MaxImageSeries {
+		return 0, errors.New("image batch count must be between 1 and 1000")
 	}
 	return count, nil
 }

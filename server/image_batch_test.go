@@ -77,6 +77,23 @@ func (b *imageBatchTestRunner) Run(ctx context.Context, profile imagegen.Profile
 			return imagegen.Result{}, ctx.Err()
 		}
 	}
+	if plan := request.Series; plan != nil {
+		var last imagegen.Result
+		for i, item := range plan.Outputs {
+			request.Seed = item.Seed
+			request.OutputPath = filepath.Join(filepath.Dir(request.OutputPath), item.Filename)
+			result, err := b.base.Run(ctx, profile, request, progress)
+			if err != nil {
+				return last, err
+			}
+			if err := plan.Publish(i, result); err != nil {
+				return last, err
+			}
+			last = result
+			progress(imagegen.Progress{Phase: "sampling", BatchIndex: i + 1, Current: 8, Total: 8})
+		}
+		return last, nil
+	}
 	result, err := b.base.Run(ctx, profile, request, progress)
 	if b.afterSave != nil {
 		b.afterSave(index)
@@ -350,7 +367,7 @@ func TestImageGenerationSnapshotAndSessionFilterPreserveRecoveryMetadata(t *test
 
 func TestImageBatchCountSeedAndCacheBoundsFailBeforeNativeWork(t *testing.T) {
 	_, _, router, events, _ := newImageBatchTestService(t)
-	for _, body := range []string{`{"prompt":"x","count":9}`, `{"prompt":"x","count":-1}`, `{"prompt":"x","count":2,"seed":9223372036854775807}`} {
+	for _, body := range []string{`{"prompt":"x","count":1001}`, `{"prompt":"x","count":-1}`, `{"prompt":"x","count":2,"seed":9223372036854775807}`} {
 		response := imageTestHTTP(router, "POST", "/api/images/jobs", []byte(body), "application/json")
 		require.Equal(t, 400, response.Code, response.Body.String())
 	}
@@ -387,5 +404,35 @@ func TestImageVariationLineageDoesNotSilentlyAddReferenceConditioning(t *testing
 	runner.mu.Unlock()
 	for _, request := range calls {
 		require.Empty(t, request.ReferenceImages)
+	}
+}
+
+func TestImageBatchNativeSeries(t *testing.T) {
+	for _, seed := range []int64{-1, 41} {
+		_, service, _, events, runner := newImageBatchTestService(t)
+		runner.base.status = &imagegen.RunnerStatus{Ready: true, Revision: "test", RAMBudgetSupported: true, ImageSeriesSupported: true}
+		job := imageLifecycleJob(service, "")
+		job.Request.Count, job.Request.Seed = 5, &seed
+		job, err := service.enqueue(job)
+		require.NoError(t, err)
+		waitImageBatchTerminal(t, service, job)
+		service.mu.Lock()
+		results := append([]imageAsset(nil), job.Results...)
+		status, problem, index := job.Status, job.Error, job.Progress.BatchIndex
+		service.mu.Unlock()
+		require.Equal(t, "completed", status, problem)
+		require.Len(t, results, 5)
+		require.Equal(t, 5, index)
+		used := map[int64]bool{}
+		for i, r := range results {
+			require.False(t, used[r.Seed])
+			used[r.Seed] = true
+			if seed >= 0 {
+				require.Equal(t, seed+int64(i), r.Seed)
+			}
+			require.FileExists(t, r.Path)
+		}
+		require.Len(t, runner.calls, 1)
+		require.Equal(t, 1, countImageEvent(events, "restore_text"))
 	}
 }

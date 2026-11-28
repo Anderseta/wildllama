@@ -101,6 +101,8 @@ type LocalInspection struct {
 }
 
 type Request struct {
+	Series          *ImageSeries `json:"-"`
+	seriesRun       *imageSeriesRun
 	Video           *VideoOptions    `json:"-"`
 	VideoCheckpoint *VideoCheckpoint `json:"-"`
 	crop            image.Rectangle
@@ -119,6 +121,7 @@ type Request struct {
 }
 
 type Progress struct {
+	BatchIndex       int     `json:"batch_index,omitempty"`
 	VideoPercent     int     `json:"video_percent,omitempty"`
 	VideoETASeconds  int     `json:"video_eta_seconds,omitempty"`
 	VideoAttempt     int     `json:"video_attempt,omitempty"`
@@ -145,6 +148,7 @@ type Result struct {
 }
 
 type RunnerStatus struct {
+	ImageSeriesSupported       bool   `json:"image_series_supported,omitempty"`
 	Ready                      bool   `json:"ready"`
 	Running                    bool   `json:"running"`
 	PID                        int    `json:"pid,omitempty"`

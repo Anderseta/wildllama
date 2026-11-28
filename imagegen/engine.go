@@ -86,6 +86,7 @@ func (e *Engine) Status() RunnerStatus {
 		var manifest struct {
 			Revision string `json:"revision"`
 			Features struct {
+				ImageSeries       bool `json:"image_series"`
 				ConditioningCache bool `json:"conditioning_cache"`
 				RAMBudget         bool `json:"ram_budget"`
 				MOSSEdit          bool `json:"moss_edit"`
@@ -140,6 +141,7 @@ func (e *Engine) Status() RunnerStatus {
 			return status
 		}
 		status.Revision = manifest.Revision
+		status.ImageSeriesSupported = manifest.Features.ImageSeries
 		status.ConditioningCacheSupported = manifest.Features.ConditioningCache
 		status.RAMBudgetSupported = manifest.Features.RAMBudget
 		status.MOSSEditSupported = manifest.Features.MOSSEdit
@@ -568,6 +570,14 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Result{}, err
 	}
+	if r.Series != nil {
+		if !runnerStatus.ImageSeriesSupported || r.Video != nil {
+			return Result{}, errors.New("runner does not support image series")
+		}
+		if err := r.Series.validate(output, r.Seed); err != nil {
+			return Result{}, err
+		}
+	}
 	if err := CheckDiskSpace(ctx, output, OutputSpaceBudget(p.Width, p.Height, r.Video)); err != nil {
 		return Result{}, err
 	}
@@ -648,6 +658,24 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	seed = ResolveSeed(seed)
 	start := time.Now()
 	log := &progressLog{callback: progress, start: start, expectedSteps: p.Steps, video: r.Video != nil}
+	if r.Series != nil {
+		staging, err := os.MkdirTemp(filepath.Dir(finalPath), ".series-")
+		if err != nil {
+			return Result{}, err
+		}
+		defer os.RemoveAll(staging)
+		series := &imageSeriesRun{plan: r.Series, staging: staging, destination: filepath.Dir(finalPath), started: start,
+			width: p.Width, height: p.Height, group: seriesGroupSize(p, r), revision: runnerStatus.Revision}
+		if r.Inpaint != nil {
+			series.compose = func(img image.Image, dest string) (image.Point, error) {
+				return composeInpaint(ctx, mask, r.ReferenceImages[0], img, dest, r.crop)
+			}
+		}
+		r.seriesRun = series
+		log.series = series
+		series.stop = cancel
+		output = filepath.Join(staging, "series.png")
+	}
 	if !r.crop.Empty() {
 		log.emit(Progress{Phase: "preparing", Message: fmt.Sprintf("Editando recorte de %d × %d pixels em %d × %d. A saída mantém as dimensões da referência.", r.crop.Dx(), r.crop.Dy(), p.Width, p.Height)}, true)
 	}
@@ -713,6 +741,19 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 	allowCUDARetry := runtime.GOOS == "windows" && !cudaload.HasExplicitModuleLoading(os.Environ())
 	for {
 		err = e.runChild(ctx, p, r, jobDir, output, seed, mode, eagerCUDA, runnerStatus, log, reference, checkpoint)
+		if s := r.seriesRun; s != nil {
+			// The process can exit after a rename and before its stdout notification.
+			s.collect(len(s.plan.Outputs))
+			if s.err != nil {
+				return s.last, s.err
+			}
+			if s.next == len(s.plan.Outputs) {
+				break
+			}
+			if err == nil {
+				err = errors.New("native image series ended before all requested images were saved")
+			}
+		}
 		if err != nil && checkpoint.view != nil {
 			log.wan.savedStep = checkpoint.publishedStep(p.Steps)
 		}
@@ -724,6 +765,11 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		var exit *exec.ExitError
 		if runErr != nil || ctx.Err() != nil || mode == imageRAMCPU || !errors.As(err, &exit) {
 			break
+		}
+		if s := r.seriesRun; s != nil && min(s.group, len(s.plan.Outputs)-s.next) > 1 && (exit.ExitCode() == RAMBudgetExitCode || exit.ExitCode() == GPUOutOfMemoryExitCode && log.lastPhase == "decoding") {
+			s.group = max(1, min(s.group, len(s.plan.Outputs)-s.next)/2)
+			log.emit(Progress{Phase: "preparing", Message: "Reduzindo o grupo de imagens para respeitar a memória disponível."}, true)
+			continue
 		}
 		retryCUDA := allowCUDARetry && !eagerCUDA && cudaload.IsSharedObjectInitFailure(log.tail())
 		retryMemory := p.OffloadToCPU && exit.ExitCode() == GPUOutOfMemoryExitCode
@@ -738,7 +784,7 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 			if checkWebM(output, r.Video.Frames, p.Width, p.Height) == nil {
 				break
 			}
-		} else {
+		} else if r.seriesRun == nil {
 			decoded, _ = decodeOutputPNG(output, p.Width, p.Height)
 		}
 		if decoded != nil {
@@ -781,6 +827,9 @@ func (e *Engine) Run(ctx context.Context, p Profile, r Request, progress func(Pr
 		runErr = ctx.Err()
 	} else if err != nil {
 		runErr = err
+	}
+	if r.seriesRun != nil {
+		return r.seriesRun.last, runErr
 	}
 	if r.Video != nil {
 		if err := publishWebM(output, finalPath, r.Video.Frames, p.Width, p.Height); err != nil {
@@ -839,7 +888,16 @@ func (e *Engine) runChild(ctx context.Context, p Profile, r Request, jobDir, out
 		// profile, generation summary and user-selected resource caps stay intact.
 		p.EncoderOnCPU, p.VAEOnCPU = true, true
 	}
+	if r.seriesRun != nil {
+		args = append(args, "--wildimage-series")
+	}
 	cmd := exec.CommandContext(ctx, e.config.RunnerPath, args...)
+	if s := r.seriesRun; s != nil {
+		if err := CheckDiskSpace(ctx, output, int64(min(s.group, len(s.plan.Outputs)-s.next))*OutputSpaceBudget(p.Width, p.Height, nil)); err != nil {
+			return err
+		}
+		cmd.Stdin = s.seedInput()
+	}
 	cmd.Dir = jobDir
 	cmd.Env = isolatedEnvironment(e.config, jobDir)
 	if r.Video != nil {
@@ -1171,6 +1229,7 @@ var stepPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,9})/([0-9]{1,9})(?:[^
 var byteRatePattern = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:[kmgt]i?)?b/s\b`)
 
 type progressLog struct {
+	series         *imageSeriesRun
 	wan            wanProgress
 	mu             sync.Mutex
 	pending        string
@@ -1228,6 +1287,9 @@ func (p *progressLog) line(line string) {
 	if len(p.lines) > 16 {
 		p.lines = p.lines[len(p.lines)-16:]
 	}
+	if p.series != nil && p.series.notice(line) {
+		return
+	}
 	lower := strings.ToLower(line)
 	if p.video {
 		if update, ok := p.wan.observe(lower, p.expectedSteps); ok {
@@ -1246,6 +1308,13 @@ func (p *progressLog) line(line string) {
 		update.Phase = "sampling"
 		update.Message = "Generating image"
 		update.Total = p.expectedSteps
+		if p.series != nil {
+			at := strings.Index(lower, "generating image:") + len("generating image:")
+			counter, _, _ := strings.Cut(strings.TrimSpace(lower[at:]), "/")
+			if n, err := strconv.Atoi(counter); err == nil && n > 0 && n <= p.series.activeCount {
+				update.BatchIndex = p.series.first + n
+			}
+		}
 	case samplerSelected:
 		// The native request planner prints the sampler before reference
 		// encoding. This is not the first diffusion step.
@@ -1331,7 +1400,7 @@ func (p *progressLog) emit(v Progress, force bool) {
 	if p.callback == nil {
 		return
 	}
-	if !force && v.VideoAttempt == 0 && v.Phase == p.lastPhase && v.Current == p.lastCurrent && v.Total == p.lastTotal && time.Since(p.lastEmit) < 500*time.Millisecond {
+	if !force && v.BatchIndex == 0 && v.VideoAttempt == 0 && v.Phase == p.lastPhase && v.Current == p.lastCurrent && v.Total == p.lastTotal && time.Since(p.lastEmit) < 500*time.Millisecond {
 		return
 	}
 	p.lastPhase = v.Phase
