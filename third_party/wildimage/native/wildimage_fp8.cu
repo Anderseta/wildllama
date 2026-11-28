@@ -1,4 +1,5 @@
 #include "core/wildimage_fp8.h"
+#include "core/wildimage_flash_values.h"
 #include "core/wildimage_scaled_projection.h"
 #include "core/cuda/runtime.h"
 #include <cuda_fp8.h>
@@ -186,6 +187,61 @@ static ggml_status execute(const ggml_ext_execution_context* execution, ggml_ten
     return cudaGetLastError() == cudaSuccess ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 }
+namespace wildimage_flash_values {
+// A warp writes one 128-channel row. Copy cached half bits verbatim and
+// round fresh values once, directly into their final attention layout.
+template<bool aligned>
+__global__ void pack_rows(const half* prefix, const float* target, half* output,
+                          int64_t heads, int64_t prefix_len, int64_t total) {
+    const int64_t token = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
+    if (token >= total) return;
+    const int64_t head = blockIdx.y, col = 4 * threadIdx.x;
+    half* dst = output + (head * total + token) * 128 + col;
+    if (token < prefix_len) {
+        const half* src = prefix + (token * heads + head) * 128 + col;
+        if constexpr (aligned) {
+            *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(src);
+        } else {
+            for (int i = 0; i < 4; ++i) dst[i] = src[i];
+        }
+    } else {
+        const float* src = target + ((token - prefix_len) * heads + head) * 128 + col;
+        if constexpr (aligned) {
+            const float4 v = *reinterpret_cast<const float4*>(src);
+            auto* d = reinterpret_cast<half2*>(dst);
+            d[0] = __floats2half2_rn(v.x, v.y);
+            d[1] = __floats2half2_rn(v.z, v.w);
+        } else {
+            for (int i = 0; i < 4; ++i) dst[i] = __float2half_rn(src[i]);
+        }
+    }
+}
+
+static bool supports(ggml_backend_dev_t, const ggml_tensor* node, void*) {
+    ggml_ext_tensor_desc out;
+    return shape(node->src, 2, nullptr, &out) && node->type == out.type &&
+           !std::memcmp(node->ne, out.ne, sizeof(out.ne)) && ggml_is_contiguous(node);
+}
+
+static ggml_status execute(const ggml_ext_execution_context* e, ggml_tensor* const* nodes, int, void*, void*) {
+    ggml_ext_gpu_context context;
+    if (!sd_cuda::cuda_context(e->backend, &context)) return GGML_STATUS_FAILED;
+    auto node = nodes[0];
+    auto p = static_cast<const half*>(node->src[0]->data);
+    auto t = static_cast<const float*>(node->src[1]->data);
+    auto out = static_cast<half*>(node->data);
+    const int64_t prefix = node->src[0]->ne[1], total = node->ne[1], heads = node->ne[2];
+    const dim3 block(32, 8), grid(unsigned((total + 7) / 8), unsigned(heads));
+    const auto stream = static_cast<cudaStream_t>(context.stream);
+    if (!(uintptr_t(p) % alignof(uint2)) && !(uintptr_t(t) % alignof(float4)) && !(uintptr_t(out) % alignof(uint2))) {
+        pack_rows<true><<<grid, block, 0, stream>>>(p, t, out, heads, prefix, total);
+    } else {
+        pack_rows<false><<<grid, block, 0, stream>>>(p, t, out, heads, prefix, total);
+    }
+    return cudaGetLastError() == cudaSuccess ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+}
+}
+
 void wildimage_register_fp8(ggml_backend_dev_t device) {
     const auto info = sd_cuda::cuda_device_info(device);
     int major = 0, minor = 0;
@@ -213,4 +269,13 @@ void wildimage_register_fp8(ggml_backend_dev_t device) {
         epilogue.name = residual ? "wildimage.scaled_gated_residual.cuda.v1" : "wildimage.scaled_swiglu.cuda.v1";
         GGML_ASSERT(ggml_ext_register_kernel_ex(device, &epilogue, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
     }
+    ggml_ext_kernel_desc values{};
+    values.abi_version = GGML_EXT_ABI_VERSION;
+    values.op = GGML_OP_CUSTOM;
+    values.priority = 100;
+    values.name = "wildimage.flash_values.cuda.v1";
+    values.custom_op = wildimage_flash_values::operation();
+    values.supports = wildimage_flash_values::supports;
+    values.execute = wildimage_flash_values::execute;
+    GGML_ASSERT(ggml_ext_register_kernel_ex(device, &values, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
 }

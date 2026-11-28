@@ -214,6 +214,16 @@ attention operation. Other configurations use the existing attention path.
 and the host allocation limit. `tests/qwen_cached_flash_test.cpp` compares GPU
 outputs byte for byte against the original graph.
 
+CUDA devices with the WildImage FP8 extensions can pack cached values and
+fresh values directly into the Flash Attention input. One pass copies the
+cached half bits and converts the fresh FP32 values. The key path retains
+the backend's rotary fusion. The same fixture checks the packed half bits,
+including an unaligned target and repeated graph execution.
+
+Runtime linear LoRAs with an effective gain of exactly one pass their FP32
+projection directly to the adapter sum. Other gains use the normal scaling
+operation, including per-module alpha and the user's adapter strength.
+
 On supported CUDA devices, Qwen Image 2.1 combines a scalar projection scale
 with the SwiGLU activation or the gated residual addition. Each kernel reads
 the projected values once and preserves the original FP32 operation order.
